@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PhotoSorter — Обзор папки</title>
+    <style>
+      :root { color-scheme: light; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      a { color: #0b57d0; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      .header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; max-width: 1200px; }
+      .muted { color: #6b7280; }
+      table { border-collapse: collapse; width: 100%; max-width: 1200px; margin-top: 14px; }
+      th, td { border-bottom: 1px solid #e5e7eb; padding: 10px 8px; vertical-align: top; text-align: left; }
+      th { font-weight: 600; color: #111827; background: #fafafa; position: sticky; top: 0; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+      .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f3f4f6; color: #374151; font-size: 12px; }
+      .right { text-align: right; }
+      .count-cell { font-variant-numeric: tabular-nums; }
+      .err { color: #b91c1c; }
+      .topline { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; max-width: 1200px; margin-top: 10px; }
+    </style>
+  </head>
+  <body>
+    <div class="header">
+      <div>
+        <h2 style="margin: 0;">Обзор папки</h2>
+        <div class="muted">Путь: <code id="root-path">{{ path }}</code></div>
+      </div>
+      <div class="muted">
+        <a href="/folders">← к списку папок</a>
+        &nbsp;·&nbsp;
+        <a href="#" id="reload">Обновить</a>
+      </div>
+    </div>
+
+    <div class="topline">
+      <div class="muted">Файлы в этой папке (без подпапок): <span class="pill" id="direct-files">…</span></div>
+      <div class="muted" id="progress">Готово: 0 / 0</div>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Подпапка (1 уровень)</th>
+          <th>Путь</th>
+          <th class="right">Файлов (рекурсивно)</th>
+          <th class="right">Сек</th>
+          <th>Ошибка</th>
+        </tr>
+      </thead>
+      <tbody id="tbody">
+        <tr><td colspan="5" class="muted">Загрузка…</td></tr>
+      </tbody>
+    </table>
+
+    <script>
+      const CONCURRENCY = 8;
+
+      function setProgress(done, total) {
+        const el = document.getElementById("progress");
+        if (el) el.textContent = `Готово: ${done} / ${total}`;
+      }
+
+      function escapeHtml(s) {
+        return (s ?? "").toString()
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll("\"", "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      async function load() {
+        const rootPath = document.getElementById("root-path")?.textContent ?? "";
+        const tbody = document.getElementById("tbody");
+        if (!tbody) return;
+
+        tbody.innerHTML = `<tr><td colspan="5" class="muted">Загрузка…</td></tr>`;
+        document.getElementById("direct-files").textContent = "…";
+        setProgress(0, 0);
+
+        let listing;
+        try {
+          const resp = await fetch(`/api/path-listing?path=${encodeURIComponent(rootPath)}`, { cache: "no-store" });
+          if (!resp.ok) throw new Error("HTTP " + resp.status);
+          listing = await resp.json();
+        } catch (e) {
+          tbody.innerHTML = `<tr><td colspan="5" class="err">Ошибка листинга: ${escapeHtml(String(e))}</td></tr>`;
+          return;
+        }
+
+        document.getElementById("direct-files").textContent = String(listing.direct_files ?? "");
+
+        const dirs = Array.isArray(listing.dirs) ? listing.dirs : [];
+        const total = dirs.length;
+        let done = 0;
+        setProgress(done, total);
+
+        if (total === 0) {
+          tbody.innerHTML = `<tr><td colspan="5" class="muted">Подпапок нет.</td></tr>`;
+          return;
+        }
+
+        // Рендерим строки сразу (с "…"), потом обновляем построчно.
+        tbody.innerHTML = dirs.map(d => {
+          const name = escapeHtml(d.name);
+          const p = escapeHtml(d.path);
+          const href = `/browse?path=${encodeURIComponent(d.path)}`;
+          return `
+            <tr data-path="${p}">
+              <td><a href="${href}">${name}</a></td>
+              <td><code>${p}</code></td>
+              <td class="right count-cell">…</td>
+              <td class="right sec-cell"></td>
+              <td class="err-cell"></td>
+            </tr>
+          `;
+        }).join("");
+
+        const rows = Array.from(tbody.querySelectorAll("tr[data-path]"));
+        const queue = rows.slice();
+
+        async function worker() {
+          while (queue.length) {
+            const row = queue.shift();
+            const p = row?.getAttribute("data-path");
+            if (!row || !p) continue;
+
+            const countCell = row.querySelector(".count-cell");
+            const secCell = row.querySelector(".sec-cell");
+            const errCell = row.querySelector(".err-cell");
+
+            try {
+              const resp = await fetch(`/api/path-count?path=${encodeURIComponent(p)}`, { cache: "no-store" });
+              if (!resp.ok) throw new Error("HTTP " + resp.status);
+              const data = await resp.json();
+
+              if (data.error) {
+                if (countCell) countCell.textContent = "ошибка";
+                if (secCell) secCell.textContent = data.seconds ? String(data.seconds) : "";
+                if (errCell) errCell.textContent = data.error_path ? `${data.error} @ ${data.error_path}` : data.error;
+              } else {
+                if (countCell) countCell.textContent = String(data.count ?? "");
+                if (secCell) secCell.textContent = data.seconds ? String(data.seconds) : "";
+                if (errCell) errCell.textContent = "";
+              }
+            } catch (e) {
+              if (countCell) countCell.textContent = "ошибка";
+              if (errCell) errCell.textContent = String(e);
+            } finally {
+              done += 1;
+              setProgress(done, total);
+            }
+          }
+        }
+
+        const workers = Array.from({ length: Math.min(CONCURRENCY, total) }, () => worker());
+        await Promise.all(workers);
+      }
+
+      document.getElementById("reload")?.addEventListener("click", (e) => {
+        e.preventDefault();
+        load();
+      });
+
+      load();
+    </script>
+  </body>
+</html>
+
+

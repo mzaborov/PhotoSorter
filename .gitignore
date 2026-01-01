@@ -209,3 +209,6 @@ __marimo__/
 # Local secrets and DB
 secrets.env
 data/photosorter.db
+
+# Local history log (human-readable progress journal)
+History.log

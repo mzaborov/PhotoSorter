@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PhotoSorter — Папки</title>
+    <style>
+      :root { color-scheme: light; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      a { color: #0b57d0; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      .header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; max-width: 1200px; }
+      .muted { color: #6b7280; }
+      table { border-collapse: collapse; width: 100%; max-width: 1200px; margin-top: 14px; }
+      th, td { border-bottom: 1px solid #e5e7eb; padding: 10px 8px; vertical-align: top; text-align: left; }
+      th { font-weight: 600; color: #111827; background: #fafafa; position: sticky; top: 0; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+      .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f3f4f6; color: #374151; font-size: 12px; }
+      .num { width: 64px; }
+      .nowrap { white-space: nowrap; }
+      .right { text-align: right; }
+      .count-cell { font-variant-numeric: tabular-nums; }
+      .err { color: #b91c1c; }
+      .topline { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; max-width: 1200px; }
+    </style>
+  </head>
+  <body>
+    <div class="header">
+      <div>
+        <h2 style="margin: 0;">Папки</h2>
+        <div class="muted">
+          Показаны папки из SQLite (`folders`), отсортировано по `sort_order`.
+          Количество файлов подгружается отдельно и считается рекурсивно.
+        </div>
+      </div>
+      <div class="muted">
+        <a href="/">Главная</a>
+        &nbsp;·&nbsp;
+        <a href="#" id="recount">Пересчитать</a>
+      </div>
+    </div>
+    <div class="topline" style="margin-top: 10px;">
+      <div class="muted" id="progress">Готово: 0 / 0</div>
+      <div class="muted" id="hint"></div>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th class="num">Порядок</th>
+          <th>Имя</th>
+          <th class="right">Файлов</th>
+          <th>Путь</th>
+          <th class="nowrap">Код</th>
+          <th class="nowrap">Роль</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in folders %}
+        <tr>
+          <td class="num">
+            {% if f.sort_order is not none %}
+              <span class="pill">{{ f.sort_order }}</span>
+            {% endif %}
+          </td>
+          <td>{{ f.name or "" }}</td>
+          <td class="right count-cell" data-code="{{ f.code }}">…</td>
+          <td>
+            <code>{{ f.path }}</code>
+            &nbsp;
+            <a href="/browse?path={{ f.path | urlencode }}" title="Открыть вложенные папки">↗</a>
+          </td>
+          <td class="nowrap"><code>{{ f.code }}</code></td>
+          <td class="nowrap"><span class="pill">{{ f.role }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <script>
+      const CONCURRENCY = 10;
+
+      function setProgress(done, total) {
+        const el = document.getElementById("progress");
+        if (el) el.textContent = `Готово: ${done} / ${total}`;
+      }
+
+      async function loadCountsRowByRow() {
+        const cells = Array.from(document.querySelectorAll("td.count-cell[data-code]"));
+        const total = cells.length;
+        let done = 0;
+        setProgress(done, total);
+
+        for (const c of cells) {
+          c.textContent = "…";
+          c.classList.remove("err");
+          c.title = "";
+        }
+
+        const queue = cells.slice();
+
+        async function worker() {
+          while (queue.length) {
+            const cell = queue.shift();
+            const code = cell?.getAttribute("data-code");
+            if (!cell || !code) continue;
+
+            try {
+              const resp = await fetch(`/api/folder-count/${encodeURIComponent(code)}`, { cache: "no-store" });
+              if (!resp.ok) throw new Error("HTTP " + resp.status);
+              const data = await resp.json();
+
+              if (data.error) {
+                cell.textContent = "ошибка";
+                cell.classList.add("err");
+                cell.title = data.error;
+              } else {
+                cell.textContent = (data.count ?? "").toString();
+                cell.title = data.seconds ? `Время: ${data.seconds}с` : "";
+              }
+            } catch (e) {
+              cell.textContent = "ошибка";
+              cell.classList.add("err");
+              cell.title = String(e);
+            } finally {
+              done += 1;
+              setProgress(done, total);
+            }
+          }
+        }
+
+        const workers = Array.from({ length: Math.min(CONCURRENCY, total) }, () => worker());
+        await Promise.all(workers);
+      }
+
+      document.getElementById("recount")?.addEventListener("click", (e) => {
+        e.preventDefault();
+        loadCountsRowByRow();
+      });
+
+      loadCountsRowByRow();
+    </script>
+  </body>
+</html>
+
+
