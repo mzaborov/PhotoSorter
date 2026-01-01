@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- YaDisk preview hotlink защита: просим браузер не слать Referer при загрузке картинок -->
+    <meta name="referrer" content="no-referrer" />
+    <title>PhotoSorter — Дубли</title>
+    <style>
+      :root { color-scheme: light; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      a { color: #0b57d0; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      .muted { color: #6b7280; }
+      .header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; max-width: 1400px; }
+      table { border-collapse: collapse; width: 100%; max-width: 1400px; margin-top: 14px; }
+      th, td { border-bottom: 1px solid #e5e7eb; padding: 10px 8px; vertical-align: top; text-align: left; }
+      th { font-weight: 600; color: #111827; background: #fafafa; position: sticky; top: 0; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+
+      .row-meta { width: 220px; }
+      .cards { display: flex; gap: 10px; align-items: stretch; }
+      .card { width: 230px; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; background: #fff; }
+      .thumb { height: 140px; background: #fff; display: flex; align-items: center; justify-content: center; position: relative; cursor: zoom-in; }
+      /* Не обрезаем содержимое превью (важно для вертикальных фото с текстом внизу) */
+      .thumb img { width: 100%; height: 100%; object-fit: contain; display: block; background: #fff; }
+      .thumb .noimg { color: #6b7280; font-size: 12px; padding: 10px; text-align: center; }
+      .card-body { padding: 10px 10px 12px 10px; }
+      .path { font-size: 12px; }
+      .folder { font-weight: 600; }
+      .kv { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; font-size: 12px; color: #374151; }
+      .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f3f4f6; color: #374151; font-size: 12px; }
+      .keep { margin-top: 8px; display: flex; gap: 8px; align-items: center; }
+      .keep input { transform: scale(1.1); }
+      .warn { color: #b91c1c; font-weight: 600; }
+      .warn.hidden { display: none; }
+      .actions { display: flex; gap: 10px; align-items: center; margin-top: 12px; max-width: 1400px; }
+      .btn { appearance: none; border: 1px solid #d1d5db; background: #fff; padding: 8px 10px; border-radius: 10px; cursor: pointer; font-weight: 600; }
+      .btn:hover { background: #f9fafb; }
+      .btn.danger { border-color: #fecaca; background: #fff5f5; color: #991b1b; }
+      .btn.danger:hover { background: #ffecec; }
+      .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+      .toast { color: #374151; font-size: 13px; }
+      .toast.err { color: #991b1b; }
+      .link { color: #0b57d0; text-decoration: none; }
+      .link:hover { text-decoration: underline; }
+
+      /* Lightbox */
+      .lb { position: fixed; inset: 0; background: rgba(17,24,39,0.82); display: none; align-items: center; justify-content: center; padding: 18px; z-index: 9999; }
+      .lb.open { display: flex; }
+      .lb-panel { background: #fff; border-radius: 14px; max-width: 92vw; max-height: 92vh; width: min(1100px, 92vw); overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,0.35); }
+      .lb-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #e5e7eb; }
+      .lb-top code { font-size: 11px; }
+      .lb-actions { display: flex; gap: 10px; align-items: center; }
+      .lb-imgwrap { background: #111827; display: flex; align-items: center; justify-content: center; }
+      .lb-imgwrap img { max-width: 92vw; max-height: calc(92vh - 56px); width: auto; height: auto; display: block; object-fit: contain; background: #111827; }
+    </style>
+  </head>
+  <body>
+    <div class="header">
+      <div>
+        <h2 style="margin: 0;">Дубли (архив)</h2>
+      </div>
+      <div class="muted">
+        <a href="/folders">← к папкам</a>
+      </div>
+    </div>
+
+    <div class="muted" style="margin-top: 10px;">
+      Групп: <span class="pill">{{ summary.groups }}</span>
+      &nbsp;·&nbsp;
+      Максимум файлов в группе: <span class="pill">{{ summary.max_group_size }}</span>
+    </div>
+
+    <div class="actions">
+      <button id="btnDeleteCopies" class="btn danger" type="button">Удалить копии (0)</button>
+      <span id="toast" class="toast muted"></span>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th class="row-meta">Группа</th>
+          <th>Файлы</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for g in groups %}
+        <tr>
+          <td class="row-meta">
+            <div><span class="pill">{{ g.cnt }} шт</span></div>
+            <div style="margin-top: 6px;"><code>{{ g.hash_alg }}:{{ g.hash_short }}</code></div>
+            {% if g.note %}
+              <div class="muted" style="margin-top: 6px;">{{ g.note }}</div>
+            {% endif %}
+            <div class="warn hidden" style="margin-top: 8px;">Нужно оставить хотя бы один файл</div>
+            <div style="margin-top: 10px;">
+              <button class="btn" type="button" data-action="move-kids">В «Дети вместе» + удалить копии</button>
+            </div>
+          </td>
+          <td>
+            <div class="cards" data-group="{{ g.hash_alg }}:{{ g.hash_short }}">
+              {% for it in g.files %}
+              <div class="card">
+                <div class="thumb" data-path="{{ it.path }}">
+                  <div class="noimg">превью…</div>
+                </div>
+                <div class="card-body">
+                  <div class="folder">{{ it.folder_short }}</div>
+                  <div class="muted path">
+                    <a class="link" href="/api/yadisk/open?path={{ it.path | urlencode }}" target="_blank" rel="noopener noreferrer"><code>{{ it.path_short }}</code></a>
+                  </div>
+                  <div class="kv">
+                    <span class="pill">{{ it.size_human }}</span>
+                    {% if (it.media_type and it.media_type|lower == 'video') or (it.mime_type and (it.mime_type|lower).startswith('video/')) %}
+                      <span class="pill duration" data-duration="—">длительность: —</span>
+                    {% endif %}
+                    {% if it.media_type %}
+                      <span class="pill">{{ it.media_type }}</span>
+                    {% elif it.mime_type %}
+                      <span class="pill">{{ it.mime_type }}</span>
+                    {% endif %}
+                  </div>
+                  <div class="keep">
+                    <input class="keep-cb" type="checkbox" {% if it.keep %}checked{% endif %} />
+                    <span class="muted">сохранить</span>
+                  </div>
+                </div>
+              </div>
+              {% endfor %}
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <script>
+      // Важно: не запускаем десятки загрузок превью одновременно, иначе сервер будет отдавать 429
+      // (защитный лимит на get_meta для preview URL). Держим параллелизм ниже лимита сервера
+      // (_PREVIEW_MAX_CONCURRENT=4).
+      const CONCURRENCY = 3;
+
+      function escapeHtml(s) {
+        return (s ?? "").toString()
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll("\"", "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      function createLimiter(limit) {
+        let active = 0;
+        /** @type {Array<{fn: Function, resolve: Function, reject: Function}>} */
+        const queue = [];
+        const next = () => {
+          if (active >= limit) return;
+          const item = queue.shift();
+          if (!item) return;
+          active += 1;
+          Promise.resolve()
+            .then(() => item.fn())
+            .then(item.resolve, item.reject)
+            .finally(() => {
+              active -= 1;
+              next();
+            });
+        };
+        return (fn) => new Promise((resolve, reject) => {
+          queue.push({ fn, resolve, reject });
+          next();
+        });
+      }
+
+      function previewProxyUrl(path, size) {
+        // Сервер вернёт redirect на YaDisk preview URL.
+        return `/api/yadisk/preview-image?size=${encodeURIComponent(size)}&path=${encodeURIComponent(path)}`;
+      }
+
+      function loadOnePreview(el) {
+        return new Promise((resolve) => {
+          const p = el?.getAttribute("data-path");
+          if (!el || !p) return resolve();
+          el.innerHTML = `<div class="noimg">превью…</div>`;
+
+          const img = new Image();
+          img.loading = "lazy";
+          img.alt = "preview";
+          // YaDisk preview hotlink защита: не отправляем Referer
+          img.referrerPolicy = "no-referrer";
+          img.onload = () => resolve();
+          img.onerror = () => {
+            el.innerHTML = `<div class="noimg">нет превью</div>`;
+            resolve();
+          };
+          el.innerHTML = "";
+          el.appendChild(img);
+
+          // Важно: нельзя делать fetch().blob() на redirect → YaDisk preview URL из-за CORS.
+          // Через <img src="..."> браузер спокойно загрузит картинку по редиректу.
+          img.src = previewProxyUrl(p, "M");
+        });
+      }
+
+      async function loadPreviews() {
+        const thumbs = Array.from(document.querySelectorAll(".thumb[data-path]"));
+        const limit = createLimiter(CONCURRENCY);
+        await Promise.all(thumbs.map(el => limit(() => loadOnePreview(el))));
+      }
+
+      loadPreviews();
+
+      // Валидация выбора: в каждой группе должен быть выбран хотя бы 1 чекбокс.
+      function updateGroupValidity(cardsEl) {
+        const row = cardsEl.closest("tr");
+        const warn = row?.querySelector(".warn");
+        const checked = cardsEl.querySelectorAll("input.keep-cb:checked").length;
+        if (warn) {
+          warn.classList.toggle("hidden", checked > 0);
+        }
+      }
+
+      document.querySelectorAll(".cards[data-group]").forEach(cardsEl => {
+        // начальная валидация
+        updateGroupValidity(cardsEl);
+
+        cardsEl.addEventListener("change", (e) => {
+          const t = e.target;
+          if (!(t instanceof HTMLInputElement) || !t.classList.contains("keep-cb")) return;
+
+          // не даём снять последний чекбокс
+          const checked = cardsEl.querySelectorAll("input.keep-cb:checked");
+          if (checked.length === 0) {
+            t.checked = true;
+          }
+          updateGroupValidity(cardsEl);
+        });
+      });
+
+      function setToast(text, isErr = false) {
+        const el = document.getElementById("toast");
+        if (!el) return;
+        el.textContent = text || "";
+        el.classList.toggle("err", !!isErr);
+      }
+
+      function collectAllUncheckedPaths() {
+        /** @type {string[]} */
+        const paths = [];
+        document.querySelectorAll(".card").forEach(card => {
+          const thumb = card.querySelector(".thumb[data-path]");
+          const cb = card.querySelector("input.keep-cb");
+          const p = thumb?.getAttribute("data-path");
+          if (!p || !(cb instanceof HTMLInputElement)) return;
+          if (!cb.checked) paths.push(p);
+        });
+        return paths;
+      }
+
+      function updateDeleteButtonLabel() {
+        const btn = document.getElementById("btnDeleteCopies");
+        if (!btn) return;
+        const n = collectAllUncheckedPaths().length;
+        btn.textContent = `Удалить копии (${n})`;
+        btn.toggleAttribute("disabled", n === 0);
+      }
+
+      async function postJson(url, bodyObj) {
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(bodyObj ?? {}),
+        });
+        const text = await resp.text();
+        let data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (e) {}
+        if (!resp.ok) {
+          const msg = (data && (data.detail || data.message)) ? (data.detail || data.message) : (text || `HTTP ${resp.status}`);
+          throw new Error(msg);
+        }
+        return data;
+      }
+
+      // Глобальная кнопка: удалить все НЕотмеченные (в корзину)
+      document.getElementById("btnDeleteCopies")?.addEventListener("click", async () => {
+        const paths = collectAllUncheckedPaths();
+        if (paths.length === 0) return;
+        if (!confirm(`Удалить копии (в корзину): ${paths.length} файл(ов)?`)) return;
+        setToast("Удаляю копии…");
+        try {
+          const r = await postJson("/api/duplicates/delete", { paths });
+          const errs = Array.isArray(r?.errors) ? r.errors.length : 0;
+          setToast(errs ? `Удалено: ${r.deleted}. Ошибок: ${errs}` : `Удалено: ${r.deleted}.`, !!errs);
+          // Проще и надёжнее перезагрузить — группы/счётчики пересчитаются.
+          setTimeout(() => location.reload(), 350);
+        } catch (e) {
+          setToast(`Ошибка удаления: ${e?.message || e}`, true);
+        }
+      });
+
+      // Кнопка на строке: переместить 1 файл в "Дети вместе" и удалить остальные (в корзину)
+      document.querySelectorAll("button[data-action='move-kids']").forEach(btn => {
+        btn.addEventListener("click", async (e) => {
+          const b = e.currentTarget;
+          if (!(b instanceof HTMLButtonElement)) return;
+          const row = b.closest("tr");
+          const cardsEl = row?.querySelector(".cards[data-group]");
+          if (!row || !cardsEl) return;
+
+          /** @type {string[]} */
+          const all = [];
+          /** @type {string[]} */
+          const checked = [];
+          cardsEl.querySelectorAll(".card").forEach(card => {
+            const thumb = card.querySelector(".thumb[data-path]");
+            const cb = card.querySelector("input.keep-cb");
+            const p = thumb?.getAttribute("data-path");
+            if (!p || !(cb instanceof HTMLInputElement)) return;
+            all.push(p);
+            if (cb.checked) checked.push(p);
+          });
+          if (all.length < 2) return;
+          const prefer = checked[0] || all[0];
+          const delCount = all.length - 1;
+          if (!confirm(`Переместить 1 файл в «Дети вместе» и отправить в корзину ${delCount} копии(й)?`)) return;
+
+          b.disabled = true;
+          setToast("Перемещаю и удаляю копии…");
+          try {
+            const r = await postJson("/api/duplicates/move-to-kids", { paths: all, prefer_path: prefer });
+            const errs = Array.isArray(r?.errors) ? r.errors.length : 0;
+            setToast(errs ? `Готово: перемещено, удалено ${r.deleted}. Ошибок: ${errs}` : `Готово: перемещено, удалено ${r.deleted}.`, !!errs);
+            row.remove();
+            updateDeleteButtonLabel();
+          } catch (e2) {
+            setToast(`Ошибка: ${e2?.message || e2}`, true);
+            b.disabled = false;
+          }
+        });
+      });
+
+      // начальные счётчики
+      updateDeleteButtonLabel();
+      // и обновление при кликах по чекбоксам
+      document.addEventListener("change", (e) => {
+        const t = e.target;
+        if (t instanceof HTMLInputElement && t.classList.contains("keep-cb")) {
+          updateDeleteButtonLabel();
+        }
+      });
+
+      // Длительность видео: лениво через /api/yadisk/preview (вариант A, без скачивания).
+      async function loadVideoDurations() {
+        const durEls = Array.from(document.querySelectorAll(".pill.duration"));
+        if (durEls.length === 0) return;
+
+        const limit = createLimiter(2);
+        await Promise.all(durEls.map(durEl => limit(async () => {
+          const card = durEl.closest(".card");
+          const thumb = card?.querySelector(".thumb[data-path]");
+          const p = thumb?.getAttribute("data-path");
+          if (!p) return;
+          const maxPoll = 12;
+          for (let i = 0; i < maxPoll; i++) {
+            try {
+              const resp = await fetch(`/api/yadisk/video-duration?path=${encodeURIComponent(p)}`, { cache: "no-store" });
+              const data = await resp.json().catch(() => null);
+              if (resp.status === 200 && data?.status === "ready" && data?.duration_human && data.duration_human !== "—") {
+                const h = data.duration_human;
+                durEl.textContent = `длительность: ${h}`;
+                durEl.setAttribute("data-duration", h);
+                return;
+              }
+              if (resp.status >= 400 && data?.status === "error") {
+                // прекращаем опрос
+                return;
+              }
+              // pending -> ждём и повторяем
+              const ra = resp.headers.get("Retry-After");
+              const waitMs = Math.max(250, (ra ? Number(ra) : 1) * 1000);
+              await new Promise(r => setTimeout(r, isFinite(waitMs) ? waitMs : 1000));
+            } catch (e) {
+              return;
+            }
+          }
+        })));
+      }
+
+      loadVideoDurations();
+
+      // Lightbox (увеличение XL по клику на превью)
+      function ensureLightbox() {
+        let lb = document.getElementById("lightbox");
+        if (lb) return lb;
+        lb = document.createElement("div");
+        lb.id = "lightbox";
+        lb.className = "lb";
+        lb.innerHTML = `
+          <div class="lb-panel" role="dialog" aria-modal="true">
+            <div class="lb-top">
+              <div class="muted"><code id="lbPath"></code></div>
+              <div class="lb-actions">
+                <a id="lbOpenYd" class="link" href="#" target="_blank" rel="noopener noreferrer">Открыть в Я.Диске</a>
+                <button id="lbClose" class="btn" type="button">Закрыть</button>
+              </div>
+            </div>
+            <div class="lb-imgwrap"><img id="lbImg" alt="preview" /></div>
+          </div>
+        `;
+        document.body.appendChild(lb);
+
+        const close = () => lb.classList.remove("open");
+        lb.addEventListener("click", (e) => {
+          if (e.target === lb) close();
+        });
+        lb.querySelector("#lbClose")?.addEventListener("click", close);
+        document.addEventListener("keydown", (e) => {
+          if (e.key === "Escape") close();
+        });
+        return lb;
+      }
+
+      function openLightbox(path) {
+        const lb = ensureLightbox();
+        const img = lb.querySelector("#lbImg");
+        const pEl = lb.querySelector("#lbPath");
+        const openYd = lb.querySelector("#lbOpenYd");
+        if (pEl) pEl.textContent = path || "";
+        if (openYd) openYd.setAttribute("href", `/api/yadisk/open?path=${encodeURIComponent(path)}`);
+        if (img instanceof HTMLImageElement) {
+          img.referrerPolicy = "no-referrer";
+          img.src = previewProxyUrl(path, "XL");
+        }
+        lb.classList.add("open");
+      }
+
+      document.querySelectorAll(".thumb[data-path]").forEach(el => {
+        el.addEventListener("click", (e) => {
+          const p = el.getAttribute("data-path");
+          if (!p) return;
+          // не перехватываем клики по ссылкам/кнопкам внутри (на будущее)
+          if (e.target instanceof HTMLAnchorElement || e.target instanceof HTMLButtonElement) return;
+          openLightbox(p);
+        });
+      });
+    </script>
+  </body>
+</html>
+
+

@@ -22,6 +22,17 @@
       .count-cell { font-variant-numeric: tabular-nums; }
       .err { color: #b91c1c; }
       .topline { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; max-width: 1200px; }
+      .btn { display: inline-flex; align-items: center; gap: 8px; border: 1px solid #e5e7eb; background: #fff; padding: 6px 10px; border-radius: 10px; cursor: pointer; }
+      .btn:hover { background: #fafafa; }
+      .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+      .status { font-variant-numeric: tabular-nums; }
+      .section { max-width: 1200px; margin-top: 18px; border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px 14px; background: #fff; }
+      .section-title { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+      .bar { height: 10px; background: #f3f4f6; border-radius: 999px; overflow: hidden; border: 1px solid #e5e7eb; }
+      .bar > div { height: 100%; width: 0%; background: #0b57d0; transition: width 200ms linear; }
+      .form-row { display: flex; flex-wrap: wrap; gap: 10px 12px; align-items: center; margin-top: 10px; }
+      .field { display: flex; align-items: center; gap: 8px; }
+      .field input { width: 96px; padding: 6px 8px; border: 1px solid #e5e7eb; border-radius: 10px; }
     </style>
   </head>
   <body>
@@ -41,7 +52,7 @@
     </div>
     <div class="topline" style="margin-top: 10px;">
       <div class="muted" id="progress">Готово: 0 / 0</div>
-      <div class="muted" id="hint"></div>
+      <div class="muted status" id="hint"></div>
     </div>
 
     <table>
@@ -77,12 +88,326 @@
       </tbody>
     </table>
 
+    <div class="section" id="dedupArchiveSection">
+      <div class="section-title">
+        <div>
+          <div style="font-weight: 600;">Дедупликация архива</div>
+          <div class="muted">Архив: <code>disk:/Фото</code>. Запуск доступен после завершения подсчёта “Файлов” по папкам выше.</div>
+        </div>
+        <div>
+          <div class="field">
+            <span class="muted">max GB:</span>
+            <input id="dedupMaxGb" type="number" min="0" step="1" value="5" />
+          </div>
+          <button class="btn" id="dedupArchiveStart" type="button" disabled
+            title="Запустить/продолжить дедупликацию архива (resume по данным)">
+            Запустить / Продолжить
+          </button>
+          <button class="btn" id="reconcileArchiveStart" type="button"
+            title="Сверить архив (актуализировать список файлов после ручных изменений в Я.Диске)">
+            Сверить архив
+          </button>
+        </div>
+      </div>
+
+      <div style="margin-top: 10px;">
+        <div class="bar" aria-label="Dedup progress"><div id="dedupBarFill"></div></div>
+        <div class="muted status" id="dedupText" style="margin-top: 8px;">Дедупликация: статус загружается…</div>
+        <div class="bar" aria-label="Reconcile progress" style="margin-top: 10px;"><div id="reconcileBarFill"></div></div>
+        <div class="muted status" id="reconcileText" style="margin-top: 8px;">Сверка архива: статус загружается…</div>
+        <div class="muted" style="margin-top: 8px;">
+          <a href="/duplicates">Посмотреть дубли</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="section" id="dedupSourceSection">
+      <div class="section-title">
+        <div>
+          <div style="font-weight: 600;">Дедупликация источника (локально)</div>
+          <div class="muted">Папка-источник: по умолчанию <code>C:\tmp\Photo</code>. Можно запускать повторно (resume по данным).</div>
+        </div>
+        <div>
+          <div class="field">
+            <span class="muted">путь:</span>
+            <input id="dedupSourcePath" type="text" value="C:\\tmp\\Photo" style="width: 260px;" />
+          </div>
+          <button class="btn" id="dedupSourceStart" type="button"
+            title="Запустить/продолжить дедупликацию локальной папки-источника">
+            Запустить / Продолжить
+          </button>
+        </div>
+      </div>
+
+      <div style="margin-top: 10px;">
+        <div class="bar" aria-label="Dedup progress"><div id="dedupSourceBarFill"></div></div>
+        <div class="muted status" id="dedupSourceText" style="margin-top: 8px;">Дедупликация источника: статус загружается…</div>
+      </div>
+    </div>
+
     <script>
       const CONCURRENCY = 10;
+      const DEDUP_POLL_MS = 2000;
+      let folderCountsDone = false;
+      let dedupArchiveRunning = false;
+      let reconcileArchiveRunning = false;
 
       function setProgress(done, total) {
         const el = document.getElementById("progress");
         if (el) el.textContent = `Готово: ${done} / ${total}`;
+      }
+
+      function setHint(text) {
+        const el = document.getElementById("hint");
+        if (el) el.textContent = text ?? "";
+      }
+
+      function setDedupText(text) {
+        const el = document.getElementById("dedupText");
+        if (el) el.textContent = text ?? "";
+      }
+
+      function setDedupBar(percent) {
+        const el = document.getElementById("dedupBarFill");
+        if (!el) return;
+        const p = Math.max(0, Math.min(100, Number(percent) || 0));
+        el.style.width = `${p}%`;
+      }
+
+      function setReconcileText(text) {
+        const el = document.getElementById("reconcileText");
+        if (el) el.textContent = text ?? "";
+      }
+
+      function setReconcileBar(percent) {
+        const el = document.getElementById("reconcileBarFill");
+        if (!el) return;
+        const p = Math.max(0, Math.min(100, Number(percent) || 0));
+        el.style.width = `${p}%`;
+      }
+
+      function setDedupSourceText(text) {
+        const el = document.getElementById("dedupSourceText");
+        if (el) el.textContent = text ?? "";
+      }
+
+      function setDedupSourceBar(percent) {
+        const el = document.getElementById("dedupSourceBarFill");
+        if (!el) return;
+        const p = Math.max(0, Math.min(100, Number(percent) || 0));
+        el.style.width = `${p}%`;
+      }
+
+      function fmtBytes(n) {
+        const v = Number(n);
+        if (!Number.isFinite(v)) return "";
+        const units = ["B","KB","MB","GB","TB"];
+        let i = 0;
+        let x = v;
+        while (x >= 1024 && i < units.length - 1) { x /= 1024; i += 1; }
+        return `${x.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+      }
+
+      function updateArchiveButtonsDisabled() {
+        const btn = document.getElementById("dedupArchiveStart");
+        const disabled = Boolean(dedupArchiveRunning) || Boolean(reconcileArchiveRunning) || !folderCountsDone;
+        const title = !folderCountsDone
+          ? "Дождитесь окончания подсчёта файлов по папкам (верхняя таблица)."
+          : ((dedupArchiveRunning || reconcileArchiveRunning) ? "Операция по архиву уже запущена." : "");
+        if (btn) {
+          btn.disabled = disabled;
+          if (title) btn.title = title;
+        }
+
+        const btnR = document.getElementById("reconcileArchiveStart");
+        if (btnR) {
+          btnR.disabled = Boolean(dedupArchiveRunning) || Boolean(reconcileArchiveRunning);
+          if (dedupArchiveRunning || reconcileArchiveRunning) btnR.title = "Операция по архиву уже запущена.";
+        }
+      }
+
+      async function pollDedupArchiveStatusOnce() {
+        try {
+          const resp = await fetch(`/api/dedup/archive/status`, { cache: "no-store" });
+          if (!resp.ok) throw new Error("HTTP " + resp.status);
+          const data = await resp.json();
+
+          const latest = data.latest || null;
+          dedupArchiveRunning = Boolean(data.running);
+          updateArchiveButtonsDisabled();
+
+          if (!latest) {
+            setDedupBar(0);
+            setDedupText("Дедупликация: ещё не запускалась.");
+            const btn0 = document.getElementById("dedupArchiveStart");
+            if (btn0) btn0.textContent = "Запуск";
+            return;
+          }
+
+          const p = latest.processed_files ?? 0;
+          const h = latest.hashed_files ?? 0;
+          const mh = latest.meta_hashed_files ?? 0;
+          const dh = latest.downloaded_hashed_files ?? 0;
+          const sk = latest.skipped_large_files ?? 0;
+          const er = latest.errors_count ?? 0;
+          const total = latest.total_files ?? null;
+          const maxB = latest.max_download_bytes ?? null;
+          const st = latest.status ?? "";
+
+          const totalText = total ? `всего=${total}` : "всего=…";
+          const maxText = maxB ? `max=${fmtBytes(maxB)}` : "max=нет";
+
+          const denom = total ?? 0;
+          const pct = denom > 0 ? Math.round((p / denom) * 100) : 0;
+          setDedupBar(pct);
+          setDedupText(
+            `Дедупликация: ${running ? "идёт" : st} · прогресс=${pct}% (${p}/${denom || "…"}) · с хэшем=${h} (meta=${mh}, download=${dh}) · пропущено(>max)=${sk} · ошибок=${er} · ${totalText} · ${maxText}`
+          );
+
+          const btn = document.getElementById("dedupArchiveStart");
+          if (btn) {
+            if (dedupArchiveRunning) {
+              btn.textContent = "Идёт…";
+            } else if (st === "completed") {
+              btn.textContent = "Запустить заново";
+            } else if (st === "failed" || st === "running") {
+              btn.textContent = "Продолжить / запустить заново";
+            } else {
+              btn.textContent = "Запуск";
+            }
+          }
+        } catch (e) {
+          setDedupText("Дедупликация: ошибка статуса: " + String(e));
+        }
+      }
+
+      async function pollArchiveReconcileStatusOnce() {
+        try {
+          const resp = await fetch(`/api/archive/reconcile/status`, { cache: "no-store" });
+          if (!resp.ok) throw new Error("HTTP " + resp.status);
+          const data = await resp.json();
+          const latest = data.latest || null;
+          reconcileArchiveRunning = Boolean(data.running);
+          updateArchiveButtonsDisabled();
+
+          if (!latest) {
+            setReconcileBar(0);
+            setReconcileText("Сверка архива: ещё не запускалась.");
+            return;
+          }
+
+          const p = latest.processed_files ?? 0;
+          const total = latest.total_files ?? null;
+          const er = latest.errors_count ?? 0;
+          const st = latest.status ?? "";
+          const denom = total ?? 0;
+          const pct = denom > 0 ? Math.round((p / denom) * 100) : 0;
+
+          setReconcileBar(pct);
+          setReconcileText(
+            `Сверка архива: ${reconcileArchiveRunning ? "идёт" : st} · прогресс=${pct}% (${p}/${denom || "…"}) · ошибок=${er}`
+          );
+        } catch (e) {
+          setReconcileText("Сверка архива: ошибка статуса: " + String(e));
+        }
+      }
+
+      function updateDedupSourceButtonDisabled(running) {
+        const btn = document.getElementById("dedupSourceStart");
+        if (!btn) return;
+        btn.disabled = Boolean(running);
+        if (running) btn.title = "Скан уже запущен.";
+      }
+
+      async function pollDedupSourceStatusOnce() {
+        try {
+          const resp = await fetch(`/api/dedup/source/status`, { cache: "no-store" });
+          if (!resp.ok) throw new Error("HTTP " + resp.status);
+          const data = await resp.json();
+
+          const latest = data.latest || null;
+          const running = Boolean(data.running);
+          updateDedupSourceButtonDisabled(running);
+
+          if (!latest) {
+            setDedupSourceBar(0);
+            setDedupSourceText("Дедупликация источника: ещё не запускалась.");
+            return;
+          }
+
+          const p = latest.processed_files ?? 0;
+          const h = latest.hashed_files ?? 0;
+          const er = latest.errors_count ?? 0;
+          const total = latest.total_files ?? null;
+          const st = latest.status ?? "";
+          const denom = total ?? 0;
+          const pct = denom > 0 ? Math.round((p / denom) * 100) : 0;
+          setDedupSourceBar(pct);
+          setDedupSourceText(`Дедупликация источника: ${running ? "идёт" : st} · прогресс=${pct}% (${p}/${denom || "…"}) · с хэшем=${h} · ошибок=${er}`);
+        } catch (e) {
+          setDedupSourceText("Дедупликация источника: ошибка статуса: " + String(e));
+        }
+      }
+
+      function getMaxGb() {
+        const v = Number(document.getElementById("dedupMaxGb")?.value ?? 5);
+        return Number.isFinite(v) ? Math.max(0, Math.floor(v)) : 5;
+      }
+
+      async function startDedupArchive() {
+        dedupArchiveRunning = true;
+        updateArchiveButtonsDisabled();
+        setDedupText("Дедупликация: запуск…");
+        try {
+          const maxGb = getMaxGb();
+          const url = `/api/dedup/archive/start?max_download_gb=${encodeURIComponent(String(maxGb))}`;
+          const resp = await fetch(url, { method: "POST" });
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok || !data.ok) throw new Error(data.message || ("HTTP " + resp.status));
+          setDedupText(`Дедупликация: запущено (run_id=${data.run_id}).`);
+        } catch (e) {
+          setDedupText("Дедупликация: не удалось запустить: " + String(e));
+        } finally {
+          // сразу обновим статус
+          await pollDedupArchiveStatusOnce();
+        }
+      }
+
+      async function startReconcileArchive() {
+        reconcileArchiveRunning = true;
+        updateArchiveButtonsDisabled();
+        setReconcileText("Сверка архива: запуск…");
+        try {
+          const resp = await fetch(`/api/archive/reconcile/start`, { method: "POST" });
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok || !data.ok) throw new Error(data.message || ("HTTP " + resp.status));
+          setReconcileText(`Сверка архива: запущено (run_id=${data.run_id}).`);
+        } catch (e) {
+          setReconcileText("Сверка архива: не удалось запустить: " + String(e));
+        } finally {
+          await pollArchiveReconcileStatusOnce();
+        }
+      }
+
+      function getSourcePath() {
+        return (document.getElementById("dedupSourcePath")?.value ?? "").toString();
+      }
+
+      async function startDedupSource() {
+        updateDedupSourceButtonDisabled(true);
+        setDedupSourceText("Дедупликация источника: запуск…");
+        try {
+          const p = getSourcePath();
+          const url = `/api/dedup/source/start?path=${encodeURIComponent(p)}`;
+          const resp = await fetch(url, { method: "POST" });
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok || !data.ok) throw new Error(data.message || ("HTTP " + resp.status));
+          setDedupSourceText(`Дедупликация источника: запущено (run_id=${data.run_id}).`);
+        } catch (e) {
+          setDedupSourceText("Дедупликация источника: не удалось запустить: " + String(e));
+        } finally {
+          await pollDedupSourceStatusOnce();
+        }
       }
 
       async function loadCountsRowByRow() {
@@ -90,6 +415,10 @@
         const total = cells.length;
         let done = 0;
         setProgress(done, total);
+
+        folderCountsDone = false;
+        updateArchiveButtonsDisabled();
+        setHint("Подсчитываем файлы по папкам…");
 
         for (const c of cells) {
           c.textContent = "…";
@@ -131,6 +460,10 @@
 
         const workers = Array.from({ length: Math.min(CONCURRENCY, total) }, () => worker());
         await Promise.all(workers);
+
+        folderCountsDone = true;
+        updateArchiveButtonsDisabled();
+        setHint("");
       }
 
       document.getElementById("recount")?.addEventListener("click", (e) => {
@@ -138,7 +471,30 @@
         loadCountsRowByRow();
       });
 
+      document.getElementById("dedupArchiveStart")?.addEventListener("click", (e) => {
+        e.preventDefault();
+        startDedupArchive();
+      });
+
+      document.getElementById("reconcileArchiveStart")?.addEventListener("click", (e) => {
+        e.preventDefault();
+        startReconcileArchive();
+      });
+
+      document.getElementById("dedupSourceStart")?.addEventListener("click", (e) => {
+        e.preventDefault();
+        startDedupSource();
+      });
+
       loadCountsRowByRow();
+      pollDedupArchiveStatusOnce();
+      pollArchiveReconcileStatusOnce();
+      pollDedupSourceStatusOnce();
+      setInterval(() => {
+        pollDedupArchiveStatusOnce();
+        pollArchiveReconcileStatusOnce();
+        pollDedupSourceStatusOnce();
+      }, DEDUP_POLL_MS);
     </script>
   </body>
 </html>

@@ -1,18 +1,25 @@
 from __future__ import annotations
 
+import hashlib
+import tempfile
+import threading
 import time
 import os
 import sys
+import urllib.parse
+import subprocess
+import json
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from DB.db import list_folders
+from DB.db import DedupStore, list_folders
 from yadisk_client import get_disk
 
 APP_DIR = Path(__file__).resolve().parent
@@ -22,14 +29,85 @@ app = FastAPI(title="PhotoSorter")
 
 _T = TypeVar("_T")
 
+# Build/runtime идентификатор процесса — чтобы быстро проверять, что запущена "правильная" версия.
+# Генерируется один раз при импорте модуля и остаётся неизменным до перезапуска uvicorn.
+_STARTED_AT = time.time()
+STARTED_AT_UTC_ISO = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_STARTED_AT))
+BUILD_ID = time.strftime("%Y%m%d-%H%M%S", time.gmtime(_STARTED_AT)) + f"-pid{os.getpid()}"
+
+
+@app.middleware("http")
+async def _add_build_id_header(request: Request, call_next):  # type: ignore[no-untyped-def]
+    resp = await call_next(request)
+    resp.headers["X-PhotoSorter-Build"] = BUILD_ID
+    return resp
+
 # Общий пул для вызовов YaDisk (нужно, чтобы иметь timeout на уровне приложения).
 # Важно: timeout не убивает запрос внутри библиотеки, но предотвращает "вечные" зависания в обработчике.
 _YD_POOL = ThreadPoolExecutor(max_workers=16)
 
+# Отдельные одиночные исполнители для дедуп-сканов (чтобы не запускать несколько сканов одного типа параллельно).
+_DEDUP_ARCHIVE_EXEC = ThreadPoolExecutor(max_workers=1)
+_DEDUP_SOURCE_EXEC = ThreadPoolExecutor(max_workers=1)
+_DEDUP_LOCK = threading.Lock()
+_DEDUP_FUTURES: dict[str, Any] = {"archive": None, "source": None}
+_DEDUP_RUN_IDS: dict[str, Optional[int]] = {"archive": None, "source": None}
+
+# Сверка архива (актуализация списка файлов после редких ручных изменений в Я.Диске).
+_RECONCILE_EXEC = ThreadPoolExecutor(max_workers=1)
+_RECONCILE_LOCK = threading.Lock()
+_RECONCILE_FUTURE: Any = None
+_RECONCILE_RUN_ID: Optional[int] = None
+
 # Таймауты/ретраи по умолчанию (можно будет вынести в настройки).
-YD_CALL_TIMEOUT_SEC = 15
+YD_CALL_TIMEOUT_SEC = 60
 YD_RETRIES = 2
 YD_RETRY_DELAY_SEC = 0.5
+
+# Превью (proxy): защита от "забивания" сервера пачкой запросов со страницы /duplicates.
+_PREVIEW_MAX_CONCURRENT = 4
+_PREVIEW_SEM = threading.BoundedSemaphore(_PREVIEW_MAX_CONCURRENT)
+# Важно: YaDisk preview URL обычно "временный". Держим небольшой TTL, чтобы ускорить повторы,
+# но не полагаться на вечную валидность ссылки.
+_PREVIEW_CACHE_TTL_SEC = 10 * 60  # 10 minutes
+_PREVIEW_CACHE_MAX_ITEMS = 256
+_PREVIEW_CACHE_LOCK = threading.Lock()
+# key -> (ts, preview_url)
+_PREVIEW_CACHE: "OrderedDict[tuple[str, str], tuple[float, str]]" = OrderedDict()
+
+# Длительность видео (ffprobe): отдельный пул + защита от штормов.
+_VIDEO_EXEC = ThreadPoolExecutor(max_workers=2)
+_VIDEO_LOCK = threading.Lock()
+_VIDEO_FUTURES: dict[str, Any] = {}
+_VIDEO_ERRORS: dict[str, str] = {}
+
+
+def _preview_cache_get(key: tuple[str, str]) -> Optional[str]:
+    now = time.time()
+    with _PREVIEW_CACHE_LOCK:
+        item = _PREVIEW_CACHE.get(key)
+        if not item:
+            return None
+        ts, preview_url = item
+        if now - ts > _PREVIEW_CACHE_TTL_SEC:
+            # expired
+            try:
+                del _PREVIEW_CACHE[key]
+            except KeyError:
+                pass
+            return None
+        # LRU bump
+        _PREVIEW_CACHE.move_to_end(key, last=True)
+        return preview_url
+
+
+def _preview_cache_put(key: tuple[str, str], preview_url: str) -> None:
+    now = time.time()
+    with _PREVIEW_CACHE_LOCK:
+        _PREVIEW_CACHE[key] = (now, preview_url)
+        _PREVIEW_CACHE.move_to_end(key, last=True)
+        while len(_PREVIEW_CACHE) > _PREVIEW_CACHE_MAX_ITEMS:
+            _PREVIEW_CACHE.popitem(last=False)
 
 
 def _get(item: Any, key: str) -> Optional[Any]:
@@ -40,7 +118,9 @@ def _get(item: Any, key: str) -> Optional[Any]:
 
 def _normalize_yadisk_path(path: str) -> str:
     # В БД у нас может храниться `disk:/...`, но в yadisk-python удобно использовать `/...`.
-    p = (path or "").strip()
+    # Важно: НЕ используем .strip() — в именах папок могут быть значимые пробелы/символы,
+    # и их "подчистка" ломает путь (приводит к 404 при listdir/get_meta).
+    p = path or ""
     if p.startswith("disk:"):
         p = p[len("disk:") :]
     if not p.startswith("/"):
@@ -49,7 +129,7 @@ def _normalize_yadisk_path(path: str) -> str:
 
 
 def _as_disk_path(path: str) -> str:
-    p = (path or "").strip()
+    p = path or ""
     if p.startswith("disk:"):
         return p
     p2 = p if p.startswith("/") else ("/" + p)
@@ -69,6 +149,23 @@ def _yd_call_retry(fn: Callable[[], _T]) -> _T:
     for attempt in range(YD_RETRIES + 1):
         try:
             return _yd_call(fn)
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if attempt < YD_RETRIES:
+                time.sleep(YD_RETRY_DELAY_SEC * (attempt + 1))
+                continue
+            raise last
+
+
+def _yd_call_retry_timeout(fn: Callable[[], _T], *, timeout_sec: float) -> _T:
+    """
+    То же самое, что _yd_call_retry, но с настраиваемым timeout.
+    Нужно, например, для скачивания файлов (оно может занимать минуты).
+    """
+    last: Optional[Exception] = None
+    for attempt in range(YD_RETRIES + 1):
+        try:
+            return _yd_call(fn, timeout_sec=timeout_sec)
         except Exception as e:  # noqa: BLE001
             last = e
             if attempt < YD_RETRIES:
@@ -139,6 +236,787 @@ def _resolve_first_level_folder_path(disk, *, base_dir: str, folder_name: str) -
     return None
 
 
+def _sha256_file(path: str, *, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _dedup_scan_archive(
+    *,
+    run_id: int,
+    root_path: str,
+    limit_files: int | None,
+    max_download_bytes: int | None,
+) -> None:
+    """
+    Заполняет БД дублей: рекурсивно проходит архив (disk:/Фото),
+    сохраняет метаданные файлов и хэш (sha256/md5). Если хэша нет — докачивает файл и считает sha256.
+    """
+    disk = get_disk()
+    store = DedupStore()
+
+    processed = 0
+    hashed = 0
+    meta_hashed = 0
+    downloaded_hashed = 0
+    skipped_large = 0
+    errors = 0
+
+    root = _normalize_yadisk_path(root_path)
+    stack = [root]
+    visited: set[str] = set()
+
+    try:
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+
+            try:
+                items = _yd_call_retry(lambda: list(disk.listdir(current)))
+            except Exception as e:  # noqa: BLE001
+                errors += 1
+                store.update_run_progress(
+                    run_id=run_id,
+                    errors_count=errors,
+                    last_path=_as_disk_path(current),
+                    last_error=f"{type(e).__name__}: {e}",
+                )
+                continue
+
+            for item in items:
+                t = _get(item, "type")
+                if t == "dir":
+                    child_path = _get(item, "path")
+                    if child_path:
+                        stack.append(_normalize_yadisk_path(str(child_path)))
+                    continue
+
+                if t != "file":
+                    continue
+
+                path = str(_get(item, "path") or "")
+                if not path:
+                    continue
+                path = _as_disk_path(path)
+
+                processed += 1
+                resource_id = str(_get(item, "resource_id") or _get(item, "resourceId") or "") or None
+                name = str(_get(item, "name") or "")
+                size_val = _get(item, "size")
+                size = int(size_val) if isinstance(size_val, (int, float)) else None
+                created = str(_get(item, "created") or "") or None
+                modified = str(_get(item, "modified") or "") or None
+                mime_type = str(_get(item, "mime_type") or "") or None
+                media_type = str(_get(item, "media_type") or "") or None
+
+                # parent_path: disk:/Фото/..../<file> -> disk:/Фото/....
+                parent_path: Optional[str] = None
+                if path.startswith("disk:"):
+                    p = path[len("disk:") :]
+                    if "/" in p:
+                        parent_path = "disk:" + p.rsplit("/", 1)[0]
+
+                # Если уже есть хэш в БД — не перехешируем.
+                existing_alg, existing_hash = store.get_existing_hash(path=path)
+                if existing_alg and existing_hash:
+                    store.upsert_file(
+                        run_id=run_id,
+                        path=path,
+                        resource_id=resource_id,
+                        name=name or None,
+                        parent_path=parent_path,
+                        size=size,
+                        created=created,
+                        modified=modified,
+                        mime_type=mime_type,
+                        media_type=media_type,
+                        hash_alg=None,
+                        hash_value=None,
+                        hash_source=None,
+                        status="hashed",
+                        error=None,
+                        scanned_at=None,
+                        hashed_at=None,
+                    )
+                else:
+                    sha256 = str(_get(item, "sha256") or "") or None
+                    md5 = str(_get(item, "md5") or "") or None
+
+                    if sha256:
+                        hashed += 1
+                        meta_hashed += 1
+                        store.upsert_file(
+                            run_id=run_id,
+                            path=path,
+                            resource_id=resource_id,
+                            name=name or None,
+                            parent_path=parent_path,
+                            size=size,
+                            created=created,
+                            modified=modified,
+                            mime_type=mime_type,
+                            media_type=media_type,
+                            hash_alg="sha256",
+                            hash_value=sha256,
+                            hash_source="meta",
+                            status="hashed",
+                            error=None,
+                            scanned_at=None,
+                            hashed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        )
+                    elif md5:
+                        hashed += 1
+                        meta_hashed += 1
+                        store.upsert_file(
+                            run_id=run_id,
+                            path=path,
+                            resource_id=resource_id,
+                            name=name or None,
+                            parent_path=parent_path,
+                            size=size,
+                            created=created,
+                            modified=modified,
+                            mime_type=mime_type,
+                            media_type=media_type,
+                            hash_alg="md5",
+                            hash_value=md5,
+                            hash_source="meta",
+                            status="hashed",
+                            error=None,
+                            scanned_at=None,
+                            hashed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        )
+                    else:
+                        # Нету хэша в метаданных -> докачиваем файл и считаем sha256.
+                        if max_download_bytes is not None and size is not None and size > max_download_bytes:
+                            skipped_large += 1
+                            store.upsert_file(
+                                run_id=run_id,
+                                path=path,
+                                resource_id=resource_id,
+                                name=name or None,
+                                parent_path=parent_path,
+                                size=size,
+                                created=created,
+                                modified=modified,
+                                mime_type=mime_type,
+                                media_type=media_type,
+                                hash_alg=None,
+                                hash_value=None,
+                                hash_source=None,
+                                status="skipped_large",
+                                error=f"too_large: size={size} > max_download_bytes={max_download_bytes}",
+                                scanned_at=None,
+                                hashed_at=None,
+                            )
+                        else:
+                            remote = _normalize_yadisk_path(path)
+                            tmp_path = None
+                            try:
+                                with tempfile.NamedTemporaryFile(prefix="photosorter_dedup_", suffix=".bin", delete=False) as tmp:
+                                    tmp_path = tmp.name
+
+                                # На скачивание даём увеличенный таймаут (по умолчанию 10 минут).
+                                _yd_call_retry_timeout(lambda: disk.download(remote, tmp_path), timeout_sec=600)
+
+                                sha = _sha256_file(tmp_path)
+                                hashed += 1
+                                downloaded_hashed += 1
+                                store.upsert_file(
+                                    run_id=run_id,
+                                    path=path,
+                                    resource_id=resource_id,
+                                    name=name or None,
+                                    parent_path=parent_path,
+                                    size=size,
+                                    created=created,
+                                    modified=modified,
+                                    mime_type=mime_type,
+                                    media_type=media_type,
+                                    hash_alg="sha256",
+                                    hash_value=sha,
+                                    hash_source="download",
+                                    status="hashed",
+                                    error=None,
+                                    scanned_at=None,
+                                    hashed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                )
+                            except Exception as e:  # noqa: BLE001
+                                errors += 1
+                                store.upsert_file(
+                                    run_id=run_id,
+                                    path=path,
+                                    resource_id=resource_id,
+                                    name=name or None,
+                                    parent_path=parent_path,
+                                    size=size,
+                                    created=created,
+                                    modified=modified,
+                                    mime_type=mime_type,
+                                    media_type=media_type,
+                                    hash_alg=None,
+                                    hash_value=None,
+                                    hash_source=None,
+                                    status="error",
+                                    error=f"{type(e).__name__}: {e}",
+                                    scanned_at=None,
+                                    hashed_at=None,
+                                )
+                            finally:
+                                if tmp_path:
+                                    try:
+                                        os.unlink(tmp_path)
+                                    except OSError:
+                                        pass
+
+                store.update_run_progress(
+                    run_id=run_id,
+                    processed_files=processed,
+                    hashed_files=hashed,
+                    meta_hashed_files=meta_hashed,
+                    downloaded_hashed_files=downloaded_hashed,
+                    skipped_large_files=skipped_large,
+                    errors_count=errors,
+                    last_path=path,
+                )
+
+                if limit_files is not None and processed >= limit_files:
+                    return
+    finally:
+        store.close()
+
+
+def _as_local_path(p: str) -> str:
+    # Храним локальные пути в общей таблице с префиксом, чтобы не конфликтовать с disk:/...
+    return "local:" + str(p)
+
+
+def _dedup_scan_local_source(*, run_id: int, root_dir: str) -> None:
+    """
+    Заполняет БД дублей для локальной папки-источника (например C:\\tmp\\Photo).
+    Всегда считаем sha256 локально.
+    """
+    store = DedupStore()
+    processed = 0
+    hashed = 0
+    errors = 0
+
+    root = os.path.abspath(root_dir)
+
+    # Считаем total_files для процентов.
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(root):
+        total += len(filenames)
+    store.update_run_progress(run_id=run_id, total_files=total)
+
+    try:
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for fn in filenames:
+                abspath = os.path.join(dirpath, fn)
+                processed += 1
+
+                db_path = _as_local_path(abspath)
+                parent_path = _as_local_path(dirpath)
+
+                size: Optional[int] = None
+                modified: Optional[str] = None
+                try:
+                    st = os.stat(abspath)
+                    size = int(st.st_size)
+                    modified = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime))
+                except OSError:
+                    pass
+
+                existing_alg, existing_hash = store.get_existing_hash(path=db_path)
+                if existing_alg and existing_hash:
+                    hashed += 1
+                    store.upsert_file(
+                        run_id=run_id,
+                        path=db_path,
+                        name=fn,
+                        parent_path=parent_path,
+                        size=size,
+                        created=None,
+                        modified=modified,
+                        mime_type=None,
+                        media_type=None,
+                        hash_alg=None,
+                        hash_value=None,
+                        hash_source=None,
+                        status="hashed",
+                        error=None,
+                        scanned_at=None,
+                        hashed_at=None,
+                    )
+                else:
+                    try:
+                        sha = _sha256_file(abspath)
+                        hashed += 1
+                        store.upsert_file(
+                            run_id=run_id,
+                            path=db_path,
+                            name=fn,
+                            parent_path=parent_path,
+                            size=size,
+                            created=None,
+                            modified=modified,
+                            mime_type=None,
+                            media_type=None,
+                            hash_alg="sha256",
+                            hash_value=sha,
+                            hash_source="local",
+                            status="hashed",
+                            error=None,
+                            scanned_at=None,
+                            hashed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        errors += 1
+                        store.upsert_file(
+                            run_id=run_id,
+                            path=db_path,
+                            name=fn,
+                            parent_path=parent_path,
+                            size=size,
+                            created=None,
+                            modified=modified,
+                            mime_type=None,
+                            media_type=None,
+                            hash_alg=None,
+                            hash_value=None,
+                            hash_source=None,
+                            status="error",
+                            error=f"{type(e).__name__}: {e}",
+                            scanned_at=None,
+                            hashed_at=None,
+                        )
+
+                store.update_run_progress(
+                    run_id=run_id,
+                    processed_files=processed,
+                    hashed_files=hashed,
+                    errors_count=errors,
+                    last_path=db_path,
+                )
+    finally:
+        store.close()
+
+
+def _human_bytes(n: Optional[int]) -> str:
+    if n is None:
+        return "—"
+    x = float(n)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    while x >= 1024 and i < len(units) - 1:
+        x /= 1024
+        i += 1
+    if i == 0:
+        return f"{int(x)} {units[i]}"
+    return f"{x:.1f} {units[i]}"
+
+
+def _short_folder_from_disk_path(path: str) -> str:
+    # disk:/Фото/<Top>/<...>/<file>
+    p = path or ""
+    if not p.startswith("disk:/"):
+        return "—"
+    parts = p.split("/")
+    # parts: ["disk:", "Фото", "<Top>", ...]
+    if len(parts) >= 3:
+        return parts[2] or "—"
+    return "—"
+
+
+def _short_path_for_ui(path: str) -> str:
+    # Показываем путь короче: обрезаем disk:/Фото/ и оставляем хвост.
+    p = path or ""
+    prefix = "disk:/Фото/"
+    if p.startswith(prefix):
+        tail = p[len(prefix) :]
+        return "…/" + tail
+    return p
+
+
+def _basename_from_disk_path(path: str) -> str:
+    p = path or ""
+    if "/" not in p:
+        return p
+    return p.rsplit("/", 1)[-1]
+
+
+def _parent_from_disk_path(path: str) -> Optional[str]:
+    p = path or ""
+    if not p.startswith("disk:"):
+        return None
+    tail = p[len("disk:") :]
+    if "/" not in tail:
+        return None
+    return "disk:" + tail.rsplit("/", 1)[0]
+
+
+def _disk_join(dir_path: str, name: str) -> str:
+    d = (dir_path or "").rstrip("/")
+    return d + "/" + (name or "").lstrip("/")
+
+
+def _yadisk_web_url(path: str) -> str:
+    """
+    Открывает файл/папку в веб-интерфейсе Я.Диска (в браузере).
+    """
+    # disk:/Фото/... -> /Фото/...
+    p = _normalize_yadisk_path(path)
+    encoded = urllib.parse.quote(p, safe="/")
+    return "https://disk.yandex.ru/client/disk" + encoded
+
+
+def _yadisk_slider_url(path: str) -> str:
+    """
+    Открывает КОНКРЕТНЫЙ файл в веб-интерфейсе Я.Диска через "slider" (просмотр),
+    чтобы открывался именно файл, а не только папка.
+
+    Пример формата:
+      https://disk.yandex.ru/client/disk/<DIR>?idApp=client&dialog=slider&idDialog=%2Fdisk%2F<DIR>%2F<FILE>
+    """
+    # disk:/Фото/... -> /Фото/... (для /disk/... в idDialog)
+    p = _normalize_yadisk_path(path)
+    # Базовый URL берём на папку (без имени файла)
+    dir_path = p.rsplit("/", 1)[0] if "/" in p else p
+    base = "https://disk.yandex.ru/client/disk" + urllib.parse.quote(dir_path, safe="/")
+    # idDialog ожидает абсолютный путь вида /disk/Фото/.../file.ext, с экранированием '/' как %2F
+    id_dialog = urllib.parse.quote("/disk" + p, safe="")
+    return f"{base}?idApp=client&dialog=slider&idDialog={id_dialog}"
+
+
+def _resolve_target_folder_path_kids_together() -> str:
+    """
+    Возвращает путь до папки 'Дети вместе' в формате disk:/...
+    Пытаемся взять из таблицы folders (target yadisk), иначе fallback.
+    """
+    folders = list_folders(location="yadisk", role="target")
+    for f in folders:
+        code = str(f.get("code") or "").lower()
+        name = str(f.get("name") or "").lower()
+        if "deti_vmeste" in code or name == "дети вместе":
+            p = str(f.get("path") or "")
+            if p:
+                return p
+    return "disk:/Фото/Дети вместе"
+
+
+def _unique_dest_name(*, store: DedupStore, disk, dest_dir: str, src_name: str) -> str:
+    """
+    Подбирает имя в dest_dir так, чтобы не конфликтовать ни с YaDisk, ни с локальной БД.
+    """
+    base = src_name or "file"
+    if "." in base:
+        stem, ext = base.rsplit(".", 1)
+        ext = "." + ext
+    else:
+        stem, ext = base, ""
+
+    for n in range(0, 200):
+        candidate = base if n == 0 else f"{stem} ({n}){ext}"
+        dest_disk = _disk_join(dest_dir, candidate)
+        # Проверяем и на стороне Я.Диска, и в БД (чтобы избежать UNIQUE конфликтов).
+        exists_remote = False
+        try:
+            exists_remote = bool(_yd_call_retry(lambda: disk.exists(_normalize_yadisk_path(dest_disk))))
+        except Exception:
+            exists_remote = False
+        if exists_remote:
+            continue
+        if store.path_exists(path=dest_disk):
+            continue
+        return candidate
+    raise RuntimeError("Не удалось подобрать уникальное имя (слишком много конфликтов)")
+
+
+def _human_duration(seconds: Optional[int]) -> str:
+    if seconds is None or seconds < 0:
+        return "—"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def _extract_duration_seconds(md: Any) -> Optional[int]:
+    """
+    Best-effort: пытаемся достать длительность видео из метаданных YaDisk.
+    Форматы/поля отличаются между версиями/типами ресурсов.
+    """
+    # Частые варианты: md.media_info.duration, md.duration, md.video_duration, dict['duration']
+    candidates: list[Any] = []
+    for attr in ("duration", "video_duration", "duration_sec", "duration_seconds", "duration_ms"):
+        candidates.append(getattr(md, attr, None))
+        candidates.append(_get(md, attr))
+
+    mi = getattr(md, "media_info", None)
+    if mi is None:
+        mi = _get(md, "media_info")
+    if mi is not None:
+        for attr in ("duration", "video_duration", "duration_sec", "duration_seconds", "duration_ms"):
+            candidates.append(getattr(mi, attr, None))
+            candidates.append(_get(mi, attr))
+
+    for v in candidates:
+        if v is None or v == "":
+            continue
+        try:
+            if isinstance(v, str):
+                # иногда приходит строка числа
+                v2 = float(v)
+            else:
+                v2 = float(v)
+        except Exception:
+            continue
+        # если похоже на миллисекунды
+        if v2 > 10_000:  # 10k seconds ~ 2.7h, типично видео короче; ms будут >> 10k
+            # эвристика: ms
+            sec = int(round(v2 / 1000.0))
+        else:
+            sec = int(round(v2))
+        if sec >= 0:
+            return sec
+    return None
+
+
+def _ffprobe_path() -> str:
+    """
+    ffprobe должен быть либо в PATH, либо задан в env `FFPROBE_PATH` (secrets.env/.env).
+    """
+    return os.getenv("FFPROBE_PATH") or "ffprobe"
+
+
+def _ffprobe_duration_seconds_from_url(url: str, *, timeout_sec: float = 30) -> Optional[int]:
+    """
+    Запускает ffprobe на URL и пытается извлечь длительность (секунды).
+    """
+    # ffprobe -v error -of json -show_entries format=duration <url>
+    cmd = [
+        _ffprobe_path(),
+        "-v",
+        "error",
+        "-of",
+        "json",
+        "-show_entries",
+        "format=duration",
+        url,
+    ]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)  # noqa: S603,S607
+    except FileNotFoundError as e:
+        raise RuntimeError("ffprobe не найден. Установите ffmpeg/ffprobe или задайте FFPROBE_PATH в secrets.env/.env") from e
+    except subprocess.TimeoutExpired:
+        return None
+
+    if p.returncode != 0:
+        # иногда ffprobe пишет в stderr; не считаем это фатальным, просто нет длительности
+        return None
+    try:
+        obj = json.loads(p.stdout or "{}")
+    except Exception:
+        return None
+    dur = (((obj or {}).get("format") or {}).get("duration"))
+    try:
+        if dur is None:
+            return None
+        sec = int(round(float(dur)))
+        return sec if sec >= 0 else None
+    except Exception:
+        return None
+
+
+def _get_download_url(disk, *, path: str) -> str:
+    """
+    Получает прямую ссылку скачивания для ресурса YaDisk.
+    """
+    p = _normalize_yadisk_path(path)
+    if hasattr(disk, "get_download_link"):
+        return str(_yd_call_retry(lambda: disk.get_download_link(p)))
+    # fallback: некоторые обёртки могут отдавать link иначе
+    raise RuntimeError("YaDisk client не поддерживает get_download_link()")
+
+
+def _reconcile_archive_inventory(*, run_id: int, root_path: str) -> None:
+    """
+    Актуализация инвентаря архива (disk:/Фото) после редких ручных изменений на Я.Диске.
+
+    Делает:
+    - рекурсивный обход файлов под root_path
+    - upsert/обновление метаданных по resource_id (если есть) или path
+    - помечает отсутствующие в скане записи как status='deleted'
+    - если size/modified изменились — сбрасывает hash_* (нужно пересчитать)
+    """
+    disk = get_disk()
+    store = DedupStore()
+
+    processed = 0
+    errors = 0
+
+    root = _normalize_yadisk_path(root_path)
+    stack = [root]
+    visited: set[str] = set()
+    seen_resource_ids: set[str] = set()
+    seen_paths: set[str] = set()
+
+    try:
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+
+            try:
+                items = _yd_call_retry(lambda: list(disk.listdir(current)))
+            except Exception as e:  # noqa: BLE001
+                errors += 1
+                store.update_run_progress(
+                    run_id=run_id,
+                    errors_count=errors,
+                    last_path=_as_disk_path(current),
+                    last_error=f"{type(e).__name__}: {e}",
+                )
+                continue
+
+            for item in items:
+                t = _get(item, "type")
+                if t == "dir":
+                    child_path = _get(item, "path")
+                    if child_path:
+                        stack.append(_normalize_yadisk_path(str(child_path)))
+                    continue
+                if t != "file":
+                    continue
+
+                path = str(_get(item, "path") or "")
+                if not path:
+                    continue
+
+                processed += 1
+                resource_id = str(_get(item, "resource_id") or _get(item, "resourceId") or "") or None
+                if resource_id:
+                    seen_resource_ids.add(resource_id)
+                seen_paths.add(path)
+
+                name = str(_get(item, "name") or "") or None
+                size_val = _get(item, "size")
+                size = int(size_val) if isinstance(size_val, (int, float)) else None
+                created = str(_get(item, "created") or "") or None
+                modified = str(_get(item, "modified") or "") or None
+                mime_type = str(_get(item, "mime_type") or "") or None
+                media_type = str(_get(item, "media_type") or "") or None
+
+                parent_path: Optional[str] = None
+                if path.startswith("disk:"):
+                    p = path[len("disk:") :]
+                    if "/" in p:
+                        parent_path = "disk:" + p.rsplit("/", 1)[0]
+
+                try:
+                    store.reconcile_upsert_present_file(
+                        run_id=run_id,
+                        path=path,
+                        resource_id=resource_id,
+                        name=name,
+                        parent_path=parent_path,
+                        size=size,
+                        created=created,
+                        modified=modified,
+                        mime_type=mime_type,
+                        media_type=media_type,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    errors += 1
+                    store.update_run_progress(
+                        run_id=run_id,
+                        errors_count=errors,
+                        last_path=path,
+                        last_error=f"upsert_failed: {type(e).__name__}: {e}",
+                    )
+
+                # прогресс
+                if processed % 200 == 0:
+                    store.update_run_progress(
+                        run_id=run_id,
+                        processed_files=processed,
+                        errors_count=errors,
+                        last_path=path,
+                    )
+
+        # Финальный прогресс
+        store.update_run_progress(
+            run_id=run_id,
+            processed_files=processed,
+            errors_count=errors,
+            last_path=_as_disk_path(root),
+        )
+
+        # Помечаем отсутствующие (под root_path) как deleted.
+        prefix = (root_path.rstrip("/") + "/%") if root_path else "disk:/Фото/%"
+        cur = store.conn.cursor()  # type: ignore[attr-defined]
+        cur.execute(
+            """
+            SELECT path, resource_id
+            FROM yd_files
+            WHERE path LIKE ? AND status != 'deleted'
+            """,
+            (prefix,),
+        )
+        rows = cur.fetchall()
+        missing: list[str] = []
+        for r in rows:
+            p = str(r["path"] or "")
+            rid = str(r["resource_id"] or "") or None
+            if rid:
+                if rid not in seen_resource_ids:
+                    missing.append(p)
+            else:
+                if p not in seen_paths:
+                    missing.append(p)
+
+        # UPDATE батчами (чтобы не делать IN на десятки тысяч).
+        for i in range(0, len(missing), 500):
+            store.mark_deleted(paths=missing[i : i + 500])
+
+    finally:
+        store.close()
+
+
+def _pick_keep_indexes(items: list[dict[str, Any]], sort_order_by_folder: dict[str, int]) -> int:
+    """
+    Выбираем индекс элемента, который "оставляем" по умолчанию.
+    1) минимальный sort_order по top-level папке (Темка/Нюся/...), если известен
+    2) fallback: самый короткий path
+    """
+    best_idx = 0
+    best_order: Optional[int] = None
+    best_len: Optional[int] = None
+    for i, it in enumerate(items):
+        p = str(it.get("path") or "")
+        folder = _short_folder_from_disk_path(p)
+        order = sort_order_by_folder.get(folder.lower())
+        plen = len(p)
+        if order is not None:
+            if best_order is None or order < best_order or (order == best_order and plen < (best_len or plen + 1)):
+                best_idx = i
+                best_order = order
+                best_len = plen
+        else:
+            if best_order is None:  # пока нет кандидата с sort_order
+                if best_len is None or plen < best_len:
+                    best_idx = i
+                    best_len = plen
+    return best_idx
+
+
 @app.get("/api/folders")
 def api_folders() -> list[dict]:
     return list_folders(location="yadisk", role="target")
@@ -156,6 +1034,246 @@ def api_debug_module_path() -> dict[str, Any]:
         "cwd": os.getcwd(),
         "sys_path_head": sys.path[:10],
     }
+
+
+@app.get("/api/debug/build-info")
+def api_debug_build_info() -> dict[str, Any]:
+    """
+    Диагностика: build/runtime информация о запущенном процессе.
+    Полезно, чтобы быстро понять, что запущена именно текущая версия кода.
+    """
+    return {
+        "ok": True,
+        "build_id": BUILD_ID,
+        "started_at_utc": STARTED_AT_UTC_ISO,
+        "pid": os.getpid(),
+        "module_file": __file__,
+        "cwd": os.getcwd(),
+    }
+
+
+@app.get("/api/yadisk/open")
+def api_yadisk_open(path: str) -> Response:
+    """
+    Redirect на веб-интерфейс Яндекс.Диска для указанного disk:/... пути.
+    """
+    if not path.startswith("disk:"):
+        raise HTTPException(status_code=400, detail="Only disk: paths are supported")
+    # Открываем файл в "slider" просмотре (как в веб-интерфейсе Я.Диска).
+    return RedirectResponse(url=_yadisk_slider_url(path), status_code=307)
+
+
+@app.post("/api/dedup/archive/start")
+def api_dedup_archive_start(max_download_gb: int = 5) -> dict[str, Any]:
+    """
+    Запускает фоновый скан архива (disk:/Фото) для заполнения БД дублей.
+    Упрощение: всегда "полный" прогон, без лимита; можно запускать повторно (resume по данным).
+    """
+    global _DEDUP_FUTURES, _DEDUP_RUN_IDS  # noqa: PLW0603
+
+    root_path = "disk:/Фото"
+    max_download_bytes = None if max_download_gb <= 0 else (max_download_gb * 1024 * 1024 * 1024)
+
+    with _DEDUP_LOCK:
+        fut = _DEDUP_FUTURES.get("archive")
+        if fut is not None and not fut.done():
+            return {"ok": False, "message": "dedup scan already running", "run_id": _DEDUP_RUN_IDS.get("archive")}
+
+        store = DedupStore()
+        try:
+            run_id = store.create_run(
+                scope="archive",
+                root_path=root_path,
+                max_download_bytes=max_download_bytes,
+            )
+        finally:
+            store.close()
+
+        _DEDUP_RUN_IDS["archive"] = run_id
+
+        def _runner() -> None:
+            store2 = DedupStore()
+            try:
+                # Всегда считаем total_files, чтобы UI мог рисовать процент.
+                try:
+                    disk = get_disk()
+                    total, err, err_path = _count_files_recursive(disk, root_path)
+                    if total is not None:
+                        store2.update_run_progress(run_id=run_id, total_files=int(total))
+                    else:
+                        store2.update_run_progress(
+                            run_id=run_id,
+                            last_path=err_path,
+                            last_error=f"total_files_count_failed: {err}",
+                        )
+                except Exception as e:  # noqa: BLE001
+                    store2.update_run_progress(
+                        run_id=run_id,
+                        last_error=f"total_files_count_failed: {type(e).__name__}: {e}",
+                    )
+
+                _dedup_scan_archive(
+                    run_id=run_id,
+                    root_path=root_path,
+                    limit_files=None,
+                    max_download_bytes=max_download_bytes,
+                )
+                store2.finish_run(run_id=run_id, status="completed")
+            except Exception as e:  # noqa: BLE001
+                store2.finish_run(run_id=run_id, status="failed", last_error=f"{type(e).__name__}: {e}")
+            finally:
+                store2.close()
+
+        _DEDUP_FUTURES["archive"] = _DEDUP_ARCHIVE_EXEC.submit(_runner)
+
+    return {"ok": True, "message": "started", "run_id": run_id, "root_path": root_path}
+
+
+@app.post("/api/archive/reconcile/start")
+def api_archive_reconcile_start() -> dict[str, Any]:
+    """
+    Запускает фоновую сверку архива (актуализация списка файлов в yd_files),
+    чтобы "догонять" редкие ручные изменения в веб-интерфейсе Я.Диска.
+    """
+    global _RECONCILE_FUTURE, _RECONCILE_RUN_ID  # noqa: PLW0603
+
+    root_path = "disk:/Фото"
+
+    with _RECONCILE_LOCK:
+        if _RECONCILE_FUTURE is not None and not _RECONCILE_FUTURE.done():
+            return {"ok": False, "message": "reconcile already running", "run_id": _RECONCILE_RUN_ID}
+
+        store = DedupStore()
+        try:
+            run_id = store.create_run(scope="archive_reconcile", root_path=root_path, max_download_bytes=None)
+        finally:
+            store.close()
+
+        _RECONCILE_RUN_ID = run_id
+
+        def _runner() -> None:
+            store2 = DedupStore()
+            try:
+                # total_files считаем ПАРАЛЛЕЛЬНО (иначе старт сверки может долго "висеть" на 0%).
+                def _count_total() -> None:
+                    s = DedupStore()
+                    try:
+                        disk = get_disk()
+                        total, err, err_path = _count_files_recursive(disk, root_path)
+                        if total is not None:
+                            s.update_run_progress(run_id=run_id, total_files=int(total))
+                        else:
+                            s.update_run_progress(
+                                run_id=run_id,
+                                last_path=err_path,
+                                last_error=f"total_files_count_failed: {err}",
+                            )
+                    except Exception as e:  # noqa: BLE001
+                        s.update_run_progress(run_id=run_id, last_error=f"total_files_count_failed: {type(e).__name__}: {e}")
+                    finally:
+                        s.close()
+
+                threading.Thread(target=_count_total, daemon=True).start()
+
+                _reconcile_archive_inventory(run_id=run_id, root_path=root_path)
+                store2.finish_run(run_id=run_id, status="completed")
+            except Exception as e:  # noqa: BLE001
+                store2.finish_run(run_id=run_id, status="failed", last_error=f"{type(e).__name__}: {e}")
+            finally:
+                store2.close()
+
+        _RECONCILE_FUTURE = _RECONCILE_EXEC.submit(_runner)
+
+    return {"ok": True, "message": "started", "run_id": run_id, "root_path": root_path}
+
+
+@app.get("/api/archive/reconcile/status")
+def api_archive_reconcile_status() -> dict[str, Any]:
+    global _RECONCILE_FUTURE, _RECONCILE_RUN_ID  # noqa: PLW0603
+
+    store = DedupStore()
+    try:
+        latest = store.get_latest_run(scope="archive_reconcile")
+    finally:
+        store.close()
+
+    running = False
+    with _RECONCILE_LOCK:
+        running = _RECONCILE_FUTURE is not None and not _RECONCILE_FUTURE.done()
+
+    return {"running": running, "active_run_id": _RECONCILE_RUN_ID, "latest": latest}
+
+
+@app.get("/api/dedup/archive/status")
+def api_dedup_archive_status() -> dict[str, Any]:
+    global _DEDUP_FUTURES, _DEDUP_RUN_IDS  # noqa: PLW0603
+
+    store = DedupStore()
+    try:
+        latest = store.get_latest_run(scope="archive")
+    finally:
+        store.close()
+
+    running = False
+    with _DEDUP_LOCK:
+        fut = _DEDUP_FUTURES.get("archive")
+        running = fut is not None and not fut.done()
+
+    return {"running": running, "active_run_id": _DEDUP_RUN_IDS.get("archive"), "latest": latest}
+
+
+@app.post("/api/dedup/source/start")
+def api_dedup_source_start(path: str = r"C:\tmp\Photo") -> dict[str, Any]:
+    """
+    Запускает/продолжает дедупликацию локальной папки-источника (resume по данным).
+    """
+    global _DEDUP_FUTURES, _DEDUP_RUN_IDS  # noqa: PLW0603
+
+    root_path = path
+    with _DEDUP_LOCK:
+        fut = _DEDUP_FUTURES.get("source")
+        if fut is not None and not fut.done():
+            return {"ok": False, "message": "dedup scan already running", "run_id": _DEDUP_RUN_IDS.get("source")}
+
+        store = DedupStore()
+        try:
+            run_id = store.create_run(scope="source", root_path=root_path, max_download_bytes=None)
+        finally:
+            store.close()
+
+        _DEDUP_RUN_IDS["source"] = run_id
+
+        def _runner() -> None:
+            store2 = DedupStore()
+            try:
+                _dedup_scan_local_source(run_id=run_id, root_dir=root_path)
+                store2.finish_run(run_id=run_id, status="completed")
+            except Exception as e:  # noqa: BLE001
+                store2.finish_run(run_id=run_id, status="failed", last_error=f"{type(e).__name__}: {e}")
+            finally:
+                store2.close()
+
+        _DEDUP_FUTURES["source"] = _DEDUP_SOURCE_EXEC.submit(_runner)
+
+    return {"ok": True, "message": "started", "run_id": run_id, "root_path": root_path}
+
+
+@app.get("/api/dedup/source/status")
+def api_dedup_source_status() -> dict[str, Any]:
+    global _DEDUP_FUTURES, _DEDUP_RUN_IDS  # noqa: PLW0603
+
+    store = DedupStore()
+    try:
+        latest = store.get_latest_run(scope="source")
+    finally:
+        store.close()
+
+    running = False
+    with _DEDUP_LOCK:
+        fut = _DEDUP_FUTURES.get("source")
+        running = fut is not None and not fut.done()
+
+    return {"running": running, "active_run_id": _DEDUP_RUN_IDS.get("source"), "latest": latest}
 
 
 @app.get("/api/folder-counts")
@@ -260,8 +1378,18 @@ def api_path_listing(path: str) -> dict[str, Any]:
     p = _normalize_yadisk_path(path)
 
     t0 = time.perf_counter()
-    items = _yd_call_retry(lambda: list(disk.listdir(p)))
-    seconds = round(time.perf_counter() - t0, 2)
+    try:
+        items = _yd_call_retry(lambda: list(disk.listdir(p)))
+        seconds = round(time.perf_counter() - t0, 2)
+    except Exception as e:  # noqa: BLE001
+        seconds = round(time.perf_counter() - t0, 2)
+        return {
+            "path": _as_disk_path(p),
+            "direct_files": None,
+            "dirs": [],
+            "seconds": seconds,
+            "error": f"{type(e).__name__}: {e}",
+        }
 
     direct_files = 0
     dirs: list[dict[str, str]] = []
@@ -308,6 +1436,404 @@ def folders_page(request: Request):
             "folders": folders,
         },
     )
+
+
+@app.get("/duplicates", response_class=HTMLResponse)
+def duplicates_page(request: Request):
+    """
+    Просмотр дублей в архиве (disk:/Фото). Пока read-only.
+    Превью и тип подтягиваем "лениво" через YaDisk get_meta.
+    """
+    store = DedupStore()
+    try:
+        groups_raw = store.list_dup_groups_archive()
+        folders = list_folders(location="yadisk", role="target")
+    finally:
+        store.close()
+
+    sort_order_by_folder: dict[str, int] = {}
+    for f in folders:
+        name = str(f.get("name") or "")
+        so = f.get("sort_order")
+        if name and isinstance(so, int):
+            sort_order_by_folder[name.lower()] = so
+
+    groups: list[dict[str, Any]] = []
+    max_group_size = 0
+    for g in groups_raw:
+        hash_alg = str(g.get("hash_alg") or "")
+        hash_value = str(g.get("hash_value") or "")
+        cnt = int(g.get("cnt") or 0)
+        max_group_size = max(max_group_size, cnt)
+
+        store2 = DedupStore()
+        try:
+            items = store2.list_group_items(hash_alg=hash_alg, hash_value=hash_value)
+        finally:
+            store2.close()
+
+        keep_idx = _pick_keep_indexes(items, sort_order_by_folder)
+
+        ui_items: list[dict[str, Any]] = []
+        for i, it in enumerate(items):
+            path = str(it.get("path") or "")
+            mime_type = str(it.get("mime_type") or "") or None
+            media_type = str(it.get("media_type") or "") or None
+            size = it.get("size")
+            size_i = int(size) if isinstance(size, (int, float)) else None
+
+            ui_items.append(
+                {
+                    "path": path,
+                    "path_short": _short_path_for_ui(path),
+                    "folder_short": _short_folder_from_disk_path(path),
+                    "size_human": _human_bytes(size_i),
+                    "mime_type": mime_type,
+                    "media_type": media_type,
+                    "keep": i == keep_idx,
+                }
+            )
+
+        groups.append(
+            {
+                "hash_alg": hash_alg,
+                "hash_short": (hash_value[:12] + "…") if len(hash_value) > 12 else hash_value,
+                "cnt": cnt,
+                "files": ui_items,
+                "keep_invalid": False,
+                "note": None,
+            }
+        )
+
+    summary = {"groups": len(groups), "max_group_size": max_group_size}
+    return templates.TemplateResponse("duplicates.html", {"request": request, "groups": groups, "summary": summary})
+
+
+def _yadisk_remove_to_trash(disk, *, path: str) -> None:
+    p = _normalize_yadisk_path(path)
+    try:
+        _yd_call_retry(lambda: disk.remove(p, permanently=False))
+    except TypeError:
+        # старые версии/обёртки могли не поддерживать permanently
+        _yd_call_retry(lambda: disk.remove(p))
+
+
+def _yadisk_move(disk, *, src_path: str, dst_path: str) -> None:
+    src = _normalize_yadisk_path(src_path)
+    dst = _normalize_yadisk_path(dst_path)
+    try:
+        _yd_call_retry(lambda: disk.move(src, dst, overwrite=False))
+    except TypeError:
+        _yd_call_retry(lambda: disk.move(src, dst))
+
+
+@app.post("/api/duplicates/delete")
+def api_duplicates_delete(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Удаляет (в корзину) набор файлов Я.Диска и помечает их как deleted в БД,
+    чтобы они исчезали из /duplicates без перескана.
+    """
+    paths = payload.get("paths")
+    if not isinstance(paths, list) or not paths:
+        raise HTTPException(status_code=400, detail="paths[] is required")
+    if len(paths) > 500:
+        raise HTTPException(status_code=400, detail="too many paths (max 500)")
+
+    clean: list[str] = []
+    for p in paths:
+        if not isinstance(p, str) or not p.startswith("disk:"):
+            continue
+        clean.append(p)
+    if not clean:
+        raise HTTPException(status_code=400, detail="no valid disk: paths")
+
+    disk = get_disk()
+    ok_paths: list[str] = []
+    errors: list[dict[str, str]] = []
+    for p in clean:
+        try:
+            _yadisk_remove_to_trash(disk, path=p)
+            ok_paths.append(p)
+        except Exception as e:  # noqa: BLE001
+            errors.append({"path": p, "error": f"{type(e).__name__}: {e}"})
+
+    store = DedupStore()
+    try:
+        store.mark_deleted(paths=ok_paths)
+    finally:
+        store.close()
+
+    return {"ok": True, "deleted": len(ok_paths), "errors": errors}
+
+
+@app.post("/api/duplicates/move-to-kids")
+def api_duplicates_move_to_kids(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Перемещает один файл в папку 'Дети вместе' и удаляет (в корзину) остальные
+    файлы из группы.
+    """
+    paths = payload.get("paths")
+    prefer = payload.get("prefer_path")
+    if not isinstance(paths, list) or not paths:
+        raise HTTPException(status_code=400, detail="paths[] is required")
+
+    all_paths: list[str] = []
+    for p in paths:
+        if isinstance(p, str) and p.startswith("disk:"):
+            all_paths.append(p)
+    if len(all_paths) < 2:
+        raise HTTPException(status_code=400, detail="need at least 2 disk: paths")
+
+    # Приоритет: prefer_path (если валиден), затем остальные.
+    candidates: list[str] = []
+    if isinstance(prefer, str) and prefer in all_paths:
+        candidates.append(prefer)
+    for p in all_paths:
+        if p not in candidates:
+            candidates.append(p)
+
+    dest_dir = _resolve_target_folder_path_kids_together()
+    dest_dir_norm = _normalize_yadisk_path(dest_dir)
+
+    disk = get_disk()
+    store = DedupStore()
+    try:
+        # Сначала пытаемся выбрать файл, который не УЖЕ в целевой папке (чтобы move не был no-op).
+        dest_prefix = dest_dir_norm.rstrip("/") + "/"
+        candidates_sorted = sorted(
+            candidates,
+            key=lambda p: 0 if not _normalize_yadisk_path(p).startswith(dest_prefix) else 1,
+        )
+
+        def _is_free_name(name: str) -> bool:
+            dp = _disk_join(dest_dir, name)
+            try:
+                if bool(_yd_call_retry(lambda: disk.exists(_normalize_yadisk_path(dp)))):
+                    return False
+            except Exception:
+                # если exists не работает, полагаемся на БД + fallback-rename
+                pass
+            return not store.path_exists(path=dp)
+
+        chosen_src: str | None = None
+        chosen_name: str | None = None
+        # Попробуем сначала "взять файл с другим именем" (без переименования).
+        for p in candidates_sorted:
+            base = _basename_from_disk_path(p)
+            if base and _is_free_name(base):
+                chosen_src = p
+                chosen_name = base
+                break
+
+        # Если все имена конфликтуют — переименуем.
+        if not chosen_src:
+            chosen_src = candidates_sorted[0]
+            chosen_name = _unique_dest_name(store=store, disk=disk, dest_dir=dest_dir, src_name=_basename_from_disk_path(chosen_src))
+
+        dest_path = _disk_join(dest_dir, str(chosen_name))
+
+        _yadisk_move(disk, src_path=chosen_src, dst_path=dest_path)
+
+        # Удаляем остальные (в корзину).
+        to_delete = [p for p in all_paths if p != chosen_src]
+        deleted_ok: list[str] = []
+        errors: list[dict[str, str]] = []
+        for p in to_delete:
+            try:
+                _yadisk_remove_to_trash(disk, path=p)
+                deleted_ok.append(p)
+            except Exception as e:  # noqa: BLE001
+                errors.append({"path": p, "error": f"{type(e).__name__}: {e}"})
+
+        # Обновляем БД: moved path + помечаем удалённые.
+        store.update_path(
+            old_path=chosen_src,
+            new_path=dest_path,
+            new_name=_basename_from_disk_path(dest_path),
+            new_parent_path=_parent_from_disk_path(dest_path),
+        )
+        store.mark_deleted(paths=deleted_ok)
+
+        return {
+            "ok": True,
+            "moved_from": chosen_src,
+            "moved_to": dest_path,
+            "deleted": len(deleted_ok),
+            "errors": errors,
+        }
+    finally:
+        store.close()
+
+
+@app.get("/api/yadisk/preview")
+def api_yadisk_preview(path: str) -> dict[str, Any]:
+    """
+    Ленивая подгрузка превью/типа через YaDisk get_meta для конкретного файла.
+    Используется страницей /duplicates, чтобы она открывалась быстро.
+    """
+    disk = get_disk()
+    try:
+        # `preview` часто приходит только при явном запросе размера превью.
+        # Если библиотека/эндпойнт не поддерживают preview_size — fallback на обычный get_meta.
+        try:
+            md = _yd_call_retry(lambda: disk.get_meta(_normalize_yadisk_path(path), limit=0, preview_size="M"))
+        except TypeError:
+            md = _yd_call_retry(lambda: disk.get_meta(_normalize_yadisk_path(path), limit=0))
+        # В yadisk 3.4.x meta-объект обычно отдаёт значения как атрибуты (meta.preview),
+        # а `to_json()` может отсутствовать.
+        preview = getattr(md, "preview", None)
+        mime_type = getattr(md, "mime_type", None)
+        media_type = getattr(md, "media_type", None)
+        dur_sec: Optional[int] = None
+        mt = (media_type or "").lower()
+        mime = (mime_type or "").lower()
+        if mt == "video" or mime.startswith("video/"):
+            dur_sec = _extract_duration_seconds(md)
+        return {
+            "ok": True,
+            "path": path,
+            "preview": preview or None,
+            "mime_type": mime_type or None,
+            "media_type": media_type or None,
+            "duration_sec": dur_sec,
+            "duration_human": _human_duration(dur_sec),
+            "error": None,
+        }
+    except Exception as e:  # noqa: BLE001
+        return {
+            "ok": False,
+            "path": path,
+            "preview": None,
+            "mime_type": None,
+            "media_type": None,
+            "duration_sec": None,
+            "duration_human": "—",
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
+@app.get("/api/yadisk/video-duration")
+def api_yadisk_video_duration(path: str) -> Response:
+    """
+    Асинхронно вычисляет длительность видео через ffprobe (вариант B).
+    Возвращает:
+      - 200 {status:'ready', duration_sec, duration_human}
+      - 202 {status:'pending'}
+      - 400/500 {status:'error', error}
+    """
+    if not path.startswith("disk:"):
+        return JSONResponse(status_code=400, content={"ok": False, "status": "error", "error": "Only disk: paths are supported"})
+
+    store = DedupStore()
+    try:
+        cached = store.get_duration(path=path)
+    finally:
+        store.close()
+
+    if isinstance(cached, int) and cached >= 0:
+        return JSONResponse(
+            status_code=200,
+            content={"ok": True, "status": "ready", "duration_sec": cached, "duration_human": _human_duration(cached)},
+            headers={"Cache-Control": "private, max-age=3600"},
+        )
+
+    with _VIDEO_LOCK:
+        # Если уже есть ошибка — отдадим её (чтобы UI мог остановиться).
+        err = _VIDEO_ERRORS.get(path)
+        if err:
+            return JSONResponse(status_code=500, content={"ok": False, "status": "error", "error": err}, headers={"Cache-Control": "no-store"})
+
+        fut = _VIDEO_FUTURES.get(path)
+        if fut is None or fut.done():
+            # Планируем вычисление.
+            def _runner() -> None:
+                try:
+                    disk = get_disk()
+                    url = _get_download_url(disk, path=path)
+                    sec = _ffprobe_duration_seconds_from_url(url, timeout_sec=35)
+                    store2 = DedupStore()
+                    try:
+                        store2.set_duration(path=path, duration_sec=sec, source="ffprobe")
+                    finally:
+                        store2.close()
+                except Exception as e:  # noqa: BLE001
+                    with _VIDEO_LOCK:
+                        _VIDEO_ERRORS[path] = f"{type(e).__name__}: {e}"
+                finally:
+                    # очищаем future
+                    with _VIDEO_LOCK:
+                        _VIDEO_FUTURES.pop(path, None)
+
+            _VIDEO_FUTURES[path] = _VIDEO_EXEC.submit(_runner)
+
+    return JSONResponse(status_code=202, content={"ok": True, "status": "pending"}, headers={"Retry-After": "1", "Cache-Control": "no-store"})
+
+
+@app.get("/api/yadisk/preview-image")
+def api_yadisk_preview_image(path: str, size: str = "M") -> Response:
+    """
+    Проксирует превью-картинку через наш сервер (localhost), чтобы браузеру не нужно было
+    грузить изображения напрямую с downloader.disk.yandex.ru (иногда это блокируется).
+
+    size: размер превью (S/M/L/XL, зависит от API; по умолчанию M).
+    """
+    # Кэшируем preview_url, чтобы повторные заходы на /duplicates были быстрее и дешевле по YaDisk API.
+    cache_key = (path, size)
+    cached_url = _preview_cache_get(cache_key)
+    if cached_url:
+        return RedirectResponse(url=cached_url, status_code=307, headers={"Cache-Control": "private, max-age=300"})
+
+    # Ограничиваем параллелизм, чтобы /duplicates не "вешал" весь сервер.
+    acquired = _PREVIEW_SEM.acquire(timeout=0.2)
+    if not acquired:
+        return Response(
+            status_code=429,
+            content=b"Too many requests; retry later",
+            media_type="text/plain",
+            headers={"Retry-After": "1", "Cache-Control": "no-store"},
+        )
+
+    try:
+        disk = get_disk()
+        p = _normalize_yadisk_path(path)
+
+        try:
+            md = _yd_call_retry(lambda: disk.get_meta(p, limit=0, preview_size=size))
+        except TypeError:
+            md = _yd_call_retry(lambda: disk.get_meta(p, limit=0))
+
+        preview_url = getattr(md, "preview", None)
+        if not preview_url:
+            return Response(
+                status_code=404,
+                content=b"No preview for this file",
+                media_type="text/plain",
+                headers={"Cache-Control": "no-store", "X-Preview-Reason": "no-preview-url"},
+            )
+
+        # Важно: Яндекс часто блокирует "серверное" скачивание превью (403 Forbidden),
+        # но браузер может открыть этот URL напрямую. Поэтому вместо проксирования байтов
+        # делаем redirect на preview_url.
+        preview_url_str = str(preview_url)
+        _preview_cache_put(cache_key, preview_url_str)
+        return RedirectResponse(url=preview_url_str, status_code=307, headers={"Cache-Control": "private, max-age=300"})
+    except Exception as e:  # noqa: BLE001
+        # Важно: на /duplicates нам нужно понять причину (timeout/403/SSL/etc).
+        # Отдаём текст ошибки — его можно посмотреть в DevTools → Network → Response.
+        msg = f"{type(e).__name__}: {e}"
+        # Не раздуваем заголовки
+        hdr_msg = (msg[:200]).encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
+        return Response(
+            status_code=502,
+            content=msg.encode("utf-8", errors="ignore"),
+            media_type="text/plain",
+            headers={"Cache-Control": "no-store", "X-Preview-Error": hdr_msg},
+        )
+    finally:
+        try:
+            _PREVIEW_SEM.release()
+        except ValueError:
+            pass
 
 
 @app.get("/browse", response_class=HTMLResponse)

@@ -1,6 +1,7 @@
 import sqlite3
 from pathlib import Path
 from typing import Any
+from datetime import datetime, timezone
 
 # data/photosorter.db рядом с проектом
 DB_PATH = Path(__file__).resolve().parents[1] / "data" / "photosorter.db"
@@ -31,6 +32,11 @@ def _ensure_columns(conn: sqlite3.Connection, table: str, ddl_by_column: dict[st
         cur.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
+def _now_utc_iso() -> str:
+    # Храним времена в UTC в ISO-формате, чтобы не путать часовые пояса.
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
 def init_db():
     # на всякий случай создаём папку data
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -59,6 +65,83 @@ def init_db():
             "name": "name TEXT",
             "sort_order": "sort_order INTEGER",
         },
+    )
+
+    # --- Dedup: инвентарь файлов и прогоны скана архива (disk:/Фото) ---
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS dedup_runs (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope                   TEXT,            -- 'archive'|'source' (храним только последний на scope)
+            root_path               TEXT NOT NULL,   -- например 'disk:/Фото'
+            status                  TEXT NOT NULL,   -- 'running'|'completed'|'failed'
+            limit_files             INTEGER,
+            max_download_bytes      INTEGER,
+            total_files             INTEGER,
+            started_at              TEXT NOT NULL,
+            finished_at             TEXT,
+            processed_files         INTEGER NOT NULL DEFAULT 0,
+            hashed_files            INTEGER NOT NULL DEFAULT 0,
+            meta_hashed_files       INTEGER NOT NULL DEFAULT 0,
+            downloaded_hashed_files INTEGER NOT NULL DEFAULT 0,
+            skipped_large_files     INTEGER NOT NULL DEFAULT 0,
+            errors_count            INTEGER NOT NULL DEFAULT 0,
+            last_path               TEXT,
+            last_error              TEXT
+        );
+    """)
+
+    _ensure_columns(
+        conn,
+        "dedup_runs",
+        {
+            "scope": "scope TEXT",
+            "total_files": "total_files INTEGER",
+        },
+    )
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS yd_files (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            path            TEXT UNIQUE NOT NULL,    -- 'disk:/...'
+            resource_id     TEXT,                   -- устойчивый ID ресурса Я.Диска (не зависит от пути)
+            name            TEXT,
+            parent_path     TEXT,
+            size            INTEGER,
+            created         TEXT,
+            modified        TEXT,
+            mime_type       TEXT,
+            media_type      TEXT,
+            hash_alg        TEXT,                   -- 'sha256'|'md5'
+            hash_value      TEXT,
+            hash_source     TEXT,                   -- 'meta'|'download'
+            status          TEXT NOT NULL DEFAULT 'new', -- 'new'|'hashed'|'skipped_large'|'error'
+            error           TEXT,
+            scanned_at      TEXT,
+            hashed_at       TEXT,
+            last_run_id     INTEGER,
+            duration_sec    INTEGER,                -- длительность видео (сек), если известна
+            duration_source TEXT,                   -- 'ffprobe'|'meta'
+            duration_at     TEXT                    -- когда обновляли длительность (UTC ISO)
+        );
+    """)
+
+    _ensure_columns(
+        conn,
+        "yd_files",
+        {
+            "resource_id": "resource_id TEXT",
+            "duration_sec": "duration_sec INTEGER",
+            "duration_source": "duration_source TEXT",
+            "duration_at": "duration_at TEXT",
+        },
+    )
+
+    # Индексы для быстрых группировок дублей.
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_yd_files_hash ON yd_files(hash_alg, hash_value);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_yd_files_parent ON yd_files(parent_path);")
+    # Устойчивый идентификатор: уникален, если известен (partial unique index).
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_yd_files_resource_id ON yd_files(resource_id) WHERE resource_id IS NOT NULL;"
     )
 
     conn.commit()
@@ -106,6 +189,408 @@ def list_folders(*, location: str | None = None, role: str | None = None) -> lis
         return [dict(r) for r in rows]
     finally:
         conn.close()
+
+
+class DedupStore:
+    """
+    Хранилище дедуп-данных поверх текущей SQLite БД (data/photosorter.db).
+    Используется для заполнения БД дублей (инвентарь файлов + хэши + статус прогона).
+    """
+
+    def __init__(self) -> None:
+        init_db()
+        self.conn = get_connection()
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def create_run(
+        self,
+        *,
+        scope: str,
+        root_path: str,
+        max_download_bytes: int | None,
+    ) -> int:
+        cur = self.conn.cursor()
+        # Упрощение: истории не ведём — держим только последний прогон на scope.
+        cur.execute("DELETE FROM dedup_runs WHERE scope = ?", (scope,))
+        cur.execute(
+            """
+            INSERT INTO dedup_runs(scope, root_path, status, limit_files, max_download_bytes, started_at)
+            VALUES (?, ?, 'running', NULL, ?, ?)
+            """,
+            (scope, root_path, max_download_bytes, _now_utc_iso()),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def finish_run(self, *, run_id: int, status: str, last_error: str | None = None) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            UPDATE dedup_runs
+            SET status = ?, finished_at = ?, last_error = COALESCE(?, last_error)
+            WHERE id = ?
+            """,
+            (status, _now_utc_iso(), last_error, run_id),
+        )
+        self.conn.commit()
+
+    def update_run_progress(
+        self,
+        *,
+        run_id: int,
+        total_files: int | None = None,
+        processed_files: int | None = None,
+        hashed_files: int | None = None,
+        meta_hashed_files: int | None = None,
+        downloaded_hashed_files: int | None = None,
+        skipped_large_files: int | None = None,
+        errors_count: int | None = None,
+        last_path: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        fields: list[str] = []
+        params: list[Any] = []
+        for key, val in [
+            ("total_files", total_files),
+            ("processed_files", processed_files),
+            ("hashed_files", hashed_files),
+            ("meta_hashed_files", meta_hashed_files),
+            ("downloaded_hashed_files", downloaded_hashed_files),
+            ("skipped_large_files", skipped_large_files),
+            ("errors_count", errors_count),
+            ("last_path", last_path),
+            ("last_error", last_error),
+        ]:
+            if val is None:
+                continue
+            fields.append(f"{key} = ?")
+            params.append(val)
+
+        if not fields:
+            return
+        params.append(run_id)
+        sql = f"UPDATE dedup_runs SET {', '.join(fields)} WHERE id = ?"
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
+        self.conn.commit()
+
+    def get_latest_run(self, *, scope: str) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT *
+            FROM dedup_runs
+            WHERE scope = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (scope,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def upsert_file(
+        self,
+        *,
+        run_id: int,
+        path: str,
+        resource_id: str | None = None,
+        name: str | None,
+        parent_path: str | None,
+        size: int | None,
+        created: str | None,
+        modified: str | None,
+        mime_type: str | None,
+        media_type: str | None,
+        hash_alg: str | None,
+        hash_value: str | None,
+        hash_source: str | None,
+        status: str,
+        error: str | None,
+        scanned_at: str | None = None,
+        hashed_at: str | None = None,
+    ) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO yd_files(
+              path, resource_id, name, parent_path, size, created, modified, mime_type, media_type,
+              hash_alg, hash_value, hash_source, status, error, scanned_at, hashed_at, last_run_id
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+              resource_id = COALESCE(excluded.resource_id, yd_files.resource_id),
+              name = excluded.name,
+              parent_path = excluded.parent_path,
+              size = excluded.size,
+              created = excluded.created,
+              modified = excluded.modified,
+              mime_type = excluded.mime_type,
+              media_type = excluded.media_type,
+              hash_alg = COALESCE(excluded.hash_alg, yd_files.hash_alg),
+              hash_value = COALESCE(excluded.hash_value, yd_files.hash_value),
+              hash_source = COALESCE(excluded.hash_source, yd_files.hash_source),
+              status = excluded.status,
+              error = excluded.error,
+              scanned_at = excluded.scanned_at,
+              hashed_at = COALESCE(excluded.hashed_at, yd_files.hashed_at),
+              last_run_id = excluded.last_run_id
+            """,
+            (
+                path,
+                resource_id,
+                name,
+                parent_path,
+                size,
+                created,
+                modified,
+                mime_type,
+                media_type,
+                hash_alg,
+                hash_value,
+                hash_source,
+                status,
+                error,
+                scanned_at or _now_utc_iso(),
+                hashed_at,
+                run_id,
+            ),
+        )
+        self.conn.commit()
+
+    def get_existing_hash(self, *, path: str) -> tuple[str | None, str | None]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT hash_alg, hash_value FROM yd_files WHERE path = ? LIMIT 1", (path,))
+        row = cur.fetchone()
+        if not row:
+            return None, None
+        return (row["hash_alg"], row["hash_value"])
+
+    def list_dup_groups_archive(self) -> list[dict[str, Any]]:
+        """
+        Возвращает группы дублей для архива YaDisk (только paths, начинающиеся с 'disk:').
+        Группа = одинаковый (hash_alg, hash_value), где количество файлов > 1.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT
+              hash_alg,
+              hash_value,
+              COUNT(*) AS cnt
+            FROM yd_files
+            WHERE
+              hash_value IS NOT NULL
+              AND path LIKE 'disk:%'
+              AND status != 'deleted'
+            GROUP BY hash_alg, hash_value
+            HAVING COUNT(*) > 1
+            ORDER BY cnt DESC, hash_alg ASC
+            """
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_group_items(self, *, hash_alg: str, hash_value: str) -> list[dict[str, Any]]:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT path, name, parent_path, size, modified, mime_type, media_type, hash_source
+            FROM yd_files
+            WHERE hash_alg = ? AND hash_value = ?
+              AND status != 'deleted'
+            ORDER BY path ASC
+            """,
+            (hash_alg, hash_value),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def path_exists(self, *, path: str) -> bool:
+        cur = self.conn.cursor()
+        cur.execute("SELECT 1 FROM yd_files WHERE path = ? LIMIT 1", (path,))
+        return cur.fetchone() is not None
+
+    def mark_deleted(self, *, paths: list[str]) -> int:
+        """
+        Помечает файлы как удалённые (в корзину/удалены на стороне YaDisk), чтобы они
+        исчезали из /duplicates без перескана.
+        """
+        if not paths:
+            return 0
+        cur = self.conn.cursor()
+        q = ",".join(["?"] * len(paths))
+        cur.execute(f"UPDATE yd_files SET status = 'deleted', error = NULL WHERE path IN ({q})", paths)
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
+    def update_path(self, *, old_path: str, new_path: str, new_name: str | None, new_parent_path: str | None) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            UPDATE yd_files
+            SET path = ?, name = COALESCE(?, name), parent_path = COALESCE(?, parent_path)
+            WHERE path = ?
+            """,
+            (new_path, new_name, new_parent_path, old_path),
+        )
+        self.conn.commit()
+
+    def get_row_by_resource_id(self, *, resource_id: str) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM yd_files WHERE resource_id = ? LIMIT 1", (resource_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_row_by_path(self, *, path: str) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM yd_files WHERE path = ? LIMIT 1", (path,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def reconcile_upsert_present_file(
+        self,
+        *,
+        run_id: int,
+        path: str,
+        resource_id: str | None,
+        name: str | None,
+        parent_path: str | None,
+        size: int | None,
+        created: str | None,
+        modified: str | None,
+        mime_type: str | None,
+        media_type: str | None,
+    ) -> None:
+        """
+        Сверка архива: файл "присутствует" в текущем скане YaDisk.
+
+        - Если запись уже есть (по resource_id, иначе по path): обновляем метаданные.
+        - Если size/modified изменились: сбрасываем hash_* и переводим status в 'new' (нужно пересчитать).
+        - Если запись была 'deleted', но файл снова найден: "воскрешаем" (status='hashed' если hash есть, иначе 'new').
+        - Если это новый файл: создаём запись со status='new'.
+        """
+        cur = self.conn.cursor()
+
+        existing: dict[str, Any] | None = None
+        if resource_id:
+            existing = self.get_row_by_resource_id(resource_id=resource_id)
+        if not existing:
+            existing = self.get_row_by_path(path=path)
+
+        now = _now_utc_iso()
+
+        if not existing:
+            cur.execute(
+                """
+                INSERT INTO yd_files(
+                  path, resource_id, name, parent_path, size, created, modified, mime_type, media_type,
+                  hash_alg, hash_value, hash_source, status, error, scanned_at, hashed_at, last_run_id
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'new', NULL, ?, NULL, ?)
+                """,
+                (path, resource_id, name, parent_path, size, created, modified, mime_type, media_type, now, run_id),
+            )
+            return
+
+        existing_id = int(existing["id"])
+        existing_path = str(existing.get("path") or "")
+        existing_size = existing.get("size")
+        existing_modified = str(existing.get("modified") or "") or None
+        existing_hash_value = str(existing.get("hash_value") or "") or None
+        existing_status = str(existing.get("status") or "") or "new"
+
+        # Если путь изменился, но новый путь уже занят другой строкой — пометим конфликтную строку deleted.
+        if existing_path != path:
+            cur.execute("SELECT id, resource_id, status FROM yd_files WHERE path = ? LIMIT 1", (path,))
+            other = cur.fetchone()
+            if other and int(other["id"]) != existing_id:
+                cur.execute(
+                    "UPDATE yd_files SET status='deleted', error=NULL WHERE id = ?",
+                    (int(other["id"]),),
+                )
+
+        size_changed = (existing_size is None) != (size is None) or (existing_size is not None and size is not None and int(existing_size) != int(size))
+        mod_changed = (existing_modified is None) != (modified is None) or (existing_modified is not None and modified is not None and existing_modified != modified)
+        content_changed = bool(size_changed or mod_changed)
+
+        if content_changed:
+            # Содержимое могло поменяться -> сбрасываем хэш и (на всякий случай) длительность.
+            cur.execute(
+                """
+                UPDATE yd_files
+                SET
+                  path = ?,
+                  resource_id = COALESCE(?, resource_id),
+                  name = ?,
+                  parent_path = ?,
+                  size = ?,
+                  created = ?,
+                  modified = ?,
+                  mime_type = ?,
+                  media_type = ?,
+                  status = 'new',
+                  error = NULL,
+                  scanned_at = ?,
+                  last_run_id = ?,
+                  hash_alg = NULL,
+                  hash_value = NULL,
+                  hash_source = NULL,
+                  hashed_at = NULL,
+                  duration_sec = NULL,
+                  duration_source = NULL,
+                  duration_at = NULL
+                WHERE id = ?
+                """,
+                (path, resource_id, name, parent_path, size, created, modified, mime_type, media_type, now, run_id, existing_id),
+            )
+        else:
+            new_status = existing_status
+            if new_status == "deleted":
+                new_status = "hashed" if existing_hash_value else "new"
+            cur.execute(
+                """
+                UPDATE yd_files
+                SET
+                  path = ?,
+                  resource_id = COALESCE(?, resource_id),
+                  name = ?,
+                  parent_path = ?,
+                  size = ?,
+                  created = ?,
+                  modified = ?,
+                  mime_type = ?,
+                  media_type = ?,
+                  status = ?,
+                  error = NULL,
+                  scanned_at = ?,
+                  last_run_id = ?
+                WHERE id = ?
+                """,
+                (path, resource_id, name, parent_path, size, created, modified, mime_type, media_type, new_status, now, run_id, existing_id),
+            )
+        # Коммитим батчами снаружи (через update_run_progress/finish_run), чтобы сверка работала быстрее.
+
+    def get_duration(self, *, path: str) -> int | None:
+        cur = self.conn.cursor()
+        cur.execute("SELECT duration_sec FROM yd_files WHERE path = ? LIMIT 1", (path,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        val = row[0]
+        return int(val) if isinstance(val, (int, float)) else None
+
+    def set_duration(self, *, path: str, duration_sec: int | None, source: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            UPDATE yd_files
+            SET duration_sec = ?, duration_source = ?, duration_at = ?
+            WHERE path = ?
+            """,
+            (duration_sec, source, _now_utc_iso(), path),
+        )
+        self.conn.commit()
 
 
 if __name__ == "__main__":
