@@ -121,30 +121,6 @@
       </div>
     </div>
 
-    <div class="section" id="dedupSourceSection">
-      <div class="section-title">
-        <div>
-          <div style="font-weight: 600;">Дедупликация источника (локально)</div>
-          <div class="muted">Папка-источник: по умолчанию <code>C:\tmp\Photo</code>. Можно запускать повторно (resume по данным).</div>
-        </div>
-        <div>
-          <div class="field">
-            <span class="muted">путь:</span>
-            <input id="dedupSourcePath" type="text" value="C:\\tmp\\Photo" style="width: 260px;" />
-          </div>
-          <button class="btn" id="dedupSourceStart" type="button"
-            title="Запустить/продолжить дедупликацию локальной папки-источника">
-            Запустить / Продолжить
-          </button>
-        </div>
-      </div>
-
-      <div style="margin-top: 10px;">
-        <div class="bar" aria-label="Dedup progress"><div id="dedupSourceBarFill"></div></div>
-        <div class="muted status" id="dedupSourceText" style="margin-top: 8px;">Дедупликация источника: статус загружается…</div>
-      </div>
-    </div>
-
     <script>
       const CONCURRENCY = 10;
       const DEDUP_POLL_MS = 2000;
@@ -181,18 +157,6 @@
 
       function setReconcileBar(percent) {
         const el = document.getElementById("reconcileBarFill");
-        if (!el) return;
-        const p = Math.max(0, Math.min(100, Number(percent) || 0));
-        el.style.width = `${p}%`;
-      }
-
-      function setDedupSourceText(text) {
-        const el = document.getElementById("dedupSourceText");
-        if (el) el.textContent = text ?? "";
-      }
-
-      function setDedupSourceBar(percent) {
-        const el = document.getElementById("dedupSourceBarFill");
         if (!el) return;
         const p = Math.max(0, Math.min(100, Number(percent) || 0));
         el.style.width = `${p}%`;
@@ -312,43 +276,6 @@
         }
       }
 
-      function updateDedupSourceButtonDisabled(running) {
-        const btn = document.getElementById("dedupSourceStart");
-        if (!btn) return;
-        btn.disabled = Boolean(running);
-        if (running) btn.title = "Скан уже запущен.";
-      }
-
-      async function pollDedupSourceStatusOnce() {
-        try {
-          const resp = await fetch(`/api/dedup/source/status`, { cache: "no-store" });
-          if (!resp.ok) throw new Error("HTTP " + resp.status);
-          const data = await resp.json();
-
-          const latest = data.latest || null;
-          const running = Boolean(data.running);
-          updateDedupSourceButtonDisabled(running);
-
-          if (!latest) {
-            setDedupSourceBar(0);
-            setDedupSourceText("Дедупликация источника: ещё не запускалась.");
-            return;
-          }
-
-          const p = latest.processed_files ?? 0;
-          const h = latest.hashed_files ?? 0;
-          const er = latest.errors_count ?? 0;
-          const total = latest.total_files ?? null;
-          const st = latest.status ?? "";
-          const denom = total ?? 0;
-          const pct = denom > 0 ? Math.round((p / denom) * 100) : 0;
-          setDedupSourceBar(pct);
-          setDedupSourceText(`Дедупликация источника: ${running ? "идёт" : st} · прогресс=${pct}% (${p}/${denom || "…"}) · с хэшем=${h} · ошибок=${er}`);
-        } catch (e) {
-          setDedupSourceText("Дедупликация источника: ошибка статуса: " + String(e));
-        }
-      }
-
       function getMaxGb() {
         const v = Number(document.getElementById("dedupMaxGb")?.value ?? 5);
         return Number.isFinite(v) ? Math.max(0, Math.floor(v)) : 5;
@@ -386,27 +313,6 @@
           setReconcileText("Сверка архива: не удалось запустить: " + String(e));
         } finally {
           await pollArchiveReconcileStatusOnce();
-        }
-      }
-
-      function getSourcePath() {
-        return (document.getElementById("dedupSourcePath")?.value ?? "").toString();
-      }
-
-      async function startDedupSource() {
-        updateDedupSourceButtonDisabled(true);
-        setDedupSourceText("Дедупликация источника: запуск…");
-        try {
-          const p = getSourcePath();
-          const url = `/api/dedup/source/start?path=${encodeURIComponent(p)}`;
-          const resp = await fetch(url, { method: "POST" });
-          const data = await resp.json().catch(() => ({}));
-          if (!resp.ok || !data.ok) throw new Error(data.message || ("HTTP " + resp.status));
-          setDedupSourceText(`Дедупликация источника: запущено (run_id=${data.run_id}).`);
-        } catch (e) {
-          setDedupSourceText("Дедупликация источника: не удалось запустить: " + String(e));
-        } finally {
-          await pollDedupSourceStatusOnce();
         }
       }
 
@@ -481,19 +387,12 @@
         startReconcileArchive();
       });
 
-      document.getElementById("dedupSourceStart")?.addEventListener("click", (e) => {
-        e.preventDefault();
-        startDedupSource();
-      });
-
       loadCountsRowByRow();
       pollDedupArchiveStatusOnce();
       pollArchiveReconcileStatusOnce();
-      pollDedupSourceStatusOnce();
       setInterval(() => {
         pollDedupArchiveStatusOnce();
         pollArchiveReconcileStatusOnce();
-        pollDedupSourceStatusOnce();
       }, DEDUP_POLL_MS);
     </script>
   </body>

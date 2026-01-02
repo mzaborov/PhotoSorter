@@ -104,6 +104,7 @@ def init_db():
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             path            TEXT UNIQUE NOT NULL,    -- 'disk:/...'
             resource_id     TEXT,                   -- устойчивый ID ресурса Я.Диска (не зависит от пути)
+            inventory_scope TEXT,                   -- 'archive'|'source' (чтобы не смешивать разные инвентари)
             name            TEXT,
             parent_path     TEXT,
             size            INTEGER,
@@ -119,6 +120,7 @@ def init_db():
             scanned_at      TEXT,
             hashed_at       TEXT,
             last_run_id     INTEGER,
+            ignore_archive_dup_run_id INTEGER,      -- если = source run_id, то не показывать "уже есть в архиве" до нового перескана
             duration_sec    INTEGER,                -- длительность видео (сек), если известна
             duration_source TEXT,                   -- 'ffprobe'|'meta'
             duration_at     TEXT                    -- когда обновляли длительность (UTC ISO)
@@ -130,6 +132,8 @@ def init_db():
         "yd_files",
         {
             "resource_id": "resource_id TEXT",
+            "inventory_scope": "inventory_scope TEXT",
+            "ignore_archive_dup_run_id": "ignore_archive_dup_run_id INTEGER",
             "duration_sec": "duration_sec INTEGER",
             "duration_source": "duration_source TEXT",
             "duration_at": "duration_at TEXT",
@@ -297,6 +301,7 @@ class DedupStore:
         run_id: int,
         path: str,
         resource_id: str | None = None,
+        inventory_scope: str | None = None,
         name: str | None,
         parent_path: str | None,
         size: int | None,
@@ -316,12 +321,13 @@ class DedupStore:
         cur.execute(
             """
             INSERT INTO yd_files(
-              path, resource_id, name, parent_path, size, created, modified, mime_type, media_type,
+              path, resource_id, inventory_scope, name, parent_path, size, created, modified, mime_type, media_type,
               hash_alg, hash_value, hash_source, status, error, scanned_at, hashed_at, last_run_id
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
               resource_id = COALESCE(excluded.resource_id, yd_files.resource_id),
+              inventory_scope = COALESCE(excluded.inventory_scope, yd_files.inventory_scope),
               name = excluded.name,
               parent_path = excluded.parent_path,
               size = excluded.size,
@@ -341,6 +347,7 @@ class DedupStore:
             (
                 path,
                 resource_id,
+                inventory_scope,
                 name,
                 parent_path,
                 size,
@@ -370,7 +377,7 @@ class DedupStore:
 
     def list_dup_groups_archive(self) -> list[dict[str, Any]]:
         """
-        Возвращает группы дублей для архива YaDisk (только paths, начинающиеся с 'disk:').
+        Возвращает группы дублей для архива YaDisk (inventory_scope='archive').
         Группа = одинаковый (hash_alg, hash_value), где количество файлов > 1.
         """
         cur = self.conn.cursor()
@@ -383,7 +390,7 @@ class DedupStore:
             FROM yd_files
             WHERE
               hash_value IS NOT NULL
-              AND path LIKE 'disk:%'
+              AND COALESCE(inventory_scope, 'archive') = 'archive'
               AND status != 'deleted'
             GROUP BY hash_alg, hash_value
             HAVING COUNT(*) > 1
@@ -392,17 +399,109 @@ class DedupStore:
         )
         return [dict(r) for r in cur.fetchall()]
 
-    def list_group_items(self, *, hash_alg: str, hash_value: str) -> list[dict[str, Any]]:
+    def list_group_items(self, *, hash_alg: str, hash_value: str, inventory_scope: str | None = None, last_run_id: int | None = None) -> list[dict[str, Any]]:
+        cur = self.conn.cursor()
+        where: list[str] = ["hash_alg = ? AND hash_value = ?", "status != 'deleted'"]
+        params: list[Any] = [hash_alg, hash_value]
+        if inventory_scope is not None:
+            where.append("inventory_scope = ?")
+            params.append(inventory_scope)
+        if last_run_id is not None:
+            where.append("last_run_id = ?")
+            params.append(last_run_id)
+        cur.execute(
+            f"""
+            SELECT path, name, parent_path, size, modified, mime_type, media_type, hash_source
+            FROM yd_files
+            WHERE {' AND '.join(where)}
+            ORDER BY path ASC
+            """,
+            params,
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def set_ignore_archive_dup(self, *, paths: list[str], run_id: int) -> int:
+        """
+        Помечает source-файлы как "не дубль архива" ДЛЯ ТЕКУЩЕГО source run_id.
+        При новом пересканировании source run_id изменится — пометка автоматически перестанет действовать.
+        """
+        if not paths:
+            return 0
+        cur = self.conn.cursor()
+        q = ",".join(["?"] * len(paths))
+        cur.execute(
+            f"""
+            UPDATE yd_files
+            SET ignore_archive_dup_run_id = ?
+            WHERE path IN ({q})
+            """,
+            [run_id, *paths],
+        )
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
+    def list_source_dups_in_archive(self, *, source_run_id: int, archive_prefix: str = "disk:/Фото") -> list[dict[str, Any]]:
+        """
+        Возвращает пары (source file -> archive matches) по совпадающему хэшу.
+        Источник ограничиваем last_run_id=source_run_id, чтобы не смешивать разные выборы папки.
+        """
         cur = self.conn.cursor()
         cur.execute(
             """
-            SELECT path, name, parent_path, size, modified, mime_type, media_type, hash_source
-            FROM yd_files
-            WHERE hash_alg = ? AND hash_value = ?
-              AND status != 'deleted'
-            ORDER BY path ASC
+            SELECT
+              s.path AS source_path,
+              s.name AS source_name,
+              s.size AS source_size,
+              s.mime_type AS source_mime_type,
+              s.media_type AS source_media_type,
+              s.hash_alg AS hash_alg,
+              s.hash_value AS hash_value,
+              a.path AS archive_path,
+              a.name AS archive_name,
+              a.size AS archive_size,
+              a.mime_type AS archive_mime_type,
+              a.media_type AS archive_media_type
+            FROM yd_files s
+            JOIN yd_files a
+              ON a.hash_alg = s.hash_alg AND a.hash_value = s.hash_value
+            WHERE
+              s.inventory_scope = 'source'
+              AND s.last_run_id = ?
+              AND s.status != 'deleted'
+              AND s.hash_value IS NOT NULL
+              AND COALESCE(s.ignore_archive_dup_run_id, -1) != ?
+              AND COALESCE(a.inventory_scope, 'archive') = 'archive'
+              AND a.status != 'deleted'
+              AND a.hash_value IS NOT NULL
+              AND a.path LIKE ?
+            ORDER BY s.path ASC, a.path ASC
             """,
-            (hash_alg, hash_value),
+            (source_run_id, source_run_id, f"{archive_prefix.rstrip('/')}/%"),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_dup_groups_for_run(self, *, inventory_scope: str, run_id: int) -> list[dict[str, Any]]:
+        """
+        Группы дублей ВНУТРИ конкретного прогона (run_id) выбранного scope.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT
+              hash_alg,
+              hash_value,
+              COUNT(*) AS cnt
+            FROM yd_files
+            WHERE
+              hash_value IS NOT NULL
+              AND inventory_scope = ?
+              AND last_run_id = ?
+              AND status != 'deleted'
+            GROUP BY hash_alg, hash_value
+            HAVING COUNT(*) > 1
+            ORDER BY cnt DESC, hash_alg ASC
+            """,
+            (inventory_scope, run_id),
         )
         return [dict(r) for r in cur.fetchall()]
 
@@ -454,6 +553,7 @@ class DedupStore:
         run_id: int,
         path: str,
         resource_id: str | None,
+        inventory_scope: str,
         name: str | None,
         parent_path: str | None,
         size: int | None,
@@ -484,12 +584,12 @@ class DedupStore:
             cur.execute(
                 """
                 INSERT INTO yd_files(
-                  path, resource_id, name, parent_path, size, created, modified, mime_type, media_type,
+                  path, resource_id, inventory_scope, name, parent_path, size, created, modified, mime_type, media_type,
                   hash_alg, hash_value, hash_source, status, error, scanned_at, hashed_at, last_run_id
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'new', NULL, ?, NULL, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'new', NULL, ?, NULL, ?)
                 """,
-                (path, resource_id, name, parent_path, size, created, modified, mime_type, media_type, now, run_id),
+                (path, resource_id, inventory_scope, name, parent_path, size, created, modified, mime_type, media_type, now, run_id),
             )
             return
 
@@ -522,6 +622,7 @@ class DedupStore:
                 SET
                   path = ?,
                   resource_id = COALESCE(?, resource_id),
+                  inventory_scope = COALESCE(?, inventory_scope),
                   name = ?,
                   parent_path = ?,
                   size = ?,
@@ -542,7 +643,21 @@ class DedupStore:
                   duration_at = NULL
                 WHERE id = ?
                 """,
-                (path, resource_id, name, parent_path, size, created, modified, mime_type, media_type, now, run_id, existing_id),
+                (
+                    path,
+                    resource_id,
+                    inventory_scope,
+                    name,
+                    parent_path,
+                    size,
+                    created,
+                    modified,
+                    mime_type,
+                    media_type,
+                    now,
+                    run_id,
+                    existing_id,
+                ),
             )
         else:
             new_status = existing_status
@@ -554,6 +669,7 @@ class DedupStore:
                 SET
                   path = ?,
                   resource_id = COALESCE(?, resource_id),
+                  inventory_scope = COALESCE(?, inventory_scope),
                   name = ?,
                   parent_path = ?,
                   size = ?,
@@ -567,7 +683,22 @@ class DedupStore:
                   last_run_id = ?
                 WHERE id = ?
                 """,
-                (path, resource_id, name, parent_path, size, created, modified, mime_type, media_type, new_status, now, run_id, existing_id),
+                (
+                    path,
+                    resource_id,
+                    inventory_scope,
+                    name,
+                    parent_path,
+                    size,
+                    created,
+                    modified,
+                    mime_type,
+                    media_type,
+                    new_status,
+                    now,
+                    run_id,
+                    existing_id,
+                ),
             )
         # Коммитим батчами снаружи (через update_run_progress/finish_run), чтобы сверка работала быстрее.
 

@@ -6,6 +6,7 @@ import threading
 import time
 import os
 import sys
+import mimetypes
 import urllib.parse
 import subprocess
 import json
@@ -16,7 +17,7 @@ from typing import Any, Callable, Optional, TypeVar
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from fastapi import Body, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from DB.db import DedupStore, list_folders
@@ -250,9 +251,10 @@ def _dedup_scan_archive(
     root_path: str,
     limit_files: int | None,
     max_download_bytes: int | None,
+    inventory_scope: str,
 ) -> None:
     """
-    Заполняет БД дублей: рекурсивно проходит архив (disk:/Фото),
+    Заполняет БД дублей: рекурсивно проходит папку на YaDisk,
     сохраняет метаданные файлов и хэш (sha256/md5). Если хэша нет — докачивает файл и считает sha256.
     """
     disk = get_disk()
@@ -324,10 +326,11 @@ def _dedup_scan_archive(
                 # Если уже есть хэш в БД — не перехешируем.
                 existing_alg, existing_hash = store.get_existing_hash(path=path)
                 if existing_alg and existing_hash:
-                    store.upsert_file(
+                        store.upsert_file(
                         run_id=run_id,
                         path=path,
                         resource_id=resource_id,
+                            inventory_scope=inventory_scope,
                         name=name or None,
                         parent_path=parent_path,
                         size=size,
@@ -354,6 +357,7 @@ def _dedup_scan_archive(
                             run_id=run_id,
                             path=path,
                             resource_id=resource_id,
+                            inventory_scope=inventory_scope,
                             name=name or None,
                             parent_path=parent_path,
                             size=size,
@@ -376,6 +380,7 @@ def _dedup_scan_archive(
                             run_id=run_id,
                             path=path,
                             resource_id=resource_id,
+                            inventory_scope=inventory_scope,
                             name=name or None,
                             parent_path=parent_path,
                             size=size,
@@ -399,6 +404,7 @@ def _dedup_scan_archive(
                                 run_id=run_id,
                                 path=path,
                                 resource_id=resource_id,
+                                inventory_scope=inventory_scope,
                                 name=name or None,
                                 parent_path=parent_path,
                                 size=size,
@@ -431,6 +437,7 @@ def _dedup_scan_archive(
                                     run_id=run_id,
                                     path=path,
                                     resource_id=resource_id,
+                                    inventory_scope=inventory_scope,
                                     name=name or None,
                                     parent_path=parent_path,
                                     size=size,
@@ -452,6 +459,7 @@ def _dedup_scan_archive(
                                     run_id=run_id,
                                     path=path,
                                     resource_id=resource_id,
+                                    inventory_scope=inventory_scope,
                                     name=name or None,
                                     parent_path=parent_path,
                                     size=size,
@@ -495,6 +503,17 @@ def _as_local_path(p: str) -> str:
     # Храним локальные пути в общей таблице с префиксом, чтобы не конфликтовать с disk:/...
     return "local:" + str(p)
 
+def _strip_local_prefix(p: str) -> str:
+    return p[len("local:") :] if (p or "").startswith("local:") else p
+
+def _local_is_under_root(*, file_path: str, root_dir: str) -> bool:
+    try:
+        file_abs = os.path.abspath(file_path)
+        root_abs = os.path.abspath(root_dir)
+        return os.path.commonpath([file_abs, root_abs]) == root_abs
+    except Exception:
+        return False
+
 
 def _dedup_scan_local_source(*, run_id: int, root_dir: str) -> None:
     """
@@ -522,6 +541,13 @@ def _dedup_scan_local_source(*, run_id: int, root_dir: str) -> None:
 
                 db_path = _as_local_path(abspath)
                 parent_path = _as_local_path(dirpath)
+                mime_type, _enc = mimetypes.guess_type(abspath)
+                media_type: Optional[str] = None
+                if mime_type:
+                    if mime_type.startswith("image/"):
+                        media_type = "image"
+                    elif mime_type.startswith("video/"):
+                        media_type = "video"
 
                 size: Optional[int] = None
                 modified: Optional[str] = None
@@ -538,13 +564,14 @@ def _dedup_scan_local_source(*, run_id: int, root_dir: str) -> None:
                     store.upsert_file(
                         run_id=run_id,
                         path=db_path,
+                        inventory_scope="source",
                         name=fn,
                         parent_path=parent_path,
                         size=size,
                         created=None,
                         modified=modified,
-                        mime_type=None,
-                        media_type=None,
+                        mime_type=mime_type,
+                        media_type=media_type,
                         hash_alg=None,
                         hash_value=None,
                         hash_source=None,
@@ -560,13 +587,14 @@ def _dedup_scan_local_source(*, run_id: int, root_dir: str) -> None:
                         store.upsert_file(
                             run_id=run_id,
                             path=db_path,
+                            inventory_scope="source",
                             name=fn,
                             parent_path=parent_path,
                             size=size,
                             created=None,
                             modified=modified,
-                            mime_type=None,
-                            media_type=None,
+                            mime_type=mime_type,
+                            media_type=media_type,
                             hash_alg="sha256",
                             hash_value=sha,
                             hash_source="local",
@@ -580,13 +608,14 @@ def _dedup_scan_local_source(*, run_id: int, root_dir: str) -> None:
                         store.upsert_file(
                             run_id=run_id,
                             path=db_path,
+                            inventory_scope="source",
                             name=fn,
                             parent_path=parent_path,
                             size=size,
                             created=None,
                             modified=modified,
-                            mime_type=None,
-                            media_type=None,
+                            mime_type=mime_type,
+                            media_type=media_type,
                             hash_alg=None,
                             hash_value=None,
                             hash_source=None,
@@ -925,6 +954,7 @@ def _reconcile_archive_inventory(*, run_id: int, root_path: str) -> None:
                         run_id=run_id,
                         path=path,
                         resource_id=resource_id,
+                        inventory_scope="archive",
                         name=name,
                         parent_path=parent_path,
                         size=size,
@@ -1117,6 +1147,7 @@ def api_dedup_archive_start(max_download_gb: int = 5) -> dict[str, Any]:
                     root_path=root_path,
                     limit_files=None,
                     max_download_bytes=max_download_bytes,
+                    inventory_scope="archive",
                 )
                 store2.finish_run(run_id=run_id, status="completed")
             except Exception as e:  # noqa: BLE001
@@ -1223,13 +1254,29 @@ def api_dedup_archive_status() -> dict[str, Any]:
 
 
 @app.post("/api/dedup/source/start")
-def api_dedup_source_start(path: str = r"C:\tmp\Photo") -> dict[str, Any]:
+def api_dedup_source_start(path: str = r"C:\tmp\Photo", max_download_gb: int = 5) -> dict[str, Any]:
     """
-    Запускает/продолжает дедупликацию локальной папки-источника (resume по данным).
+    Запускает/продолжает дедупликацию папки-источника (локальная или YaDisk).
+    - локальная: считаем sha256 локально
+    - YaDisk: используем sha256/md5 из метаданных, иначе (опционально) докачиваем и считаем sha256
+
+    Важно: для YaDisk source запрещаем выбирать папку внутри disk:/Фото, чтобы не смешивать "archive" и "source"
+    (в таблице yd_files путь уникален).
     """
     global _DEDUP_FUTURES, _DEDUP_RUN_IDS  # noqa: PLW0603
 
     root_path = path
+    is_disk = isinstance(root_path, str) and root_path.startswith("disk:")
+    if is_disk:
+        # защитимся от пересечения с архивом
+        p = root_path.rstrip("/")
+        if p == "disk:/Фото" or p.startswith("disk:/Фото/"):
+            raise HTTPException(
+                status_code=400,
+                detail="Нельзя выбирать source внутри disk:/Фото (архив). Выберите папку вне архива, например disk:/Загрузки или disk:/Фотокамера.",
+            )
+
+    max_download_bytes = None if max_download_gb <= 0 else (max_download_gb * 1024 * 1024 * 1024)
     with _DEDUP_LOCK:
         fut = _DEDUP_FUTURES.get("source")
         if fut is not None and not fut.done():
@@ -1237,7 +1284,7 @@ def api_dedup_source_start(path: str = r"C:\tmp\Photo") -> dict[str, Any]:
 
         store = DedupStore()
         try:
-            run_id = store.create_run(scope="source", root_path=root_path, max_download_bytes=None)
+            run_id = store.create_run(scope="source", root_path=root_path, max_download_bytes=(max_download_bytes if is_disk else None))
         finally:
             store.close()
 
@@ -1246,7 +1293,34 @@ def api_dedup_source_start(path: str = r"C:\tmp\Photo") -> dict[str, Any]:
         def _runner() -> None:
             store2 = DedupStore()
             try:
-                _dedup_scan_local_source(run_id=run_id, root_dir=root_path)
+                if is_disk:
+                    # total_files считаем, чтобы UI мог показывать прогресс (как в archive)
+                    try:
+                        disk = get_disk()
+                        total, err, err_path = _count_files_recursive(disk, root_path)
+                        if total is not None:
+                            store2.update_run_progress(run_id=run_id, total_files=int(total))
+                        else:
+                            store2.update_run_progress(
+                                run_id=run_id,
+                                last_path=err_path,
+                                last_error=f"total_files_count_failed: {err}",
+                            )
+                    except Exception as e:  # noqa: BLE001
+                        store2.update_run_progress(
+                            run_id=run_id,
+                            last_error=f"total_files_count_failed: {type(e).__name__}: {e}",
+                        )
+
+                    _dedup_scan_archive(
+                        run_id=run_id,
+                        root_path=root_path,
+                        limit_files=None,
+                        max_download_bytes=max_download_bytes,
+                        inventory_scope="source",
+                    )
+                else:
+                    _dedup_scan_local_source(run_id=run_id, root_dir=root_path)
                 store2.finish_run(run_id=run_id, status="completed")
             except Exception as e:  # noqa: BLE001
                 store2.finish_run(run_id=run_id, status="failed", last_error=f"{type(e).__name__}: {e}")
@@ -1274,6 +1348,359 @@ def api_dedup_source_status() -> dict[str, Any]:
         running = fut is not None and not fut.done()
 
     return {"running": running, "active_run_id": _DEDUP_RUN_IDS.get("source"), "latest": latest}
+
+
+@app.post("/api/sort/start")
+def api_sort_start(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Единый старт для "рабочей формы сортировки" (главная страница):
+    - запускаем дедуп-скан source (YaDisk или local)
+    - при первом запуске (если archive ещё не сканировался) — стартуем archive scan
+    """
+    location = str(payload.get("location") or "").lower()
+    path = str(payload.get("path") or "")
+    max_download_gb = payload.get("max_download_gb")
+    try:
+        max_download_gb_i = int(max_download_gb) if max_download_gb is not None else 5
+    except Exception:
+        max_download_gb_i = 5
+
+    if location not in ("yadisk", "local"):
+        raise HTTPException(status_code=400, detail="location must be 'yadisk' or 'local'")
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+    if location == "yadisk" and not path.startswith("disk:"):
+        raise HTTPException(status_code=400, detail="Для YaDisk путь должен начинаться с 'disk:/'")
+    if location == "local" and path.startswith("disk:"):
+        raise HTTPException(status_code=400, detail="Для локальной папки укажите путь вида C:\\... (без disk:)")
+
+    # 1) source
+    src = api_dedup_source_start(path=path, max_download_gb=max_download_gb_i)
+
+    # 2) archive (если ещё не запускали ни разу)
+    store = DedupStore()
+    try:
+        archive_latest = store.get_latest_run(scope="archive")
+    finally:
+        store.close()
+    archive_started = False
+    archive_start_resp: dict[str, Any] | None = None
+    if archive_latest is None:
+        archive_start_resp = api_dedup_archive_start(max_download_gb=5)
+        archive_started = bool(archive_start_resp.get("ok"))
+
+    return {
+        "ok": True,
+        "source": src,
+        "archive_started": archive_started,
+        "archive_start": archive_start_resp,
+    }
+
+
+@app.get("/api/sort/context")
+def api_sort_context() -> dict[str, Any]:
+    """
+    Контекст для UI: последние прогоны archive/source + флаги running.
+    """
+    archive = api_dedup_archive_status()
+    source = api_dedup_source_status()
+    return {"archive": archive, "source": source}
+
+
+@app.get("/api/sort/dup-in-archive")
+def api_sort_dup_in_archive(source_run_id: int | None = None) -> dict[str, Any]:
+    """
+    Шаг 1: source-файлы, которые уже есть в архиве (совпадает хэш с inventory_scope=archive).
+    """
+    store = DedupStore()
+    try:
+        src_latest = store.get_latest_run(scope="source")
+        run_id = int(source_run_id) if source_run_id is not None else (int(src_latest["id"]) if src_latest else None)
+        if not run_id:
+            raise HTTPException(status_code=400, detail="Нет активного source run. Сначала запустите сортировку на главной странице.")
+
+        rows = store.list_source_dups_in_archive(source_run_id=run_id)
+        root_path = str(src_latest.get("root_path") or "") if src_latest else None
+
+        archive_latest = store.get_latest_run(scope="archive")
+        archive_scanned = bool(archive_latest and str(archive_latest.get("status") or "") == "completed")
+    finally:
+        store.close()
+
+    # Группируем по source_path
+    grouped: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        sp = str(r.get("source_path") or "")
+        if not sp:
+            continue
+        g = grouped.get(sp)
+        if not g:
+            g = {
+                "source_path": sp,
+                "source_name": r.get("source_name"),
+                "source_size": r.get("source_size"),
+                "source_mime_type": r.get("source_mime_type"),
+                "source_media_type": r.get("source_media_type"),
+                "hash_alg": r.get("hash_alg"),
+                "hash_value": r.get("hash_value"),
+                "matches": [],
+            }
+            grouped[sp] = g
+        g["matches"].append(
+            {
+                "path": r.get("archive_path"),
+                "name": r.get("archive_name"),
+                "size": r.get("archive_size"),
+                "mime_type": r.get("archive_mime_type"),
+                "media_type": r.get("archive_media_type"),
+            }
+        )
+
+    items = list(grouped.values())
+    return {
+        "ok": True,
+        "source_run_id": run_id,
+        "source_root_path": root_path,
+        "items": items,
+        "total": len(items),
+        "archive_scanned": bool(locals().get("archive_scanned", False)),
+    }
+
+
+@app.post("/api/sort/source/ignore-archive-dup")
+def api_sort_source_ignore_archive_dup(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Шаг 1: "Оставить (не дубль)" — скрыть совпадение до следующего пересканирования source.
+    """
+    paths = payload.get("paths")
+    run_id = payload.get("source_run_id")
+    if not isinstance(paths, list) or not paths:
+        raise HTTPException(status_code=400, detail="paths[] is required")
+    try:
+        run_id_i = int(run_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="source_run_id is required") from None
+
+    clean: list[str] = [p for p in paths if isinstance(p, str) and p]
+    if not clean:
+        raise HTTPException(status_code=400, detail="no valid paths")
+
+    store = DedupStore()
+    try:
+        # минимальная валидация: пути должны принадлежать текущему run_id
+        bad: list[str] = []
+        for p in clean:
+            row = store.get_row_by_path(path=p)
+            if not row:
+                bad.append(p)
+                continue
+            if str(row.get("inventory_scope") or "") != "source":
+                bad.append(p)
+                continue
+            if int(row.get("last_run_id") or 0) != run_id_i:
+                bad.append(p)
+        if bad:
+            raise HTTPException(status_code=400, detail=f"paths do not belong to source run {run_id_i}: {bad[:5]}")
+
+        n = store.set_ignore_archive_dup(paths=clean, run_id=run_id_i)
+    finally:
+        store.close()
+    return {"ok": True, "updated": n}
+
+
+@app.post("/api/sort/source/delete")
+def api_sort_source_delete(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Удаляет файлы ИЗ ИСТОЧНИКА:
+    - YaDisk source: в корзину
+    - local source: навсегда (os.remove)
+    """
+    paths = payload.get("paths")
+    run_id = payload.get("source_run_id")
+    if not isinstance(paths, list) or not paths:
+        raise HTTPException(status_code=400, detail="paths[] is required")
+    try:
+        run_id_i = int(run_id) if run_id is not None else None
+    except Exception:
+        run_id_i = None
+
+    clean: list[str] = [p for p in paths if isinstance(p, str) and p]
+    if not clean:
+        raise HTTPException(status_code=400, detail="no valid paths")
+
+    store = DedupStore()
+    try:
+        src_latest = store.get_latest_run(scope="source")
+        if not src_latest:
+            raise HTTPException(status_code=400, detail="Нет активного source run.")
+        active_run_id = int(src_latest["id"])
+        if run_id_i is not None and run_id_i != active_run_id:
+            raise HTTPException(status_code=400, detail=f"source_run_id mismatch: active={active_run_id}, got={run_id_i}")
+        root_path = str(src_latest.get("root_path") or "")
+    finally:
+        store.close()
+
+    disk = None
+    ok_paths: list[str] = []
+    errors: list[dict[str, str]] = []
+
+    for p in clean:
+        # v1 безопасности: удаляем только файлы, которые реально были в текущем source run
+        st = DedupStore()
+        try:
+            row = st.get_row_by_path(path=p)
+        finally:
+            st.close()
+        if not row or str(row.get("inventory_scope") or "") != "source" or int(row.get("last_run_id") or 0) != active_run_id:
+            errors.append({"path": p, "error": "not_in_active_source_run"})
+            continue
+
+        try:
+            if p.startswith("disk:"):
+                if disk is None:
+                    disk = get_disk()
+                rp = root_path.rstrip("/")
+                if rp and not (p == rp or p.startswith(rp + "/")):
+                    raise RuntimeError("path_outside_source_root")
+                _yadisk_remove_to_trash(disk, path=p)
+                ok_paths.append(p)
+            elif p.startswith("local:"):
+                file_path = _strip_local_prefix(p)
+                if root_path and not _local_is_under_root(file_path=file_path, root_dir=root_path):
+                    raise RuntimeError("path_outside_source_root")
+                try:
+                    os.remove(file_path)
+                except FileNotFoundError:
+                    # считаем как удалённый
+                    pass
+                ok_paths.append(p)
+            else:
+                raise RuntimeError("unknown_path_scheme")
+        except Exception as e:  # noqa: BLE001
+            errors.append({"path": p, "error": f"{type(e).__name__}: {e}"})
+
+    st2 = DedupStore()
+    try:
+        st2.mark_deleted(paths=ok_paths)
+    finally:
+        st2.close()
+
+    return {"ok": True, "deleted": len(ok_paths), "errors": errors}
+
+
+@app.get("/api/sort/dup-in-source")
+def api_sort_dup_in_source(source_run_id: int | None = None) -> dict[str, Any]:
+    """
+    Шаг 2: дубли ВНУТРИ выбранной папки source (по текущему source run).
+    """
+    store = DedupStore()
+    try:
+        src_latest = store.get_latest_run(scope="source")
+        run_id = int(source_run_id) if source_run_id is not None else (int(src_latest["id"]) if src_latest else None)
+        if not run_id:
+            raise HTTPException(status_code=400, detail="Нет активного source run. Сначала запустите сортировку на главной странице.")
+
+        groups_raw = store.list_dup_groups_for_run(inventory_scope="source", run_id=run_id)
+        root_path = str(src_latest.get("root_path") or "") if src_latest else None
+    finally:
+        store.close()
+
+    groups: list[dict[str, Any]] = []
+    max_group_size = 0
+    for g in groups_raw:
+        hash_alg = str(g.get("hash_alg") or "")
+        hash_value = str(g.get("hash_value") or "")
+        cnt = int(g.get("cnt") or 0)
+        max_group_size = max(max_group_size, cnt)
+
+        store2 = DedupStore()
+        try:
+            items = store2.list_group_items(hash_alg=hash_alg, hash_value=hash_value, inventory_scope="source", last_run_id=run_id)
+        finally:
+            store2.close()
+
+        keep_idx = _pick_keep_indexes(items, {})
+
+        ui_items: list[dict[str, Any]] = []
+        for i, it in enumerate(items):
+            path = str(it.get("path") or "")
+            mime_type = str(it.get("mime_type") or "") or None
+            media_type = str(it.get("media_type") or "") or None
+            # Fallback: для старых записей mime/media могут быть пустыми -> попробуем угадать по расширению.
+            if not mime_type:
+                guess_name = _strip_local_prefix(path) if path.startswith("local:") else _basename_from_disk_path(path)
+                mt2, _enc = mimetypes.guess_type(guess_name)
+                mime_type = mt2 or None
+            if not media_type and mime_type:
+                if mime_type.startswith("image/"):
+                    media_type = "image"
+                elif mime_type.startswith("video/"):
+                    media_type = "video"
+            size = it.get("size")
+            size_i = int(size) if isinstance(size, (int, float)) else None
+
+            preview_kind = "none"  # 'image'|'video'|'none'
+            preview_url: Optional[str] = None
+            open_url: Optional[str] = None
+
+            if path.startswith("disk:"):
+                open_url = "/api/yadisk/open?path=" + urllib.parse.quote(path, safe="")
+                mt = (media_type or "").lower()
+                mime = (mime_type or "").lower()
+                if mt == "image" or mime.startswith("image/"):
+                    preview_kind = "image"
+                    preview_url = "/api/yadisk/preview-image?size=M&path=" + urllib.parse.quote(path, safe="")
+                elif mt == "video" or mime.startswith("video/"):
+                    preview_kind = "video"
+                    preview_url = None
+            elif path.startswith("local:"):
+                local_p = path
+                mt = (media_type or "").lower()
+                mime = (mime_type or "").lower()
+                if mt == "image" or mime.startswith("image/"):
+                    preview_kind = "image"
+                    preview_url = "/api/local/preview?path=" + urllib.parse.quote(local_p, safe="")
+                elif mt == "video" or mime.startswith("video/"):
+                    preview_kind = "video"
+                    preview_url = "/api/local/preview?path=" + urllib.parse.quote(local_p, safe="")
+
+            ui_items.append(
+                {
+                    "path": path,
+                    "path_short": _short_path_for_ui(path) if path.startswith("disk:") else path,
+                    "size_human": _human_bytes(size_i),
+                    "keep": i == keep_idx,
+                    "mime_type": mime_type,
+                    "media_type": media_type,
+                    "preview_kind": preview_kind,
+                    "preview_url": preview_url,
+                    "open_url": open_url,
+                }
+            )
+
+        groups.append(
+            {
+                "hash_alg": hash_alg,
+                "hash_short": (hash_value[:12] + "…") if len(hash_value) > 12 else hash_value,
+                "cnt": cnt,
+                "files": ui_items,
+            }
+        )
+
+    summary = {"groups": len(groups), "max_group_size": max_group_size}
+    return {"ok": True, "source_run_id": run_id, "source_root_path": root_path, "summary": summary, "groups": groups}
+
+
+@app.get("/sort/dup-in-archive", response_class=HTMLResponse)
+def sort_dup_in_archive_page(request: Request):
+    # One-page mode: оставляем только главную рабочую форму.
+    return RedirectResponse(url="/", status_code=307)
+
+
+@app.get("/sort/dup-in-source", response_class=HTMLResponse)
+def sort_dup_in_source_page(request: Request):
+    # One-page mode: оставляем только главную рабочую форму.
+    return RedirectResponse(url="/", status_code=307)
 
 
 @app.get("/api/folder-counts")
@@ -1468,7 +1895,7 @@ def duplicates_page(request: Request):
 
         store2 = DedupStore()
         try:
-            items = store2.list_group_items(hash_alg=hash_alg, hash_value=hash_value)
+            items = store2.list_group_items(hash_alg=hash_alg, hash_value=hash_value, inventory_scope="archive")
         finally:
             store2.close()
 
@@ -1769,6 +2196,69 @@ def api_yadisk_video_duration(path: str) -> Response:
     return JSONResponse(status_code=202, content={"ok": True, "status": "pending"}, headers={"Retry-After": "1", "Cache-Control": "no-store"})
 
 
+@app.get("/api/local/video-duration")
+def api_local_video_duration(path: str) -> Response:
+    """
+    Асинхронно вычисляет длительность ЛОКАЛЬНОГО видео через ffprobe.
+    Возвращает:
+      - 200 {status:'ready', duration_sec, duration_human}
+      - 202 {status:'pending'}
+      - 400/403/404/500 {status:'error', error}
+    """
+    if not isinstance(path, str) or not path.startswith("local:"):
+        return JSONResponse(status_code=400, content={"ok": False, "status": "error", "error": "Only local: paths are supported"})
+
+    store = DedupStore()
+    try:
+        src_latest = store.get_latest_run(scope="source")
+        if not src_latest:
+            return JSONResponse(status_code=400, content={"ok": False, "status": "error", "error": "No active source run"})
+        root_path = str(src_latest.get("root_path") or "")
+        cached = store.get_duration(path=path)
+    finally:
+        store.close()
+
+    if isinstance(cached, int) and cached >= 0:
+        return JSONResponse(
+            status_code=200,
+            content={"ok": True, "status": "ready", "duration_sec": cached, "duration_human": _human_duration(cached)},
+            headers={"Cache-Control": "private, max-age=3600"},
+        )
+
+    file_path = _strip_local_prefix(path)
+    if root_path and not _local_is_under_root(file_path=file_path, root_dir=root_path):
+        return JSONResponse(status_code=403, content={"ok": False, "status": "error", "error": "Path is outside active source root"})
+    abs_path = os.path.abspath(file_path)
+    if not os.path.isfile(abs_path):
+        return JSONResponse(status_code=404, content={"ok": False, "status": "error", "error": "File not found"})
+
+    with _VIDEO_LOCK:
+        err = _VIDEO_ERRORS.get(path)
+        if err:
+            return JSONResponse(status_code=500, content={"ok": False, "status": "error", "error": err}, headers={"Cache-Control": "no-store"})
+
+        fut = _VIDEO_FUTURES.get(path)
+        if fut is None or fut.done():
+            def _runner() -> None:
+                try:
+                    sec = _ffprobe_duration_seconds_from_url(abs_path, timeout_sec=35)
+                    store2 = DedupStore()
+                    try:
+                        store2.set_duration(path=path, duration_sec=sec, source="ffprobe")
+                    finally:
+                        store2.close()
+                except Exception as e:  # noqa: BLE001
+                    with _VIDEO_LOCK:
+                        _VIDEO_ERRORS[path] = f"{type(e).__name__}: {e}"
+                finally:
+                    with _VIDEO_LOCK:
+                        _VIDEO_FUTURES.pop(path, None)
+
+            _VIDEO_FUTURES[path] = _VIDEO_EXEC.submit(_runner)
+
+    return JSONResponse(status_code=202, content={"ok": True, "status": "pending"}, headers={"Retry-After": "1", "Cache-Control": "no-store"})
+
+
 @app.get("/api/yadisk/preview-image")
 def api_yadisk_preview_image(path: str, size: str = "M") -> Response:
     """
@@ -1834,6 +2324,46 @@ def api_yadisk_preview_image(path: str, size: str = "M") -> Response:
             _PREVIEW_SEM.release()
         except ValueError:
             pass
+
+
+@app.get("/api/local/preview")
+def api_local_preview(path: str) -> Response:
+    """
+    Preview для локальных файлов.
+    Принимает path в формате `local:C:\\...\\file.ext`.
+    ВАЖНО: отдаём файл только если он лежит внутри текущего source root (последний scope=source).
+    """
+    if not isinstance(path, str) or not path.startswith("local:"):
+        raise HTTPException(status_code=400, detail="Only local: paths are supported")
+
+    store = DedupStore()
+    try:
+        src_latest = store.get_latest_run(scope="source")
+        if not src_latest:
+            raise HTTPException(status_code=400, detail="Нет активного source run.")
+        root_path = str(src_latest.get("root_path") or "")
+    finally:
+        store.close()
+
+    file_path = _strip_local_prefix(path)
+    if not file_path:
+        raise HTTPException(status_code=400, detail="Empty local path")
+    if root_path and not _local_is_under_root(file_path=file_path, root_dir=root_path):
+        raise HTTPException(status_code=403, detail="Path is outside active source root")
+
+    # минимальные защиты
+    try:
+        abs_path = os.path.abspath(file_path)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Bad path") from None
+
+    if not os.path.isfile(abs_path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    mime_type, _enc = mimetypes.guess_type(abs_path)
+    media_type = mime_type or "application/octet-stream"
+    # FileResponse поддерживает Range-запросы (полезно для <video>)
+    return FileResponse(path=abs_path, media_type=media_type, filename=os.path.basename(abs_path))
 
 
 @app.get("/browse", response_class=HTMLResponse)

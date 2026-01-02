@@ -57,6 +57,7 @@ cover/
 
 # Django stuff:
 *.log
+!History.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -211,5 +212,4 @@ __marimo__/
 secrets.env
 data/photosorter.db
 
-# Local history log (human-readable progress journal)
-History.log
+# History.log теперь коммитим (вехи процесса/среды для воспроизводимости)

@@ -3,26 +3,833 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>PhotoSorter</title>
+    <title>PhotoSorter — Сортировка</title>
+    <!-- YaDisk preview hotlink защита: просим браузер не слать Referer при загрузке картинок -->
+    <meta name="referrer" content="no-referrer" />
     <style>
       :root { color-scheme: light; }
       body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
       a { color: #0b57d0; text-decoration: none; }
       a:hover { text-decoration: underline; }
-      .card { max-width: 920px; padding: 16px 18px; border: 1px solid #e5e7eb; border-radius: 12px; }
+      .wrap { max-width: 1080px; }
+      .card { padding: 16px 18px; border: 1px solid #e5e7eb; border-radius: 14px; background: #fff; }
       .muted { color: #6b7280; }
-      ul { margin: 12px 0 0 18px; }
+      .row { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+      .grid { display: grid; gap: 12px; grid-template-columns: 1fr; margin-top: 12px; }
+      @media (min-width: 900px) { .grid { grid-template-columns: 1fr 1fr; } }
+      .field { display: grid; gap: 6px; }
+      label { font-weight: 600; }
+      input[type="text"] { width: min(820px, 100%); padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 12px; font-size: 14px; }
+      .btn { appearance: none; border: 1px solid #d1d5db; background: #fff; padding: 9px 12px; border-radius: 12px; cursor: pointer; font-weight: 700; }
+      .btn:hover { background: #f9fafb; }
+      .btn.primary { border-color: #c7d2fe; background: #eef2ff; }
+      .btn.primary:hover { background: #e0e7ff; }
+      .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+      .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f3f4f6; color: #374151; font-size: 12px; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+      .status { display: grid; gap: 6px; }
+      .err { color: #991b1b; }
+      .section { margin-top: 14px; border: 1px solid #e5e7eb; border-radius: 14px; padding: 12px 14px; background: #fff; }
+      .section h3 { margin: 0 0 6px 0; }
+      table { border-collapse: collapse; width: 100%; margin-top: 10px; }
+      th, td { border-bottom: 1px solid #e5e7eb; padding: 10px 8px; vertical-align: top; text-align: left; }
+      th { font-weight: 700; color: #111827; background: #fafafa; position: sticky; top: 0; }
+      .btn.danger { border-color: #fecaca; background: #fff5f5; color: #991b1b; }
+      .btn.danger:hover { background: #ffecec; }
+      .cards { display: grid; gap: 10px; align-items: stretch; grid-template-columns: repeat(5, minmax(220px, 1fr)); }
+      @media (max-width: 1500px) { .cards { grid-template-columns: repeat(4, minmax(220px, 1fr)); } }
+      @media (max-width: 1200px) { .cards { grid-template-columns: repeat(3, minmax(220px, 1fr)); } }
+      @media (max-width: 900px)  { .cards { grid-template-columns: repeat(2, minmax(220px, 1fr)); } }
+      @media (max-width: 560px)  { .cards { grid-template-columns: 1fr; } }
+      .card2 { border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; background: #fff; }
+      .thumb { height: 140px; background: #fff; display: flex; align-items: center; justify-content: center; position: relative; }
+      .thumb img { width: 100%; height: 100%; object-fit: contain; display: block; background: #fff; }
+      .thumb video { width: 100%; height: 100%; object-fit: contain; display: block; background: #111827; }
+      .thumb .noimg { color: #6b7280; font-size: 12px; padding: 10px; text-align: center; }
+      .thumb { cursor: zoom-in; }
+      .fsbtn { position: absolute; right: 8px; bottom: 8px; border: 1px solid rgba(255,255,255,0.3); background: rgba(17,24,39,0.7); color: #fff; padding: 6px 8px; border-radius: 10px; font-weight: 700; cursor: pointer; }
+      .fsbtn:hover { background: rgba(17,24,39,0.85); }
+      .card2-body { padding: 10px 10px 12px 10px; }
+      .keep { margin-top: 8px; display: flex; gap: 8px; align-items: center; }
+      .keep input { transform: scale(1.1); }
+
+      /* Lightbox */
+      .lb { position: fixed; inset: 0; background: rgba(17,24,39,0.82); display: none; align-items: center; justify-content: center; padding: 18px; z-index: 9999; }
+      .lb.open { display: flex; }
+      .lb-panel { background: #fff; border-radius: 14px; max-width: 92vw; max-height: 92vh; width: min(1200px, 92vw); overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,0.35); }
+      .lb-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #e5e7eb; }
+      .lb-top code { font-size: 11px; }
+      .lb-actions { display: flex; gap: 10px; align-items: center; }
+      .lb-body { background: #111827; display: flex; align-items: center; justify-content: center; }
+      .lb-body img { max-width: 92vw; max-height: calc(92vh - 56px); width: auto; height: auto; display: block; object-fit: contain; background: #111827; }
+      .lb-body video { max-width: 92vw; max-height: calc(92vh - 56px); width: auto; height: auto; display: block; background: #111827; }
     </style>
   </head>
   <body>
+    <div class="wrap">
     <div class="card">
-      <h2 style="margin: 0 0 8px 0;">PhotoSorter</h2>
-      <div class="muted">Локальный Web-интерфейс для просмотра справочника папок.</div>
-      <ul>
-        <li><a href="/folders">Папки (таблица)</a></li>
-        <li><a href="/api/folders">API: /api/folders (JSON)</a></li>
-      </ul>
+        <div class="row" style="justify-content: space-between;">
+          <div>
+            <h2 style="margin: 0;">PhotoSorter — основная форма сортировки</h2>
+            <div class="muted" style="margin-top: 6px;">Шаг 1: “уже есть в архиве” · Шаг 2: “дубли внутри папки”</div>
+          </div>
+          <div class="row">
+            <a href="/folders" class="muted">Папки</a>
+            <a href="/duplicates" class="muted">Дубли (фотоархив)</a>
+          </div>
+        </div>
+
+        <div style="margin-top: 14px;" class="field">
+          <label>Источник для сортировки</label>
+          <div class="row">
+            <label style="font-weight: 600;"><input type="radio" name="location" value="yadisk" checked /> Я.Диск</label>
+            <label style="font-weight: 600;"><input type="radio" name="location" value="local" /> Локальная папка</label>
+          </div>
+          <div class="row">
+            <input id="path" type="text" placeholder="disk:/Загрузки  или  C:\tmp\Photo" />
+            <button id="btnSort" class="btn primary" type="button">Сортировать</button>
+            <a id="btnBrowse" class="btn" href="#" style="display: none;">Открыть обзор папки</a>
+          </div>
+          <div id="hint" class="muted" style="margin-top: 6px;">
+            Для YaDisk можно указывать любую папку вне <code>disk:/Фото</code> (например <code>disk:/Загрузки</code>).
+          </div>
+          <div id="toast" class="muted" style="margin-top: 8px;"></div>
+        </div>
+
+        <div class="section">
+          <div class="row" style="justify-content: space-between;">
+            <div>
+              <div class="muted">Лишних копий (найдено):</div>
+              <div class="row" style="margin-top: 6px;">
+                <span class="pill">шаг 1: <b id="cntStep1">—</b></span>
+                <span class="pill">шаг 2: <b id="cntStep2">—</b></span>
+                <span class="pill">итого: <b id="cntTotal">—</b></span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section" id="secStep1">
+          <div class="row" style="justify-content: space-between;">
+            <div>
+              <h3>Шаг 1 — Уже есть в архиве</h3>
+              <div class="muted">Source-файлы, которые совпали по содержимому с архивом <code>disk:/Фото</code>.</div>
+            </div>
+            <div class="row">
+              <button id="btnStep1Del" class="btn danger" type="button" disabled>Удалить выбранные (0)</button>
+              <button id="btnStep1Ignore" class="btn" type="button" disabled>Не дубль (0)</button>
+              <button id="btnStep1Reload" class="btn" type="button">Обновить</button>
+            </div>
+          </div>
+          <div class="muted" style="margin-top: 8px;">run: <span class="pill" id="runStep1">—</span> · источник: <code id="rootStep1">—</code></div>
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 44px;"></th>
+                <th>Файл в источнике</th>
+                <th>Совпало в архиве</th>
+                <th style="width: 240px;">Действия</th>
+              </tr>
+            </thead>
+            <tbody id="tbodyStep1">
+              <tr><td colspan="4" class="muted">—</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section" id="secStep2">
+          <div class="row" style="justify-content: space-between;">
+            <div>
+              <h3>Шаг 2 — Дубли внутри папки (source)</h3>
+              <div class="muted">Группы дублей внутри выбранного источника. По умолчанию “оставляем 1”.</div>
+            </div>
+            <div class="row">
+              <button id="btnStep2Del" class="btn danger" type="button" disabled>Удалить копии (0)</button>
+              <button id="btnStep2Reload" class="btn" type="button">Обновить</button>
+            </div>
+          </div>
+          <div class="muted" style="margin-top: 8px;">run: <span class="pill" id="runStep2">—</span> · источник: <code id="rootStep2">—</code></div>
+          <div class="muted" style="margin-top: 8px;">
+            Групп: <span class="pill" id="groupsCnt">—</span>
+            &nbsp;·&nbsp;
+            Макс. размер группы: <span class="pill" id="maxGroup">—</span>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 220px;">Группа</th>
+                <th>Файлы</th>
+              </tr>
+            </thead>
+            <tbody id="tbodyStep2">
+              <tr><td colspan="2" class="muted">—</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="status" style="margin-top: 12px;">
+          <div class="muted">Статус прогона:</div>
+          <div><span class="pill">source</span> <span id="srcStatus">…</span></div>
+          <div><span class="pill">archive</span> <span id="arcStatus">…</span></div>
+        </div>
+      </div>
     </div>
+
+    <script>
+      function qs(sel) { return document.querySelector(sel); }
+      function getLocation() {
+        const el = document.querySelector("input[name='location']:checked");
+        return el ? el.value : "yadisk";
+      }
+      function setToast(text, isErr=false) {
+        const el = qs("#toast");
+        if (!el) return;
+        el.textContent = text || "";
+        el.classList.toggle("err", !!isErr);
+      }
+      function updateBrowseLink() {
+        const loc = getLocation();
+        const p = (qs("#path")?.value || "").trim();
+        const a = qs("#btnBrowse");
+        if (!a) return;
+        if (loc === "yadisk" && p.startsWith("disk:")) {
+          a.style.display = "inline-block";
+          a.setAttribute("href", `/browse?path=${encodeURIComponent(p)}`);
+        } else {
+          a.style.display = "none";
+          a.setAttribute("href", "#");
+        }
+      }
+      async function fetchJson(url, opts) {
+        const resp = await fetch(url, opts || { cache: "no-store" });
+        const text = await resp.text();
+        let data = null;
+        try { data = text ? JSON.parse(text) : null; } catch(e) {}
+        if (!resp.ok) {
+          const msg = (data && (data.detail || data.message)) ? (data.detail || data.message) : (text || `HTTP ${resp.status}`);
+          throw new Error(msg);
+        }
+        return data;
+      }
+      function fmtRun(r) {
+        if (!r) return "—";
+        const st = r.status || "—";
+        const proc = (r.processed_files != null && r.total_files != null) ? ` · ${r.processed_files}/${r.total_files}` : "";
+        const err = r.last_error ? ` · ошибка: ${r.last_error}` : "";
+        return `${st}${proc}${err}`;
+      }
+      function escapeHtml(s) {
+        return (s ?? "").toString()
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll("\"", "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+      async function postJson(url, bodyObj) {
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(bodyObj ?? {}),
+        });
+        const text = await resp.text();
+        let data = null;
+        try { data = text ? JSON.parse(text) : null; } catch(e) {}
+        if (!resp.ok) {
+          const msg = (data && (data.detail || data.message)) ? (data.detail || data.message) : (text || `HTTP ${resp.status}`);
+          throw new Error(msg);
+        }
+        return data;
+      }
+      function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+      function createLimiter(limit) {
+        let active = 0;
+        const queue = [];
+        const next = () => {
+          if (active >= limit) return;
+          const item = queue.shift();
+          if (!item) return;
+          active += 1;
+          Promise.resolve()
+            .then(() => item.fn())
+            .then(item.resolve, item.reject)
+            .finally(() => { active -= 1; next(); });
+        };
+        return (fn) => new Promise((resolve, reject) => {
+          queue.push({ fn, resolve, reject });
+          next();
+        });
+      }
+
+      async function loadThumb(el) {
+        const kind = el?.getAttribute("data-kind") || "none";
+        const src = el?.getAttribute("data-src") || "";
+        const openUrl = el?.getAttribute("data-open-url") || "";
+        if (!el || !src || kind === "none") return;
+
+        const hadFs = !!el.querySelector("button.fsbtn[data-fs='1']");
+        const ensureFs = () => {
+          if (!hadFs) return;
+          if (el.querySelector("button.fsbtn[data-fs='1']")) return;
+          const b = document.createElement("button");
+          b.type = "button";
+          b.className = "fsbtn";
+          b.setAttribute("data-fs", "1");
+          b.textContent = "⤢";
+          el.appendChild(b);
+        };
+
+        // local video: ставим src напрямую (Range поддерживается FileResponse)
+        if (kind === "video" && src.includes("/api/local/preview")) {
+          const v = document.createElement("video");
+          v.controls = true;
+          v.preload = "metadata";
+          v.src = src;
+          el.innerHTML = "";
+          el.appendChild(v);
+          ensureFs();
+          return;
+        }
+
+        // image: чтобы не ловить 429, делаем fetch с redirect:manual и ограничиваем параллелизм.
+        if (kind === "image") {
+          el.innerHTML = `<div class="noimg">превью…</div>`;
+
+          // Если это YaDisk proxy — он может отдавать 307 или 429. Если это local preview — обычно 200.
+          let finalUrl = src;
+          for (let attempt = 0; attempt < 6; attempt++) {
+            try {
+              const resp = await fetch(src, { cache: "no-store", redirect: "manual" });
+              if (resp.status === 307) {
+                const loc = resp.headers.get("location");
+                if (loc) { finalUrl = loc; break; }
+                // нет location — fallback на src
+                finalUrl = src;
+                break;
+              }
+              if (resp.status === 200) {
+                // local preview
+                finalUrl = src;
+                break;
+              }
+              if (resp.status === 429) {
+                await sleep(400 + attempt * 250);
+                continue;
+              }
+              // другое: нет превью
+              el.innerHTML = `<div class="noimg">нет превью</div>`;
+              return;
+            } catch (e) {
+              await sleep(250 + attempt * 200);
+            }
+          }
+
+          const img = new Image();
+          img.loading = "lazy";
+          img.alt = "preview";
+          img.referrerPolicy = "no-referrer";
+          img.onerror = () => { el.innerHTML = `<div class="noimg">нет превью</div>`; };
+          el.innerHTML = "";
+          el.appendChild(img);
+          img.src = finalUrl;
+          ensureFs();
+          return;
+        }
+
+        // disk video: thumb не грузим, но если есть openUrl — покажем подсказку
+        if (kind === "video" && openUrl) {
+          el.innerHTML = `<div class="noimg">видео · <a href="${escapeHtml(openUrl)}" target="_blank" rel="noopener noreferrer">открыть</a></div>`;
+          ensureFs();
+        }
+      }
+
+      async function loadAllThumbs() {
+        // Параллелизм держим ниже серверного лимита превью (у нас 4), чтобы не ловить 429.
+        const limit = createLimiter(2);
+        const thumbs = Array.from(document.querySelectorAll(".thumb[data-src][data-kind]"));
+        await Promise.all(thumbs.map(el => limit(() => loadThumb(el))));
+      }
+
+      async function loadVideoDurations() {
+        const els = Array.from(document.querySelectorAll(".pill.duration[data-path]"));
+        if (els.length === 0) return;
+        const limit = createLimiter(2);
+        await Promise.all(els.map(el => limit(async () => {
+          const p = el.getAttribute("data-path") || "";
+          if (!(p.startsWith("disk:") || p.startsWith("local:"))) return;
+          const url = p.startsWith("disk:")
+            ? `/api/yadisk/video-duration?path=${encodeURIComponent(p)}`
+            : `/api/local/video-duration?path=${encodeURIComponent(p)}`;
+          const maxPoll = 12;
+          for (let i = 0; i < maxPoll; i++) {
+            try {
+              const resp = await fetch(url, { cache: "no-store" });
+              const data = await resp.json().catch(() => null);
+              if (resp.status === 200 && data?.status === "ready" && data?.duration_human && data.duration_human !== "—") {
+                el.textContent = `длительность: ${data.duration_human}`;
+                el.setAttribute("data-duration", data.duration_human);
+                return;
+              }
+              if (resp.status >= 400 && data?.status === "error") {
+                return;
+              }
+              const ra = resp.headers.get("Retry-After");
+              const waitMs = Math.max(250, (ra ? Number(ra) : 1) * 1000);
+              await sleep(isFinite(waitMs) ? waitMs : 1000);
+            } catch (e) {
+              return;
+            }
+          }
+        })));
+      }
+
+      function ensureLightbox() {
+        let lb = document.getElementById("lightbox");
+        if (lb) return lb;
+        lb = document.createElement("div");
+        lb.id = "lightbox";
+        lb.className = "lb";
+        lb.innerHTML = `
+          <div class="lb-panel" role="dialog" aria-modal="true">
+            <div class="lb-top">
+              <div class="muted"><code id="lbPath"></code></div>
+              <div class="lb-actions">
+                <a id="lbOpen" class="pill" href="#" target="_blank" rel="noopener noreferrer" style="display:none;">Открыть</a>
+                <button id="lbClose" class="btn" type="button">Закрыть</button>
+              </div>
+            </div>
+            <div class="lb-body" id="lbBody"></div>
+          </div>
+        `;
+        document.body.appendChild(lb);
+        const close = () => lb.classList.remove("open");
+        lb.addEventListener("click", (e) => { if (e.target === lb) close(); });
+        lb.querySelector("#lbClose")?.addEventListener("click", close);
+        document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+        return lb;
+      }
+
+      function openLightbox({ kind, path, src, openUrl }) {
+        if (!path) return;
+        // YaDisk video: inline-стриминг не делаем -> открываем в новой вкладке
+        if (kind === "video" && path.startsWith("disk:") && openUrl) {
+          window.open(openUrl, "_blank", "noopener,noreferrer");
+          return;
+        }
+        const lb = ensureLightbox();
+        const pEl = lb.querySelector("#lbPath");
+        const openA = lb.querySelector("#lbOpen");
+        const body = lb.querySelector("#lbBody");
+        if (pEl) pEl.textContent = path;
+        if (openA instanceof HTMLAnchorElement) {
+          if (openUrl) {
+            openA.style.display = "inline-block";
+            openA.href = openUrl;
+          } else {
+            openA.style.display = "none";
+            openA.href = "#";
+          }
+        }
+        if (!body) return;
+        body.innerHTML = "";
+
+        if (kind === "image") {
+          const img = new Image();
+          img.alt = "preview";
+          img.referrerPolicy = "no-referrer";
+          // YaDisk: берём XL
+          const fullSrc = path.startsWith("disk:")
+            ? `/api/yadisk/preview-image?size=XL&path=${encodeURIComponent(path)}`
+            : (src || `/api/local/preview?path=${encodeURIComponent(path)}`);
+          img.src = fullSrc;
+          body.appendChild(img);
+          lb.classList.add("open");
+          return;
+        }
+
+        if (kind === "video" && path.startsWith("local:")) {
+          const v = document.createElement("video");
+          v.controls = true;
+          v.autoplay = true;
+          v.preload = "metadata";
+          v.src = `/api/local/preview?path=${encodeURIComponent(path)}`;
+          body.appendChild(v);
+          lb.classList.add("open");
+        }
+      }
+      async function refreshStatus() {
+        try {
+          const ctx = await fetchJson("/api/sort/context", { cache: "no-store" });
+          qs("#srcStatus").textContent = fmtRun(ctx?.source?.latest);
+          qs("#arcStatus").textContent = fmtRun(ctx?.archive?.latest);
+        } catch(e) {
+          qs("#srcStatus").textContent = "—";
+          qs("#arcStatus").textContent = "—";
+        }
+      }
+
+      function updateCounters(n1, n2) {
+        const a = Number(n1) || 0;
+        const b = Number(n2) || 0;
+        qs("#cntStep1").textContent = String(a);
+        qs("#cntStep2").textContent = String(b);
+        qs("#cntTotal").textContent = String(a + b);
+      }
+
+      function step1CollectSelected() {
+        const res = [];
+        document.querySelectorAll("input.step1-sel:checked").forEach(cb => {
+          const p = cb.getAttribute("data-path");
+          if (p) res.push(p);
+        });
+        return res;
+      }
+      function step1UpdateButtons() {
+        const n = step1CollectSelected().length;
+        const del = qs("#btnStep1Del");
+        const ign = qs("#btnStep1Ignore");
+        del.textContent = `Удалить выбранные (${n})`;
+        ign.textContent = `Не дубль (${n})`;
+        del.disabled = (n === 0);
+        ign.disabled = (n === 0);
+      }
+
+      async function loadStep1() {
+        const tbody = qs("#tbodyStep1");
+        tbody.innerHTML = `<tr><td colspan="4" class="muted">Загрузка…</td></tr>`;
+        step1UpdateButtons();
+        try {
+          const data = await fetchJson("/api/sort/dup-in-archive", { cache: "no-store" });
+          qs("#runStep1").textContent = data?.source_run_id ? `#${data.source_run_id}` : "—";
+          qs("#rootStep1").textContent = data?.source_root_path || "—";
+          const items = Array.isArray(data?.items) ? data.items : [];
+          // счётчик шага 1 = кол-во source-файлов (лишние копии в архиве-аспекте)
+          qs("#cntStep1").textContent = String(Number(data?.total) || items.length || 0);
+          if (items.length === 0) {
+            const scanned = !!data?.archive_scanned;
+            tbody.innerHTML = scanned
+              ? `<tr><td colspan="4" class="muted">Совпадений с архивом не найдено.</td></tr>`
+              : `<tr><td colspan="4" class="muted">Архив ещё не просканирован. Запусти “Сортировать” и дождись завершения scan архива.</td></tr>`;
+            step1UpdateButtons();
+            return;
+          }
+          tbody.innerHTML = items.map(it => {
+            const sp = escapeHtml(it.source_path || "");
+            const disk = (it.source_path || "").startsWith("disk:");
+            const srcLink = disk
+              ? `<a href="/api/yadisk/open?path=${encodeURIComponent(it.source_path)}" target="_blank" rel="noopener noreferrer"><code>${sp}</code></a>`
+              : `<code>${sp}</code>`;
+            const matches = Array.isArray(it.matches) ? it.matches : [];
+            const matchHtml = matches.slice(0, 8).map(m => {
+              const ap = escapeHtml(m.path || "");
+              return `<div><a href="/api/yadisk/open?path=${encodeURIComponent(m.path)}" target="_blank" rel="noopener noreferrer"><code>${ap}</code></a></div>`;
+            }).join("") + (matches.length > 8 ? `<div class="muted">… ещё ${matches.length - 8}</div>` : "");
+            return `
+              <tr>
+                <td><input class="step1-sel" type="checkbox" data-path="${sp}" /></td>
+                <td>${srcLink}<div class="muted" style="margin-top:6px;"><span class="pill">${matches.length} совп.</span></div></td>
+                <td>${matchHtml}</td>
+                <td>
+                  <div class="row" style="gap:8px;">
+                    <button class="btn danger" type="button" data-act="step1-del" data-path="${sp}">Удалить</button>
+                    <button class="btn" type="button" data-act="step1-ign" data-path="${sp}">Не дубль</button>
+                  </div>
+                </td>
+              </tr>
+            `;
+          }).join("");
+
+          const runId = data?.source_run_id;
+          tbody.querySelectorAll("input.step1-sel").forEach(cb => cb.addEventListener("change", step1UpdateButtons));
+          tbody.querySelectorAll("button[data-act='step1-del']").forEach(btn => btn.addEventListener("click", async () => {
+            const p = btn.getAttribute("data-path");
+            if (!p) return;
+            if (!confirm("Удалить из источника (локально — навсегда, на Я.Диске — в корзину)?")) return;
+            await postJson("/api/sort/source/delete", { paths: [p], source_run_id: runId });
+            await loadAllResults();
+          }));
+          tbody.querySelectorAll("button[data-act='step1-ign']").forEach(btn => btn.addEventListener("click", async () => {
+            const p = btn.getAttribute("data-path");
+            if (!p) return;
+            await postJson("/api/sort/source/ignore-archive-dup", { paths: [p], source_run_id: runId });
+            await loadAllResults();
+          }));
+
+          qs("#btnStep1Del").onclick = async () => {
+            const paths = step1CollectSelected();
+            if (!paths.length) return;
+            if (!confirm(`Удалить из источника: ${paths.length} файл(ов)?`)) return;
+            await postJson("/api/sort/source/delete", { paths, source_run_id: runId });
+            await loadAllResults();
+          };
+          qs("#btnStep1Ignore").onclick = async () => {
+            const paths = step1CollectSelected();
+            if (!paths.length) return;
+            await postJson("/api/sort/source/ignore-archive-dup", { paths, source_run_id: runId });
+            await loadAllResults();
+          };
+          step1UpdateButtons();
+        } catch (e) {
+          tbody.innerHTML = `<tr><td colspan="4" class="err">Ошибка: ${escapeHtml(e?.message || e)}</td></tr>`;
+          step1UpdateButtons();
+          qs("#cntStep1").textContent = "0";
+        }
+      }
+
+      function step2CollectAllUnchecked() {
+        const paths = [];
+        document.querySelectorAll(".cards[data-group]").forEach(cardsEl => {
+          cardsEl.querySelectorAll(".card2").forEach(card => {
+            const cb = card.querySelector("input.keep-cb");
+            const p = card.getAttribute("data-path");
+            if (!p || !(cb instanceof HTMLInputElement)) return;
+            if (!cb.checked) paths.push(p);
+          });
+        });
+        return paths;
+      }
+      function step2UpdateDeleteBtn() {
+        const n = step2CollectAllUnchecked().length;
+        const btn = qs("#btnStep2Del");
+        btn.textContent = `Удалить копии (${n})`;
+        btn.disabled = (n === 0);
+      }
+      function step2UpdateGroupValidity(cardsEl) {
+        const row = cardsEl.closest("tr");
+        const warn = row?.querySelector(".warn");
+        const checked = cardsEl.querySelectorAll("input.keep-cb:checked").length;
+        if (warn) warn.classList.toggle("hidden", checked > 0);
+      }
+
+      async function loadStep2() {
+        const tbody = qs("#tbodyStep2");
+        tbody.innerHTML = `<tr><td colspan="2" class="muted">Загрузка…</td></tr>`;
+        step2UpdateDeleteBtn();
+        try {
+          const data = await fetchJson("/api/sort/dup-in-source", { cache: "no-store" });
+          const runId = data?.source_run_id;
+          qs("#runStep2").textContent = runId ? `#${runId}` : "—";
+          qs("#rootStep2").textContent = data?.source_root_path || "—";
+          qs("#groupsCnt").textContent = String(data?.summary?.groups ?? "0");
+          qs("#maxGroup").textContent = String(data?.summary?.max_group_size ?? "0");
+
+          const groups = Array.isArray(data?.groups) ? data.groups : [];
+          // счётчик шага 2 = сумма (cnt - 1) по группам (лишние копии)
+          let extra = 0;
+          for (const g of groups) {
+            const c = Number(g?.cnt) || 0;
+            if (c > 1) extra += (c - 1);
+          }
+          qs("#cntStep2").textContent = String(extra);
+
+          if (groups.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="2" class="muted">Дублей внутри источника не найдено.</td></tr>`;
+            step2UpdateDeleteBtn();
+            return;
+          }
+
+          tbody.innerHTML = groups.map(g => {
+            const files = Array.isArray(g.files) ? g.files : [];
+            const groupKey = `${escapeHtml(g.hash_alg || "")}:${escapeHtml(g.hash_short || "")}`;
+            const cards = files.map(f => {
+              const p = escapeHtml(f.path || "");
+              const short = escapeHtml(f.path_short || f.path || "");
+              const keep = !!f.keep;
+              const pk = (f.preview_kind || "none");
+              const pu = f.preview_url || "";
+              const openUrl = f.open_url || "";
+              const isDiskVideo = (pk === "video") && ((f.path || "").startsWith("disk:"));
+              const isLocalVideo = (pk === "video") && ((f.path || "").startsWith("local:"));
+              // Превью грузим очередью после рендера (иначе большие группы забивают сервер и ловят 429).
+              const fsBtn = (pk === "image" || pk === "video") ? `<button class="fsbtn" type="button" data-fs="1">⤢</button>` : ``;
+              const thumbHtml = `<div class="noimg">превью…</div>${fsBtn}`;
+              return `
+                <div class="card2" data-path="${p}">
+                  <div class="thumb"
+                       data-kind="${escapeHtml(pk)}"
+                       data-path="${p}"
+                       data-src="${escapeHtml(pu)}"
+                       data-open-url="${escapeHtml(openUrl)}">${thumbHtml}</div>
+                  <div class="card2-body">
+                    <div class="muted"><code>${short}</code></div>
+                    <div style="margin-top:6px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+                      <span class="pill">${escapeHtml(f.size_human || "—")}</span>
+                      ${(isDiskVideo || isLocalVideo) ? `<span class="pill duration" data-path="${p}" data-duration="—">длительность: —</span>` : ``}
+                      ${(openUrl && (f.path || "").startsWith("disk:")) ? `<a class="pill" href="${escapeHtml(openUrl)}" target="_blank" rel="noopener noreferrer">Открыть</a>` : ``}
+                    </div>
+                    <div class="keep">
+                      <input class="keep-cb" type="checkbox" ${keep ? "checked" : ""} />
+                      <span class="muted">сохранить</span>
+                    </div>
+                  </div>
+                </div>
+              `;
+            }).join("");
+            return `
+              <tr>
+                <td>
+                  <div><span class="pill">${escapeHtml(g.cnt || "")} шт</span></div>
+                  <div style="margin-top: 6px;"><code>${escapeHtml(g.hash_alg || "")}:${escapeHtml(g.hash_short || "")}</code></div>
+                  <div class="warn hidden" style="margin-top: 8px;">Нужно оставить хотя бы один файл</div>
+                  <div style="margin-top: 10px;">
+                    <button class="btn danger" type="button" data-action="del-group" data-group="${groupKey}">Удалить копии в группе</button>
+                    <button class="btn danger" type="button" data-action="del-group-all" data-group="${groupKey}">Удалить ВСЁ (мусор)</button>
+                  </div>
+                </td>
+                <td>
+                  <div class="cards" data-group="${groupKey}">
+                    ${cards}
+    </div>
+                </td>
+              </tr>
+            `;
+          }).join("");
+
+          // валидация групп и кнопка
+          document.querySelectorAll(".cards[data-group]").forEach(cardsEl => {
+            step2UpdateGroupValidity(cardsEl);
+            cardsEl.addEventListener("change", (e) => {
+              const t = e.target;
+              if (!(t instanceof HTMLInputElement) || !t.classList.contains("keep-cb")) return;
+              const checked = cardsEl.querySelectorAll("input.keep-cb:checked");
+              if (checked.length === 0) t.checked = true;
+              step2UpdateGroupValidity(cardsEl);
+              step2UpdateDeleteBtn();
+            });
+          });
+
+          qs("#btnStep2Del").onclick = async () => {
+            const paths = step2CollectAllUnchecked();
+            if (!paths.length) return;
+            if (!confirm(`Удалить копии из источника: ${paths.length} файл(ов)?`)) return;
+            await postJson("/api/sort/source/delete", { paths, source_run_id: runId });
+            await loadAllResults();
+          };
+          document.querySelectorAll("button[data-action='del-group']").forEach(btn => {
+            btn.addEventListener("click", async () => {
+              const row = btn.closest("tr");
+              const cardsEl = row?.querySelector(".cards[data-group]");
+              if (!cardsEl) return;
+              const paths = [];
+              cardsEl.querySelectorAll(".card2").forEach(card => {
+                const p = card.getAttribute("data-path");
+                const cb = card.querySelector("input.keep-cb");
+                if (!p || !(cb instanceof HTMLInputElement)) return;
+                if (!cb.checked) paths.push(p);
+              });
+              if (!paths.length) return;
+              await postJson("/api/sort/source/delete", { paths, source_run_id: runId });
+              await loadAllResults();
+            });
+          });
+          document.querySelectorAll("button[data-action='del-group-all']").forEach(btn => {
+            btn.addEventListener("click", async () => {
+              const row = btn.closest("tr");
+              const cardsEl = row?.querySelector(".cards[data-group]");
+              if (!cardsEl) return;
+              const paths = [];
+              cardsEl.querySelectorAll(".card2").forEach(card => {
+                const p = card.getAttribute("data-path");
+                if (p) paths.push(p);
+              });
+              if (!paths.length) return;
+              if (!confirm(`Удалить ВСЕ файлы в группе (мусор): ${paths.length} файл(ов)?`)) return;
+              await postJson("/api/sort/source/delete", { paths, source_run_id: runId });
+              await loadAllResults();
+            });
+          });
+          step2UpdateDeleteBtn();
+
+          // Важно: превью/длительности догружаем В ФОНЕ и не блокируем подсчёт/кнопки.
+          // 1) Сразу навешиваем обработчики lightbox (до загрузки превью).
+          document.querySelectorAll(".thumb[data-kind][data-path]").forEach(el => {
+            el.addEventListener("click", (e) => {
+              // открываем только по кнопке ⤢ или по клику по img (для фото)
+              const t = e.target;
+              const kind = el.getAttribute("data-kind") || "none";
+              if (t instanceof HTMLButtonElement && t.getAttribute("data-fs") === "1") {
+                e.preventDefault();
+              } else if (kind === "image" && t instanceof HTMLImageElement) {
+                // ok
+              } else {
+                return;
+              }
+              const path = el.getAttribute("data-path") || "";
+              const src = el.getAttribute("data-src") || "";
+              const openUrl = el.getAttribute("data-open-url") || "";
+              openLightbox({ kind, path, src, openUrl });
+            });
+          });
+          // 2) Фоновая загрузка превью/длительности
+          loadAllThumbs().catch(() => {});
+          loadVideoDurations().catch(() => {});
+        } catch (e) {
+          tbody.innerHTML = `<tr><td colspan="2" class="err">Ошибка: ${escapeHtml(e?.message || e)}</td></tr>`;
+          qs("#cntStep2").textContent = "0";
+          step2UpdateDeleteBtn();
+        }
+      }
+
+      async function loadAllResults() {
+        // Данные шагов 1/2 грузим синхронно, но превью/длительности (шаг 2) догружаются в фоне.
+        await Promise.all([loadStep1(), loadStep2()]);
+        // Сразу считаем итого по уже выставленным значениям (без ожидания медиа).
+        updateCounters(
+          Number(qs("#cntStep1")?.textContent) || 0,
+          Number(qs("#cntStep2")?.textContent) || 0
+        );
+      }
+      function loadSaved() {
+        const loc = localStorage.getItem("ps.location");
+        const p = localStorage.getItem("ps.path");
+        if (loc === "local" || loc === "yadisk") {
+          document.querySelectorAll("input[name='location']").forEach(r => {
+            r.checked = (r.value === loc);
+          });
+        }
+        if (p) qs("#path").value = p;
+        updateBrowseLink();
+      }
+
+      document.querySelectorAll("input[name='location']").forEach(r => r.addEventListener("change", () => {
+        localStorage.setItem("ps.location", getLocation());
+        updateBrowseLink();
+      }));
+      qs("#path")?.addEventListener("input", () => {
+        localStorage.setItem("ps.path", qs("#path").value || "");
+        updateBrowseLink();
+      });
+
+      qs("#btnSort")?.addEventListener("click", async () => {
+        const loc = getLocation();
+        const p = (qs("#path")?.value || "").trim();
+        if (!p) return setToast("Укажи путь к папке.", true);
+        setToast("Запускаю скан…");
+        qs("#btnSort").disabled = true;
+        try {
+          const data = await fetchJson("/api/sort/start", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ location: loc, path: p }),
+          });
+          const srcRun = data?.source?.run_id;
+          setToast(srcRun ? `Запущено. source run_id=${srcRun}` : "Запущено.");
+          await refreshStatus();
+          await loadAllResults();
+        } catch(e) {
+          setToast(`Ошибка: ${e?.message || e}`, true);
+        } finally {
+          qs("#btnSort").disabled = false;
+        }
+      });
+
+      loadSaved();
+      refreshStatus();
+      loadAllResults();
+      qs("#btnStep1Reload")?.addEventListener("click", loadAllResults);
+      qs("#btnStep2Reload")?.addEventListener("click", loadAllResults);
+      setInterval(() => { refreshStatus(); }, 2500);
+    </script>
   </body>
 </html>
 
