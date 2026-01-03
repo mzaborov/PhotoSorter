@@ -63,7 +63,8 @@ class yd_files <<table>> {
   duration_at: TEXT
 }
 
-dedup_runs "1" -- "many" yd_files : last_run_id (logical)
+folders "0..1" -- "*" yd_files : файлы в папке (parent_path, логически)
+dedup_runs "1" -- "*" yd_files : прогон дедупа
 
 class face_runs <<table>> {
   +id: INTEGER <<PK>>
@@ -79,7 +80,7 @@ class face_runs <<table>> {
   last_error: TEXT
 }
 
-class face_detections <<table>> {
+class face_rectangles <<table>> {
   +id: INTEGER <<PK>>
   run_id: INTEGER <<FK>>
   file_path: TEXT               ' disk:/...
@@ -96,9 +97,9 @@ class face_detections <<table>> {
   created_at: TEXT
 }
 
-face_runs "1" -- "many" face_detections : run_id
+face_runs "1" -- "*" face_rectangles : прямоугольники лиц
 
-note right of face_detections
+note right of face_rectangles
   presence_score (photo) =
   area(face_bbox) / sum(area(all_face_bbox))
 end note

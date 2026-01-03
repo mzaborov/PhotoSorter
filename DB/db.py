@@ -180,6 +180,19 @@ class FaceStore:
     def _ensure_face_schema(self) -> None:
         cur = self.conn.cursor()
 
+        # Миграция: раньше таблица называлась face_detections, теперь face_rectangles.
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('face_detections','face_rectangles')")
+        existing = {r[0] for r in cur.fetchall()}
+        if "face_detections" in existing and "face_rectangles" not in existing:
+            cur.execute("ALTER TABLE face_detections RENAME TO face_rectangles;")
+            # Старые индексы могли называться idx_face_det_*. Их можно оставить,
+            # но создаём новые с актуальными именами для читаемости.
+            try:
+                cur.execute("DROP INDEX IF EXISTS idx_face_det_run;")
+                cur.execute("DROP INDEX IF EXISTS idx_face_det_file;")
+            except Exception:
+                pass
+
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS face_runs (
@@ -200,7 +213,7 @@ class FaceStore:
 
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS face_detections (
+            CREATE TABLE IF NOT EXISTS face_rectangles (
               id             INTEGER PRIMARY KEY AUTOINCREMENT,
               run_id         INTEGER NOT NULL,
               file_path      TEXT NOT NULL,    -- 'disk:/...'
@@ -219,8 +232,8 @@ class FaceStore:
             """
         )
 
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_det_run ON face_detections(run_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_det_file ON face_detections(file_path);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_rect_run ON face_rectangles(run_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_rect_file ON face_rectangles(file_path);")
 
         self.conn.commit()
 
@@ -278,7 +291,7 @@ class FaceStore:
 
     def clear_run_detections_for_file(self, *, run_id: int, file_path: str) -> None:
         cur = self.conn.cursor()
-        cur.execute("DELETE FROM face_detections WHERE run_id = ? AND file_path = ?", (run_id, file_path))
+        cur.execute("DELETE FROM face_rectangles WHERE run_id = ? AND file_path = ?", (run_id, file_path))
         self.conn.commit()
 
     def insert_detection(
@@ -298,7 +311,7 @@ class FaceStore:
         cur = self.conn.cursor()
         cur.execute(
             """
-            INSERT INTO face_detections(
+            INSERT INTO face_rectangles(
               run_id, file_path, face_index,
               bbox_x, bbox_y, bbox_w, bbox_h,
               confidence, presence_score, thumb_jpeg,

@@ -31,12 +31,25 @@ class person_group_members <<table>> {
   +person_id: INTEGER <<FK>>
 }
 
-person_groups "1" -- "many" person_group_members
-persons "1" -- "many" person_group_members
+person_groups "1" -- "*" person_group_members : состав группы
+persons "1" -- "*" person_group_members : членство в группе
+
+class folders <<table>> {
+  +id: INTEGER <<PK>>
+  code: TEXT <<UNIQUE>>
+  path: TEXT
+  name: TEXT
+  location: TEXT
+  role: TEXT
+  priority_after_code: TEXT
+  sort_order: INTEGER
+  content_rule: TEXT
+}
 
 class media_files <<table>> {
   +id: INTEGER <<PK>>
   path: TEXT <<UNIQUE>>         ' disk:/... or local:...
+  parent_path: TEXT             ' disk:/... (папка-родитель)
   storage: TEXT                 ' yadisk|local
   mime_type: TEXT
   media_type: TEXT              ' image|video
@@ -59,7 +72,7 @@ class face_runs <<table>> {
   last_error: TEXT
 }
 
-class face_detections <<table>> {
+class face_rectangles <<table>> {
   +id: INTEGER <<PK>>
   run_id: INTEGER <<FK>>
   file_id: INTEGER <<FK>>
@@ -75,33 +88,34 @@ class face_detections <<table>> {
   created_at: TEXT
 }
 
-face_runs "1" -- "many" face_detections : run_id
-media_files "1" -- "many" face_detections : file_id
-persons "0..1" -- "0..1" face_detections : avatar_face_id -> face_detections.id
+face_runs "1" -- "*" face_rectangles : прямоугольники лиц
+media_files "1" -- "*" face_rectangles : лица на файле
+persons "0..1" -- "0..1" face_rectangles : аватар (лицо)
+folders "0..1" -- "*" media_files : файлы в папке (parent_path)
 
 class face_labels <<table>> {
   +id: INTEGER <<PK>>
-  face_detection_id: INTEGER <<FK>>
+  face_rectangle_id: INTEGER <<FK>>
   person_id: INTEGER <<FK>>
   source: TEXT                  ' manual|cluster|ai
   confidence: REAL
   created_at: TEXT
 }
 
-face_detections "1" -- "0..1" face_labels
-persons "1" -- "many" face_labels
+face_rectangles "1" -- "0..1" face_labels : назначение персоны
+persons "1" -- "*" face_labels : метки лица
 
 class face_identity_candidates <<table>> {
   +id: INTEGER <<PK>>
-  face_detection_id: INTEGER <<FK>>
+  face_rectangle_id: INTEGER <<FK>>
   person_id: INTEGER <<FK>>
   score: REAL
   model_version: TEXT
   created_at: TEXT
 }
 
-face_detections "1" -- "many" face_identity_candidates
-persons "1" -- "many" face_identity_candidates
+face_rectangles "1" -- "*" face_identity_candidates : AI-кандидаты
+persons "1" -- "*" face_identity_candidates : кандидат для лица
 
 class file_anchors <<table>> {
   +id: INTEGER <<PK>>
@@ -113,8 +127,9 @@ class file_anchors <<table>> {
   created_at: TEXT
 }
 
-media_files "1" -- "many" file_anchors
-persons "1" -- "many" file_anchors : person_id (optional)
+media_files "1" -- "*" file_anchors : якоря
+persons "1" -- "*" file_anchors : якорь на персону
+folders "0..1" -- "*" file_anchors : якорь на папку (folder_path)
 
 class video_face_tracks <<table>> {
   +id: INTEGER <<PK>>
@@ -129,19 +144,20 @@ class video_face_tracks <<table>> {
   created_at: TEXT
 }
 
-face_runs "1" -- "many" video_face_tracks
-media_files "1" -- "many" video_face_tracks
+face_runs "1" -- "*" video_face_tracks : треки лиц
+media_files "1" -- "*" video_face_tracks : треки на файле
 
 class face_embeddings <<table>> {
   +id: INTEGER <<PK>>
-  face_detection_id: INTEGER <<FK>>
+  face_rectangle_id: INTEGER <<FK>>
   model: TEXT
+  model_version: TEXT
   dims: INTEGER
   vector: BLOB                  ' float32[]
   created_at: TEXT
 }
 
-face_detections "1" -- "0..1" face_embeddings
+face_rectangles "1" -- "0..*" face_embeddings : эмбеддинги (модели/версии)
 
 class face_clusters <<table>> {
   +id: INTEGER <<PK>>
@@ -153,12 +169,12 @@ class face_clusters <<table>> {
 
 class face_cluster_members <<table>> {
   +cluster_id: INTEGER <<FK>>
-  +face_detection_id: INTEGER <<FK>>
+  +face_rectangle_id: INTEGER <<FK>>
 }
 
-face_runs "1" -- "many" face_clusters
-face_clusters "1" -- "many" face_cluster_members
-face_detections "1" -- "many" face_cluster_members
+face_runs "1" -- "*" face_clusters : кластеры
+face_clusters "1" -- "*" face_cluster_members : элементы кластера
+face_rectangles "1" -- "*" face_cluster_members : участие в кластере
 
 note bottom
   Семантика только:[X]:
