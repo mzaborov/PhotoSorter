@@ -152,6 +152,177 @@ def init_db():
     conn.close()
 
 
+def _as_int(v: Any) -> int | None:
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        return None
+
+
+class FaceStore:
+    """
+    Хранилище результатов распознавания лиц (детект лиц на фото/видео).
+
+    Важно: ML-часть запускается из отдельного окружения (.venv-face, Python 3.12),
+    но данные пишем в общую SQLite БД проекта (data/photosorter.db).
+    """
+
+    def __init__(self) -> None:
+        init_db()
+        self.conn = get_connection()
+        self._ensure_face_schema()
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def _ensure_face_schema(self) -> None:
+        cur = self.conn.cursor()
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS face_runs (
+              id              INTEGER PRIMARY KEY AUTOINCREMENT,
+              scope           TEXT NOT NULL,    -- 'yadisk'|'local'|'...'
+              root_path       TEXT NOT NULL,    -- например 'disk:/Фото/Агата'
+              status          TEXT NOT NULL,    -- 'running'|'completed'|'failed'
+              total_files     INTEGER,
+              processed_files INTEGER NOT NULL DEFAULT 0,
+              faces_found     INTEGER NOT NULL DEFAULT 0,
+              started_at      TEXT NOT NULL,
+              finished_at     TEXT,
+              last_path       TEXT,
+              last_error      TEXT
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS face_detections (
+              id             INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id         INTEGER NOT NULL,
+              file_path      TEXT NOT NULL,    -- 'disk:/...'
+              face_index     INTEGER NOT NULL, -- индекс лица внутри файла в рамках текущего прогона
+              bbox_x         INTEGER NOT NULL,
+              bbox_y         INTEGER NOT NULL,
+              bbox_w         INTEGER NOT NULL,
+              bbox_h         INTEGER NOT NULL,
+              confidence     REAL,
+              presence_score REAL,             -- доля площади лица среди всех лиц в кадре
+              thumb_jpeg     BLOB,             -- маленький кроп лица для UI/Inbox
+              manual_person  TEXT,             -- имя/код персоны (пока строка; схему персон сделаем позже)
+              ignore_flag    INTEGER NOT NULL DEFAULT 0,
+              created_at     TEXT NOT NULL
+            );
+            """
+        )
+
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_det_run ON face_detections(run_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_det_file ON face_detections(file_path);")
+
+        self.conn.commit()
+
+    def create_run(self, *, scope: str, root_path: str, total_files: int | None) -> int:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO face_runs(scope, root_path, status, total_files, started_at)
+            VALUES (?, ?, 'running', ?, ?)
+            """,
+            (scope, root_path, _as_int(total_files), _now_utc_iso()),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def finish_run(self, *, run_id: int, status: str, last_error: str | None = None) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            UPDATE face_runs
+            SET status = ?, finished_at = ?, last_error = COALESCE(?, last_error)
+            WHERE id = ?
+            """,
+            (status, _now_utc_iso(), last_error, run_id),
+        )
+        self.conn.commit()
+
+    def update_run_progress(
+        self,
+        *,
+        run_id: int,
+        processed_files: int | None = None,
+        faces_found: int | None = None,
+        last_path: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        fields: list[str] = []
+        params: list[Any] = []
+        for key, val in [
+            ("processed_files", processed_files),
+            ("faces_found", faces_found),
+            ("last_path", last_path),
+            ("last_error", last_error),
+        ]:
+            if val is None:
+                continue
+            fields.append(f"{key} = ?")
+            params.append(val)
+        if not fields:
+            return
+        params.append(run_id)
+        cur = self.conn.cursor()
+        cur.execute(f"UPDATE face_runs SET {', '.join(fields)} WHERE id = ?", params)
+        self.conn.commit()
+
+    def clear_run_detections_for_file(self, *, run_id: int, file_path: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM face_detections WHERE run_id = ? AND file_path = ?", (run_id, file_path))
+        self.conn.commit()
+
+    def insert_detection(
+        self,
+        *,
+        run_id: int,
+        file_path: str,
+        face_index: int,
+        bbox_x: int,
+        bbox_y: int,
+        bbox_w: int,
+        bbox_h: int,
+        confidence: float | None,
+        presence_score: float | None,
+        thumb_jpeg: bytes | None,
+    ) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO face_detections(
+              run_id, file_path, face_index,
+              bbox_x, bbox_y, bbox_w, bbox_h,
+              confidence, presence_score, thumb_jpeg,
+              manual_person, ignore_flag, created_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?)
+            """,
+            (
+                run_id,
+                file_path,
+                int(face_index),
+                int(bbox_x),
+                int(bbox_y),
+                int(bbox_w),
+                int(bbox_h),
+                float(confidence) if confidence is not None else None,
+                float(presence_score) if presence_score is not None else None,
+                thumb_jpeg,
+                _now_utc_iso(),
+            ),
+        )
+        self.conn.commit()
+
+
 def list_folders(*, location: str | None = None, role: str | None = None) -> list[dict[str, Any]]:
     """
     Возвращает папки из таблицы `folders` в порядке:

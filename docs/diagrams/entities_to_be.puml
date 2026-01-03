@@ -1,0 +1,171 @@
+@startuml
+hide circle
+skinparam linetype ortho
+skinparam classAttributeIconSize 0
+
+title PhotoSorter — Entities (TO-BE)
+
+' TO-BE: целевая схема под распознавание лиц + разметку + сортировку.
+' Это не 1:1 с текущей БД, а желаемая структура.
+
+class persons <<table>> {
+  +id: INTEGER <<PK>>
+  name: TEXT <<UNIQUE>>
+  mode: TEXT                   ' active|deferred|never
+  is_me: INTEGER               ' 0/1
+  kinship: TEXT                ' степень родства/близости (уточним)
+  avatar_face_id: INTEGER <<FK>>
+  created_at: TEXT
+  updated_at: TEXT
+}
+
+class person_groups <<table>> {
+  +id: INTEGER <<PK>>
+  name: TEXT <<UNIQUE>>
+  created_at: TEXT
+  updated_at: TEXT
+}
+
+class person_group_members <<table>> {
+  +group_id: INTEGER <<FK>>
+  +person_id: INTEGER <<FK>>
+}
+
+person_groups "1" -- "many" person_group_members
+persons "1" -- "many" person_group_members
+
+class media_files <<table>> {
+  +id: INTEGER <<PK>>
+  path: TEXT <<UNIQUE>>         ' disk:/... or local:...
+  storage: TEXT                 ' yadisk|local
+  mime_type: TEXT
+  media_type: TEXT              ' image|video
+  size: INTEGER
+  created: TEXT
+  modified: TEXT
+}
+
+class face_runs <<table>> {
+  +id: INTEGER <<PK>>
+  scope: TEXT                   ' yadisk|local|...
+  root_path: TEXT
+  status: TEXT
+  total_files: INTEGER
+  processed_files: INTEGER
+  faces_found: INTEGER
+  started_at: TEXT
+  finished_at: TEXT
+  last_path: TEXT
+  last_error: TEXT
+}
+
+class face_detections <<table>> {
+  +id: INTEGER <<PK>>
+  run_id: INTEGER <<FK>>
+  file_id: INTEGER <<FK>>
+  face_index: INTEGER
+  bbox_x: INTEGER
+  bbox_y: INTEGER
+  bbox_w: INTEGER
+  bbox_h: INTEGER
+  confidence: REAL
+  presence_score: REAL          ' photo: доля среди лиц в кадре
+  thumb_jpeg: BLOB
+  ignore_flag: INTEGER
+  created_at: TEXT
+}
+
+face_runs "1" -- "many" face_detections : run_id
+media_files "1" -- "many" face_detections : file_id
+persons "0..1" -- "0..1" face_detections : avatar_face_id -> face_detections.id
+
+class face_labels <<table>> {
+  +id: INTEGER <<PK>>
+  face_detection_id: INTEGER <<FK>>
+  person_id: INTEGER <<FK>>
+  source: TEXT                  ' manual|cluster|ai
+  confidence: REAL
+  created_at: TEXT
+}
+
+face_detections "1" -- "0..1" face_labels
+persons "1" -- "many" face_labels
+
+class face_identity_candidates <<table>> {
+  +id: INTEGER <<PK>>
+  face_detection_id: INTEGER <<FK>>
+  person_id: INTEGER <<FK>>
+  score: REAL
+  model_version: TEXT
+  created_at: TEXT
+}
+
+face_detections "1" -- "many" face_identity_candidates
+persons "1" -- "many" face_identity_candidates
+
+class file_anchors <<table>> {
+  +id: INTEGER <<PK>>
+  file_id: INTEGER <<FK>>
+  anchor_type: TEXT             ' folder|person
+  folder_path: TEXT             ' disk:/Фото/...
+  person_id: INTEGER <<FK>>
+  note: TEXT
+  created_at: TEXT
+}
+
+media_files "1" -- "many" file_anchors
+persons "1" -- "many" file_anchors : person_id (optional)
+
+class video_face_tracks <<table>> {
+  +id: INTEGER <<PK>>
+  run_id: INTEGER <<FK>>
+  file_id: INTEGER <<FK>>
+  track_index: INTEGER
+  start_ms: INTEGER
+  end_ms: INTEGER
+  presence_score: REAL          ' video: доля времени/кадров
+  keyframe_ms: INTEGER
+  keyframe_thumb_jpeg: BLOB
+  created_at: TEXT
+}
+
+face_runs "1" -- "many" video_face_tracks
+media_files "1" -- "many" video_face_tracks
+
+class face_embeddings <<table>> {
+  +id: INTEGER <<PK>>
+  face_detection_id: INTEGER <<FK>>
+  model: TEXT
+  dims: INTEGER
+  vector: BLOB                  ' float32[]
+  created_at: TEXT
+}
+
+face_detections "1" -- "0..1" face_embeddings
+
+class face_clusters <<table>> {
+  +id: INTEGER <<PK>>
+  run_id: INTEGER <<FK>>
+  method: TEXT
+  params_json: TEXT
+  created_at: TEXT
+}
+
+class face_cluster_members <<table>> {
+  +cluster_id: INTEGER <<FK>>
+  +face_detection_id: INTEGER <<FK>>
+}
+
+face_runs "1" -- "many" face_clusters
+face_clusters "1" -- "many" face_cluster_members
+face_detections "1" -- "many" face_cluster_members
+
+note bottom
+  Семантика только:[X]:
+  unknown-лица не мешают; true если среди распознанных персон нет Y != X.
+end note
+
+@enduml
+
+
+

@@ -1,0 +1,109 @@
+@startuml
+hide circle
+skinparam linetype ortho
+skinparam classAttributeIconSize 0
+
+title PhotoSorter — Entities (AS-IS)
+
+class folders <<table>> {
+  +id: INTEGER <<PK>>
+  code: TEXT <<UNIQUE>>
+  path: TEXT
+  name: TEXT
+  location: TEXT
+  role: TEXT
+  priority_after_code: TEXT
+  sort_order: INTEGER
+  content_rule: TEXT
+}
+
+class dedup_runs <<table>> {
+  +id: INTEGER <<PK>>
+  scope: TEXT
+  root_path: TEXT
+  status: TEXT
+  limit_files: INTEGER
+  max_download_bytes: INTEGER
+  total_files: INTEGER
+  started_at: TEXT
+  finished_at: TEXT
+  processed_files: INTEGER
+  hashed_files: INTEGER
+  meta_hashed_files: INTEGER
+  downloaded_hashed_files: INTEGER
+  skipped_large_files: INTEGER
+  errors_count: INTEGER
+  last_path: TEXT
+  last_error: TEXT
+}
+
+class yd_files <<table>> {
+  +id: INTEGER <<PK>>
+  path: TEXT <<UNIQUE>>         ' disk:/... or local:...
+  resource_id: TEXT             ' YaDisk stable id (optional)
+  inventory_scope: TEXT         ' archive|source
+  name: TEXT
+  parent_path: TEXT
+  size: INTEGER
+  created: TEXT
+  modified: TEXT
+  mime_type: TEXT
+  media_type: TEXT
+  hash_alg: TEXT                ' sha256|md5
+  hash_value: TEXT
+  hash_source: TEXT             ' meta|download|local
+  status: TEXT                  ' new|hashed|skipped_large|error|deleted
+  error: TEXT
+  scanned_at: TEXT
+  hashed_at: TEXT
+  last_run_id: INTEGER
+  ignore_archive_dup_run_id: INTEGER
+  duration_sec: INTEGER
+  duration_source: TEXT
+  duration_at: TEXT
+}
+
+dedup_runs "1" -- "many" yd_files : last_run_id (logical)
+
+class face_runs <<table>> {
+  +id: INTEGER <<PK>>
+  scope: TEXT                   ' yadisk|local|...
+  root_path: TEXT               ' disk:/Фото/Агата
+  status: TEXT                  ' running|completed|failed
+  total_files: INTEGER
+  processed_files: INTEGER
+  faces_found: INTEGER
+  started_at: TEXT
+  finished_at: TEXT
+  last_path: TEXT
+  last_error: TEXT
+}
+
+class face_detections <<table>> {
+  +id: INTEGER <<PK>>
+  run_id: INTEGER <<FK>>
+  file_path: TEXT               ' disk:/...
+  face_index: INTEGER
+  bbox_x: INTEGER
+  bbox_y: INTEGER
+  bbox_w: INTEGER
+  bbox_h: INTEGER
+  confidence: REAL
+  presence_score: REAL
+  thumb_jpeg: BLOB
+  manual_person: TEXT           ' временно (до persons/person_id)
+  ignore_flag: INTEGER
+  created_at: TEXT
+}
+
+face_runs "1" -- "many" face_detections : run_id
+
+note right of face_detections
+  presence_score (photo) =
+  area(face_bbox) / sum(area(all_face_bbox))
+end note
+
+@enduml
+
+
+

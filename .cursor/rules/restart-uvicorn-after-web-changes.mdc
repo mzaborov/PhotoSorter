@@ -1,0 +1,30 @@
+---
+alwaysApply: true
+---
+Если я вношу изменения в код веб‑сервера (папка `app/`, шаблоны `app/templates/`, роуты FastAPI, запуск/зависимости Web UI), я автоматически:
+
+0) Предпочтительный режим разработки: `uvicorn --reload`.
+   - Сервер запускается в отдельном “окне сервера” (один PowerShell) и остаётся запущенным.
+   - При изменениях в `app/` и шаблонах перезапуск происходит автоматически, без ручного стоп/старта.
+   - Команда запуска:
+     `C:\Users\mzaborov\AppData\Local\Python\pythoncore-3.14-64\python.exe -m uvicorn --reload --app-dir . app.main:app --host 127.0.0.1 --port 8000`
+
+1) Если `--reload` по какой-то причине не подхватил изменения (или менялись зависимости/окружение):
+   - Пытаюсь корректно остановить (Ctrl+C в “окне сервера”).
+   - Если терминал потерян/процесс завис — освобождаю порт 8000 (см. шаг 2).
+
+2) Если порт 8000 занят — нахожу PID(ы), слушающие `127.0.0.1:8000`, и завершаю их (PowerShell):
+   - Безопасная версия (если слушателей нет — пишет “Порт 8000 свободен”, без ошибок):
+     - `$pids = @(Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique); if ($pids.Count -eq 0) { "Порт 8000 свободен" } else { Stop-Process -Id $pids -Force; "Остановлены PID: $($pids -join ',')" }`
+
+3) Поднимаю сервер снова (без `--reload`, если нужен “стабильный” режим):
+   - `C:\Users\mzaborov\AppData\Local\Python\pythoncore-3.14-64\python.exe -m uvicorn --app-dir . app.main:app --host 127.0.0.1 --port 8000`
+
+4) Проверяю, что сервер отвечает и что запущен “свежий” билд:
+   - В “терминале команд” (НЕ в “окне сервера”) выполняю:
+     - `curl.exe -i --connect-timeout 1 --max-time 5 http://127.0.0.1:8000/api/debug/build-info`
+   - Проверяю, что:
+     - HTTP 200 OK
+     - есть заголовок `x-photosorter-build`
+     - `x-photosorter-build` совпадает с JSON полем `"build_id"`
+   - Если после ожидаемого reload/рестарта `build_id` не поменялся — считаю, что смотрим на старый процесс, и повторяю шаги 1→2→3, затем снова выполняю проверку `build-info`.
