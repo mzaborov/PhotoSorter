@@ -56,7 +56,30 @@ class media_files <<table>> {
   size: INTEGER
   created: TEXT
   modified: TEXT
+  last_dedup_run_id: INTEGER    ' последний прогон дедупа (логически)
 }
+
+class dedup_runs <<table>> {
+  +id: INTEGER <<PK>>
+  scope: TEXT
+  root_path: TEXT
+  status: TEXT
+  limit_files: INTEGER
+  max_download_bytes: INTEGER
+  total_files: INTEGER
+  started_at: TEXT
+  finished_at: TEXT
+  processed_files: INTEGER
+  hashed_files: INTEGER
+  meta_hashed_files: INTEGER
+  downloaded_hashed_files: INTEGER
+  skipped_large_files: INTEGER
+  errors_count: INTEGER
+  last_path: TEXT
+  last_error: TEXT
+}
+
+dedup_runs "1" -- "*" media_files : прогон дедупа (последний для файла)
 
 class face_runs <<table>> {
   +id: INTEGER <<PK>>
