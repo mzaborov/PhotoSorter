@@ -311,13 +311,14 @@ def dedup_local(
             _move_file(src=abspath, dst=dst, dry_run=dry_run)
             stats.duplicates_moved += 1
 
-            # update DB path to new location
-            store.update_path(
-                old_path=_as_local_path(abspath),
-                new_path=_as_local_path(dst),
-                new_name=os.path.basename(dst),
-                new_parent_path=_as_local_path(os.path.dirname(dst)),
-            )
+            # update DB path to new location (ONLY if реально переместили файл)
+            if not dry_run:
+                store.update_path(
+                    old_path=_as_local_path(abspath),
+                    new_path=_as_local_path(dst),
+                    new_name=os.path.basename(dst),
+                    new_parent_path=_as_local_path(os.path.dirname(dst)),
+                )
             if pipeline is not None and pipeline_run_id is not None:
                 pipeline.update_run(run_id=int(pipeline_run_id), last_src_path="", last_dst_path="")
 
@@ -530,15 +531,16 @@ def sort_by_faces(
                 pipeline.update_run(run_id=int(pipeline_run_id), last_src_path=src_abs, last_dst_path=dst_abs)
             _move_file(src=src_abs, dst=dst_abs, dry_run=dry_run)
 
-            # update DB paths (yd_files + face_rectangles)
-            new_db_path = _as_local_path(dst_abs)
-            dedup.update_path(
-                old_path=file_path,
-                new_path=new_db_path,
-                new_name=os.path.basename(dst_abs),
-                new_parent_path=_as_local_path(os.path.dirname(dst_abs)),
-            )
-            store.update_file_path(old_file_path=file_path, new_file_path=new_db_path)
+            # update DB paths (yd_files + face_rectangles) ONLY when не dry-run
+            if not dry_run:
+                new_db_path = _as_local_path(dst_abs)
+                dedup.update_path(
+                    old_path=file_path,
+                    new_path=new_db_path,
+                    new_name=os.path.basename(dst_abs),
+                    new_parent_path=_as_local_path(os.path.dirname(dst_abs)),
+                )
+                store.update_file_path(old_file_path=file_path, new_file_path=new_db_path)
             if pipeline is not None and pipeline_run_id is not None:
                 pipeline.update_run(run_id=int(pipeline_run_id), last_src_path="", last_dst_path="")
 
@@ -689,14 +691,15 @@ def sort_faces_into_named_folders(
                 pipeline.update_run(run_id=int(pipeline_run_id), last_src_path=src_abs, last_dst_path=dst_abs)
             _move_file(src=src_abs, dst=dst_abs, dry_run=dry_run)
 
-            new_db_path = _as_local_path(dst_abs)
-            dedup.update_path(
-                old_path=db_path,
-                new_path=new_db_path,
-                new_name=os.path.basename(dst_abs),
-                new_parent_path=_as_local_path(os.path.dirname(dst_abs)),
-            )
-            store.update_file_path(old_file_path=db_path, new_file_path=new_db_path)
+            if not dry_run:
+                new_db_path = _as_local_path(dst_abs)
+                dedup.update_path(
+                    old_path=db_path,
+                    new_path=new_db_path,
+                    new_name=os.path.basename(dst_abs),
+                    new_parent_path=_as_local_path(os.path.dirname(dst_abs)),
+                )
+                store.update_file_path(old_file_path=db_path, new_file_path=new_db_path)
             if pipeline is not None and pipeline_run_id is not None:
                 pipeline.update_run(run_id=int(pipeline_run_id), last_src_path="", last_dst_path="")
     finally:
@@ -770,14 +773,15 @@ def sort_no_faces_by_geo_year(
                 pipeline.update_run(run_id=int(pipeline_run_id), last_src_path=src_abs, last_dst_path=dst_abs)
             _move_file(src=src_abs, dst=dst_abs, dry_run=dry_run)
 
-            new_db_path = _as_local_path(dst_abs)
-            dedup.update_path(
-                old_path=_as_local_path(src_abs),
-                new_path=new_db_path,
-                new_name=os.path.basename(dst_abs),
-                new_parent_path=_as_local_path(os.path.dirname(dst_abs)),
-            )
-            store.update_file_path(old_file_path=_as_local_path(src_abs), new_file_path=new_db_path)
+            if not dry_run:
+                new_db_path = _as_local_path(dst_abs)
+                dedup.update_path(
+                    old_path=_as_local_path(src_abs),
+                    new_path=new_db_path,
+                    new_name=os.path.basename(dst_abs),
+                    new_parent_path=_as_local_path(os.path.dirname(dst_abs)),
+                )
+                store.update_file_path(old_file_path=_as_local_path(src_abs), new_file_path=new_db_path)
             if pipeline is not None and pipeline_run_id is not None:
                 pipeline.update_run(run_id=int(pipeline_run_id), last_src_path="", last_dst_path="")
             stats.moved_no_faces_by_geo_year += 1
@@ -837,7 +841,10 @@ def main() -> int:
             raise
 
         # Если упали между move и update_path — добиваем последнюю транзакцию (best-effort).
+        # В dry-run мы не двигаем файлы и не должны менять пути в БД.
         try:
+            if dry_run:
+                raise RuntimeError("skip_fixup_in_dry_run")
             src0 = str(pr.get("last_src_path") or "")
             dst0 = str(pr.get("last_dst_path") or "")
             if src0 and dst0 and (not os.path.exists(src0)) and os.path.exists(dst0):
