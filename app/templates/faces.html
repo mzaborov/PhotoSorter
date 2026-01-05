@@ -93,6 +93,7 @@
           <code id="lbPath">—</code>
           <div class="lb-actions">
             <span class="pill" id="lbMode">просмотр</span>
+            <button class="btn" id="lbAnnotate" type="button" style="display:none;">Разметить</button>
             <button class="btn" id="lbClear" type="button" style="display:none;">Очистить</button>
             <button class="btn" id="lbSave" type="button" style="display:none;">Сохранить</button>
             <button class="btn" id="lbClose" type="button">Закрыть</button>
@@ -281,6 +282,7 @@
       const lbCtx = lbCanvas.getContext("2d");
       const lbPath = qs("#lbPath");
       const lbMode = qs("#lbMode");
+      const lbAnnotate = qs("#lbAnnotate");
       const lbClear = qs("#lbClear");
       const lbSave = qs("#lbSave");
       const rectList = qs("#rectList");
@@ -291,11 +293,13 @@
       let dragging = false;
       let dragStart = null;
       let tempRect = null;
+      let curSrc = "";
 
       function closeLb() {
         lb.classList.remove("open");
         lb.setAttribute("aria-hidden","true");
         curPath = "";
+        curSrc = "";
         curAutoRects = [];
         curManualRects = [];
         drawEnabled = false;
@@ -303,6 +307,7 @@
         dragStart = null;
         tempRect = null;
         lbCanvas.classList.remove("draw-on");
+        if (lbAnnotate) lbAnnotate.style.display = "none";
       }
       qs("#lbClose").onclick = closeLb;
       lb.addEventListener("click", (e) => { if (e.target === lb) closeLb(); });
@@ -363,14 +368,18 @@
 
       async function openViewer(path, src, opts={}) {
         curPath = path;
+        curSrc = src || "";
         lbPath.textContent = path;
         lbImg.referrerPolicy = "no-referrer";
         lbImg.draggable = false;
         lbImg.src = src;
-        lbMode.textContent = (opts.mode === "annotate") ? "разметка" : "просмотр";
-        lbClear.style.display = (opts.mode === "annotate") ? "" : "none";
-        lbSave.style.display = (opts.mode === "annotate") ? "" : "none";
-        drawEnabled = (opts.mode === "annotate");
+        const isAnnotate = (opts.mode === "annotate");
+        lbMode.textContent = isAnnotate ? "разметка" : "просмотр";
+        lbClear.style.display = isAnnotate ? "" : "none";
+        lbSave.style.display = isAnnotate ? "" : "none";
+        // В режиме просмотра показываем кнопку "Разметить" (только для картинок)
+        if (lbAnnotate) lbAnnotate.style.display = (!isAnnotate && !!curSrc) ? "" : "none";
+        drawEnabled = isAnnotate;
         lbCanvas.classList.toggle("draw-on", !!drawEnabled);
 
         lb.classList.add("open");
@@ -387,6 +396,22 @@
         curManualRects = rr.manual || [];
         renderRectList();
         drawOverlay();
+      }
+
+      // Переключение "просмотр" -> "разметка" прямо в модалке
+      if (lbAnnotate) {
+        lbAnnotate.onclick = async () => {
+          if (!curPath || !curSrc) return;
+          // Просто перевключаем UI-флаги, прямоугольники уже загружены в curAutoRects/curManualRects
+          lbMode.textContent = "разметка";
+          lbClear.style.display = "";
+          lbSave.style.display = "";
+          lbAnnotate.style.display = "none";
+          drawEnabled = true;
+          lbCanvas.classList.add("draw-on");
+          drawOverlay();
+          setToast("Режим разметки: потяни мышью по картинке, чтобы добавить прямоугольник.");
+        };
       }
 
       function screenToNatural(pt) {
