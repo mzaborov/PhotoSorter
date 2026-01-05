@@ -149,6 +149,50 @@ def init_db():
             "faces_count": "faces_count INTEGER",
             "faces_run_id": "faces_run_id INTEGER",
             "faces_scanned_at": "faces_scanned_at TEXT",
+            # Ручные правки (UI шага 2: лица/нет лиц)
+            # faces_manual_label: 'faces'|'no_faces'|NULL
+            "faces_manual_label": "faces_manual_label TEXT",
+            "faces_manual_at": "faces_manual_at TEXT",
+        },
+    )
+
+    # --- Pipeline: единый конвейер сортировки локальной папки с resume ---
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pipeline_runs (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind            TEXT NOT NULL,        -- 'local_sort'
+            root_path        TEXT NOT NULL,        -- 'C:\\Photos'
+            status           TEXT NOT NULL,        -- 'running'|'completed'|'failed'
+            step_num         INTEGER NOT NULL DEFAULT 0,
+            step_total       INTEGER NOT NULL DEFAULT 0,
+            step_title       TEXT,
+            apply            INTEGER NOT NULL DEFAULT 0,
+            skip_dedup       INTEGER NOT NULL DEFAULT 0,
+            dedup_run_id     INTEGER,
+            face_run_id      INTEGER,
+            pid              INTEGER,
+            last_src_path    TEXT,
+            last_dst_path    TEXT,
+            last_error       TEXT,
+            log_tail         TEXT,
+            started_at       TEXT NOT NULL,
+            updated_at       TEXT NOT NULL,
+            finished_at      TEXT
+        );
+        """
+    )
+
+    _ensure_columns(
+        conn,
+        "pipeline_runs",
+        {
+            "kind": "kind TEXT NOT NULL DEFAULT 'local_sort'",
+            "pid": "pid INTEGER",
+            "last_src_path": "last_src_path TEXT",
+            "last_dst_path": "last_dst_path TEXT",
+            "log_tail": "log_tail TEXT",
+            "updated_at": "updated_at TEXT",
         },
     )
 
@@ -247,6 +291,70 @@ class FaceStore:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_rect_run ON face_rectangles(run_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_rect_file ON face_rectangles(file_path);")
 
+        # Ручная разметка (UI шага 2: корректировка лиц/нет лиц)
+        _ensure_columns(
+            self.conn,
+            "face_rectangles",
+            {
+                "is_manual": "is_manual INTEGER NOT NULL DEFAULT 0",
+                "manual_created_at": "manual_created_at TEXT",
+            },
+        )
+
+        self.conn.commit()
+
+    def list_rectangles(self, *, run_id: int, file_path: str) -> list[dict[str, Any]]:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT
+              id, run_id, file_path, face_index,
+              bbox_x, bbox_y, bbox_w, bbox_h,
+              confidence, presence_score,
+              manual_person, ignore_flag,
+              created_at,
+              COALESCE(is_manual, 0) AS is_manual,
+              manual_created_at
+            FROM face_rectangles
+            WHERE run_id = ? AND file_path = ?
+            ORDER BY COALESCE(is_manual, 0) ASC, face_index ASC, id ASC
+            """,
+            (int(run_id), str(file_path)),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def replace_manual_rectangles(self, *, run_id: int, file_path: str, rects: list[dict[str, int]]) -> None:
+        """
+        Заменяет ручные прямоугольники для файла (run_id + file_path).
+        rects: [{"x":int,"y":int,"w":int,"h":int}, ...]
+        """
+        now = _now_utc_iso()
+        cur = self.conn.cursor()
+        cur.execute(
+            "DELETE FROM face_rectangles WHERE run_id = ? AND file_path = ? AND COALESCE(is_manual, 0) = 1",
+            (int(run_id), str(file_path)),
+        )
+        for i, r in enumerate(rects or []):
+            x = int(r.get("x") or 0)
+            y = int(r.get("y") or 0)
+            w = int(r.get("w") or 0)
+            h = int(r.get("h") or 0)
+            if w <= 0 or h <= 0:
+                continue
+            cur.execute(
+                """
+                INSERT INTO face_rectangles(
+                  run_id, file_path, face_index,
+                  bbox_x, bbox_y, bbox_w, bbox_h,
+                  confidence, presence_score,
+                  thumb_jpeg, manual_person, ignore_flag,
+                  created_at,
+                  is_manual, manual_created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, ?, 1, ?)
+                """,
+                (int(run_id), str(file_path), int(i), x, y, w, h, now, now),
+            )
         self.conn.commit()
 
     def create_run(self, *, scope: str, root_path: str, total_files: int | None) -> int:
@@ -260,6 +368,12 @@ class FaceStore:
         )
         self.conn.commit()
         return int(cur.lastrowid)
+
+    def get_run_by_id(self, *, run_id: int) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM face_runs WHERE id = ? LIMIT 1", (int(run_id),))
+        row = cur.fetchone()
+        return dict(row) if row else None
 
     def finish_run(self, *, run_id: int, status: str, last_error: str | None = None) -> None:
         cur = self.conn.cursor()
@@ -451,6 +565,20 @@ class DedupStore:
             """,
             (status, _now_utc_iso(), last_error, run_id),
         )
+        # Если прогон завершён, но processed_files не успели "догнать" total_files,
+        # доводим до консистентного состояния (иначе UI показывает 0% при completed).
+        if str(status) == "completed":
+            cur.execute(
+                """
+                UPDATE dedup_runs
+                SET processed_files = CASE
+                    WHEN total_files IS NOT NULL AND processed_files < total_files THEN total_files
+                    ELSE processed_files
+                END
+                WHERE id = ?
+                """,
+                (int(run_id),),
+            )
         self.conn.commit()
 
     def update_run_progress(
@@ -507,6 +635,622 @@ class DedupStore:
         )
         row = cur.fetchone()
         return dict(row) if row else None
+
+    def get_run_by_id(self, *, run_id: int) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM dedup_runs WHERE id = ? LIMIT 1", (int(run_id),))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    # --- yd_files helpers (инвентарь/хэши/дубли) ---
+    #
+    # Эти методы нужны и Web UI (дедуп архива/источника), и локальному конвейеру
+    # (dedup локальной папки + idempotent update_path). Ранее они оказались
+    # внутри PipelineStore, из-за чего DedupStore падал с AttributeError.
+
+    def upsert_file(
+        self,
+        *,
+        run_id: int,
+        path: str,
+        resource_id: str | None = None,
+        inventory_scope: str | None = None,
+        name: str | None,
+        parent_path: str | None,
+        size: int | None,
+        created: str | None,
+        modified: str | None,
+        mime_type: str | None,
+        media_type: str | None,
+        hash_alg: str | None,
+        hash_value: str | None,
+        hash_source: str | None,
+        status: str,
+        error: str | None,
+        scanned_at: str | None = None,
+        hashed_at: str | None = None,
+    ) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO yd_files(
+              path, resource_id, inventory_scope, name, parent_path, size, created, modified, mime_type, media_type,
+              hash_alg, hash_value, hash_source, status, error, scanned_at, hashed_at, last_run_id
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+              resource_id = COALESCE(excluded.resource_id, yd_files.resource_id),
+              inventory_scope = COALESCE(excluded.inventory_scope, yd_files.inventory_scope),
+              name = excluded.name,
+              parent_path = excluded.parent_path,
+              size = excluded.size,
+              created = excluded.created,
+              modified = excluded.modified,
+              mime_type = excluded.mime_type,
+              media_type = excluded.media_type,
+              hash_alg = COALESCE(excluded.hash_alg, yd_files.hash_alg),
+              hash_value = COALESCE(excluded.hash_value, yd_files.hash_value),
+              hash_source = COALESCE(excluded.hash_source, yd_files.hash_source),
+              status = excluded.status,
+              error = excluded.error,
+              scanned_at = excluded.scanned_at,
+              hashed_at = COALESCE(excluded.hashed_at, yd_files.hashed_at),
+              last_run_id = excluded.last_run_id
+            """,
+            (
+                path,
+                resource_id,
+                inventory_scope,
+                name,
+                parent_path,
+                size,
+                created,
+                modified,
+                mime_type,
+                media_type,
+                hash_alg,
+                hash_value,
+                hash_source,
+                status,
+                error,
+                scanned_at or _now_utc_iso(),
+                hashed_at,
+                run_id,
+            ),
+        )
+        self.conn.commit()
+
+    def get_existing_hash(self, *, path: str) -> tuple[str | None, str | None]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT hash_alg, hash_value FROM yd_files WHERE path = ? LIMIT 1", (path,))
+        row = cur.fetchone()
+        if not row:
+            return None, None
+        return (row["hash_alg"], row["hash_value"])
+
+    def list_dup_groups_archive(self) -> list[dict[str, Any]]:
+        """
+        Возвращает группы дублей для архива YaDisk (inventory_scope='archive').
+        Группа = одинаковый (hash_alg, hash_value), где количество файлов > 1.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT
+              hash_alg,
+              hash_value,
+              COUNT(*) AS cnt
+            FROM yd_files
+            WHERE
+              hash_value IS NOT NULL
+              AND COALESCE(inventory_scope, 'archive') = 'archive'
+              AND status != 'deleted'
+            GROUP BY hash_alg, hash_value
+            HAVING COUNT(*) > 1
+            ORDER BY cnt DESC, hash_alg ASC
+            """
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_group_items(self, *, hash_alg: str, hash_value: str, inventory_scope: str | None = None, last_run_id: int | None = None) -> list[dict[str, Any]]:
+        cur = self.conn.cursor()
+        where: list[str] = ["hash_alg = ? AND hash_value = ?", "status != 'deleted'"]
+        params: list[Any] = [hash_alg, hash_value]
+        if inventory_scope is not None:
+            where.append("inventory_scope = ?")
+            params.append(inventory_scope)
+        if last_run_id is not None:
+            where.append("last_run_id = ?")
+            params.append(last_run_id)
+        cur.execute(
+            f"""
+            SELECT path, name, parent_path, size, modified, mime_type, media_type, hash_source
+            FROM yd_files
+            WHERE {' AND '.join(where)}
+            ORDER BY path ASC
+            """,
+            params,
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def set_ignore_archive_dup(self, *, paths: list[str], run_id: int) -> int:
+        """
+        Помечает source-файлы как "не дубль архива" ДЛЯ ТЕКУЩЕГО source run_id.
+        При новом пересканировании source run_id изменится — пометка автоматически перестанет действовать.
+        """
+        if not paths:
+            return 0
+        cur = self.conn.cursor()
+        q = ",".join(["?"] * len(paths))
+        cur.execute(
+            f"""
+            UPDATE yd_files
+            SET ignore_archive_dup_run_id = ?
+            WHERE path IN ({q})
+            """,
+            [run_id, *paths],
+        )
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
+    def list_source_dups_in_archive(self, *, source_run_id: int, archive_prefix: str = "disk:/Фото") -> list[dict[str, Any]]:
+        """
+        Возвращает пары (source file -> archive matches) по совпадающему хэшу.
+        Источник ограничиваем last_run_id=source_run_id, чтобы не смешивать разные выборы папки.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT
+              s.path AS source_path,
+              s.name AS source_name,
+              s.size AS source_size,
+              s.mime_type AS source_mime_type,
+              s.media_type AS source_media_type,
+              s.hash_alg AS hash_alg,
+              s.hash_value AS hash_value,
+              a.path AS archive_path,
+              a.name AS archive_name,
+              a.size AS archive_size,
+              a.mime_type AS archive_mime_type,
+              a.media_type AS archive_media_type
+            FROM yd_files s
+            JOIN yd_files a
+              ON a.hash_alg = s.hash_alg AND a.hash_value = s.hash_value
+            WHERE
+              s.inventory_scope = 'source'
+              AND s.last_run_id = ?
+              AND s.status != 'deleted'
+              AND s.hash_value IS NOT NULL
+              AND COALESCE(s.ignore_archive_dup_run_id, -1) != ?
+              AND COALESCE(a.inventory_scope, 'archive') = 'archive'
+              AND a.status != 'deleted'
+              AND a.hash_value IS NOT NULL
+              AND a.path LIKE ?
+            ORDER BY s.path ASC, a.path ASC
+            """,
+            (source_run_id, source_run_id, f"{archive_prefix.rstrip('/')}/%"),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_dup_groups_for_run(self, *, inventory_scope: str, run_id: int) -> list[dict[str, Any]]:
+        """
+        Группы дублей ВНУТРИ конкретного прогона (run_id) выбранного scope.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT
+              hash_alg,
+              hash_value,
+              COUNT(*) AS cnt
+            FROM yd_files
+            WHERE
+              hash_value IS NOT NULL
+              AND inventory_scope = ?
+              AND last_run_id = ?
+              AND status != 'deleted'
+            GROUP BY hash_alg, hash_value
+            HAVING COUNT(*) > 1
+            ORDER BY cnt DESC, hash_alg ASC
+            """,
+            (inventory_scope, run_id),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def path_exists(self, *, path: str) -> bool:
+        cur = self.conn.cursor()
+        cur.execute("SELECT 1 FROM yd_files WHERE path = ? LIMIT 1", (path,))
+        return cur.fetchone() is not None
+
+    def mark_deleted(self, *, paths: list[str]) -> int:
+        """
+        Помечает файлы как удалённые (в корзину/удалены на стороне YaDisk), чтобы они
+        исчезали из /duplicates без перескана.
+        """
+        if not paths:
+            return 0
+        cur = self.conn.cursor()
+        q = ",".join(["?"] * len(paths))
+        cur.execute(f"UPDATE yd_files SET status = 'deleted', error = NULL WHERE path IN ({q})", paths)
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
+    def update_path(self, *, old_path: str, new_path: str, new_name: str | None, new_parent_path: str | None) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            UPDATE yd_files
+            SET path = ?, name = COALESCE(?, name), parent_path = COALESCE(?, parent_path)
+            WHERE path = ?
+            """,
+            (new_path, new_name, new_parent_path, old_path),
+        )
+        self.conn.commit()
+
+    def set_faces_summary(self, *, path: str, faces_run_id: int, faces_count: int, faces_scanned_at: str | None = None) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            UPDATE yd_files
+            SET faces_count = ?, faces_run_id = ?, faces_scanned_at = ?
+            WHERE path = ?
+            """,
+            (int(faces_count), int(faces_run_id), faces_scanned_at or _now_utc_iso(), path),
+        )
+        self.conn.commit()
+
+    def set_faces_manual_label(self, *, path: str, label: str | None) -> None:
+        """
+        Ручная правка результата "лица/нет лиц" для файла.
+        label: 'faces' | 'no_faces' | None (сброс)
+        """
+        lab = (label or "").strip().lower()
+        if lab == "":
+            lab = ""
+        if lab not in ("", "faces", "no_faces"):
+            raise ValueError("label must be one of: faces, no_faces, (empty)")
+        cur = self.conn.cursor()
+        if lab == "":
+            cur.execute(
+                """
+                UPDATE yd_files
+                SET faces_manual_label = NULL, faces_manual_at = NULL
+                WHERE path = ?
+                """,
+                (path,),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE yd_files
+                SET faces_manual_label = ?, faces_manual_at = ?
+                WHERE path = ?
+                """,
+                (lab, _now_utc_iso(), path),
+            )
+        self.conn.commit()
+
+    def get_row_by_resource_id(self, *, resource_id: str) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM yd_files WHERE resource_id = ? LIMIT 1", (resource_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_row_by_path(self, *, path: str) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM yd_files WHERE path = ? LIMIT 1", (path,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def reconcile_upsert_present_file(
+        self,
+        *,
+        run_id: int,
+        path: str,
+        resource_id: str | None,
+        inventory_scope: str,
+        name: str | None,
+        parent_path: str | None,
+        size: int | None,
+        created: str | None,
+        modified: str | None,
+        mime_type: str | None,
+        media_type: str | None,
+    ) -> None:
+        """
+        Сверка архива: файл "присутствует" в текущем скане YaDisk.
+
+        - Если запись уже есть (по resource_id, иначе по path): обновляем метаданные.
+        - Если size/modified изменились: сбрасываем hash_* и переводим status в 'new' (нужно пересчитать).
+        - Если запись была 'deleted', но файл снова найден: "воскрешаем" (status='hashed' если hash есть, иначе 'new').
+        - Если это новый файл: создаём запись со status='new'.
+        """
+        cur = self.conn.cursor()
+
+        existing: dict[str, Any] | None = None
+        if resource_id:
+            existing = self.get_row_by_resource_id(resource_id=resource_id)
+        if not existing:
+            existing = self.get_row_by_path(path=path)
+
+        now = _now_utc_iso()
+
+        if not existing:
+            cur.execute(
+                """
+                INSERT INTO yd_files(
+                  path, resource_id, inventory_scope, name, parent_path, size, created, modified, mime_type, media_type,
+                  hash_alg, hash_value, hash_source, status, error, scanned_at, hashed_at, last_run_id
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'new', NULL, ?, NULL, ?)
+                """,
+                (path, resource_id, inventory_scope, name, parent_path, size, created, modified, mime_type, media_type, now, run_id),
+            )
+            return
+
+        existing_id = int(existing["id"])
+        existing_path = str(existing.get("path") or "")
+        existing_size = existing.get("size")
+        existing_modified = str(existing.get("modified") or "") or None
+        existing_hash_value = str(existing.get("hash_value") or "") or None
+        existing_status = str(existing.get("status") or "") or "new"
+
+        # Если путь изменился, но новый путь уже занят другой строкой — пометим конфликтную строку deleted.
+        if existing_path != path:
+            cur.execute("SELECT id, resource_id, status FROM yd_files WHERE path = ? LIMIT 1", (path,))
+            other = cur.fetchone()
+            if other and int(other["id"]) != existing_id:
+                cur.execute(
+                    "UPDATE yd_files SET status='deleted', error=NULL WHERE id = ?",
+                    (int(other["id"]),),
+                )
+
+        size_changed = (existing_size is None) != (size is None) or (existing_size is not None and size is not None and int(existing_size) != int(size))
+        mod_changed = (existing_modified is None) != (modified is None) or (existing_modified is not None and modified is not None and existing_modified != modified)
+        content_changed = bool(size_changed or mod_changed)
+
+        if content_changed:
+            # Содержимое могло поменяться -> сбрасываем хэш и (на всякий случай) длительность.
+            cur.execute(
+                """
+                UPDATE yd_files
+                SET
+                  path = ?,
+                  resource_id = COALESCE(?, resource_id),
+                  inventory_scope = COALESCE(?, inventory_scope),
+                  name = ?,
+                  parent_path = ?,
+                  size = ?,
+                  created = ?,
+                  modified = ?,
+                  mime_type = ?,
+                  media_type = ?,
+                  status = 'new',
+                  error = NULL,
+                  scanned_at = ?,
+                  last_run_id = ?,
+                  hash_alg = NULL,
+                  hash_value = NULL,
+                  hash_source = NULL,
+                  hashed_at = NULL,
+                  duration_sec = NULL,
+                  duration_source = NULL,
+                  duration_at = NULL
+                WHERE id = ?
+                """,
+                (
+                    path,
+                    resource_id,
+                    inventory_scope,
+                    name,
+                    parent_path,
+                    size,
+                    created,
+                    modified,
+                    mime_type,
+                    media_type,
+                    now,
+                    run_id,
+                    existing_id,
+                ),
+            )
+        else:
+            new_status = existing_status
+            if new_status == "deleted":
+                new_status = "hashed" if existing_hash_value else "new"
+            cur.execute(
+                """
+                UPDATE yd_files
+                SET
+                  path = ?,
+                  resource_id = COALESCE(?, resource_id),
+                  inventory_scope = COALESCE(?, inventory_scope),
+                  name = ?,
+                  parent_path = ?,
+                  size = ?,
+                  created = ?,
+                  modified = ?,
+                  mime_type = ?,
+                  media_type = ?,
+                  status = ?,
+                  error = NULL,
+                  scanned_at = ?,
+                  last_run_id = ?
+                WHERE id = ?
+                """,
+                (
+                    path,
+                    resource_id,
+                    inventory_scope,
+                    name,
+                    parent_path,
+                    size,
+                    created,
+                    modified,
+                    mime_type,
+                    media_type,
+                    new_status,
+                    now,
+                    run_id,
+                    existing_id,
+                ),
+            )
+        # Коммитим батчами снаружи (через update_run_progress/finish_run), чтобы сверка работала быстрее.
+
+    def get_duration(self, *, path: str) -> int | None:
+        cur = self.conn.cursor()
+        cur.execute("SELECT duration_sec FROM yd_files WHERE path = ? LIMIT 1", (path,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        val = row[0]
+        return int(val) if isinstance(val, (int, float)) else None
+
+    def set_duration(self, *, path: str, duration_sec: int | None, source: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            UPDATE yd_files
+            SET duration_sec = ?, duration_source = ?, duration_at = ?
+            WHERE path = ?
+            """,
+            (duration_sec, source, _now_utc_iso(), path),
+        )
+        self.conn.commit()
+
+
+class PipelineStore:
+    """
+    Хранилище прогонов единого конвейера сортировки (resume после рестарта).
+
+    Важно: запись в pipeline_runs — это "текущая правда" для UI, поэтому держим log_tail
+    и updated_at в БД, а не только в памяти процесса.
+    """
+
+    def __init__(self) -> None:
+        init_db()
+        self.conn = get_connection()
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def create_run(self, *, kind: str, root_path: str, apply: bool, skip_dedup: bool) -> int:
+        cur = self.conn.cursor()
+        now = _now_utc_iso()
+        cur.execute(
+            """
+            INSERT INTO pipeline_runs(kind, root_path, status, step_num, step_total, step_title,
+                                      apply, skip_dedup, started_at, updated_at, log_tail)
+            VALUES(?, ?, 'running', 0, 0, NULL, ?, ?, ?, ?, '')
+            """,
+            (str(kind), str(root_path), 1 if apply else 0, 1 if skip_dedup else 0, now, now),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def get_run_by_id(self, *, run_id: int) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM pipeline_runs WHERE id = ? LIMIT 1", (int(run_id),))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_latest_run(self, *, kind: str, root_path: str) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT *
+            FROM pipeline_runs
+            WHERE kind = ? AND root_path = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (str(kind), str(root_path)),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_latest_any(self, *, kind: str) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT *
+            FROM pipeline_runs
+            WHERE kind = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (str(kind),),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def update_run(
+        self,
+        *,
+        run_id: int,
+        status: str | None = None,
+        step_num: int | None = None,
+        step_total: int | None = None,
+        step_title: str | None = None,
+        dedup_run_id: int | None = None,
+        face_run_id: int | None = None,
+        pid: int | None = None,
+        last_src_path: str | None = None,
+        last_dst_path: str | None = None,
+        last_error: str | None = None,
+        finished_at: str | None = None,
+    ) -> None:
+        fields: list[str] = []
+        params: list[Any] = []
+
+        def _set(key: str, val: Any) -> None:
+            fields.append(f"{key} = ?")
+            params.append(val)
+
+        if status is not None:
+            _set("status", str(status))
+        if step_num is not None:
+            _set("step_num", int(step_num))
+        if step_total is not None:
+            _set("step_total", int(step_total))
+        if step_title is not None:
+            _set("step_title", str(step_title))
+        if dedup_run_id is not None:
+            _set("dedup_run_id", int(dedup_run_id))
+        if face_run_id is not None:
+            _set("face_run_id", int(face_run_id))
+        if pid is not None:
+            _set("pid", int(pid))
+        if last_src_path is not None:
+            _set("last_src_path", str(last_src_path))
+        if last_dst_path is not None:
+            _set("last_dst_path", str(last_dst_path))
+        if last_error is not None:
+            _set("last_error", str(last_error))
+        if finished_at is not None:
+            _set("finished_at", str(finished_at))
+
+        # updated_at всегда двигаем при любом update
+        _set("updated_at", _now_utc_iso())
+
+        if not fields:
+            return
+        params.append(int(run_id))
+        cur = self.conn.cursor()
+        cur.execute(f"UPDATE pipeline_runs SET {', '.join(fields)} WHERE id = ?", params)
+        self.conn.commit()
+
+    def append_log(self, *, run_id: int, line: str, max_chars: int = 120_000) -> None:
+        cur = self.conn.cursor()
+        cur.execute("SELECT log_tail FROM pipeline_runs WHERE id = ? LIMIT 1", (int(run_id),))
+        row = cur.fetchone()
+        s = (row["log_tail"] if row and row["log_tail"] is not None else "") + (line or "")
+        s = s.replace("\r\n", "\n")
+        if len(s) > max_chars:
+            s = s[-max_chars:]
+        cur.execute("UPDATE pipeline_runs SET log_tail = ?, updated_at = ? WHERE id = ?", (s, _now_utc_iso(), int(run_id)))
+        self.conn.commit()
 
     def upsert_file(
         self,

@@ -53,6 +53,10 @@
       .keep { margin-top: 8px; display: flex; gap: 8px; align-items: center; }
       .keep input { transform: scale(1.1); }
       pre.log { margin: 10px 0 0 0; padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 12px; background: #f9fafb; white-space: pre-wrap; max-height: 260px; overflow: auto; font-size: 12px; }
+      details { margin-top: 10px; }
+      details > summary { cursor: pointer; user-select: none; font-weight: 700; }
+      .bar { height: 10px; background: #f3f4f6; border-radius: 999px; overflow: hidden; border: 1px solid #e5e7eb; }
+      .bar > div { height: 100%; width: 0%; background: #0b57d0; transition: width 200ms linear; }
 
       /* Lightbox */
       .lb { position: fixed; inset: 0; background: rgba(17,24,39,0.82); display: none; align-items: center; justify-content: center; padding: 18px; z-index: 9999; }
@@ -72,7 +76,7 @@
         <div class="row" style="justify-content: space-between;">
           <div>
             <h2 style="margin: 0;">PhotoSorter — основная форма сортировки</h2>
-            <div class="muted" style="margin-top: 6px;">Шаг 1: “уже есть в архиве” · Шаг 2: “дубли внутри папки”</div>
+            <div class="muted" style="margin-top: 6px;" id="subtitle">Шаг 1: “уже есть в архиве” · Шаг 2: “дубли внутри папки”</div>
           </div>
           <div class="row">
             <a href="/folders" class="muted">Фотоархив</a>
@@ -99,29 +103,56 @@
         <div class="section" id="secLocalPipeline" style="display:none;">
           <div class="row" style="justify-content: space-between;">
             <div>
-              <h3>Локальный конвейер (quick win)</h3>
-              <div class="muted">Дедуп → лица/не лица → лица по именам (manual) → не‑лица по GPS+год (EXIF/mtime).</div>
+              <h3>Процесс сортировки локальной папки</h3>
+              <div class="muted">Дубликаты всегда складываем в <code>_duplicates</code>. Удаление делаем позже из формы дублей.</div>
             </div>
             <div class="row">
-              <button id="btnPipeDry" class="btn" type="button">Запустить (dry-run)</button>
-              <button id="btnPipeApply" class="btn danger" type="button">Запустить (APPLY)</button>
+              <span class="pill">статус: <b id="pipeStatus">—</b></span>
+              <span class="pill">run: <b id="pipeRunId">—</b></span>
             </div>
           </div>
           <div class="row" style="margin-top: 10px;">
-            <label style="font-weight: 600;"><input id="pipeSkipDedup" type="checkbox" /> пропустить дедуп</label>
-            <label style="font-weight: 600;"><input id="pipeNoDedupMove" type="checkbox" /> не переносить дубликаты в <code>_duplicates</code></label>
-            <span class="pill">статус: <b id="pipeStatus">—</b></span>
+            <label style="font-weight: 600;"><input id="pipeApply" type="checkbox" /> APPLY (двигаем файлы)</label>
+            <button class="btn" id="btnPipeResume" type="button" disabled title="Продолжить последний незавершённый прогон (если есть)">Продолжить</button>
+            <button class="btn primary" id="btnPipeStartNew" type="button">Начать заново</button>
           </div>
-          <pre id="pipeLog" class="log">—</pre>
+
+          <div style="margin-top: 12px;">
+            <div class="muted" style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+              <span>Шаг 1 — Дедупликация (внутри папки)</span>
+              <a class="pill" id="pipeDedupLink" href="/dedup-results" target="_blank" rel="noopener noreferrer">Результаты</a>
+            </div>
+            <div class="bar" aria-label="dedup progress"><div id="pipeBar1Fill"></div></div>
+            <div class="muted" id="pipeStep1Text" style="margin-top: 6px;">—</div>
+          </div>
+
+          <div style="margin-top: 12px;">
+            <div class="muted" style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+              <span>Шаг 2 — Лица / нет лиц (скан + разложение)</span>
+              <a class="pill" id="pipeFacesLink" href="/faces" style="display:none;" target="_blank" rel="noopener noreferrer">Результаты</a>
+            </div>
+            <div class="bar" aria-label="faces/no-faces progress"><div id="pipeBar2Fill"></div></div>
+            <div class="muted" id="pipeStep2Text" style="margin-top: 6px;">—</div>
+          </div>
+
+          <div class="muted" id="pipeSummary" style="margin-top: 10px;">—</div>
+          <details id="pipeDetails">
+            <summary class="muted">Показать детали (лог)</summary>
+            <pre id="pipeLog" class="log">—</pre>
+          </details>
         </div>
 
-        <div class="section">
+        <div class="section" id="secDedup">
+          <h3 style="margin-top: 0;">Дедупликация</h3>
+          <div class="muted">Два подшага: сверить дубли с фотоархивом и сверить дубли внутри исходной папки.</div>
+
+        <div class="section" id="secLegacyCounters">
           <div class="row" style="justify-content: space-between;">
             <div>
               <div class="muted">Лишних копий (найдено):</div>
               <div class="row" style="margin-top: 6px;">
-                <span class="pill">шаг 1: <b id="cntStep1">—</b></span>
-                <span class="pill">шаг 2: <b id="cntStep2">—</b></span>
+                <span class="pill">подшаг A: <b id="cntStep1">—</b></span>
+                <span class="pill">подшаг B: <b id="cntStep2">—</b></span>
                 <span class="pill">итого: <b id="cntTotal">—</b></span>
               </div>
             </div>
@@ -131,8 +162,8 @@
         <div class="section" id="secStep1">
           <div class="row" style="justify-content: space-between;">
             <div>
-              <h3>Шаг 1 — Уже есть в архиве</h3>
-              <div class="muted">Source-файлы, которые совпали по содержимому с архивом <code>disk:/Фото</code>.</div>
+              <h3>Подшаг A — Дубли с фотоархивом</h3>
+              <div class="muted">Сверяем исходную папку с фотоархивом <code>disk:/Фото</code> по содержимому (хэши).</div>
             </div>
             <div class="row">
               <button id="btnStep1Del" class="btn danger" type="button" disabled>Удалить выбранные (0)</button>
@@ -141,6 +172,11 @@
             </div>
           </div>
           <div class="muted" style="margin-top: 8px;">run: <span class="pill" id="runStep1">—</span> · источник: <code id="rootStep1">—</code></div>
+          <div class="status" style="margin-top: 10px;">
+            <div class="muted">Статус скана (для сравнения по хэшу):</div>
+            <div><span class="pill">Источник</span> <span id="srcStatus">…</span></div>
+            <div><span class="pill">Фотоархив</span> <span id="arcStatus">…</span></div>
+          </div>
           <table>
             <thead>
               <tr>
@@ -159,7 +195,7 @@
         <div class="section" id="secStep2">
           <div class="row" style="justify-content: space-between;">
             <div>
-              <h3>Шаг 2 — Дубли внутри папки (source)</h3>
+              <h3>Подшаг B — Дубли внутри исходной папки</h3>
               <div class="muted">Группы дублей внутри выбранного источника. По умолчанию “оставляем 1”.</div>
             </div>
             <div class="row">
@@ -186,11 +222,7 @@
           </table>
         </div>
 
-        <div class="status" style="margin-top: 12px;">
-          <div class="muted">Статус прогона:</div>
-          <div><span class="pill">source</span> <span id="srcStatus">…</span></div>
-          <div><span class="pill">archive</span> <span id="arcStatus">…</span></div>
-        </div>
+        </div> <!-- /secDedup -->
       </div>
     </div>
 
@@ -224,6 +256,19 @@
         const sec = qs("#secLocalPipeline");
         if (!sec) return;
         sec.style.display = (loc === "local") ? "block" : "none";
+
+        // Для локального конвейера скрываем YaDisk-часть формы, чтобы UX был однозначным.
+        const hint = qs("#hint");
+        if (hint) hint.style.display = (loc === "yadisk") ? "block" : "none";
+        const btnSort = qs("#btnSort");
+        if (btnSort) btnSort.style.display = (loc === "yadisk") ? "inline-block" : "none";
+        const dedup = qs("#secDedup");
+        if (dedup) dedup.style.display = (loc === "yadisk") ? "block" : "none";
+
+        // При входе в local — сразу обновим статус (идёт/завершено/ошибка), чтобы было понятно, нужно ли запускать заново.
+        if (loc === "local" && !pipePollTimer) {
+          pipePollOnce();
+        }
       }
       async function fetchJson(url, opts) {
         const resp = await fetch(url, opts || { cache: "no-store" });
@@ -376,47 +421,176 @@
       }
 
       let pipePollTimer = null;
+      function isLocalSelected() { return getLocation() === "local"; }
       async function pipePollOnce() {
         try {
           const st = await fetchJson("/api/local-pipeline/status", { cache: "no-store" });
-          qs("#pipeStatus").textContent = st.running ? "running" : (st.exit_code === 0 ? "done" : (st.exit_code != null ? `exit ${st.exit_code}` : "idle"));
+          const running = !!st.running;
+          const exitCode = (st.exit_code == null) ? null : Number(st.exit_code);
+          const hasRun = !!st.started_at;
+          const okDone = (!running) && (exitCode === 0) && hasRun;
+          const hasErr = (!running) && (exitCode != null) && (exitCode !== 0);
+
+          const statusRu = running
+            ? "идёт"
+            : (okDone ? "завершено" : (hasErr ? `ошибка (exit ${exitCode})` : (hasRun ? "остановлено" : "не запускали")));
+          qs("#pipeStatus").textContent = statusRu;
+          const ridEl = qs("#pipeRunId");
+          if (ridEl) ridEl.textContent = (st.run_id != null) ? String(st.run_id) : "—";
+          const facesLink = qs("#pipeFacesLink");
+          if (facesLink) {
+            if (st.run_id != null) {
+              facesLink.href = `/faces?pipeline_run_id=${encodeURIComponent(String(st.run_id))}`;
+              facesLink.style.display = "";
+            } else {
+              facesLink.style.display = "none";
+            }
+          }
+          const dedupLink = qs("#pipeDedupLink");
+          if (dedupLink) {
+            if (st.run_id != null) {
+              dedupLink.href = `/dedup-results?pipeline_run_id=${encodeURIComponent(String(st.run_id))}`;
+            } else {
+              dedupLink.href = "/dedup-results";
+            }
+          }
+
+          // Кнопка "Продолжить": включаем только если для текущего пути есть незавершённый прогон.
+          const btnResume = qs("#btnPipeResume");
+          if (btnResume) {
+            const rootNow = (qs("#path")?.value || "").trim();
+            if (!rootNow || !isLocalSelected()) {
+              btnResume.disabled = true;
+              btnResume.textContent = "Продолжить";
+            } else {
+              try {
+                const lr = await fetchJson(`/api/local-pipeline/latest?root_path=${encodeURIComponent(rootNow)}`, { cache: "no-store" });
+                const pr = lr?.latest || null;
+                const stt = String(pr?.status || "");
+                const resumable = !!pr?.id && (stt === "failed" || stt === "running");
+                btnResume.disabled = !resumable;
+                btnResume.textContent = resumable ? `Продолжить (run ${pr.id})` : "Продолжить";
+              } catch (e) {
+                btnResume.disabled = true;
+                btnResume.textContent = "Продолжить";
+              }
+            }
+          }
+
+          const step1 = st.step1 || {};
+          const step2 = st.step2 || {};
+          const pct1 = Math.max(0, Math.min(100, Number(step1.pct) || 0));
+          const pct2 = Math.max(0, Math.min(100, Number(step2.pct) || 0));
+          const bar1 = qs("#pipeBar1Fill");
+          if (bar1) bar1.style.width = `${pct1}%`;
+          const bar2 = qs("#pipeBar2Fill");
+          if (bar2) bar2.style.width = `${pct2}%`;
+
+          const s1 = (step1.processed != null && step1.total != null) ? `${step1.processed}/${step1.total}` : "—";
+          const s2 = (step2.images != null && step2.total != null) ? `${step2.images}/${step2.total}` : "—";
+          const elS1 = qs("#pipeStep1Text");
+          if (elS1) elS1.textContent = `Статус: ${step1.status || "—"} · обработано: ${s1} · ${pct1}%`;
+          const elS2 = qs("#pipeStep2Text");
+          if (elS2) elS2.textContent = `Статус: ${step2.status || "—"} · обработано: ${s2} · лиц: ${step2.faces ?? "—"} · ${pct2}%`;
+
+          const root = st.root_path || "—";
+          const mode = st.apply ? "APPLY" : "DRY-RUN";
+          const sd = st.skip_dedup ? "skip dedup" : "dedup";
+          const started = st.started_at ? `start: ${st.started_at}` : "";
+          const finished = st.finished_at ? `finish: ${st.finished_at}` : "";
+          const err = st.error ? `ошибка: ${st.error}` : "";
+          const elSum = qs("#pipeSummary");
+          if (elSum) elSum.textContent = [mode, sd, `root: ${root}`, started, finished, err].filter(Boolean).join(" · ") || "—";
+
           const log = (st.log_tail || "").trim();
           qs("#pipeLog").textContent = log ? log : "—";
-          if (st.running) {
-            pipePollTimer = setTimeout(pipePollOnce, 1200);
+          // Пока выбрана "Локальная папка", держим polling всегда:
+          // - чтобы статус был виден даже после ошибки/завершения
+          // - чтобы UI не "замирал" на старом значении
+          if (isLocalSelected()) {
+            pipePollTimer = setTimeout(pipePollOnce, running ? 1200 : 2000);
           } else {
             pipePollTimer = null;
           }
         } catch (e) {
-          qs("#pipeStatus").textContent = "error";
-          pipePollTimer = null;
+          qs("#pipeStatus").textContent = "ошибка";
+          const btnResume = qs("#btnPipeResume");
+          if (btnResume) { btnResume.disabled = true; btnResume.textContent = "Продолжить"; }
+          if (isLocalSelected()) {
+            pipePollTimer = setTimeout(pipePollOnce, 2500);
+          } else {
+            pipePollTimer = null;
+          }
         }
       }
 
-      async function startLocalPipeline(apply) {
+      async function startLocalPipelineNew() {
         const loc = getLocation();
         if (loc !== "local") return;
         const root = (qs("#path")?.value || "").trim();
         if (!root) { setToast("Укажи путь к локальной папке (C:\\...)", true); return; }
         try {
           setToast("");
-          qs("#btnPipeDry").disabled = true;
-          qs("#btnPipeApply").disabled = true;
-          const skipDedup = !!qs("#pipeSkipDedup")?.checked;
-          const noDedupMove = !!qs("#pipeNoDedupMove")?.checked;
-          const resp = await postJson("/api/local-pipeline/start", { root_path: root, apply: !!apply, skip_dedup: skipDedup, no_dedup_move: noDedupMove });
+          const btn = qs("#btnPipeStartNew");
+          if (btn) btn.disabled = true;
+          // В UI всегда запускаем шаг 1 → шаг 2. skip_dedup оставлен только для отладки через API.
+          const skipDedup = false;
+          const apply = !!qs("#pipeApply")?.checked;
+          const resp = await postJson("/api/local-pipeline/start", { root_path: root, apply: apply, skip_dedup: skipDedup, start_mode: "new" });
           if (!resp?.ok) {
             setToast(resp?.message || "Не удалось запустить конвейер", true);
           } else {
-            setToast("Локальный конвейер запущен (см. лог ниже).");
+            const rid = resp?.run_id ? `run_id=${resp.run_id}` : "";
+            const resumed = resp?.resumed ? " (resume)" : "";
+            setToast(["Конвейер запущен", rid + resumed].filter(Boolean).join(" · ") + " (см. статус/прогресс).");
             if (pipePollTimer) clearTimeout(pipePollTimer);
             pipePollOnce();
           }
         } catch (e) {
           setToast(e?.message || String(e), true);
         } finally {
-          qs("#btnPipeDry").disabled = false;
-          qs("#btnPipeApply").disabled = false;
+          const btn = qs("#btnPipeStartNew");
+          if (btn) btn.disabled = false;
+        }
+      }
+
+      async function startLocalPipelineResume() {
+        const loc = getLocation();
+        if (loc !== "local") return;
+        const root = (qs("#path")?.value || "").trim();
+        if (!root) { setToast("Укажи путь к локальной папке (C:\\...)", true); return; }
+        try {
+          setToast("");
+          const btn = qs("#btnPipeResume");
+          if (btn) btn.disabled = true;
+          const latest = await fetchJson(`/api/local-pipeline/latest?root_path=${encodeURIComponent(root)}`, { cache: "no-store" });
+          const pr = latest?.latest || null;
+          const rid = pr?.id;
+          if (!rid) {
+            setToast("Нет прогона для продолжения — начни заново.", true);
+            return;
+          }
+          const st = String(pr?.status || "");
+          if (!(st === "failed" || st === "running")) {
+            setToast(`Последний прогон уже завершён (${st || "—"}) — начни заново.`, true);
+            return;
+          }
+          // Важно: продолжаем ровно с теми же опциями, что были у прогона.
+          const apply = !!Number(pr?.apply || 0);
+          const skipDedup = !!Number(pr?.skip_dedup || 0);
+          const resp = await postJson("/api/local-pipeline/start", { root_path: root, apply, skip_dedup: skipDedup, start_mode: "continue", resume_run_id: Number(rid) });
+          if (!resp?.ok) {
+            setToast(resp?.message || "Не удалось продолжить конвейер", true);
+          } else {
+            setToast(`Продолжаем run_id=${resp.run_id} (resume).`);
+            if (pipePollTimer) clearTimeout(pipePollTimer);
+            pipePollOnce();
+          }
+        } catch (e) {
+          setToast(e?.message || String(e), true);
+        } finally {
+          const btn = qs("#btnPipeResume");
+          if (btn) btn.disabled = false;
         }
       }
 
@@ -895,8 +1069,8 @@
         }
       });
 
-      qs("#btnPipeDry")?.addEventListener("click", () => startLocalPipeline(false));
-      qs("#btnPipeApply")?.addEventListener("click", () => startLocalPipeline(true));
+      qs("#btnPipeStartNew")?.addEventListener("click", () => startLocalPipelineNew());
+      qs("#btnPipeResume")?.addEventListener("click", () => startLocalPipelineResume());
 
       Array.from(document.querySelectorAll("input[name='location']")).forEach(el => {
         el.addEventListener("change", () => { updateBrowseLink(); updateLocalPipelineVisibility(); });

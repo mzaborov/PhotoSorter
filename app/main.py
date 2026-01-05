@@ -20,7 +20,7 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from DB.db import DedupStore, list_folders
+from DB.db import DedupStore, FaceStore, PipelineStore, list_folders
 from yadisk_client import get_disk
 
 APP_DIR = Path(__file__).resolve().parent
@@ -90,6 +90,7 @@ _VIDEO_ERRORS: dict[str, str] = {}
 _LOCAL_PIPELINE_EXEC = ThreadPoolExecutor(max_workers=1)
 _LOCAL_PIPELINE_LOCK = threading.Lock()
 _LOCAL_PIPELINE_FUTURE: Any = None
+_LOCAL_PIPELINE_RUN_ID: Optional[int] = None
 _LOCAL_PIPELINE_STATE: dict[str, Any] = {
     "running": False,
     "root_path": None,
@@ -118,11 +119,20 @@ def _local_pipeline_log_append(line: str) -> None:
             s = s[-120_000:]
         _LOCAL_PIPELINE_STATE["log"] = s
 
+        run_id = _LOCAL_PIPELINE_RUN_ID
+    # Важно: persist в SQLite, чтобы пережить перезапуск сервера/IDE.
+    if run_id is not None:
+        ps = PipelineStore()
+        try:
+            ps.append_log(run_id=int(run_id), line=line or "")
+        finally:
+            ps.close()
 
-def _run_local_pipeline(*, root_path: str, apply: bool, skip_dedup: bool, no_dedup_move: bool) -> None:
-    # Запускаем scripts/run_face.ps1 -> python из .venv-face -> scripts/tools/local_sort_by_faces.py
+
+def _run_local_pipeline(*, root_path: str, apply: bool, skip_dedup: bool, no_dedup_move: bool, pipeline_run_id: int) -> None:
+    # Запускаем python из .venv-face -> scripts/tools/local_sort_by_faces.py напрямую (без .ps1),
+    # чтобы не упираться в ExecutionPolicy/подписи PowerShell-скриптов.
     rr = _repo_root()
-    ps1 = rr / "scripts" / "run_face.ps1"
     py = rr / ".venv-face" / "Scripts" / "python.exe"
     script = rr / "scripts" / "tools" / "local_sort_by_faces.py"
 
@@ -141,13 +151,10 @@ def _run_local_pipeline(*, root_path: str, apply: bool, skip_dedup: bool, no_ded
                 "log": "",
             }
         )
+        global _LOCAL_PIPELINE_RUN_ID  # noqa: PLW0603
+        _LOCAL_PIPELINE_RUN_ID = int(pipeline_run_id)
 
     # Дополнительные проверки на всякий случай (в start мы тоже проверяем).
-    if not ps1.exists():
-        _local_pipeline_log_append(f"ERROR: not found: {ps1}\n")
-        with _LOCAL_PIPELINE_LOCK:
-            _LOCAL_PIPELINE_STATE.update({"running": False, "finished_at": _now_utc_iso(), "exit_code": 2, "error": "run_face.ps1 not found"})
-        return
     if not py.exists():
         _local_pipeline_log_append(f"ERROR: not found: {py}\n")
         with _LOCAL_PIPELINE_LOCK:
@@ -162,15 +169,12 @@ def _run_local_pipeline(*, root_path: str, apply: bool, skip_dedup: bool, no_ded
         return
 
     cmd: list[str] = [
-        "pwsh",
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        str(ps1),
+        str(py),
         str(script.relative_to(rr)),
         "--root",
         root_path,
+        "--pipeline-run-id",
+        str(int(pipeline_run_id)),
     ]
     if apply:
         cmd.append("--apply")
@@ -182,6 +186,13 @@ def _run_local_pipeline(*, root_path: str, apply: bool, skip_dedup: bool, no_ded
     _local_pipeline_log_append("RUN: " + " ".join(cmd) + "\n")
 
     try:
+        # Важно: без этого Python часто буферизует stdout при запуске через pipe,
+        # и UI не видит прогресс (dedup_progress/faces_progress) до конца выполнения.
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        # Гарантируем импорты из корня проекта (DB, yadisk_client и т.п.)
+        env["PYTHONPATH"] = str(rr)
+
         p = subprocess.Popen(  # noqa: S603
             cmd,
             cwd=str(rr),
@@ -189,11 +200,28 @@ def _run_local_pipeline(*, root_path: str, apply: bool, skip_dedup: bool, no_ded
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            env=env,
         )
         assert p.stdout is not None
+        # сохраняем PID процесса в БД
+        ps = PipelineStore()
+        try:
+            ps.update_run(run_id=int(pipeline_run_id), pid=int(p.pid), status="running")
+        finally:
+            ps.close()
         for line in p.stdout:
             _local_pipeline_log_append(line)
         rc = int(p.wait())
+        ps2 = PipelineStore()
+        try:
+            ps2.update_run(
+                run_id=int(pipeline_run_id),
+                status="completed" if rc == 0 else "failed",
+                last_error="" if rc == 0 else f"exit_code={rc}",
+                finished_at=_now_utc_iso(),
+            )
+        finally:
+            ps2.close()
         with _LOCAL_PIPELINE_LOCK:
             _LOCAL_PIPELINE_STATE.update(
                 {
@@ -205,6 +233,11 @@ def _run_local_pipeline(*, root_path: str, apply: bool, skip_dedup: bool, no_ded
             )
     except Exception as e:  # noqa: BLE001
         _local_pipeline_log_append(f"ERROR: {type(e).__name__}: {e}\n")
+        ps3 = PipelineStore()
+        try:
+            ps3.update_run(run_id=int(pipeline_run_id), status="failed", last_error=f"{type(e).__name__}: {e}", finished_at=_now_utc_iso())
+        finally:
+            ps3.close()
         with _LOCAL_PIPELINE_LOCK:
             _LOCAL_PIPELINE_STATE.update({"running": False, "finished_at": _now_utc_iso(), "exit_code": 1, "error": f"{type(e).__name__}: {e}"})
 
@@ -1528,12 +1561,16 @@ def api_sort_start(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 def api_local_pipeline_start(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """
     Запуск локального конвейера (ML в отдельном процессе через .venv-face).
-    Использует scripts/run_face.ps1 -> scripts/tools/local_sort_by_faces.py.
+    Запускает scripts/tools/local_sort_by_faces.py напрямую через python из .venv-face
+    (без .ps1), чтобы не упираться в ExecutionPolicy/подписи PowerShell-скриптов.
     """
     root_path = str(payload.get("root_path") or "").strip()
     apply = bool(payload.get("apply") or False)
     skip_dedup = bool(payload.get("skip_dedup") or False)
-    no_dedup_move = bool(payload.get("no_dedup_move") or False)
+    start_mode = str(payload.get("start_mode") or "").strip().lower()  # 'new'|'continue'|''
+    resume_run_id = payload.get("resume_run_id")
+    # Решение по UX: дубликаты всегда складываем в _duplicates; удаление делаем осознанно из формы дублей.
+    no_dedup_move = False
 
     if not root_path:
         raise HTTPException(status_code=400, detail="root_path is required")
@@ -1543,42 +1580,297 @@ def api_local_pipeline_start(payload: dict[str, Any] = Body(...)) -> dict[str, A
         raise HTTPException(status_code=400, detail=f"Folder not found: {root_path}")
 
     rr = _repo_root()
-    ps1 = rr / "scripts" / "run_face.ps1"
     py = rr / ".venv-face" / "Scripts" / "python.exe"
     script = rr / "scripts" / "tools" / "local_sort_by_faces.py"
-    if not ps1.exists():
-        raise HTTPException(status_code=500, detail=f"Missing: {ps1}")
     if not py.exists():
         raise HTTPException(status_code=500, detail="Missing .venv-face (Python 3.12) — create it before running ML pipeline")
     if not script.exists():
         raise HTTPException(status_code=500, detail=f"Missing: {script}")
+
+    # Создаём/переиспользуем pipeline_run_id, чтобы поддержать resume после рестарта.
+    ps = PipelineStore()
+    try:
+        latest = ps.get_latest_run(kind="local_sort", root_path=root_path)
+        resumed = False
+        # 0) Явный resume конкретного run_id (UI кнопка "Продолжить")
+        if resume_run_id is not None:
+            try:
+                rid = int(resume_run_id)
+            except Exception:
+                raise HTTPException(status_code=400, detail="resume_run_id must be int") from None
+            pr0 = ps.get_run_by_id(run_id=rid)
+            if not pr0:
+                raise HTTPException(status_code=404, detail="resume_run_id not found")
+            if str(pr0.get("kind") or "") != "local_sort":
+                raise HTTPException(status_code=400, detail="resume_run_id kind mismatch")
+            if str(pr0.get("root_path") or "") != root_path:
+                raise HTTPException(status_code=400, detail="resume_run_id root_path mismatch")
+            st0 = str(pr0.get("status") or "")
+            if st0 not in ("failed", "running"):
+                raise HTTPException(status_code=400, detail=f"resume_run_id not resumable (status={st0})")
+            # безопасность: опции должны совпадать с тем, что было у прогона
+            same_apply = bool(int(pr0.get("apply") or 0)) == bool(apply)
+            same_skip = bool(int(pr0.get("skip_dedup") or 0)) == bool(skip_dedup)
+            if not (same_apply and same_skip):
+                raise HTTPException(status_code=400, detail="resume_run_id options mismatch (apply/skip_dedup)")
+            pipeline_run_id = rid
+            resumed = True
+            ps.update_run(run_id=pipeline_run_id, status="running", last_error="", finished_at="")
+        # 1) Принудительно "новый прогон"
+        elif start_mode == "new":
+            pipeline_run_id = ps.create_run(kind="local_sort", root_path=root_path, apply=apply, skip_dedup=skip_dedup)
+        elif latest:
+            same_opts = bool(int(latest.get("apply") or 0)) == bool(apply) and bool(int(latest.get("skip_dedup") or 0)) == bool(skip_dedup)
+            st = str(latest.get("status") or "")
+            # Если прошлый прогон "упал" — продолжаем его же (resume).
+            if st in ("failed",) and same_opts:
+                pipeline_run_id = int(latest["id"])
+                resumed = True
+                ps.update_run(run_id=pipeline_run_id, status="running", last_error="", finished_at="")
+            # Если он ещё "running", но давно не обновлялся — считаем его залипшим и продолжаем (resume).
+            elif st == "running" and same_opts:
+                # updated_at хранится в UTC ISO; если пусто — считаем залипшим.
+                updated_at = str(latest.get("updated_at") or "")
+                is_stale = True
+                try:
+                    from datetime import datetime, timezone
+
+                    dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                    is_stale = (datetime.now(timezone.utc) - dt).total_seconds() > 180
+                except Exception:
+                    is_stale = True
+                if not is_stale:
+                    return {"ok": False, "message": "local pipeline already running", "run_id": int(latest["id"])}
+                pipeline_run_id = int(latest["id"])
+                resumed = True
+                ps.update_run(run_id=pipeline_run_id, status="running", last_error="stale: restarting worker", finished_at="")
+            else:
+                pipeline_run_id = ps.create_run(kind="local_sort", root_path=root_path, apply=apply, skip_dedup=skip_dedup)
+        else:
+            pipeline_run_id = ps.create_run(kind="local_sort", root_path=root_path, apply=apply, skip_dedup=skip_dedup)
+    finally:
+        ps.close()
+
+    # Если resume происходит после старого прогона, где dedup_run уже completed,
+    # но processed_files остались 0/total — "долечим" это в БД (данные, не UI).
+    try:
+        ps_fix = PipelineStore()
+        try:
+            pr = ps_fix.get_run_by_id(run_id=int(pipeline_run_id))
+        finally:
+            ps_fix.close()
+        dedup_run_id = pr.get("dedup_run_id") if pr else None
+        if dedup_run_id:
+            ds_fix = DedupStore()
+            try:
+                dr = ds_fix.get_run_by_id(run_id=int(dedup_run_id))
+                if dr and str(dr.get("status") or "") == "completed":
+                    total = dr.get("total_files")
+                    proc = dr.get("processed_files")
+                    if total is not None:
+                        try:
+                            ti = int(total)
+                            pi = int(proc or 0)
+                            if ti > 0 and pi < ti:
+                                ds_fix.update_run_progress(run_id=int(dedup_run_id), processed_files=ti)
+                        except Exception:
+                            pass
+            finally:
+                ds_fix.close()
+    except Exception:
+        # best-effort: не ломаем старт конвейера из-за "лечения" статистики
+        pass
 
     global _LOCAL_PIPELINE_FUTURE  # noqa: PLW0603
     with _LOCAL_PIPELINE_LOCK:
         fut = _LOCAL_PIPELINE_FUTURE
         if fut is not None and not fut.done():
             return {"ok": False, "message": "local pipeline already running"}
+        global _LOCAL_PIPELINE_RUN_ID  # noqa: PLW0603
+        _LOCAL_PIPELINE_RUN_ID = int(pipeline_run_id)
         _LOCAL_PIPELINE_FUTURE = _LOCAL_PIPELINE_EXEC.submit(
             _run_local_pipeline,
             root_path=root_path,
             apply=apply,
             skip_dedup=skip_dedup,
             no_dedup_move=no_dedup_move,
+            pipeline_run_id=int(pipeline_run_id),
         )
 
-    return {"ok": True, "message": "started", "root_path": root_path, "apply": apply, "skip_dedup": skip_dedup, "no_dedup_move": no_dedup_move}
+    return {
+        "ok": True,
+        "message": "started",
+        "run_id": int(pipeline_run_id),
+        "resumed": bool(resumed),
+        "start_mode": start_mode or ("continue" if resumed else "new"),
+        "root_path": root_path,
+        "apply": apply,
+        "skip_dedup": skip_dedup,
+        "no_dedup_move": no_dedup_move,
+    }
+
+
+@app.get("/api/local-pipeline/latest")
+def api_local_pipeline_latest(root_path: str) -> dict[str, Any]:
+    """
+    Возвращает последний pipeline_run для указанной папки (root_path) — чтобы UI мог показать кнопку "Продолжить".
+    """
+    rp = str(root_path or "").strip()
+    if not rp:
+        raise HTTPException(status_code=400, detail="root_path is required")
+    ps = PipelineStore()
+    try:
+        pr = ps.get_latest_run(kind="local_sort", root_path=rp)
+    finally:
+        ps.close()
+    return {"ok": True, "latest": pr}
 
 
 @app.get("/api/local-pipeline/status")
 def api_local_pipeline_status() -> dict[str, Any]:
-    with _LOCAL_PIPELINE_LOCK:
-        st = dict(_LOCAL_PIPELINE_STATE)
-    log = (st.get("log") or "").replace("\r\n", "\n")
-    lines = log.splitlines()[-120:]
-    st["log_tail"] = "\n".join(lines)
-    # не отдаём полный лог (может разрастись)
-    st.pop("log", None)
-    return st
+    ps = PipelineStore()
+    try:
+        pr = ps.get_latest_any(kind="local_sort")
+    finally:
+        ps.close()
+
+    if not pr:
+        return {
+            "running": False,
+            "exit_code": None,
+            "error": None,
+            "run_id": None,
+            "root_path": None,
+            "apply": False,
+            "skip_dedup": False,
+            "step": {"num": 0, "total": 0, "title": ""},
+            "step1": {"status": "idle", "pct": 0, "processed": None, "total": None},
+            "step2": {"status": "idle", "pct": 0, "images": None, "total": None, "faces": None},
+            "log_tail": "",
+        }
+
+    status = str(pr.get("status") or "")
+    running = status == "running"
+    # Стараемся вернуть реальный exit code (например, для нативных крэшей OpenCV).
+    # В БД last_error часто хранится как "exit_code=3221225786".
+    exit_code: int | None
+    if status == "completed":
+        exit_code = 0
+    elif status == "failed":
+        le = str(pr.get("last_error") or "")
+        if le.startswith("exit_code="):
+            try:
+                exit_code = int(le.split("=", 1)[1].strip())
+            except Exception:
+                exit_code = 1
+        else:
+            exit_code = 1
+    else:
+        exit_code = None
+
+    step_num = int(pr.get("step_num") or 0)
+    step_total = int(pr.get("step_total") or 0)
+    step_title = str(pr.get("step_title") or "")
+
+    # log tail
+    log = str(pr.get("log_tail") or "").replace("\r\n", "\n")
+    log_tail = "\n".join(log.splitlines()[-160:])
+
+    # Step 1: dedup прогресс берём из dedup_runs
+    dedup_proc = dedup_total = None
+    dedup_run_id = pr.get("dedup_run_id")
+    if dedup_run_id:
+        ds = DedupStore()
+        try:
+            dr = ds.get_run_by_id(run_id=int(dedup_run_id))
+        finally:
+            ds.close()
+        if dr:
+            dedup_proc = dr.get("processed_files")
+            dedup_total = dr.get("total_files")
+
+    if dedup_total and int(dedup_total) > 0 and dedup_proc is not None:
+        step1_pct = int(round((int(dedup_proc) / int(dedup_total)) * 100))
+        step1_pct = max(0, min(100, step1_pct))
+    else:
+        step1_pct = 100 if step_num >= 2 or status == "completed" else (0 if status in ("", "failed") else 0)
+    # Статус шага 1 определяем по номеру шага, а не по общему статусу:
+    # если упал шаг 2, шаг 1 всё равно "done".
+    if step_num >= 2 or status == "completed":
+        step1_status = "done"
+    elif running and step_num == 1:
+        step1_status = "running"
+    elif status == "failed" and step_num <= 1:
+        step1_status = "error"
+    else:
+        step1_status = "idle"
+
+    # Step 2: лица/не лица — прогресс из face_runs, фазы 85/95 как раньше
+    faces_img = faces_total = None
+    faces_found = None
+    face_run_id = pr.get("face_run_id")
+    if face_run_id:
+        fs = FaceStore()
+        try:
+            fr = fs.get_run_by_id(run_id=int(face_run_id))
+        finally:
+            fs.close()
+        if fr:
+            faces_img = fr.get("processed_files")
+            faces_total = fr.get("total_files")
+            faces_found = fr.get("faces_found")
+
+    # Сейчас у конвейера 2 шага:
+    # 1) дедуп
+    # 2) лица/нет лиц (скан + разложение)
+    def _scan_pct() -> int:
+        if faces_total and int(faces_total) > 0 and faces_img is not None:
+            pct = int(round((int(faces_img) / int(faces_total)) * 90))
+            return max(0, min(90, pct))
+        return 0
+
+    scan_pct = _scan_pct()
+    is_split_phase = "разлож" in step_title.lower()
+
+    if status == "completed":
+        step2_pct = 100
+        step2_status = "done"
+    elif running:
+        if step_num < 2:
+            step2_pct = 0
+            step2_status = "pending"
+        else:
+            step2_status = "running"
+            step2_pct = scan_pct
+            if is_split_phase:
+                step2_pct = max(step2_pct, 95)
+    elif status == "failed":
+        # Важно: даже при ошибке показываем реальный прогресс скана по face_runs,
+        # иначе UI выглядит как "0%", хотя обработано N/total.
+        step2_status = "error" if step_num >= 2 else "idle"
+        step2_pct = scan_pct
+        if is_split_phase:
+            step2_pct = max(step2_pct, 95)
+    else:
+        step2_pct = 0
+        step2_status = "idle"
+
+    return {
+        "running": running,
+        "exit_code": exit_code,
+        "error": pr.get("last_error"),
+        "run_id": pr.get("id"),
+        "root_path": pr.get("root_path"),
+        "apply": bool(int(pr.get("apply") or 0)),
+        "skip_dedup": bool(int(pr.get("skip_dedup") or 0)),
+        "started_at": pr.get("started_at"),
+        "updated_at": pr.get("updated_at"),
+        "finished_at": pr.get("finished_at"),
+        "step": {"num": step_num, "total": step_total, "title": step_title},
+        "step1": {"status": step1_status, "pct": step1_pct, "processed": dedup_proc, "total": dedup_total},
+        "step2": {"status": step2_status, "pct": step2_pct, "images": faces_img, "total": faces_total, "faces": faces_found},
+        "log_tail": log_tail,
+    }
 
 
 @app.get("/api/sort/context")
@@ -1604,7 +1896,9 @@ def api_sort_dup_in_archive(source_run_id: int | None = None) -> dict[str, Any]:
             raise HTTPException(status_code=400, detail="Нет активного source run. Сначала запустите сортировку на главной странице.")
 
         rows = store.list_source_dups_in_archive(source_run_id=run_id)
-        root_path = str(src_latest.get("root_path") or "") if src_latest else None
+        # root_path должен соответствовать выбранному run_id (а не обязательно последнему scope=source)
+        dr = store.get_run_by_id(run_id=int(run_id))
+        root_path = str(dr.get("root_path") or "") if dr else None
 
         archive_latest = store.get_latest_run(scope="archive")
         archive_scanned = bool(archive_latest and str(archive_latest.get("status") or "") == "completed")
@@ -1714,13 +2008,16 @@ def api_sort_source_delete(payload: dict[str, Any] = Body(...)) -> dict[str, Any
 
     store = DedupStore()
     try:
-        src_latest = store.get_latest_run(scope="source")
-        if not src_latest:
-            raise HTTPException(status_code=400, detail="Нет активного source run.")
-        active_run_id = int(src_latest["id"])
-        if run_id_i is not None and run_id_i != active_run_id:
-            raise HTTPException(status_code=400, detail=f"source_run_id mismatch: active={active_run_id}, got={run_id_i}")
-        root_path = str(src_latest.get("root_path") or "")
+        # Если source_run_id не передали — работаем по последнему scope=source (legacy).
+        if run_id_i is None:
+            src_latest = store.get_latest_run(scope="source")
+            if not src_latest:
+                raise HTTPException(status_code=400, detail="Нет активного source run.")
+            run_id_i = int(src_latest["id"])
+        dr = store.get_run_by_id(run_id=int(run_id_i))
+        if not dr:
+            raise HTTPException(status_code=400, detail=f"source_run_id not found: {run_id_i}")
+        root_path = str(dr.get("root_path") or "")
     finally:
         store.close()
 
@@ -1735,7 +2032,7 @@ def api_sort_source_delete(payload: dict[str, Any] = Body(...)) -> dict[str, Any
             row = st.get_row_by_path(path=p)
         finally:
             st.close()
-        if not row or str(row.get("inventory_scope") or "") != "source" or int(row.get("last_run_id") or 0) != active_run_id:
+        if not row or str(row.get("inventory_scope") or "") != "source" or int(row.get("last_run_id") or 0) != int(run_id_i or 0):
             errors.append({"path": p, "error": "not_in_active_source_run"})
             continue
 
@@ -1785,7 +2082,8 @@ def api_sort_dup_in_source(source_run_id: int | None = None) -> dict[str, Any]:
             raise HTTPException(status_code=400, detail="Нет активного source run. Сначала запустите сортировку на главной странице.")
 
         groups_raw = store.list_dup_groups_for_run(inventory_scope="source", run_id=run_id)
-        root_path = str(src_latest.get("root_path") or "") if src_latest else None
+        dr = store.get_run_by_id(run_id=int(run_id))
+        root_path = str(dr.get("root_path") or "") if dr else None
     finally:
         store.close()
 
@@ -2118,6 +2416,304 @@ def duplicates_page(request: Request):
 
     summary = {"groups": len(groups), "max_group_size": max_group_size}
     return templates.TemplateResponse("duplicates.html", {"request": request, "groups": groups, "summary": summary})
+
+
+@app.get("/dedup-results", response_class=HTMLResponse)
+def dedup_results_page(request: Request):
+    """
+    Результаты шага 1 (дедупликация) в отдельных вкладках:
+    1.1 дубли с архивом, 1.2 дубли внутри исходной папки.
+    Источник данных: существующие API /api/sort/dup-in-archive и /api/sort/dup-in-source.
+    """
+    return templates.TemplateResponse("dedup_results.html", {"request": request})
+
+
+@app.get("/api/dedup-results/context")
+def api_dedup_results_context(pipeline_run_id: int) -> dict[str, Any]:
+    """
+    Контекст для страницы результатов шага 1:
+    возвращает dedup_run_id и root_path для выбранного pipeline_run_id.
+    """
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    drid = pr.get("dedup_run_id")
+    return {
+        "ok": True,
+        "pipeline_run_id": int(pipeline_run_id),
+        "dedup_run_id": int(drid) if drid else None,
+        "root_path": pr.get("root_path"),
+    }
+
+
+@app.get("/faces", response_class=HTMLResponse)
+def faces_results_page(request: Request, pipeline_run_id: int | None = None):
+    """
+    Результаты шага 2 (лица/нет лиц): две вкладки и ручная корректировка.
+    pipeline_run_id нужен, чтобы брать актуальный root/run_id и безопасно отдавать local preview.
+    """
+    return templates.TemplateResponse("faces.html", {"request": request, "pipeline_run_id": pipeline_run_id})
+
+
+def _faces_preview_meta(*, path: str, mime_type: str | None, media_type: str | None, pipeline_run_id: int | None) -> dict[str, Any]:
+    preview_kind = "none"  # 'image'|'video'|'none'
+    preview_url: Optional[str] = None
+    open_url: Optional[str] = None
+    mt = (media_type or "").lower()
+    mime = (mime_type or "").lower()
+    if path.startswith("disk:"):
+        open_url = "/api/yadisk/open?path=" + urllib.parse.quote(path, safe="")
+        if mt == "image" or mime.startswith("image/"):
+            preview_kind = "image"
+            preview_url = "/api/yadisk/preview-image?size=M&path=" + urllib.parse.quote(path, safe="")
+        elif mt == "video" or mime.startswith("video/"):
+            preview_kind = "video"
+            preview_url = None
+    elif path.startswith("local:"):
+        if mt == "image" or mime.startswith("image/"):
+            preview_kind = "image"
+        elif mt == "video" or mime.startswith("video/"):
+            preview_kind = "video"
+        if preview_kind != "none":
+            q = "path=" + urllib.parse.quote(path, safe="")
+            if pipeline_run_id is not None:
+                q += "&pipeline_run_id=" + urllib.parse.quote(str(int(pipeline_run_id)), safe="")
+            preview_url = "/api/local/preview?" + q
+    return {"preview_kind": preview_kind, "preview_url": preview_url, "open_url": open_url}
+
+
+@app.get("/api/faces/results")
+def api_faces_results(
+    pipeline_run_id: int,
+    tab: str = "faces",
+    page: int = 1,
+    page_size: int = 60,
+) -> dict[str, Any]:
+    """
+    Возвращает список файлов для UI шага 2:
+    - tab=faces: эффективное "есть лица"
+    - tab=no_faces: эффективное "нет лиц"
+    Приоритет: faces_manual_label > faces_count.
+    """
+    tab_n = (tab or "").strip().lower()
+    if tab_n not in ("faces", "no_faces"):
+        raise HTTPException(status_code=400, detail="tab must be faces|no_faces")
+    page_i = max(1, int(page or 1))
+    size_i = max(10, min(200, int(page_size or 60)))
+    offset = (page_i - 1) * size_i
+
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    face_run_id = pr.get("face_run_id")
+    if not face_run_id:
+        raise HTTPException(status_code=400, detail="face_run_id is not set yet (step 2 not started)")
+    face_run_id_i = int(face_run_id)
+    root_path = str(pr.get("root_path") or "")
+
+    # Фильтр по root: только файлы внутри исходной папки прогона.
+    root_like = None
+    if root_path.startswith("disk:"):
+        rp = root_path.rstrip("/")
+        root_like = rp + "/%"
+    else:
+        try:
+            rp_abs = os.path.abspath(root_path)
+            rp_abs = rp_abs.rstrip("\\/") + "\\"
+            root_like = "local:" + rp_abs + "%"
+        except Exception:
+            root_like = None
+
+    want_faces = 1 if tab_n == "faces" else 0
+    where = ["faces_run_id = ?", "status != 'deleted'"]
+    params: list[Any] = [face_run_id_i]
+    if root_like:
+        where.append("path LIKE ?")
+        params.append(root_like)
+    where_sql = " AND ".join(where)
+
+    # Фильтр по "эффективному" результату (manual_label приоритетнее).
+    eff_sql = """
+    CASE
+      WHEN lower(trim(coalesce(faces_manual_label, ''))) = 'faces' THEN 1
+      WHEN lower(trim(coalesce(faces_manual_label, ''))) = 'no_faces' THEN 0
+      ELSE (CASE WHEN coalesce(faces_count, 0) > 0 THEN 1 ELSE 0 END)
+    END
+    """
+
+    ds = DedupStore()
+    try:
+        cur = ds.conn.cursor()
+        cur.execute(
+            f"SELECT COUNT(*) AS cnt FROM yd_files WHERE {where_sql} AND ({eff_sql}) = ?",
+            params + [want_faces],
+        )
+        total = int(cur.fetchone()[0] or 0)
+
+        cur.execute(
+            f"""
+            SELECT
+              path, name, parent_path, size, mime_type, media_type,
+              COALESCE(faces_count, 0) AS faces_count,
+              COALESCE(faces_manual_label, '') AS faces_manual_label
+            FROM yd_files
+            WHERE {where_sql} AND ({eff_sql}) = ?
+            ORDER BY path ASC
+            LIMIT ? OFFSET ?
+            """,
+            params + [want_faces, size_i, offset],
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        ds.close()
+
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        path = str(r.get("path") or "")
+        mime_type = str(r.get("mime_type") or "") or None
+        media_type = str(r.get("media_type") or "") or None
+        # Fallback guess по расширению (как в дедуп UI)
+        if not mime_type:
+            guess_name = _strip_local_prefix(path) if path.startswith("local:") else _basename_from_disk_path(path)
+            mt2, _enc = mimetypes.guess_type(guess_name)
+            mime_type = mt2 or None
+        if not media_type and mime_type:
+            if mime_type.startswith("image/"):
+                media_type = "image"
+            elif mime_type.startswith("video/"):
+                media_type = "video"
+
+        items.append(
+            {
+                "path": path,
+                "path_short": _short_path_for_ui(path) if path.startswith("disk:") else path,
+                "size_human": _human_bytes(int(r["size"]) if r.get("size") is not None else None),
+                "mime_type": mime_type,
+                "media_type": media_type,
+                "faces_count": int(r.get("faces_count") or 0),
+                "faces_manual_label": (str(r.get("faces_manual_label") or "") or ""),
+                **_faces_preview_meta(path=path, mime_type=mime_type, media_type=media_type, pipeline_run_id=int(pipeline_run_id)),
+            }
+        )
+
+    return {
+        "ok": True,
+        "pipeline_run_id": int(pipeline_run_id),
+        "face_run_id": face_run_id_i,
+        "root_path": root_path,
+        "tab": tab_n,
+        "page": page_i,
+        "page_size": size_i,
+        "total": total,
+        "items": items,
+    }
+
+
+@app.get("/api/faces/rectangles")
+def api_faces_rectangles(pipeline_run_id: int, path: str) -> dict[str, Any]:
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    face_run_id = pr.get("face_run_id")
+    if not face_run_id:
+        raise HTTPException(status_code=400, detail="face_run_id is not set yet")
+    fs = FaceStore()
+    try:
+        rects = fs.list_rectangles(run_id=int(face_run_id), file_path=str(path))
+    finally:
+        fs.close()
+    return {"ok": True, "pipeline_run_id": int(pipeline_run_id), "run_id": int(face_run_id), "path": path, "rectangles": rects}
+
+
+@app.post("/api/faces/manual-label")
+def api_faces_manual_label(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    pipeline_run_id = payload.get("pipeline_run_id")
+    path = payload.get("path")
+    label = payload.get("label")
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required")
+    if not isinstance(path, str) or not (path.startswith("local:") or path.startswith("disk:")):
+        raise HTTPException(status_code=400, detail="path must start with local: or disk:")
+    lab = (str(label) if label is not None else "").strip().lower()
+    if lab not in ("faces", "no_faces", ""):
+        raise HTTPException(status_code=400, detail="label must be faces|no_faces|''")
+
+    ds = DedupStore()
+    try:
+        ds.set_faces_manual_label(path=path, label=(lab or None))
+    finally:
+        ds.close()
+
+    # Если руками сказали "лиц нет" — убираем ручные прямоугольники (best-effort).
+    if lab == "no_faces":
+        ps = PipelineStore()
+        try:
+            pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+        finally:
+            ps.close()
+        face_run_id = int(pr.get("face_run_id") or 0) if pr else 0
+        if face_run_id:
+            fs = FaceStore()
+            try:
+                fs.replace_manual_rectangles(run_id=face_run_id, file_path=path, rects=[])
+            finally:
+                fs.close()
+
+    return {"ok": True}
+
+
+@app.post("/api/faces/manual-rectangles")
+def api_faces_manual_rectangles(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    pipeline_run_id = payload.get("pipeline_run_id")
+    path = payload.get("path")
+    rects = payload.get("rects")
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required")
+    if not isinstance(path, str) or not path.startswith("local:"):
+        raise HTTPException(status_code=400, detail="path must start with local:")
+    if rects is None:
+        rects = []
+    if not isinstance(rects, list):
+        raise HTTPException(status_code=400, detail="rects must be list")
+
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    face_run_id = pr.get("face_run_id")
+    if not face_run_id:
+        raise HTTPException(status_code=400, detail="face_run_id is not set yet")
+    face_run_id_i = int(face_run_id)
+
+    fs = FaceStore()
+    try:
+        fs.replace_manual_rectangles(run_id=face_run_id_i, file_path=str(path), rects=rects)
+    finally:
+        fs.close()
+
+    # Раз есть ручные прямоугольники — считаем "лица есть" (manual override).
+    ds = DedupStore()
+    try:
+        ds.set_faces_manual_label(path=str(path), label="faces")
+    finally:
+        ds.close()
+
+    return {"ok": True}
 
 
 def _yadisk_remove_to_trash(disk, *, path: str) -> None:
@@ -2511,7 +3107,7 @@ def api_yadisk_preview_image(path: str, size: str = "M") -> Response:
 
 
 @app.get("/api/local/preview")
-def api_local_preview(path: str) -> Response:
+def api_local_preview(path: str, pipeline_run_id: int | None = None) -> Response:
     """
     Preview для локальных файлов.
     Принимает path в формате `local:C:\\...\\file.ext`.
@@ -2520,14 +3116,27 @@ def api_local_preview(path: str) -> Response:
     if not isinstance(path, str) or not path.startswith("local:"):
         raise HTTPException(status_code=400, detail="Only local: paths are supported")
 
-    store = DedupStore()
-    try:
-        src_latest = store.get_latest_run(scope="source")
-        if not src_latest:
-            raise HTTPException(status_code=400, detail="Нет активного source run.")
-        root_path = str(src_latest.get("root_path") or "")
-    finally:
-        store.close()
+    root_path = ""
+    # 1) Если явно указан pipeline_run_id — доверяем root_path этого прогона конвейера сортировки исходной папки.
+    if pipeline_run_id is not None:
+        ps = PipelineStore()
+        try:
+            pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+        finally:
+            ps.close()
+        if not pr:
+            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+        root_path = str(pr.get("root_path") or "")
+    # 2) Fallback: legacy-логика (последний scope=source)
+    if not root_path:
+        store = DedupStore()
+        try:
+            src_latest = store.get_latest_run(scope="source")
+            if not src_latest:
+                raise HTTPException(status_code=400, detail="Нет активного source run.")
+            root_path = str(src_latest.get("root_path") or "")
+        finally:
+            store.close()
 
     file_path = _strip_local_prefix(path)
     if not file_path:

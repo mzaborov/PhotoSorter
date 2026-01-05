@@ -46,6 +46,23 @@ class folders <<table>> {
   content_rule: TEXT
 }
 
+class pipeline_runs <<table>> {
+  +id: INTEGER <<PK>>
+  kind: TEXT                    ' local_sort|...
+  root_path: TEXT               ' локальный корень
+  status: TEXT                  ' running|completed|failed
+  step_num: INTEGER
+  step_total: INTEGER
+  step_title: TEXT
+  apply: INTEGER
+  skip_dedup: INTEGER
+  dedup_run_id: INTEGER
+  face_run_id: INTEGER
+  started_at: TEXT
+  updated_at: TEXT
+  finished_at: TEXT
+}
+
 class media_files <<table>> {
   +id: INTEGER <<PK>>
   path: TEXT <<UNIQUE>>         ' disk:/... or local:...
@@ -80,6 +97,7 @@ class dedup_runs <<table>> {
 }
 
 dedup_runs "1" -- "*" media_files : прогон дедупа (последний для файла)
+pipeline_runs "0..1" -- "0..1" dedup_runs : шаг (дедуп)
 
 class face_runs <<table>> {
   +id: INTEGER <<PK>>
@@ -115,6 +133,7 @@ face_runs "1" -- "*" face_rectangles : прямоугольники лиц
 media_files "1" -- "*" face_rectangles : лица на файле
 persons "0..1" -- "0..1" face_rectangles : аватар (лицо)
 folders "0..1" -- "*" media_files : файлы в папке (parent_path)
+pipeline_runs "0..1" -- "0..1" face_runs : шаг (лица)
 
 class face_labels <<table>> {
   +id: INTEGER <<PK>>

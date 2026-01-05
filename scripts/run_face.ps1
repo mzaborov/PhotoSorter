@@ -24,8 +24,15 @@ if (-not (Test-Path $py)) {
 # Гарантируем импорт модулей из корня проекта (чтобы работали 'import yadisk_client', 'from DB.db ...').
 $env:PYTHONPATH = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 
+# Важно для UI: печатать прогресс сразу, без буферизации stdout (иначе прогресс-бары "висят" на заглушке).
+$env:PYTHONUNBUFFERED = "1"
+
 Write-Host "Running: $py $Args"
 Write-Host ("Running: " + $py + " " + ($Args -join " "))
 & $py @Args
+
+# Важно: пробрасываем код возврата python-процесса наружу,
+# чтобы Web API мог корректно выставить статус completed/failed.
+exit $LASTEXITCODE
 
 

@@ -39,10 +39,6 @@
     <div class="header">
       <div>
         <h2 style="margin: 0;">Фотоархив</h2>
-        <div class="muted">
-          Показаны папки из SQLite (`folders`), отсортировано по `sort_order`.
-          Количество файлов подгружается отдельно и считается рекурсивно.
-        </div>
       </div>
       <div class="muted">
         <a href="/">Главная</a>
@@ -104,8 +100,8 @@
             Запустить / Продолжить
           </button>
           <button class="btn" id="reconcileArchiveStart" type="button"
-            title="Сверить архив (актуализировать список файлов после ручных изменений в Я.Диске)">
-            Сверить архив
+            title="Синхронизировать БД с Я.Диском (актуализировать список файлов после ручных изменений на диске)">
+            Синхронизировать БД с Я.Диском
           </button>
         </div>
       </div>
@@ -114,7 +110,7 @@
         <div class="bar" aria-label="Dedup progress"><div id="dedupBarFill"></div></div>
         <div class="muted status" id="dedupText" style="margin-top: 8px;">Дедупликация: статус загружается…</div>
         <div class="bar" aria-label="Reconcile progress" style="margin-top: 10px;"><div id="reconcileBarFill"></div></div>
-        <div class="muted status" id="reconcileText" style="margin-top: 8px;">Сверка архива: статус загружается…</div>
+        <div class="muted status" id="reconcileText" style="margin-top: 8px;">Синхронизация: статус загружается…</div>
         <div class="muted" style="margin-top: 8px;">
           <a href="/duplicates">Посмотреть дубли</a>
         </div>
@@ -225,7 +221,7 @@
           const pct = denom > 0 ? Math.round((p / denom) * 100) : 0;
           setDedupBar(pct);
           setDedupText(
-            `Дедупликация: ${running ? "идёт" : st} · прогресс=${pct}% (${p}/${denom || "…"}) · с хэшем=${h} (meta=${mh}, download=${dh}) · пропущено(>max)=${sk} · ошибок=${er} · ${totalText} · ${maxText}`
+            `Дедупликация: ${dedupArchiveRunning ? "идёт" : st} · прогресс=${pct}% (${p}/${denom || "…"}) · с хэшем=${h} (meta=${mh}, download=${dh}) · пропущено(>max)=${sk} · ошибок=${er} · ${totalText} · ${maxText}`
           );
 
           const btn = document.getElementById("dedupArchiveStart");

@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- YaDisk preview hotlink защита: просим браузер не слать Referer при загрузке картинок -->
+    <meta name="referrer" content="no-referrer" />
+    <title>PhotoSorter — Результаты дедупликации</title>
+    <style>
+      :root { color-scheme: light; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      a { color: #0b57d0; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+      .muted { color: #6b7280; }
+      .wrap { max-width: 1400px; }
+      .header { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
+      .tabs { display:flex; gap:8px; margin-top: 14px; }
+      .tab { appearance:none; border:1px solid #d1d5db; background:#fff; padding:8px 10px; border-radius:999px; cursor:pointer; font-weight:700; }
+      .tab.active { background:#111827; color:#fff; border-color:#111827; }
+      .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#f3f4f6; color:#374151; font-size:12px; }
+      .actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top: 12px; }
+      .btn { appearance:none; border:1px solid #d1d5db; background:#fff; padding:8px 10px; border-radius:10px; cursor:pointer; font-weight:700; }
+      .btn:hover { background:#f9fafb; }
+      .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+      .btn.danger { border-color:#fecaca; background:#fff5f5; color:#991b1b; }
+      .btn.danger:hover { background:#ffecec; }
+
+      .list { margin-top: 14px; }
+      .row { display:flex; gap:12px; align-items:flex-start; padding:12px 0; border-bottom:1px solid #e5e7eb; }
+      .row-left { width: 340px; flex: 0 0 340px; }
+      .row-right { flex: 1 1 auto; }
+      .cards { display:flex; gap:10px; flex-wrap:wrap; }
+      .card { width: 240px; border:1px solid #e5e7eb; border-radius:12px; overflow:hidden; background:#fff; }
+      .thumb { height: 140px; background:#fff; display:flex; align-items:center; justify-content:center; position:relative; cursor: zoom-in; }
+      .thumb img { width: 100%; height: 100%; object-fit: contain; display:block; background:#fff; }
+      .thumb video { width: 100%; height: 100%; object-fit: contain; display:block; background:#111827; }
+      .thumb .noimg { color:#6b7280; font-size:12px; padding:10px; text-align:center; }
+      .card-body { padding: 10px 10px 12px 10px; }
+      .kv { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; font-size:12px; color:#374151; }
+      .path { font-size: 12px; }
+      .chk { display:flex; gap:8px; align-items:center; margin-top: 8px; }
+      .chk input { transform: scale(1.1); }
+
+      /* Lightbox (простая) */
+      .lb { position: fixed; inset: 0; background: rgba(17,24,39,0.82); display: none; align-items: center; justify-content: center; padding: 18px; z-index: 9999; }
+      .lb.open { display: flex; }
+      .lb-panel { background: #fff; border-radius: 14px; max-width: 92vw; max-height: 92vh; width: min(1200px, 92vw); overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,0.35); }
+      .lb-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #e5e7eb; }
+      .lb-top code { font-size: 11px; }
+      .lb-actions { display: flex; gap: 10px; align-items: center; }
+      .lb-body { background: #111827; display: flex; align-items: center; justify-content: center; }
+      .lb-body img { max-width: 92vw; max-height: calc(92vh - 56px); width: auto; height: auto; display: block; object-fit: contain; background: #111827; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="header">
+        <div>
+          <h2 style="margin: 0;">Результаты дедупликации (шаг 1)</h2>
+          <div class="muted" style="margin-top: 6px;">Вкладки: <b>1.1</b> “с архивом” и <b>1.2</b> “внутри папки”.</div>
+        </div>
+        <div class="muted">
+          <a href="/">← на главную</a>
+        </div>
+      </div>
+
+      <div class="tabs">
+        <button class="tab active" id="tabA" type="button">1.1 С архивом</button>
+        <button class="tab" id="tabB" type="button">1.2 Внутри папки</button>
+      </div>
+
+      <div class="actions">
+        <span class="pill">run: <b id="runId">—</b></span>
+        <span class="pill">источник: <code id="rootPath">—</code></span>
+        <button class="btn" id="btnReload" type="button">Обновить</button>
+        <span class="muted" id="toast"></span>
+      </div>
+
+      <!-- actions for tab A -->
+      <div class="actions" id="actionsA" style="display:flex;">
+        <button class="btn danger" id="btnDelA" type="button" disabled>Удалить выбранные (0)</button>
+        <button class="btn" id="btnIgnoreA" type="button" disabled>Не дубль (0)</button>
+        <span class="muted" id="noteA"></span>
+      </div>
+
+      <!-- actions for tab B -->
+      <div class="actions" id="actionsB" style="display:none;">
+        <button class="btn danger" id="btnDelB" type="button" disabled>Удалить копии (0)</button>
+        <span class="muted">Важно: в каждой группе должен остаться хотя бы 1 файл.</span>
+      </div>
+
+      <div class="list" id="content"></div>
+    </div>
+
+    <div class="lb" id="lightbox" aria-hidden="true">
+      <div class="lb-panel" role="dialog" aria-modal="true">
+        <div class="lb-top">
+          <code id="lbPath">—</code>
+          <div class="lb-actions">
+            <button class="btn" id="lbClose" type="button">Закрыть</button>
+          </div>
+        </div>
+        <div class="lb-body">
+          <img id="lbImg" alt="preview" />
+        </div>
+      </div>
+    </div>
+
+    <script>
+      function qs(sel, el=document) { return el.querySelector(sel); }
+      function qsa(sel, el=document) { return Array.from(el.querySelectorAll(sel)); }
+      function escapeHtml(s) {
+        return (s ?? "").toString()
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll("\"", "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+      async function fetchJson(url, opts={}) {
+        const r = await fetch(url, { cache:"no-store", ...opts });
+        const t = await r.text();
+        let j = null;
+        try { j = t ? JSON.parse(t) : null; } catch (e) { j = null; }
+        if (!r.ok) throw new Error((j && (j.detail || j.error)) ? (j.detail || j.error) : (t || `HTTP ${r.status}`));
+        return j;
+      }
+      async function postJson(url, payload) {
+        return await fetchJson(url, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(payload ?? {}) });
+      }
+      function createLimiter(limit) {
+        let active = 0;
+        const queue = [];
+        const next = () => {
+          if (active >= limit) return;
+          const item = queue.shift();
+          if (!item) return;
+          active += 1;
+          Promise.resolve().then(item.fn).then(item.resolve, item.reject).finally(() => { active -= 1; next(); });
+        };
+        return (fn) => new Promise((resolve, reject) => { queue.push({ fn, resolve, reject }); next(); });
+      }
+
+      function previewUrlForPath(path, kind) {
+        if (!path) return null;
+        const p = String(path);
+        if (p.startsWith("disk:")) {
+          if (kind === "image") return `/api/yadisk/preview-image?size=M&path=${encodeURIComponent(p)}`;
+          return null;
+        }
+        if (p.startsWith("local:")) {
+          const pr = (window.__PIPELINE_RUN_ID__ != null) ? `&pipeline_run_id=${encodeURIComponent(String(window.__PIPELINE_RUN_ID__))}` : "";
+          return `/api/local/preview?path=${encodeURIComponent(p)}${pr}`;
+        }
+        return null;
+      }
+
+      function ensureLightbox() {
+        const lb = qs("#lightbox");
+        const close = () => { lb.classList.remove("open"); lb.setAttribute("aria-hidden","true"); };
+        qs("#lbClose").onclick = close;
+        lb.addEventListener("click", (e) => { if (e.target === lb) close(); });
+        window.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+        return { open: (src, path) => {
+          qs("#lbPath").textContent = path || "—";
+          const img = qs("#lbImg");
+          img.referrerPolicy = "no-referrer";
+          img.src = src;
+          lb.classList.add("open");
+          lb.setAttribute("aria-hidden","false");
+        }};
+      }
+
+      const lb = ensureLightbox();
+      const CONCURRENCY = 3;
+      const limit = createLimiter(CONCURRENCY);
+
+      let activeTab = "A";
+      let ctxRunId = null;
+      // pipeline_run_id (если пришли со страницы конвейера) — нужен, чтобы выбрать правильный dedup_run_id
+      window.__PIPELINE_RUN_ID__ = (() => {
+        const u = new URL(window.location.href);
+        const v = u.searchParams.get("pipeline_run_id");
+        return (v && /^\d+$/.test(v)) ? Number(v) : null;
+      })();
+
+      async function ensureCtxRunId() {
+        if (ctxRunId != null) return ctxRunId;
+        if (window.__PIPELINE_RUN_ID__ == null) return null;
+        try {
+          const ctx = await fetchJson(`/api/dedup-results/context?pipeline_run_id=${encodeURIComponent(String(window.__PIPELINE_RUN_ID__))}`);
+          if (ctx?.root_path) qs("#rootPath").textContent = ctx.root_path;
+          if (ctx?.dedup_run_id != null) ctxRunId = Number(ctx.dedup_run_id);
+          if (ctxRunId != null) qs("#runId").textContent = String(ctxRunId);
+        } catch (e) {
+          // ok: fallback на API без source_run_id
+        }
+        return ctxRunId;
+      }
+
+      function setToast(msg, isErr=false) {
+        const el = qs("#toast");
+        el.textContent = msg || "";
+        el.style.color = isErr ? "#991b1b" : "#6b7280";
+      }
+
+      function setTab(tab) {
+        activeTab = tab;
+        qs("#tabA").classList.toggle("active", tab === "A");
+        qs("#tabB").classList.toggle("active", tab === "B");
+        qs("#actionsA").style.display = (tab === "A") ? "flex" : "none";
+        qs("#actionsB").style.display = (tab === "B") ? "flex" : "none";
+        render();
+      }
+
+      qs("#tabA").onclick = () => setTab("A");
+      qs("#tabB").onclick = () => setTab("B");
+      qs("#btnReload").onclick = () => render();
+
+      function cardHtml(item, opts={}) {
+        const path = item.path || item.source_path || "";
+        const mime = (item.mime_type || item.source_mime_type || "").toLowerCase();
+        const mt = (item.media_type || item.source_media_type || "").toLowerCase();
+        const kind = (mt === "video" || mime.startsWith("video/")) ? "video" : ((mt === "image" || mime.startsWith("image/")) ? "image" : "none");
+        const pv = item.preview_url || previewUrlForPath(path, kind);
+        const openUrl = path.startsWith("disk:") ? `/api/yadisk/open?path=${encodeURIComponent(path)}` : null;
+        const chkId = opts.chkId || "";
+        const chkLabel = opts.chkLabel || "";
+        const checked = !!opts.checked;
+        const size = item.size_human || (item.size != null ? String(item.size) : "—");
+        const name = item.name || item.source_name || "";
+        const head = name ? `<div class="muted">${escapeHtml(name)}</div>` : "";
+        const thumb = (kind === "image" && pv)
+          ? `<img loading="lazy" alt="preview" referrerpolicy="no-referrer" data-src="${escapeHtml(pv)}" />`
+          : (kind === "video" && pv)
+            ? `<video controls muted preload="metadata" src="${escapeHtml(pv)}"></video>`
+            : `<div class="noimg">нет превью</div>`;
+        const openLink = openUrl ? `<a href="${escapeHtml(openUrl)}" target="_blank" rel="noopener noreferrer" class="pill">Открыть</a>` : "";
+        const chk = chkId ? `
+          <div class="chk">
+            <input type="checkbox" data-chk="${escapeHtml(chkId)}" ${checked ? "checked" : ""}/>
+            <span class="muted">${escapeHtml(chkLabel)}</span>
+          </div>` : "";
+        return `
+          <div class="card" data-path="${escapeHtml(path)}">
+            <div class="thumb" data-src="${escapeHtml(pv || "")}" data-kind="${escapeHtml(kind)}" data-path="${escapeHtml(path)}">
+              ${thumb}
+            </div>
+            <div class="card-body">
+              ${head}
+              <div class="path"><code>${escapeHtml(path)}</code></div>
+              <div class="kv">
+                <span class="pill">${escapeHtml(size)}</span>
+                ${openLink}
+              </div>
+              ${chk}
+            </div>
+          </div>
+        `;
+      }
+
+      async function renderA() {
+        await ensureCtxRunId();
+        const url = (ctxRunId != null) ? `/api/sort/dup-in-archive?source_run_id=${encodeURIComponent(String(ctxRunId))}` : "/api/sort/dup-in-archive";
+        const data = await fetchJson(url, { cache:"no-store" });
+        ctxRunId = data?.source_run_id ?? null;
+        qs("#runId").textContent = ctxRunId != null ? String(ctxRunId) : "—";
+        qs("#rootPath").textContent = data?.source_root_path || "—";
+        qs("#noteA").textContent = data?.archive_scanned ? "" : "Архив ещё не просканирован (часть совпадений может отсутствовать).";
+
+        const items = Array.isArray(data?.items) ? data.items : [];
+        const selected = new Set();
+        const content = qs("#content");
+        if (!items.length) {
+          content.innerHTML = `<div class="muted">Совпадений с архивом нет.</div>`;
+        } else {
+          content.innerHTML = items.map((it, idx) => {
+          const src = {
+            path: it.source_path,
+            name: it.source_name,
+            size: it.source_size,
+            mime_type: it.source_mime_type,
+            media_type: it.source_media_type,
+          };
+          const srcCard = cardHtml(src, { chkId: `A:${idx}`, chkLabel: "выбрать", checked: false });
+          const matches = Array.isArray(it.matches) ? it.matches : [];
+          const matchCards = matches.map(m => cardHtml({ path: m.path, name: m.name, size: m.size, mime_type: m.mime_type, media_type: m.media_type })).join("");
+          return `
+            <div class="row" data-row="${idx}">
+              <div class="row-left">
+                <div class="muted">Источник</div>
+                ${srcCard}
+              </div>
+              <div class="row-right">
+                <div class="muted">Совпало в архиве: <span class="pill">${matches.length}</span></div>
+                <div class="cards" style="margin-top:8px;">${matchCards || `<span class="muted">—</span>`}</div>
+              </div>
+            </div>
+          `;
+          }).join("");
+        }
+
+        function updateButtons() {
+          const n = selected.size;
+          const del = qs("#btnDelA");
+          const ign = qs("#btnIgnoreA");
+          del.disabled = n === 0;
+          ign.disabled = n === 0;
+          del.textContent = `Удалить выбранные (${n})`;
+          ign.textContent = `Не дубль (${n})`;
+        }
+        updateButtons();
+
+        qsa("input[type=checkbox][data-chk^='A:']").forEach(cb => {
+          cb.addEventListener("change", () => {
+            const key = cb.getAttribute("data-chk");
+            if (!key) return;
+            if (cb.checked) selected.add(key); else selected.delete(key);
+            updateButtons();
+          });
+        });
+
+        qs("#btnDelA").onclick = async () => {
+          const paths = [];
+          selected.forEach(key => {
+            const idx = Number(String(key).split(":")[1]);
+            const it = items[idx];
+            if (it?.source_path) paths.push(String(it.source_path));
+          });
+          if (!paths.length) return;
+          if (!confirm(`Удалить выбранные из источника: ${paths.length} файл(ов)?`)) return;
+          await postJson("/api/sort/source/delete", { paths, source_run_id: ctxRunId });
+          await render();
+        };
+        qs("#btnIgnoreA").onclick = async () => {
+          const paths = [];
+          selected.forEach(key => {
+            const idx = Number(String(key).split(":")[1]);
+            const it = items[idx];
+            if (it?.source_path) paths.push(String(it.source_path));
+          });
+          if (!paths.length) return;
+          await postJson("/api/sort/source/ignore-archive-dup", { paths, source_run_id: ctxRunId });
+          await render();
+        };
+
+        // lightbox for images
+        qsa(".thumb[data-kind='image'][data-src]").forEach(el => {
+          el.addEventListener("dblclick", () => {
+            const src = el.getAttribute("data-src") || "";
+            const path = el.getAttribute("data-path") || "";
+            if (src) lb.open(src, path);
+          });
+        });
+      }
+
+      async function renderB() {
+        await ensureCtxRunId();
+        const url = (ctxRunId != null) ? `/api/sort/dup-in-source?source_run_id=${encodeURIComponent(String(ctxRunId))}` : "/api/sort/dup-in-source";
+        const data = await fetchJson(url, { cache:"no-store" });
+        ctxRunId = data?.source_run_id ?? null;
+        qs("#runId").textContent = ctxRunId != null ? String(ctxRunId) : "—";
+        qs("#rootPath").textContent = data?.source_root_path || "—";
+
+        const groups = Array.isArray(data?.groups) ? data.groups : [];
+        const content = qs("#content");
+        content.innerHTML = groups.map((g, gi) => {
+          const files = Array.isArray(g.files) ? g.files : [];
+          const cards = files.map((f, fi) => cardHtml(f, { chkId: `B:${gi}:${fi}`, chkLabel: "сохранить", checked: !!f.keep })).join("");
+          return `
+            <div class="row" data-group="${gi}">
+              <div class="row-left">
+                <div class="muted">Группа</div>
+                <div style="margin-top:6px;"><span class="pill">${escapeHtml(g.cnt || "")} шт</span> <code>${escapeHtml(g.hash_short || "")}</code></div>
+                <div class="muted" style="margin-top:8px;">Нужно оставить хотя бы один файл.</div>
+              </div>
+              <div class="row-right">
+                <div class="cards">${cards}</div>
+              </div>
+            </div>
+          `;
+        }).join("") || `<div class="muted">Групп нет.</div>`;
+
+        function groupValidity(rowEl) {
+          const cbs = qsa("input[type=checkbox][data-chk^='B:']", rowEl);
+          const checked = cbs.filter(x => x.checked).length;
+          if (checked === 0 && cbs[0]) cbs[0].checked = true;
+        }
+        qsa(".row[data-group]").forEach(row => {
+          groupValidity(row);
+          row.addEventListener("change", (e) => {
+            const t = e.target;
+            if (!(t instanceof HTMLInputElement)) return;
+            if (!t.getAttribute("data-chk")?.startsWith("B:")) return;
+            groupValidity(row);
+            updateDelBtn();
+          });
+        });
+
+        function collectUnchecked() {
+          const paths = [];
+          qsa("input[type=checkbox][data-chk^='B:']").forEach(cb => {
+            if (!(cb instanceof HTMLInputElement)) return;
+            if (cb.checked) return;
+            const card = cb.closest(".card");
+            const p = card?.getAttribute("data-path");
+            if (p) paths.push(p);
+          });
+          return paths;
+        }
+
+        function updateDelBtn() {
+          const paths = collectUnchecked();
+          const btn = qs("#btnDelB");
+          btn.textContent = `Удалить копии (${paths.length})`;
+          btn.disabled = paths.length === 0;
+        }
+        updateDelBtn();
+
+        qs("#btnDelB").onclick = async () => {
+          const paths = collectUnchecked();
+          if (!paths.length) return;
+          if (!confirm(`Удалить копии из источника: ${paths.length} файл(ов)?`)) return;
+          await postJson("/api/sort/source/delete", { paths, source_run_id: ctxRunId });
+          await render();
+        };
+
+        qsa(".thumb[data-kind='image'][data-src]").forEach(el => {
+          el.addEventListener("dblclick", () => {
+            const src = el.getAttribute("data-src") || "";
+            const path = el.getAttribute("data-path") || "";
+            if (src) lb.open(src, path);
+          });
+        });
+      }
+
+      async function render() {
+        setToast("");
+        qs("#content").innerHTML = `<div class="muted">Загрузка…</div>`;
+        try {
+          if (activeTab === "A") {
+            await renderA();
+          } else {
+            await renderB();
+          }
+        } catch (e) {
+          setToast(e?.message || String(e), true);
+          qs("#content").innerHTML = "";
+        }
+      }
+
+      render();
+    </script>
+  </body>
+</html>
+
+

@@ -37,6 +37,28 @@ class dedup_runs <<table>> {
   last_error: TEXT
 }
 
+class pipeline_runs <<table>> {
+  +id: INTEGER <<PK>>
+  kind: TEXT                    ' local_sort
+  root_path: TEXT               ' C:\... (локальная папка)
+  status: TEXT                  ' running|completed|failed
+  step_num: INTEGER
+  step_total: INTEGER
+  step_title: TEXT
+  apply: INTEGER
+  skip_dedup: INTEGER
+  dedup_run_id: INTEGER
+  face_run_id: INTEGER
+  pid: INTEGER
+  last_src_path: TEXT
+  last_dst_path: TEXT
+  last_error: TEXT
+  log_tail: TEXT
+  started_at: TEXT
+  updated_at: TEXT
+  finished_at: TEXT
+}
+
 class yd_files <<table>> {
   +id: INTEGER <<PK>>
   path: TEXT <<UNIQUE>>         ' disk:/... or local:...
@@ -68,6 +90,7 @@ class yd_files <<table>> {
 
 folders "0..1" -- "*" yd_files : файлы в папке (parent_path, логически)
 dedup_runs "1" -- "*" yd_files : прогон дедупа
+pipeline_runs "0..1" -- "0..1" dedup_runs : шаг 1 (дедуп)
 
 class face_runs <<table>> {
   +id: INTEGER <<PK>>
@@ -101,6 +124,7 @@ class face_rectangles <<table>> {
 }
 
 face_runs "1" -- "*" face_rectangles : прямоугольники лиц
+pipeline_runs "0..1" -- "0..1" face_runs : шаг 2 (лица)
 
 note right of face_rectangles
   presence_score (photo) =
