@@ -137,6 +137,10 @@ def init_db():
             "duration_sec": "duration_sec INTEGER",
             "duration_source": "duration_source TEXT",
             "duration_at": "duration_at TEXT",
+            # Face-метаданные (quick win: лица/не лица для локальной сортировки)
+            "faces_count": "faces_count INTEGER",
+            "faces_run_id": "faces_run_id INTEGER",
+            "faces_scanned_at": "faces_scanned_at TEXT",
         },
     )
 
@@ -332,6 +336,23 @@ class FaceStore:
                 thumb_jpeg,
                 _now_utc_iso(),
             ),
+        )
+        self.conn.commit()
+
+    def update_file_path(self, *, old_file_path: str, new_file_path: str) -> None:
+        """
+        Обновляет file_path для face_rectangles (когда файл физически перенесли на диске/в YaDisk).
+
+        Важно: это чисто "техническая" миграция ссылок. Семантика детекта не меняется.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            UPDATE face_rectangles
+            SET file_path = ?
+            WHERE file_path = ?
+            """,
+            (new_file_path, old_file_path),
         )
         self.conn.commit()
 
@@ -716,6 +737,18 @@ class DedupStore:
             WHERE path = ?
             """,
             (new_path, new_name, new_parent_path, old_path),
+        )
+        self.conn.commit()
+
+    def set_faces_summary(self, *, path: str, faces_run_id: int, faces_count: int, faces_scanned_at: str | None = None) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            UPDATE yd_files
+            SET faces_count = ?, faces_run_id = ?, faces_scanned_at = ?
+            WHERE path = ?
+            """,
+            (int(faces_count), int(faces_run_id), faces_scanned_at or _now_utc_iso(), path),
         )
         self.conn.commit()
 

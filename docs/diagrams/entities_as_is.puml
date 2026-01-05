@@ -61,6 +61,9 @@ class yd_files <<table>> {
   duration_sec: INTEGER
   duration_source: TEXT
   duration_at: TEXT
+  faces_count: INTEGER
+  faces_run_id: INTEGER
+  faces_scanned_at: TEXT
 }
 
 folders "0..1" -- "*" yd_files : файлы в папке (parent_path, логически)
