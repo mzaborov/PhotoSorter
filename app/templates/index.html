@@ -75,8 +75,7 @@
             <div class="muted" style="margin-top: 6px;">Шаг 1: “уже есть в архиве” · Шаг 2: “дубли внутри папки”</div>
           </div>
           <div class="row">
-            <a href="/folders" class="muted">Папки</a>
-            <a href="/duplicates" class="muted">Дубли (фотоархив)</a>
+            <a href="/folders" class="muted">Фотоархив</a>
           </div>
         </div>
 
@@ -860,11 +859,13 @@
         }
         if (p) qs("#path").value = p;
         updateBrowseLink();
+        updateLocalPipelineVisibility();
       }
 
       document.querySelectorAll("input[name='location']").forEach(r => r.addEventListener("change", () => {
         localStorage.setItem("ps.location", getLocation());
         updateBrowseLink();
+        updateLocalPipelineVisibility();
       }));
       qs("#path")?.addEventListener("input", () => {
         localStorage.setItem("ps.path", qs("#path").value || "");

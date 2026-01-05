@@ -29,7 +29,15 @@ def _ensure_columns(conn: sqlite3.Connection, table: str, ddl_by_column: dict[st
     for col, ddl in ddl_by_column.items():
         if col in existing:
             continue
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        try:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        except sqlite3.OperationalError as e:
+            # Возможна гонка: два потока одновременно делают миграцию.
+            # В этом случае один успевает добавить колонку, второй падает на duplicate column name.
+            msg = str(e).lower()
+            if "duplicate column name" in msg:
+                continue
+            raise
 
 
 def _now_utc_iso() -> str:
