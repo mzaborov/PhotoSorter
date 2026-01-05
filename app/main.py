@@ -37,6 +37,10 @@ STARTED_AT_UTC_ISO = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_STARTED_AT
 BUILD_ID = time.strftime("%Y%m%d-%H%M%S", time.gmtime(_STARTED_AT)) + f"-pid{os.getpid()}"
 
 
+def _now_utc_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 @app.middleware("http")
 async def _add_build_id_header(request: Request, call_next):  # type: ignore[no-untyped-def]
     resp = await call_next(request)
@@ -81,6 +85,129 @@ _VIDEO_EXEC = ThreadPoolExecutor(max_workers=2)
 _VIDEO_LOCK = threading.Lock()
 _VIDEO_FUTURES: dict[str, Any] = {}
 _VIDEO_ERRORS: dict[str, str] = {}
+
+# Локальный "конвейер" (ML в отдельном процессе через .venv-face).
+_LOCAL_PIPELINE_EXEC = ThreadPoolExecutor(max_workers=1)
+_LOCAL_PIPELINE_LOCK = threading.Lock()
+_LOCAL_PIPELINE_FUTURE: Any = None
+_LOCAL_PIPELINE_STATE: dict[str, Any] = {
+    "running": False,
+    "root_path": None,
+    "apply": False,
+    "skip_dedup": False,
+    "no_dedup_move": False,
+    "started_at": None,
+    "finished_at": None,
+    "exit_code": None,
+    "error": None,
+    "log": "",
+}
+
+
+def _repo_root() -> Path:
+    # app/main.py -> repo root
+    return APP_DIR.parent
+
+
+def _local_pipeline_log_append(line: str) -> None:
+    # держим хвост лога (чтобы не раздувать память)
+    with _LOCAL_PIPELINE_LOCK:
+        s = _LOCAL_PIPELINE_STATE.get("log") or ""
+        s = (s + (line or "")).replace("\r\n", "\n")
+        if len(s) > 120_000:
+            s = s[-120_000:]
+        _LOCAL_PIPELINE_STATE["log"] = s
+
+
+def _run_local_pipeline(*, root_path: str, apply: bool, skip_dedup: bool, no_dedup_move: bool) -> None:
+    # Запускаем scripts/run_face.ps1 -> python из .venv-face -> scripts/tools/local_sort_by_faces.py
+    rr = _repo_root()
+    ps1 = rr / "scripts" / "run_face.ps1"
+    py = rr / ".venv-face" / "Scripts" / "python.exe"
+    script = rr / "scripts" / "tools" / "local_sort_by_faces.py"
+
+    with _LOCAL_PIPELINE_LOCK:
+        _LOCAL_PIPELINE_STATE.update(
+            {
+                "running": True,
+                "root_path": root_path,
+                "apply": bool(apply),
+                "skip_dedup": bool(skip_dedup),
+                "no_dedup_move": bool(no_dedup_move),
+                "started_at": _now_utc_iso(),
+                "finished_at": None,
+                "exit_code": None,
+                "error": None,
+                "log": "",
+            }
+        )
+
+    # Дополнительные проверки на всякий случай (в start мы тоже проверяем).
+    if not ps1.exists():
+        _local_pipeline_log_append(f"ERROR: not found: {ps1}\n")
+        with _LOCAL_PIPELINE_LOCK:
+            _LOCAL_PIPELINE_STATE.update({"running": False, "finished_at": _now_utc_iso(), "exit_code": 2, "error": "run_face.ps1 not found"})
+        return
+    if not py.exists():
+        _local_pipeline_log_append(f"ERROR: not found: {py}\n")
+        with _LOCAL_PIPELINE_LOCK:
+            _LOCAL_PIPELINE_STATE.update({"running": False, "finished_at": _now_utc_iso(), "exit_code": 2, "error": ".venv-face python not found"})
+        return
+    if not script.exists():
+        _local_pipeline_log_append(f"ERROR: not found: {script}\n")
+        with _LOCAL_PIPELINE_LOCK:
+            _LOCAL_PIPELINE_STATE.update(
+                {"running": False, "finished_at": _now_utc_iso(), "exit_code": 2, "error": "local_sort_by_faces.py not found"}
+            )
+        return
+
+    cmd: list[str] = [
+        "pwsh",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(ps1),
+        str(script.relative_to(rr)),
+        "--root",
+        root_path,
+    ]
+    if apply:
+        cmd.append("--apply")
+    if skip_dedup:
+        cmd.append("--skip-dedup")
+    if no_dedup_move:
+        cmd.append("--no-dedup-move")
+
+    _local_pipeline_log_append("RUN: " + " ".join(cmd) + "\n")
+
+    try:
+        p = subprocess.Popen(  # noqa: S603
+            cmd,
+            cwd=str(rr),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert p.stdout is not None
+        for line in p.stdout:
+            _local_pipeline_log_append(line)
+        rc = int(p.wait())
+        with _LOCAL_PIPELINE_LOCK:
+            _LOCAL_PIPELINE_STATE.update(
+                {
+                    "running": False,
+                    "finished_at": _now_utc_iso(),
+                    "exit_code": rc,
+                    "error": None if rc == 0 else f"exit_code={rc}",
+                }
+            )
+    except Exception as e:  # noqa: BLE001
+        _local_pipeline_log_append(f"ERROR: {type(e).__name__}: {e}\n")
+        with _LOCAL_PIPELINE_LOCK:
+            _LOCAL_PIPELINE_STATE.update({"running": False, "finished_at": _now_utc_iso(), "exit_code": 1, "error": f"{type(e).__name__}: {e}"})
+
 
 
 def _preview_cache_get(key: tuple[str, str]) -> Optional[str]:
@@ -1395,6 +1522,63 @@ def api_sort_start(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         "archive_started": archive_started,
         "archive_start": archive_start_resp,
     }
+
+
+@app.post("/api/local-pipeline/start")
+def api_local_pipeline_start(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Запуск локального конвейера (ML в отдельном процессе через .venv-face).
+    Использует scripts/run_face.ps1 -> scripts/tools/local_sort_by_faces.py.
+    """
+    root_path = str(payload.get("root_path") or "").strip()
+    apply = bool(payload.get("apply") or False)
+    skip_dedup = bool(payload.get("skip_dedup") or False)
+    no_dedup_move = bool(payload.get("no_dedup_move") or False)
+
+    if not root_path:
+        raise HTTPException(status_code=400, detail="root_path is required")
+    if root_path.startswith("disk:"):
+        raise HTTPException(status_code=400, detail="Only local folders are supported here (use C:\\... path)")
+    if not os.path.isdir(root_path):
+        raise HTTPException(status_code=400, detail=f"Folder not found: {root_path}")
+
+    rr = _repo_root()
+    ps1 = rr / "scripts" / "run_face.ps1"
+    py = rr / ".venv-face" / "Scripts" / "python.exe"
+    script = rr / "scripts" / "tools" / "local_sort_by_faces.py"
+    if not ps1.exists():
+        raise HTTPException(status_code=500, detail=f"Missing: {ps1}")
+    if not py.exists():
+        raise HTTPException(status_code=500, detail="Missing .venv-face (Python 3.12) — create it before running ML pipeline")
+    if not script.exists():
+        raise HTTPException(status_code=500, detail=f"Missing: {script}")
+
+    global _LOCAL_PIPELINE_FUTURE  # noqa: PLW0603
+    with _LOCAL_PIPELINE_LOCK:
+        fut = _LOCAL_PIPELINE_FUTURE
+        if fut is not None and not fut.done():
+            return {"ok": False, "message": "local pipeline already running"}
+        _LOCAL_PIPELINE_FUTURE = _LOCAL_PIPELINE_EXEC.submit(
+            _run_local_pipeline,
+            root_path=root_path,
+            apply=apply,
+            skip_dedup=skip_dedup,
+            no_dedup_move=no_dedup_move,
+        )
+
+    return {"ok": True, "message": "started", "root_path": root_path, "apply": apply, "skip_dedup": skip_dedup, "no_dedup_move": no_dedup_move}
+
+
+@app.get("/api/local-pipeline/status")
+def api_local_pipeline_status() -> dict[str, Any]:
+    with _LOCAL_PIPELINE_LOCK:
+        st = dict(_LOCAL_PIPELINE_STATE)
+    log = (st.get("log") or "").replace("\r\n", "\n")
+    lines = log.splitlines()[-120:]
+    st["log_tail"] = "\n".join(lines)
+    # не отдаём полный лог (может разрастись)
+    st.pop("log", None)
+    return st
 
 
 @app.get("/api/sort/context")

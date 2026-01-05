@@ -52,6 +52,7 @@
       .card2-body { padding: 10px 10px 12px 10px; }
       .keep { margin-top: 8px; display: flex; gap: 8px; align-items: center; }
       .keep input { transform: scale(1.1); }
+      pre.log { margin: 10px 0 0 0; padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 12px; background: #f9fafb; white-space: pre-wrap; max-height: 260px; overflow: auto; font-size: 12px; }
 
       /* Lightbox */
       .lb { position: fixed; inset: 0; background: rgba(17,24,39,0.82); display: none; align-items: center; justify-content: center; padding: 18px; z-index: 9999; }
@@ -94,6 +95,25 @@
             Для YaDisk можно указывать любую папку вне <code>disk:/Фото</code> (например <code>disk:/Загрузки</code>).
           </div>
           <div id="toast" class="muted" style="margin-top: 8px;"></div>
+        </div>
+
+        <div class="section" id="secLocalPipeline" style="display:none;">
+          <div class="row" style="justify-content: space-between;">
+            <div>
+              <h3>Локальный конвейер (quick win)</h3>
+              <div class="muted">Дедуп → лица/не лица → лица по именам (manual) → не‑лица по GPS+год (EXIF/mtime).</div>
+            </div>
+            <div class="row">
+              <button id="btnPipeDry" class="btn" type="button">Запустить (dry-run)</button>
+              <button id="btnPipeApply" class="btn danger" type="button">Запустить (APPLY)</button>
+            </div>
+          </div>
+          <div class="row" style="margin-top: 10px;">
+            <label style="font-weight: 600;"><input id="pipeSkipDedup" type="checkbox" /> пропустить дедуп</label>
+            <label style="font-weight: 600;"><input id="pipeNoDedupMove" type="checkbox" /> не переносить дубликаты в <code>_duplicates</code></label>
+            <span class="pill">статус: <b id="pipeStatus">—</b></span>
+          </div>
+          <pre id="pipeLog" class="log">—</pre>
         </div>
 
         <div class="section">
@@ -199,6 +219,12 @@
           a.style.display = "none";
           a.setAttribute("href", "#");
         }
+      }
+      function updateLocalPipelineVisibility() {
+        const loc = getLocation();
+        const sec = qs("#secLocalPipeline");
+        if (!sec) return;
+        sec.style.display = (loc === "local") ? "block" : "none";
       }
       async function fetchJson(url, opts) {
         const resp = await fetch(url, opts || { cache: "no-store" });
@@ -348,6 +374,51 @@
         const limit = createLimiter(2);
         const thumbs = Array.from(document.querySelectorAll(".thumb[data-src][data-kind]"));
         await Promise.all(thumbs.map(el => limit(() => loadThumb(el))));
+      }
+
+      let pipePollTimer = null;
+      async function pipePollOnce() {
+        try {
+          const st = await fetchJson("/api/local-pipeline/status", { cache: "no-store" });
+          qs("#pipeStatus").textContent = st.running ? "running" : (st.exit_code === 0 ? "done" : (st.exit_code != null ? `exit ${st.exit_code}` : "idle"));
+          const log = (st.log_tail || "").trim();
+          qs("#pipeLog").textContent = log ? log : "—";
+          if (st.running) {
+            pipePollTimer = setTimeout(pipePollOnce, 1200);
+          } else {
+            pipePollTimer = null;
+          }
+        } catch (e) {
+          qs("#pipeStatus").textContent = "error";
+          pipePollTimer = null;
+        }
+      }
+
+      async function startLocalPipeline(apply) {
+        const loc = getLocation();
+        if (loc !== "local") return;
+        const root = (qs("#path")?.value || "").trim();
+        if (!root) { setToast("Укажи путь к локальной папке (C:\\...)", true); return; }
+        try {
+          setToast("");
+          qs("#btnPipeDry").disabled = true;
+          qs("#btnPipeApply").disabled = true;
+          const skipDedup = !!qs("#pipeSkipDedup")?.checked;
+          const noDedupMove = !!qs("#pipeNoDedupMove")?.checked;
+          const resp = await postJson("/api/local-pipeline/start", { root_path: root, apply: !!apply, skip_dedup: skipDedup, no_dedup_move: noDedupMove });
+          if (!resp?.ok) {
+            setToast(resp?.message || "Не удалось запустить конвейер", true);
+          } else {
+            setToast("Локальный конвейер запущен (см. лог ниже).");
+            if (pipePollTimer) clearTimeout(pipePollTimer);
+            pipePollOnce();
+          }
+        } catch (e) {
+          setToast(e?.message || String(e), true);
+        } finally {
+          qs("#btnPipeDry").disabled = false;
+          qs("#btnPipeApply").disabled = false;
+        }
       }
 
       async function loadVideoDurations() {
@@ -822,6 +893,14 @@
           qs("#btnSort").disabled = false;
         }
       });
+
+      qs("#btnPipeDry")?.addEventListener("click", () => startLocalPipeline(false));
+      qs("#btnPipeApply")?.addEventListener("click", () => startLocalPipeline(true));
+
+      Array.from(document.querySelectorAll("input[name='location']")).forEach(el => {
+        el.addEventListener("change", () => { updateBrowseLink(); updateLocalPipelineVisibility(); });
+      });
+      updateLocalPipelineVisibility();
 
       loadSaved();
       refreshStatus();
