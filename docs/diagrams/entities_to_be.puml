@@ -120,6 +120,7 @@ class face_labels <<table>> {
   +id: INTEGER <<PK>>
   face_rectangle_id: INTEGER <<FK>>
   person_id: INTEGER <<FK>>
+  cluster_id: INTEGER <<FK>>     ' optional: если source=cluster — из какого кластера пришло решение
   source: TEXT                  ' manual|cluster|ai
   confidence: REAL
   created_at: TEXT
@@ -127,6 +128,7 @@ class face_labels <<table>> {
 
 face_rectangles "1" -- "0..1" face_labels : назначение персоны
 persons "1" -- "*" face_labels : метки лица
+face_clusters "0..1" -- "*" face_labels : источник (кластер)
 
 class face_identity_candidates <<table>> {
   +id: INTEGER <<PK>>
