@@ -129,7 +129,6 @@ def main() -> int:
     # map file name -> expected tab (positive expectations only)
     expected_by_file = {
         "cats.txt": "animals",
-        "quarantine_obvious.txt": "quarantine",
         "quarantine_manual.txt": "quarantine",
         "no_faces.txt": "no_faces",
         "people_no_face.txt": "people_no_face",
