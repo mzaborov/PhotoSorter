@@ -1,0 +1,6 @@
+local:C:\tmp\Photo\IMG-20240315-WA0001.jpg
+local:C:\tmp\Photo\IMG-20240313-WA0022.jpg
+local:C:\tmp\Photo\IMG-20240313-WA0021.jpg
+local:C:\tmp\Photo\IMG-20240313-WA0020.jpg
+
+

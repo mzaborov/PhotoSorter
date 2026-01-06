@@ -86,6 +86,14 @@ class yd_files <<table>> {
   faces_count: INTEGER
   faces_run_id: INTEGER
   faces_scanned_at: TEXT
+  faces_manual_label: TEXT
+  faces_manual_at: TEXT
+  faces_auto_quarantine: INTEGER
+  faces_quarantine_reason: TEXT
+  animals_auto: INTEGER
+  animals_kind: TEXT
+  people_no_face_manual: INTEGER
+  people_no_face_person: TEXT
 }
 
 folders "0..1" -- "*" yd_files : файлы в папке (parent_path, логически)
@@ -120,6 +128,8 @@ class face_rectangles <<table>> {
   thumb_jpeg: BLOB
   manual_person: TEXT           ' временно (до persons/person_id)
   ignore_flag: INTEGER
+  is_manual: INTEGER
+  manual_created_at: TEXT
   created_at: TEXT
 }
 

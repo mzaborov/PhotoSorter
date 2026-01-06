@@ -1,35 +1,10 @@
 from __future__ import annotations
 
-"""
-Thin CLI wrapper.
-
-Core implementation lives in `photosorter.pipeline.local_sort`.
-This file remains for backward compatibility and for Web UI which runs it via `.venv-face`.
-"""
-
-import sys
-from pathlib import Path
-
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-
-from photosorter.pipeline.local_sort import main  # noqa: E402
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-from __future__ import annotations
-
 import argparse
 import hashlib
 import mimetypes
 import os
 import shutil
-import sys
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -39,12 +14,6 @@ from typing import Iterable, Optional
 import cv2  # type: ignore[import-untyped]
 import numpy as np  # type: ignore[import-untyped]
 from PIL import Image, ExifTags, ImageOps  # type: ignore[import-untyped]
-
-# Чтобы скрипт запускался как `python scripts/tools/local_sort_by_faces.py ...`
-# и при этом видел `DB/`, добавляем корень репозитория в sys.path.
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
 
 from DB.db import DedupStore, FaceStore, PipelineStore
 

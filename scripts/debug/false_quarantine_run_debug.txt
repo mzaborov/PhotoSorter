@@ -1,0 +1,10 @@
+local:C:\tmp\Photo\IMG-20231213-WA0002.jpg
+local:C:\tmp\Photo\IMG-20231213-WA0003.jpg
+local:C:\tmp\Photo\IMG-20231213-WA0005.jpg
+local:C:\tmp\Photo\IMG-20231213-WA0008.jpg
+local:C:\tmp\Photo\IMG-20231213-WA0011.jpg
+local:C:\tmp\Photo\IMG-20231213-WA0012.jpg
+local:C:\tmp\Photo\IMG-20231213-WA0013.jpg
+local:C:\tmp\Photo\IMG-20231213-WA0015.jpg
+
+

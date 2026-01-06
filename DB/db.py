@@ -153,6 +153,17 @@ def init_db():
             # faces_manual_label: 'faces'|'no_faces'|NULL
             "faces_manual_label": "faces_manual_label TEXT",
             "faces_manual_at": "faces_manual_at TEXT",
+
+            # Локальная сортировка: дополнительные категории
+            # Авто-карантин (экраны/технические фото/сомнительные кейсы)
+            "faces_auto_quarantine": "faces_auto_quarantine INTEGER NOT NULL DEFAULT 0",
+            "faces_quarantine_reason": "faces_quarantine_reason TEXT",
+            # Авто-детект животных (MVP: кошки)
+            "animals_auto": "animals_auto INTEGER NOT NULL DEFAULT 0",
+            "animals_kind": "animals_kind TEXT",
+            # Люди, но лица не найдены (пока в основном manual)
+            "people_no_face_manual": "people_no_face_manual INTEGER NOT NULL DEFAULT 0",
+            "people_no_face_person": "people_no_face_person TEXT",
         },
     )
 
@@ -928,6 +939,82 @@ class DedupStore:
                 WHERE path = ?
                 """,
                 (lab, _now_utc_iso(), path),
+            )
+        self.conn.commit()
+
+    def set_faces_auto_quarantine(self, *, path: str, is_quarantine: bool, reason: str | None = None) -> None:
+        """
+        Авто-карантин для локальной сортировки (экраны/технические кейсы).
+        Manual labels (faces/no_faces/people_no_face) в UI имеют приоритет над этим флагом.
+        """
+        cur = self.conn.cursor()
+        if bool(is_quarantine):
+            cur.execute(
+                """
+                UPDATE yd_files
+                SET faces_auto_quarantine = 1, faces_quarantine_reason = ?
+                WHERE path = ?
+                """,
+                ((reason or "").strip() or None, path),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE yd_files
+                SET faces_auto_quarantine = 0, faces_quarantine_reason = NULL
+                WHERE path = ?
+                """,
+                (path,),
+            )
+        self.conn.commit()
+
+    def set_animals_auto(self, *, path: str, is_animal: bool, kind: str | None = None) -> None:
+        """
+        Авто-детект животных (MVP: кошки).
+        """
+        cur = self.conn.cursor()
+        if bool(is_animal):
+            cur.execute(
+                """
+                UPDATE yd_files
+                SET animals_auto = 1, animals_kind = ?
+                WHERE path = ?
+                """,
+                ((kind or "").strip() or None, path),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE yd_files
+                SET animals_auto = 0, animals_kind = NULL
+                WHERE path = ?
+                """,
+                (path,),
+            )
+        self.conn.commit()
+
+    def set_people_no_face_manual(self, *, path: str, is_people_no_face: bool, person: str | None = None) -> None:
+        """
+        Ручная пометка: "есть люди, но лица не найдены".
+        """
+        cur = self.conn.cursor()
+        if bool(is_people_no_face):
+            cur.execute(
+                """
+                UPDATE yd_files
+                SET people_no_face_manual = 1, people_no_face_person = ?
+                WHERE path = ?
+                """,
+                ((person or "").strip() or None, path),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE yd_files
+                SET people_no_face_manual = 0, people_no_face_person = NULL
+                WHERE path = ?
+                """,
+                (path,),
             )
         self.conn.commit()
 

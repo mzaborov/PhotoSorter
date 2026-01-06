@@ -240,7 +240,8 @@ def main() -> int:
                 denom = float(sum(areas)) if areas else 0.0
 
                 # Очищаем результаты для файла в рамках текущего прогона (на случай повтора).
-                store.clear_run_detections_for_file(run_id=run_id, file_path=p_disk)
+                # Важно: не удаляем ручные прямоугольники (если они когда-нибудь появятся для этого run_id).
+                store.clear_run_auto_rectangles_for_file(run_id=run_id, file_path=p_disk)
 
                 # Для thumb используем PIL (качество JPEG + быстрый resize).
                 pil = Image.open(tmp_path)

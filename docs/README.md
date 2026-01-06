@@ -150,6 +150,9 @@
 
 ```text
 PhotoSorter/
+  photosorter/                # основной код (ядро), импортируемый из UI/CLI
+    pipeline/
+      local_sort.py           # локальный конвейер: dedup -> faces -> split
   app/
     main.py                  # FastAPI-приложение: роуты страниц и API
     templates/               # Jinja2-шаблоны страниц (CSS/JS встроены в HTML)
@@ -171,11 +174,15 @@ PhotoSorter/
   scripts/
     tools/                   # Утилиты (скан/дамп/загрузка папок в БД)
       face_scan.py           # MVP: скан лиц для YaDisk папки (пишет bbox/presence/thumbnail в SQLite)
+      local_sort_by_faces.py # thin-wrapper: запускает photosorter.pipeline.local_sort (backward compat)
     debug/                   # Отладочные скрипты для YaDisk/папок
+    regression/              # экспорт/проверки регресса
     run_server.ps1           # “одной кнопкой” запустить uvicorn --reload
     run_face.ps1             # “одной кнопкой” запускать face-задачи через .venv-face (без activate)
     render_diagrams.py       # Генерация PNG из PlantUML через PlantUML server (для автодокументирования)
     render_diagrams.ps1      # Обёртка для render_diagrams.py
+  regression/
+    cases/                   # регрессионные списки путей (append-only)
   yadisk_client.py           # Создание клиента YaDisk + загрузка токена из env
   requirements.txt           # Python-зависимости (фиксированные версии)
   requirements-face.txt      # Отдельные зависимости для .venv-face (Python 3.12) под распознавание лиц
@@ -186,12 +193,14 @@ PhotoSorter/
 
 **Ключевые модули**
 
+- **`photosorter/`**: основной код сортера. `scripts/` остаётся для запускалок/дебага/экспорта.
 - **`app/main.py`**: FastAPI `app`, HTML-страницы (`/`, `/folders`, `/browse`, `/duplicates`) и JSON API (`/api/...`), плюс вспомогательная логика (ретраи/таймауты YaDisk, превью-redirect, дедуп-сканы).
 - **`app/templates/*.html`**: UI-страницы на Jinja2; стили и JS (fetch/рендер/прогресс) — инлайном.
 - **`DB/db.py`**: инициализация схемы SQLite, чтение справочника папок (`list_folders`), и слой для дедупа (`DedupStore`: прогоны, инвентарь файлов, хэши, пометки deleted/ignore, reconcile).
 - **`yadisk_client.py`**: загрузка `YADISK_ACCESS_TOKEN` из `secrets.env/.env` и создание `yadisk.YaDisk`.
 - **`scripts/tools/*`**: разовые утилиты, например скан первых уровней `/Фото` в таблицу `folders`.
 - **`scripts/debug/*`**: отладка проблемных путей/метаданных на Я.Диске.
+- **`regression/cases/*`**: регресс в виде списков путей (append-only). Экспорт из БД — `scripts/regression/export_cases_from_db.py`.
 
 ## Точные правила сортировки
 
@@ -319,10 +328,14 @@ curl.exe -i --connect-timeout 1 --max-time 5 http://127.0.0.1:8000/api/debug/bui
 - Страница результатов: `/faces?pipeline_run_id=...`
 - Вкладки:
   - **Есть лица**
+  - **Карантин**
+  - **Животные**
+  - **Есть люди (без лиц)**
   - **Нет лиц**
 - UX:
   - **double click** по превью — открыть просмотр bbox (авто + ручные)
   - бесконечная подгрузка (infinite scroll)
+  - разметка “потоком”: кнопки-метки не делают reload и не “прыгают” список
 
 ## Ручная корректировка “лица / нет лиц” (шаг 2)
 
@@ -332,10 +345,32 @@ curl.exe -i --connect-timeout 1 --max-time 5 http://127.0.0.1:8000/api/debug/bui
   - нажать **“Сохранить”**
 - Во вкладке **“Есть лица”**:
   - кнопка **“Лиц нет”** помечает файл как `no_faces`
+  - кнопки **“Карантин”** / **“Кот”** ставят ручные метки (для регресса/разбора)
+- Во вкладке **“Карантин”**:
+  - кнопки **“Нормальные лица”** / **“Кот”** снимают карантин/переопределяют категорию
 
 Данные сохраняются в SQLite:
 - `yd_files.faces_manual_label` / `yd_files.faces_manual_at`
+- `yd_files.faces_auto_quarantine` / `yd_files.faces_quarantine_reason` (в т.ч. `manual`)
+- `yd_files.animals_auto` / `yd_files.animals_kind` (в т.ч. `cat`)
+- `yd_files.people_no_face_manual` / `yd_files.people_no_face_person`
 - `face_rectangles.is_manual` / `face_rectangles.manual_created_at`
+
+## Регресс: списки путей + экспорт из БД
+
+Регресс хранится в `regression/cases/*.txt` (append-only, ничего не затираем).
+
+Экспорт из БД по конкретному прогону:
+
+```powershell
+C:\Users\mzaborov\AppData\Local\Python\pythoncore-3.14-64\python.exe scripts/regression/export_cases_from_db.py --pipeline-run-id 10 --out-dir regression/cases
+```
+
+Проверка регресса:
+
+```powershell
+C:\Users\mzaborov\AppData\Local\Python\pythoncore-3.14-64\python.exe scripts/regression/run_regression_checks.py --cases-dir regression/cases --mode effective
+```
 
 ## Важно про DRY_RUN vs apply
 

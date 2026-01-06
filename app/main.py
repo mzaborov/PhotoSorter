@@ -2495,13 +2495,18 @@ def api_faces_results(
 ) -> dict[str, Any]:
     """
     Возвращает список файлов для UI шага 2:
-    - tab=faces: эффективное "есть лица"
-    - tab=no_faces: эффективное "нет лиц"
-    Приоритет: faces_manual_label > faces_count.
+    - tab=faces: "есть лица"
+    - tab=no_faces: "нет лиц"
+    - tab=quarantine: "карантин" (авто)
+    - tab=animals: "животные" (авто)
+    - tab=people_no_face: "есть люди, но лица не найдены" (пока в основном manual)
+
+    Приоритет категорий (эффективная вкладка):
+    people_no_face_manual > faces_manual_label > animals_auto > faces_auto_quarantine > faces_count.
     """
     tab_n = (tab or "").strip().lower()
-    if tab_n not in ("faces", "no_faces"):
-        raise HTTPException(status_code=400, detail="tab must be faces|no_faces")
+    if tab_n not in ("faces", "no_faces", "quarantine", "animals", "people_no_face"):
+        raise HTTPException(status_code=400, detail="tab must be faces|no_faces|quarantine|animals|people_no_face")
     page_i = max(1, int(page or 1))
     size_i = max(10, min(200, int(page_size or 60)))
     offset = (page_i - 1) * size_i
@@ -2532,7 +2537,6 @@ def api_faces_results(
         except Exception:
             root_like = None
 
-    want_faces = 1 if tab_n == "faces" else 0
     where = ["faces_run_id = ?", "status != 'deleted'"]
     params: list[Any] = [face_run_id_i]
     if root_like:
@@ -2540,12 +2544,15 @@ def api_faces_results(
         params.append(root_like)
     where_sql = " AND ".join(where)
 
-    # Фильтр по "эффективному" результату (manual_label приоритетнее).
+    # Эффективная вкладка (manual приоритетнее авто).
     eff_sql = """
     CASE
-      WHEN lower(trim(coalesce(faces_manual_label, ''))) = 'faces' THEN 1
-      WHEN lower(trim(coalesce(faces_manual_label, ''))) = 'no_faces' THEN 0
-      ELSE (CASE WHEN coalesce(faces_count, 0) > 0 THEN 1 ELSE 0 END)
+      WHEN COALESCE(people_no_face_manual, 0) = 1 THEN 'people_no_face'
+      WHEN lower(trim(coalesce(faces_manual_label, ''))) = 'faces' THEN 'faces'
+      WHEN lower(trim(coalesce(faces_manual_label, ''))) = 'no_faces' THEN 'no_faces'
+      WHEN COALESCE(animals_auto, 0) = 1 THEN 'animals'
+      WHEN COALESCE(faces_auto_quarantine, 0) = 1 THEN 'quarantine'
+      ELSE (CASE WHEN COALESCE(faces_count, 0) > 0 THEN 'faces' ELSE 'no_faces' END)
     END
     """
 
@@ -2554,7 +2561,7 @@ def api_faces_results(
         cur = ds.conn.cursor()
         cur.execute(
             f"SELECT COUNT(*) AS cnt FROM yd_files WHERE {where_sql} AND ({eff_sql}) = ?",
-            params + [want_faces],
+            params + [tab_n],
         )
         total = int(cur.fetchone()[0] or 0)
 
@@ -2563,13 +2570,19 @@ def api_faces_results(
             SELECT
               path, name, parent_path, size, mime_type, media_type,
               COALESCE(faces_count, 0) AS faces_count,
-              COALESCE(faces_manual_label, '') AS faces_manual_label
+              COALESCE(faces_manual_label, '') AS faces_manual_label,
+              COALESCE(faces_auto_quarantine, 0) AS faces_auto_quarantine,
+              COALESCE(faces_quarantine_reason, '') AS faces_quarantine_reason,
+              COALESCE(animals_auto, 0) AS animals_auto,
+              COALESCE(animals_kind, '') AS animals_kind,
+              COALESCE(people_no_face_manual, 0) AS people_no_face_manual,
+              COALESCE(people_no_face_person, '') AS people_no_face_person
             FROM yd_files
             WHERE {where_sql} AND ({eff_sql}) = ?
             ORDER BY path ASC
             LIMIT ? OFFSET ?
             """,
-            params + [want_faces, size_i, offset],
+            params + [tab_n, size_i, offset],
         )
         rows = [dict(r) for r in cur.fetchall()]
     finally:
@@ -2600,6 +2613,12 @@ def api_faces_results(
                 "media_type": media_type,
                 "faces_count": int(r.get("faces_count") or 0),
                 "faces_manual_label": (str(r.get("faces_manual_label") or "") or ""),
+                "faces_auto_quarantine": int(r.get("faces_auto_quarantine") or 0),
+                "faces_quarantine_reason": (str(r.get("faces_quarantine_reason") or "") or "") or None,
+                "animals_auto": int(r.get("animals_auto") or 0),
+                "animals_kind": (str(r.get("animals_kind") or "") or "") or None,
+                "people_no_face_manual": int(r.get("people_no_face_manual") or 0),
+                "people_no_face_person": (str(r.get("people_no_face_person") or "") or "") or None,
                 **_faces_preview_meta(path=path, mime_type=mime_type, media_type=media_type, pipeline_run_id=int(pipeline_run_id)),
             }
         )
@@ -2615,6 +2634,78 @@ def api_faces_results(
         "total": total,
         "items": items,
     }
+
+
+@app.get("/api/faces/tab-counts")
+def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
+    """
+    Счётчики по вкладкам на странице /faces.
+    """
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    face_run_id = pr.get("face_run_id")
+    if not face_run_id:
+        raise HTTPException(status_code=400, detail="face_run_id is not set yet (step 2 not started)")
+    face_run_id_i = int(face_run_id)
+    root_path = str(pr.get("root_path") or "")
+
+    root_like = None
+    if root_path.startswith("disk:"):
+        rp = root_path.rstrip("/")
+        root_like = rp + "/%"
+    else:
+        try:
+            rp_abs = os.path.abspath(root_path)
+            rp_abs = rp_abs.rstrip("\\/") + "\\"
+            root_like = "local:" + rp_abs + "%"
+        except Exception:
+            root_like = None
+
+    where = ["faces_run_id = ?", "status != 'deleted'"]
+    params: list[Any] = [face_run_id_i]
+    if root_like:
+        where.append("path LIKE ?")
+        params.append(root_like)
+    where_sql = " AND ".join(where)
+
+    eff_sql = """
+    CASE
+      WHEN COALESCE(people_no_face_manual, 0) = 1 THEN 'people_no_face'
+      WHEN lower(trim(coalesce(faces_manual_label, ''))) = 'faces' THEN 'faces'
+      WHEN lower(trim(coalesce(faces_manual_label, ''))) = 'no_faces' THEN 'no_faces'
+      WHEN COALESCE(animals_auto, 0) = 1 THEN 'animals'
+      WHEN COALESCE(faces_auto_quarantine, 0) = 1 THEN 'quarantine'
+      ELSE (CASE WHEN COALESCE(faces_count, 0) > 0 THEN 'faces' ELSE 'no_faces' END)
+    END
+    """
+
+    ds = DedupStore()
+    try:
+        cur = ds.conn.cursor()
+        cur.execute(
+            f"""
+            SELECT ({eff_sql}) AS tab, COUNT(*) AS cnt
+            FROM yd_files
+            WHERE {where_sql}
+            GROUP BY ({eff_sql})
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+    finally:
+        ds.close()
+
+    counts = {"faces": 0, "no_faces": 0, "quarantine": 0, "animals": 0, "people_no_face": 0}
+    for r in rows:
+        t = str(r["tab"] or "")
+        if t in counts:
+            counts[t] = int(r["cnt"] or 0)
+    return {"ok": True, "pipeline_run_id": int(pipeline_run_id), "counts": counts}
 
 
 @app.get("/api/faces/rectangles")
@@ -2647,17 +2738,44 @@ def api_faces_manual_label(payload: dict[str, Any] = Body(...)) -> dict[str, Any
     if not isinstance(path, str) or not (path.startswith("local:") or path.startswith("disk:")):
         raise HTTPException(status_code=400, detail="path must start with local: or disk:")
     lab = (str(label) if label is not None else "").strip().lower()
-    if lab not in ("faces", "no_faces", ""):
-        raise HTTPException(status_code=400, detail="label must be faces|no_faces|''")
+    person = payload.get("person")
+    if person is not None and not isinstance(person, str):
+        raise HTTPException(status_code=400, detail="person must be string")
+    if lab not in ("faces", "no_faces", "people_no_face", "quarantine", "cat", ""):
+        raise HTTPException(status_code=400, detail="label must be faces|no_faces|people_no_face|quarantine|cat|''")
 
     ds = DedupStore()
     try:
-        ds.set_faces_manual_label(path=path, label=(lab or None))
+        if lab == "":
+            # полный сброс ручных меток
+            ds.set_faces_manual_label(path=path, label=None)
+            ds.set_people_no_face_manual(path=path, is_people_no_face=False, person=None)
+            # сброс карантина через reset не делаем: это авто/процедурная метка
+        elif lab in ("faces", "no_faces"):
+            ds.set_people_no_face_manual(path=path, is_people_no_face=False, person=None)
+            ds.set_faces_manual_label(path=path, label=lab)
+            # если пользователь принял решение — снимаем авто-карантин
+            ds.set_faces_auto_quarantine(path=path, is_quarantine=False, reason=None)
+        elif lab == "people_no_face":
+            ds.set_faces_manual_label(path=path, label=None)
+            ds.set_people_no_face_manual(path=path, is_people_no_face=True, person=(person or None))
+            ds.set_faces_auto_quarantine(path=path, is_quarantine=False, reason=None)
+        elif lab == "quarantine":
+            # ручной карантин: очищаем manual-метки, ставим авто-флаг как "manual"
+            ds.set_faces_manual_label(path=path, label=None)
+            ds.set_people_no_face_manual(path=path, is_people_no_face=False, person=None)
+            ds.set_faces_auto_quarantine(path=path, is_quarantine=True, reason="manual")
+        elif lab == "cat":
+            # ручная пометка "кот": ставим animals_auto и очищаем конфликтующие ручные метки
+            ds.set_faces_manual_label(path=path, label=None)
+            ds.set_people_no_face_manual(path=path, is_people_no_face=False, person=None)
+            ds.set_faces_auto_quarantine(path=path, is_quarantine=False, reason=None)
+            ds.set_animals_auto(path=path, is_animal=True, kind="cat")
     finally:
         ds.close()
 
     # Если руками сказали "лиц нет" — убираем ручные прямоугольники (best-effort).
-    if lab == "no_faces":
+    if lab in ("no_faces", "people_no_face"):
         ps = PipelineStore()
         try:
             pr = ps.get_run_by_id(run_id=int(pipeline_run_id))

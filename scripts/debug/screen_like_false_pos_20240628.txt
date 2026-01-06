@@ -1,0 +1,8 @@
+local:C:\tmp\Photo\IMG-20240628-WA0091.jpg
+local:C:\tmp\Photo\IMG-20240628-WA0084.jpg
+local:C:\tmp\Photo\IMG-20240628-WA0081.jpg
+local:C:\tmp\Photo\IMG-20240628-WA0103.jpg
+local:C:\tmp\Photo\IMG-20240628-WA0114.jpg
+local:C:\tmp\Photo\IMG-20240628-WA0112.jpg
+
+

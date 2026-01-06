@@ -73,6 +73,9 @@
 
       <div class="tabs">
         <button class="tab active" id="tabFaces" type="button">Есть лица</button>
+        <button class="tab" id="tabQuarantine" type="button">Карантин</button>
+        <button class="tab" id="tabAnimals" type="button">Животные</button>
+        <button class="tab" id="tabPeopleNoFace" type="button">Есть люди (без лиц)</button>
         <button class="tab" id="tabNoFaces" type="button">Нет лиц</button>
       </div>
 
@@ -156,17 +159,38 @@
       function setTab(t) {
         tab = t;
         qs("#tabFaces").classList.toggle("active", t === "faces");
+        qs("#tabQuarantine").classList.toggle("active", t === "quarantine");
+        qs("#tabAnimals").classList.toggle("active", t === "animals");
+        qs("#tabPeopleNoFace").classList.toggle("active", t === "people_no_face");
         qs("#tabNoFaces").classList.toggle("active", t === "no_faces");
         page = 1;
         load(true);
       }
       qs("#tabFaces").onclick = () => setTab("faces");
+      qs("#tabQuarantine").onclick = () => setTab("quarantine");
+      qs("#tabAnimals").onclick = () => setTab("animals");
+      qs("#tabPeopleNoFace").onclick = () => setTab("people_no_face");
       qs("#tabNoFaces").onclick = () => setTab("no_faces");
       // Пагинацию заменяем на бесконечную подгрузку при скролле.
       qs("#btnPrev").style.display = "none";
       qs("#btnNext").style.display = "none";
       qs("#page").textContent = "—";
       qs("#btnReload").onclick = () => load(true);
+
+      async function refreshTabCounts() {
+        if (!pipelineRunId) return;
+        try {
+          const data = await fetchJson(`/api/faces/tab-counts?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}`);
+          const c = data?.counts || {};
+          qs("#tabFaces").textContent = `Есть лица (${Number(c.faces ?? 0)})`;
+          qs("#tabQuarantine").textContent = `Карантин (${Number(c.quarantine ?? 0)})`;
+          qs("#tabAnimals").textContent = `Животные (${Number(c.animals ?? 0)})`;
+          qs("#tabPeopleNoFace").textContent = `Есть люди (без лиц) (${Number(c.people_no_face ?? 0)})`;
+          qs("#tabNoFaces").textContent = `Нет лиц (${Number(c.no_faces ?? 0)})`;
+        } catch (e) {
+          // best-effort
+        }
+      }
 
       function cardHtml(it) {
         const path = it.path || "";
@@ -175,14 +199,40 @@
         const manual = (it.faces_manual_label || "").toLowerCase();
         const manualPill = manual ? `<span class="pill">manual: ${escapeHtml(manual)}</span>` : ``;
         const facesCnt = Number(it.faces_count || 0);
+        const qReason = it.faces_quarantine_reason || "";
+        const qPill = qReason ? `<span class="pill">q: ${escapeHtml(qReason)}</span>` : ``;
+        const aKind = it.animals_kind || "";
+        const aPill = aKind ? `<span class="pill">animal: ${escapeHtml(aKind)}</span>` : ``;
+        const pnfPerson = it.people_no_face_person || "";
+        const pnfPill = (tab === "people_no_face" && pnfPerson) ? `<span class="pill">person: ${escapeHtml(pnfPerson)}</span>` : ``;
         const thumb = (kind === "image" && pv)
           ? `<img loading="lazy" alt="preview" referrerpolicy="no-referrer" src="${escapeHtml(pv)}" />`
           : (kind === "video" && pv)
             ? `<video controls muted preload="metadata" src="${escapeHtml(pv)}"></video>`
             : `<div class="noimg">нет превью</div>`;
-        const btn = (tab === "faces")
-          ? `<button class="btn danger" data-action="no_faces">Лиц нет</button>`
-          : `<button class="btn" data-action="faces">Лица есть (разметить)</button>`;
+        let btn = "";
+        if (tab === "faces") {
+          btn = `
+            <button class="btn" data-action="mark_cat">Кот</button>
+            <button class="btn" data-action="mark_quarantine">Карантин</button>
+            <button class="btn danger" data-action="no_faces">Лиц нет</button>
+          `;
+        } else if (tab === "no_faces") {
+          btn = `
+            <button class="btn" data-action="annotate_faces">Лица есть (разметить)</button>
+            <button class="btn" data-action="people_no_face">Есть люди (без лиц)</button>
+          `;
+        } else if (tab === "quarantine") {
+          btn = `
+            <button class="btn" data-action="mark_faces">Нормальные лица</button>
+            <button class="btn" data-action="mark_cat">Кот</button>
+            <button class="btn danger" data-action="no_faces">Лиц нет</button>
+          `;
+        } else if (tab === "animals") {
+          btn = `<button class="btn" data-action="mark_faces">Это не животное (лица)</button>`;
+        } else if (tab === "people_no_face") {
+          btn = `<button class="btn" data-action="reset">Сброс</button>`;
+        }
         return `
           <div class="card" data-path="${escapeHtml(path)}">
             <div class="thumb" data-path="${escapeHtml(path)}" data-kind="${escapeHtml(kind)}" data-src="${escapeHtml(pv)}">
@@ -193,6 +243,9 @@
               <div class="kv">
                 <span class="pill">лиц: ${facesCnt}</span>
                 ${manualPill}
+                ${qPill}
+                ${aPill}
+                ${pnfPill}
                 ${it.size_human ? `<span class="pill">${escapeHtml(it.size_human)}</span>` : ``}
               </div>
               <div class="actions">
@@ -234,6 +287,7 @@
           }
           loadedCount += items.length;
           hasMore = items.length === pageSize && (totalCount == null || loadedCount < totalCount);
+          await refreshTabCounts();
 
           // actions
           qsa(".card button[data-action]").slice(-items.length * 1 - 2000).forEach(btn => {
@@ -243,13 +297,65 @@
               const action = btn.getAttribute("data-action");
               if (!p) return;
               try {
+                const removeCard = () => {
+                  if (card) {
+                    card.remove();
+                    if (typeof totalCount === "number") {
+                      totalCount = Math.max(0, totalCount - 1);
+                      qs("#total").textContent = String(totalCount);
+                    }
+                    loadedCount = Math.max(0, loadedCount - 1);
+                  }
+                };
+
                 if (action === "no_faces") {
                   await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "no_faces" });
-                  await load(true);
-                } else if (action === "faces") {
+                  if (tab === "faces" || tab === "quarantine") {
+                    removeCard();
+                    await refreshTabCounts();
+                  } else {
+                    await load(true);
+                  }
+                } else if (action === "mark_faces") {
+                  await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "faces" });
+                  // В карантине/животных разметка идёт потоком: без перезагрузки списка.
+                  if (tab === "quarantine" || tab === "animals") {
+                    removeCard();
+                    await refreshTabCounts();
+                  } else {
+                    await load(true);
+                  }
+                } else if (action === "mark_cat") {
+                  await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "cat" });
+                  if (tab === "faces" || tab === "quarantine") {
+                    removeCard();
+                    await refreshTabCounts();
+                  } else {
+                    await load(true);
+                  }
+                } else if (action === "mark_quarantine") {
+                  await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "quarantine" });
+                  // На вкладке Faces не хотим дёргать список/скролл — просто убираем карточку.
+                  if (tab === "faces") {
+                    removeCard();
+                    await refreshTabCounts();
+                  } else {
+                    await load(true);
+                  }
+                } else if (action === "annotate_faces") {
                   const thumb = card?.querySelector(".thumb[data-src]");
                   const src = thumb?.getAttribute("data-src") || "";
                   await openAnnotate(p, src);
+                } else if (action === "people_no_face") {
+                  await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "people_no_face" });
+                  // Потоковая разметка: уводим карточку без reload (иначе прыгает список).
+                  removeCard();
+                  await refreshTabCounts();
+                } else if (action === "reset") {
+                  await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "" });
+                  // На вкладке people_no_face это "потоковый" сброс: просто убираем карточку.
+                  removeCard();
+                  await refreshTabCounts();
                 }
               } catch (e) {
                 setToast(e?.message || String(e), true);
@@ -510,6 +616,7 @@
       }, { root: null, rootMargin: "800px 0px", threshold: 0.01 });
       io.observe(sentinel);
 
+      refreshTabCounts();
       load(true);
     </script>
   </body>
