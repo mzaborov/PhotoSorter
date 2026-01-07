@@ -134,8 +134,8 @@ _LOCAL_PIPELINE_STATE: dict[str, Any] = {
 
 
 def _repo_root() -> Path:
-    # app/main.py -> repo root
-    return APP_DIR.parent
+    # backend/web_api/main.py -> repo root
+    return APP_DIR.parents[1]
 
 def _local_pipeline_log_append(line: str) -> None:
     # держим хвост лога (чтобы не раздувать память)
@@ -161,7 +161,7 @@ def _run_local_pipeline(*, root_path: str, apply: bool, skip_dedup: bool, no_ded
     # чтобы не упираться в ExecutionPolicy/подписи PowerShell-скриптов.
     rr = _repo_root()
     py = rr / ".venv-face" / "Scripts" / "python.exe"
-    script = rr / "scripts" / "tools" / "local_sort_by_faces.py"
+    script = rr / "backend" / "scripts" / "tools" / "local_sort_by_faces.py"
 
     with _LOCAL_PIPELINE_LOCK:
         _LOCAL_PIPELINE_STATE.update(
@@ -1608,7 +1608,7 @@ def api_local_pipeline_start(payload: dict[str, Any] = Body(...)) -> dict[str, A
 
     rr = _repo_root()
     py = rr / ".venv-face" / "Scripts" / "python.exe"
-    script = rr / "scripts" / "tools" / "local_sort_by_faces.py"
+    script = rr / "backend" / "scripts" / "tools" / "local_sort_by_faces.py"
     if not py.exists():
         raise HTTPException(status_code=500, detail="Missing .venv-face (Python 3.12) — create it before running ML pipeline")
     if not script.exists():

@@ -3,8 +3,8 @@ from pathlib import Path
 from typing import Any
 from datetime import datetime, timezone
 
-# data/photosorter.db рядом с проектом
-DB_PATH = Path(__file__).resolve().parents[1] / "data" / "photosorter.db"
+# data/photosorter.db рядом с репозиторием (НЕ внутри backend/)
+DB_PATH = Path(__file__).resolve().parents[2] / "data" / "photosorter.db"
 
 
 def get_connection():

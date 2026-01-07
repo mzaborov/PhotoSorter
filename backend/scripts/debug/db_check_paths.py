@@ -7,7 +7,8 @@ from pathlib import Path
 
 def _db_path() -> Path:
     # use project-local DB location
-    return Path(__file__).resolve().parents[2] / "data" / "photosorter.db"
+    # backend/scripts/debug/* -> repo root = parents[3]
+    return Path(__file__).resolve().parents[3] / "data" / "photosorter.db"
 
 
 def main() -> int:

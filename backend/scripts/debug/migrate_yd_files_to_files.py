@@ -6,7 +6,8 @@ from pathlib import Path
 
 
 def _default_db_path() -> Path:
-    return Path(__file__).resolve().parents[2] / "data" / "photosorter.db"
+    # backend/scripts/debug/* -> repo root = parents[3]
+    return Path(__file__).resolve().parents[3] / "data" / "photosorter.db"
 
 
 def _table_exists(cur: sqlite3.Cursor, name: str) -> bool:

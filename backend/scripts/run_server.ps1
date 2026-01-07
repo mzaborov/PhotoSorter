@@ -9,8 +9,20 @@ if (-not (Test-Path $python)) {
   Write-Error "Python не найден по пути: $python"
 }
 
+# repo root = .../backend/scripts -> ../..
+$repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+
+# ВАЖНО: web_api/common/logic лежат внутри backend/, поэтому добавляем backend/ в sys.path.
+$backendDir = (Resolve-Path (Join-Path $repo "backend")).Path
+$env:PYTHONPATH = $backendDir
+
 Write-Host "Starting uvicorn with --reload..."
-& $python -m uvicorn --reload --app-dir . web_api.main:app --host 127.0.0.1 --port 8000
+Push-Location $repo
+try {
+  & $python -m uvicorn --reload --app-dir $backendDir web_api.main:app --host 127.0.0.1 --port 8000
+} finally {
+  Pop-Location
+}
 
 
 

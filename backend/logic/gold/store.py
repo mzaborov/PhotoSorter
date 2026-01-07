@@ -7,8 +7,8 @@ from typing import Any
 
 
 def _repo_root() -> Path:
-    # photosorter/gold/store.py -> repo root
-    return Path(__file__).resolve().parents[2]
+    # backend/logic/gold/store.py -> repo root
+    return Path(__file__).resolve().parents[3]
 
 
 def gold_cases_dir() -> Path:
