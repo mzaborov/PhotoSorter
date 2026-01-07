@@ -545,6 +545,71 @@ def _detect_faces(detector, img_bgr) -> list[tuple[int, int, int, int, float]]:
     return out
 
 
+def _rotate_bgr(img_bgr, *, rot: int):
+    """
+    rot: 90|180|270 (clockwise degrees).
+    """
+    if rot == 90:
+        return cv2.rotate(img_bgr, cv2.ROTATE_90_CLOCKWISE)
+    if rot == 180:
+        return cv2.rotate(img_bgr, cv2.ROTATE_180)
+    if rot == 270:
+        return cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return img_bgr
+
+
+def _map_point_from_rotated_to_base(*, x: float, y: float, rot: int, w0: int, h0: int) -> tuple[float, float]:
+    """
+    Map a point from rotated image coordinates back to base image coordinates.
+
+    Base image: width=w0, height=h0.
+    Rotated image is produced by rotating base clockwise by rot degrees.
+    """
+    if rot == 90:
+        # base -> rot: x' = h0-1-y, y' = x
+        # rot -> base: x = y', y = h0-1-x'
+        return (float(y), float(h0 - 1) - float(x))
+    if rot == 180:
+        return (float(w0 - 1) - float(x), float(h0 - 1) - float(y))
+    if rot == 270:
+        # base -> rot: x' = y, y' = w0-1-x
+        # rot -> base: x = w0-1-y', y = x'
+        return (float(w0 - 1) - float(y), float(x))
+    return (float(x), float(y))
+
+
+def _unrotate_bbox_to_base(*, x: int, y: int, w: int, h: int, rot: int, w0: int, h0: int) -> tuple[int, int, int, int]:
+    """
+    Convert bbox from rotated image coordinates back to base image coordinates.
+    bbox: x,y,w,h (rotated coords).
+    """
+    x0 = float(x)
+    y0 = float(y)
+    x1 = float(x + w)
+    y1 = float(y + h)
+    pts = [
+        _map_point_from_rotated_to_base(x=x0, y=y0, rot=rot, w0=w0, h0=h0),
+        _map_point_from_rotated_to_base(x=x1, y=y0, rot=rot, w0=w0, h0=h0),
+        _map_point_from_rotated_to_base(x=x0, y=y1, rot=rot, w0=w0, h0=h0),
+        _map_point_from_rotated_to_base(x=x1, y=y1, rot=rot, w0=w0, h0=h0),
+    ]
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    bx0 = max(0, int(math.floor(min(xs))))
+    by0 = max(0, int(math.floor(min(ys))))
+    bx1 = min(int(w0), int(math.ceil(max(xs))))
+    by1 = min(int(h0), int(math.ceil(max(ys))))
+    bw = max(0, bx1 - bx0)
+    bh = max(0, by1 - by0)
+    if bx0 >= w0 or by0 >= h0 or bw <= 1 or bh <= 1:
+        return (0, 0, 0, 0)
+    if bx0 + bw > w0:
+        bw = max(0, w0 - bx0)
+    if by0 + bh > h0:
+        bh = max(0, h0 - by0)
+    return (bx0, by0, bw, bh)
+
+
 def _crop_thumb_jpeg(*, img: Image.Image, bbox: tuple[int, int, int, int], thumb_size: int, pad_ratio: float = 0.18) -> bytes:
     from io import BytesIO
 
@@ -973,6 +1038,51 @@ def scan_faces_local(
                         ]
                         if faces_det2:
                             faces_det = faces_det2
+                    except Exception:
+                        pass
+
+                # Fallback: некоторые "перевёрнутые" фото не имеют EXIF orientation.
+                # Если после базового + пониженного порога всё ещё 0 лиц — пробуем повороты 90/180/270.
+                if not faces_det:
+                    try:
+                        # Используем тот же "мягкий" порог, что и на втором проходе.
+                        detectorR = locals().get("detector2")
+                        if detectorR is None:
+                            detectorR = _create_face_detector(str(model), score_threshold=0.65)
+
+                        hb, wb = img_bgr.shape[:2]
+                        best: list[tuple[int, int, int, int, float]] = []
+                        best_rot = 0
+                        best_score = -1.0
+
+                        for rot in (90, 180, 270):
+                            img_rot = _rotate_bgr(img_bgr, rot=rot)
+                            det = _detect_faces(detectorR, img_rot)
+                            # тот же фильтр от мусора
+                            hr, wr = img_rot.shape[:2]
+                            img_area_r = float(max(1, int(wr) * int(hr)))
+                            det = [
+                                (x, y, w, h, s)
+                                for (x, y, w, h, s) in det
+                                if max(int(w), int(h)) >= 60 and (float(int(w) * int(h)) / img_area_r) >= 0.005
+                            ]
+                            if not det:
+                                continue
+                            max_s = max(float(s) for (_x, _y, _w, _h, s) in det)
+                            if (len(det) > len(best)) or (len(det) == len(best) and max_s > best_score):
+                                best = det
+                                best_rot = rot
+                                best_score = max_s
+
+                        if best and best_rot:
+                            # переводим bbox обратно в координаты base img_bgr (до поворота)
+                            unrot: list[tuple[int, int, int, int, float]] = []
+                            for (x, y, w, h, s) in best:
+                                bx, by, bw, bh = _unrotate_bbox_to_base(x=int(x), y=int(y), w=int(w), h=int(h), rot=int(best_rot), w0=int(wb), h0=int(hb))
+                                if bw > 1 and bh > 1:
+                                    unrot.append((bx, by, bw, bh, float(s)))
+                            if unrot:
+                                faces_det = unrot
                     except Exception:
                         pass
                 # Если детектили на уменьшенной копии — пересчитываем bbox обратно к размерам полного изображения.

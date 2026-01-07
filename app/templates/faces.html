@@ -17,6 +17,8 @@
       .header { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
       .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
       .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#f3f4f6; color:#374151; font-size:12px; }
+      .inp { border:1px solid #d1d5db; border-radius:10px; padding:8px 10px; font-weight:700; width: 110px; }
+      .inp:focus { outline: 2px solid rgba(59,130,246,0.35); outline-offset: 1px; }
       .btn { appearance:none; border:1px solid #d1d5db; background:#fff; padding:8px 10px; border-radius:10px; cursor:pointer; font-weight:700; }
       .btn:hover { background:#f9fafb; }
       .btn:disabled { opacity: 0.6; cursor: not-allowed; }
@@ -61,45 +63,67 @@
       .rectlist { display:flex; gap:8px; flex-wrap:wrap; }
       .rectpill { display:inline-block; padding:2px 8px; border-radius:999px; background:#eef2ff; color:#1f2937; font-size:12px; }
       .draw-on { cursor: crosshair; }
+
+      /* Sticky header (всё, что на верхнем блоке со вкладками/кнопками) */
+      .sticky-top {
+        position: sticky;
+        top: 0;
+        z-index: 1000;
+        background: rgba(255,255,255,0.98);
+        backdrop-filter: blur(6px);
+        border-bottom: 1px solid #e5e7eb;
+        padding-bottom: 12px;
+        margin-bottom: 14px;
+      }
     </style>
   </head>
   <body>
     <div class="wrap">
-      <div class="header">
-        <div>
-          <h2 style="margin:0;">Результаты “лица / нет лиц” (шаг 2)</h2>
-          <div class="muted" style="margin-top:6px;">Двойной клик по превью — показать прямоугольники лиц. В “Нет лиц” можно разметить лица вручную.</div>
+      <div class="sticky-top" id="stickyTop">
+        <div class="header">
+          <div>
+            <h2 style="margin:0;">Результаты “лица / нет лиц” (шаг 2)</h2>
+            <div class="muted" style="margin-top:6px;">Двойной клик по превью — показать прямоугольники лиц. В “Нет лиц” можно разметить лица вручную.</div>
+          </div>
+          <div class="muted"><a href="/">← на главную</a></div>
         </div>
-        <div class="muted"><a href="/">← на главную</a></div>
-      </div>
 
-      <div class="toolbar">
-        <span class="pill">pipeline_run_id: <b id="prId">—</b></span>
-        <span class="pill">face_run_id: <b id="frId">—</b></span>
-        <span class="pill">root: <code id="rootPath">—</code></span>
-        <span class="muted" id="toast"></span>
-      </div>
+        <div class="toolbar">
+          <span class="pill">pipeline_run_id: <b id="prId">—</b></span>
+          <span class="pill">face_run_id: <b id="frId">—</b></span>
+          <span class="pill">root: <code id="rootPath">—</code></span>
+          <span class="muted" id="toast"></span>
+        </div>
 
-      <div class="tabs">
-        <button class="tab active" id="tabFaces" type="button">Есть лица</button>
-        <button class="tab" id="tabQuarantine" type="button">Карантин</button>
-        <button class="tab" id="tabAnimals" type="button">Животные</button>
-        <button class="tab" id="tabPeopleNoFace" type="button">Есть люди (без лиц)</button>
-        <button class="tab" id="tabNoFaces" type="button">Нет лиц</button>
-      </div>
+        <div class="tabs">
+          <button class="tab active" id="tabFaces" type="button">Есть лица</button>
+          <button class="tab" id="tabQuarantine" type="button">Карантин</button>
+          <button class="tab" id="tabAnimals" type="button">Животные</button>
+          <button class="tab" id="tabPeopleNoFace" type="button">Есть люди (без лиц)</button>
+          <button class="tab" id="tabNoFaces" type="button">Нет лиц</button>
+        </div>
 
-      <!-- 2-й уровень (постепенно): пока только для "Есть лица" -->
-      <div class="subtabs" id="subtabsFaces" style="display:none;">
-        <button class="subtab active" id="subFacesAll" type="button">Неотсортировано</button>
-        <button class="subtab" id="subFacesMany" type="button">Много лиц</button>
-      </div>
+        <!-- 2-й уровень (постепенно): пока только для "Есть лица" -->
+        <div class="subtabs" id="subtabsFaces" style="display:none;">
+          <button class="subtab active" id="subFacesAll" type="button">Неотсортировано</button>
+          <button class="subtab" id="subFacesMany" type="button">Много лиц</button>
+        </div>
 
-      <div class="toolbar">
-        <button class="btn" id="btnPrev" type="button">←</button>
-        <span class="pill">страница: <b id="page">1</b></span>
-        <button class="btn" id="btnNext" type="button">→</button>
-        <span class="pill">всего: <b id="total">—</b></span>
-        <button class="btn" id="btnReload" type="button">Обновить</button>
+        <div class="toolbar">
+          <button class="btn" id="btnPrev" type="button">←</button>
+          <span class="pill">страница: <b id="page">1</b></span>
+          <button class="btn" id="btnNext" type="button">→</button>
+          <span class="pill">всего: <b id="total">—</b></span>
+          <button class="btn" id="btnReload" type="button">Обновить</button>
+        </div>
+
+        <div class="toolbar">
+          <span class="pill" id="posPill">позиция: —</span>
+          <span class="muted">строка:</span>
+          <input class="inp" id="jumpRow" type="number" inputmode="numeric" min="1" step="1" placeholder="№" />
+          <button class="btn" id="btnJump" type="button">Перейти</button>
+          <span class="muted" id="jumpHint"></span>
+        </div>
       </div>
 
       <div class="grid" id="grid"></div>
@@ -171,6 +195,70 @@
       let hasMore = true;
       let totalCount = null;
       let loadedCount = 0;
+      let jumpTargetRow = null; // 1-based
+
+      // visible-range tracking (for "где я?")
+      const visibleRows = new Set();
+      let _posRaf = 0;
+      function _posScheduleUpdate() {
+        if (_posRaf) return;
+        _posRaf = requestAnimationFrame(() => {
+          _posRaf = 0;
+          updatePositionPill();
+        });
+      }
+      function _asInt(v) {
+        const n = Number(v);
+        return Number.isFinite(n) ? Math.trunc(n) : null;
+      }
+      function _cards() { return qsa("#grid .card[data-row]"); }
+      function updatePositionPill() {
+        const el = qs("#posPill");
+        if (!el) return;
+        const tot = (typeof totalCount === "number") ? totalCount : null;
+        if (!visibleRows.size) {
+          el.textContent = "позиция: —";
+          return;
+        }
+        const sorted = Array.from(visibleRows).sort((a,b) => a-b);
+        const first = sorted[0];
+        const last = sorted[sorted.length - 1];
+        const top = Math.max(0, first - 1);
+        const bottom = (tot != null) ? Math.max(0, tot - last) : null;
+        el.textContent = `позиция: ${first}–${last}` + (tot != null ? ` из ${tot}; сверху ${top}; снизу ${bottom}` : `; сверху ${top}`);
+      }
+      const cardIo = new IntersectionObserver((entries) => {
+        entries.forEach(e => {
+          const el = e.target;
+          const row = _asInt(el?.getAttribute?.("data-row"));
+          if (!row) return;
+          if (e.isIntersecting) visibleRows.add(row);
+          else visibleRows.delete(row);
+        });
+        _posScheduleUpdate();
+      }, { root: null, threshold: 0.1 });
+
+      function observeNewCards() {
+        _cards().forEach(el => {
+          if (el.getAttribute("data-observed") === "1") return;
+          el.setAttribute("data-observed", "1");
+          try { cardIo.observe(el); } catch (e) {}
+        });
+      }
+
+      function removeCardByPath(path) {
+        const p = (path || "").toString();
+        if (!p) return false;
+        const cards = qsa("#grid .card");
+        const card = cards.find(c => (c.getAttribute("data-path") || "") === p);
+        if (!card) return false;
+        const row = _asInt(card.getAttribute("data-row"));
+        try { cardIo.unobserve(card); } catch (e) {}
+        if (row) visibleRows.delete(row);
+        card.remove();
+        _posScheduleUpdate();
+        return true;
+      }
 
       // init tab/subtab from query (до первого load)
       tab = (getParam("tab") || tab || "faces").toString().trim().toLowerCase() || "faces";
@@ -244,6 +332,24 @@
       qs("#page").textContent = "—";
       qs("#btnReload").onclick = () => load(true);
 
+      function jumpToRow(n) {
+        const nn = _asInt(n);
+        const hint = qs("#jumpHint");
+        if (!nn || nn < 1) {
+          if (hint) hint.textContent = "Введите номер строки ≥ 1";
+          return;
+        }
+        if (hint) hint.textContent = "";
+        const targetPage = Math.floor((nn - 1) / pageSize) + 1;
+        jumpTargetRow = nn;
+        page = targetPage;
+        load(true, { forcePage: targetPage });
+      }
+      qs("#btnJump").onclick = () => jumpToRow(qs("#jumpRow")?.value);
+      qs("#jumpRow").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") jumpToRow(qs("#jumpRow")?.value);
+      });
+
       async function refreshTabCounts() {
         if (!pipelineRunId) return;
         try {
@@ -266,7 +372,7 @@
         }
       }
 
-      function cardHtml(it) {
+      function cardHtml(it, rowNum) {
         const path = it.path || "";
         const kind = it.preview_kind || "none";
         const pv = it.preview_url || "";
@@ -311,13 +417,14 @@
         const pastGold = !!it.sorted_past_gold;
         const cls = pastGold ? "card past-gold" : "card";
         return `
-          <div class="${cls}" data-path="${escapeHtml(path)}">
+          <div class="${cls}" data-path="${escapeHtml(path)}" data-row="${Number(rowNum || 0) || ""}">
             <div class="thumb" data-path="${escapeHtml(path)}" data-kind="${escapeHtml(kind)}" data-src="${escapeHtml(pv)}">
               ${thumb}
             </div>
             <div class="card-body">
               <div class="path"><code>${escapeHtml(it.path_short || path)}</code></div>
               <div class="kv">
+                ${rowNum ? `<span class="pill">#${Number(rowNum)}</span>` : ``}
                 <span class="pill">лиц: ${facesCnt}</span>
                 ${manualPill}
                 ${qPill}
@@ -333,18 +440,22 @@
         `;
       }
 
-      async function load(reset=false) {
+      async function load(reset=false, opts={}) {
         if (!pipelineRunId) return;
         if (loading) return;
         if (!reset && !hasMore) return;
         loading = true;
         setToast("");
         try {
+          if (reset && opts && typeof opts.forcePage === "number" && opts.forcePage >= 1) {
+            page = Math.trunc(opts.forcePage);
+          }
           if (reset) {
-            page = 1;
             hasMore = true;
             totalCount = null;
             loadedCount = 0;
+            visibleRows.clear();
+            try { cardIo.disconnect(); } catch (e) {}
             qs("#grid").innerHTML = `<div class="muted">Загрузка…</div>`;
           } else if (page === 1 && loadedCount === 0) {
             qs("#grid").innerHTML = `<div class="muted">Загрузка…</div>`;
@@ -359,15 +470,32 @@
           totalCount = (data.total != null) ? Number(data.total) : totalCount;
           qs("#total").textContent = String(totalCount ?? "—");
           const items = Array.isArray(data.items) ? data.items : [];
+          const startRow = ((Number(page) - 1) * pageSize) + 1;
           if (reset) qs("#grid").innerHTML = "";
           if (!items.length && loadedCount === 0) {
             qs("#grid").innerHTML = `<div class="muted">Пусто.</div>`;
           } else if (items.length) {
-            qs("#grid").insertAdjacentHTML("beforeend", items.map(cardHtml).join(""));
+            qs("#grid").insertAdjacentHTML("beforeend", items.map((it, i) => cardHtml(it, startRow + i)).join(""));
           }
           loadedCount += items.length;
           hasMore = items.length === pageSize && (totalCount == null || loadedCount < totalCount);
           await refreshTabCounts();
+          observeNewCards();
+          _posScheduleUpdate();
+
+          // if jump requested: scroll to the exact row within this page
+          if (reset && jumpTargetRow != null) {
+            const target = jumpTargetRow;
+            jumpTargetRow = null;
+            const el = _cards().find(c => _asInt(c.getAttribute("data-row")) === target);
+            if (el) {
+              el.scrollIntoView({ block: "start", behavior: "auto" });
+              el.style.boxShadow = "0 0 0 2px rgba(59,130,246,0.45)";
+              setTimeout(() => { try { el.style.boxShadow = ""; } catch (e) {} }, 1200);
+            } else {
+              window.scrollTo({ top: 0, behavior: "auto" });
+            }
+          }
 
           // actions
           qsa(".card button[data-action]").slice(-items.length * 1 - 2000).forEach(btn => {
@@ -377,16 +505,7 @@
               const action = btn.getAttribute("data-action");
               if (!p) return;
               try {
-                const removeCard = () => {
-                  if (card) {
-                    card.remove();
-                    if (typeof totalCount === "number") {
-                      totalCount = Math.max(0, totalCount - 1);
-                      qs("#total").textContent = String(totalCount);
-                    }
-                    loadedCount = Math.max(0, loadedCount - 1);
-                  }
-                };
+                const removeCard = () => removeCardByPath(p);
 
                 if (action === "no_faces") {
                   await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "no_faces" });
@@ -668,9 +787,15 @@
       };
       lbSave.onclick = async () => {
         try {
+          const savedPath = curPath;
           await postJson("/api/faces/manual-rectangles", { pipeline_run_id: Number(pipelineRunId), path: curPath, rects: curManualRects });
           closeLb();
-          await load(true);
+          // На вкладке "Нет лиц" это потоковая операция: карточка должна уйти в "Есть лица" без прыжков списка.
+          if (tab === "no_faces") {
+            removeCardByPath(savedPath);
+          }
+          await refreshTabCounts();
+          setToast("Сохранено.");
         } catch (e) {
           setToast(e?.message || String(e), true);
         }

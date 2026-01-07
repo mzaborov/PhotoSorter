@@ -51,7 +51,12 @@
       .lb-top code { font-size: 11px; }
       .lb-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
       .lb-body { background: #111827; display: flex; align-items: center; justify-content: center; padding: 10px; }
-      .lb-body img { max-width: 92vw; max-height: calc(92vh - 90px); width: auto; height: auto; display: block; background: #111827; }
+      .imgwrap { position: relative; display: inline-block; }
+      .imgwrap img { max-width: 92vw; max-height: calc(92vh - 140px); width: auto; height: auto; display: block; background: #111827; }
+      .imgwrap canvas { position: absolute; left: 0; top: 0; pointer-events: none; }
+      .lb-bottom { padding: 10px 12px; border-top: 1px solid #e5e7eb; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+      .rectlist { display:flex; gap:8px; flex-wrap:wrap; }
+      .rectpill { display:inline-block; padding:2px 8px; border-radius:999px; background:#eef2ff; color:#1f2937; font-size:12px; }
     </style>
   </head>
   <body>
@@ -112,7 +117,14 @@
           </div>
         </div>
         <div class="lb-body">
-          <img id="lbImg" alt="preview" />
+          <div class="imgwrap" id="imgWrap">
+            <img id="lbImg" alt="preview" />
+            <canvas id="lbCanvas"></canvas>
+          </div>
+        </div>
+        <div class="lb-bottom">
+          <div class="muted">Прямоугольники:</div>
+          <div class="rectlist" id="rectList"></div>
         </div>
       </div>
     </div>
@@ -156,24 +168,67 @@
       let hasMore = false;
       let loading = false;
       const cardByRaw = new Map();
+      const itemByRaw = new Map();
 
       // lightbox
       const lb = qs("#lightbox");
       const lbImg = qs("#lbImg");
       const lbPath = qs("#lbPath");
+      const lbCanvas = qs("#lbCanvas");
+      const lbCtx = lbCanvas.getContext("2d");
+      const rectList = qs("#rectList");
+      let curRects = [];
       function closeLb() {
         lb.classList.remove("open");
         lb.setAttribute("aria-hidden","true");
         lbImg.src = "";
         lbPath.textContent = "—";
+        curRects = [];
+        if (rectList) rectList.innerHTML = "";
+        if (lbCtx) lbCtx.clearRect(0,0,lbCanvas.width, lbCanvas.height);
+      }
+      function resizeCanvasToImage() {
+        const w = lbImg.clientWidth;
+        const h = lbImg.clientHeight;
+        lbCanvas.width = Math.max(1, Math.floor(w));
+        lbCanvas.height = Math.max(1, Math.floor(h));
+        lbCanvas.style.width = w + "px";
+        lbCanvas.style.height = h + "px";
+      }
+      function drawRects() {
+        if (!lbCtx) return;
+        resizeCanvasToImage();
+        lbCtx.clearRect(0,0,lbCanvas.width, lbCanvas.height);
+        const iw = lbImg.naturalWidth || 1;
+        const ih = lbImg.naturalHeight || 1;
+        const sx = lbCanvas.width / iw;
+        const sy = lbCanvas.height / ih;
+        lbCtx.lineWidth = 2;
+        lbCtx.strokeStyle = "rgba(59,130,246,0.95)";
+        (curRects || []).forEach(r => {
+          lbCtx.strokeRect(Number(r.x||0) * sx, Number(r.y||0) * sy, Number(r.w||0) * sx, Number(r.h||0) * sy);
+        });
+      }
+      function renderRectList() {
+        if (!rectList) return;
+        if (!curRects || !curRects.length) {
+          rectList.innerHTML = `<span class="muted">—</span>`;
+          return;
+        }
+        rectList.innerHTML = curRects.map((r, i) => `<span class="rectpill">#${i+1} ${Number(r.w||0)}×${Number(r.h||0)}</span>`).join("");
       }
       function openLb(it) {
         const pv = it?.preview_url || "";
         if (!pv) return;
         lbImg.src = pv;
         lbPath.textContent = it?.raw_path || it?.path || "—";
+        curRects = Array.isArray(it?.manual_rects) ? it.manual_rects : [];
         lb.classList.add("open");
         lb.setAttribute("aria-hidden","false");
+        renderRectList();
+        // draw after image loads
+        lbImg.onload = () => drawRects();
+        lbImg.onerror = () => { curRects = []; renderRectList(); drawRects(); };
       }
       qs("#lbClose").onclick = () => closeLb();
       lb.addEventListener("click", (e) => { if (e.target === lb) closeLb(); });
@@ -213,6 +268,8 @@
         const kind = it?.preview_kind || "none";
         const pv = it?.preview_url || "";
         const mt = it?.mime_type ? `${escapeHtml(it.mime_type)}` : "—";
+        const rects = Array.isArray(it?.manual_rects) ? it.manual_rects : [];
+        const rectPill = (cur === "faces_gold" && rects.length) ? `<span class="pill">rects: ${rects.length}</span>` : ``;
         const thumb = (kind === "image" && pv) ? `<img loading="lazy" src="${escapeHtml(pv)}" alt="preview" />` : `<div class="noimg">—</div>`;
         return `
           <div class="card" data-raw="${escapeHtml(raw)}">
@@ -223,6 +280,7 @@
               <div class="path"><code title="${escapeHtml(raw)}">${escapeHtml(display)}</code></div>
               <div class="kv">
                 <span class="pill">${mt}</span>
+                ${rectPill}
               </div>
               <div class="actions">
                 <button class="btn danger" data-act="del" data-path="${escapeHtml(raw)}" type="button">Удалить</button>
@@ -289,12 +347,13 @@
               const raw = card.getAttribute("data-raw") || "";
               if (!raw || cardByRaw.has(raw)) return;
               cardByRaw.set(raw, card);
-              const pvImg = card.querySelector(".thumb img");
-              const pvUrl = pvImg ? pvImg.getAttribute("src") : "";
+              // store item meta for lightbox (including manual_rects)
+              const it = items.find(x => (x?.raw_path || "") === raw);
+              if (it) itemByRaw.set(raw, it);
               const thumb = card.querySelector(".thumb[data-act='lb']");
               if (thumb) {
                 // double click like /faces
-                thumb.addEventListener("dblclick", () => openLb({ raw_path: raw, preview_url: pvUrl }));
+                thumb.addEventListener("dblclick", () => openLb(itemByRaw.get(raw) || { raw_path: raw }));
               }
               const btn = card.querySelector("button[data-act='del'][data-path]");
               if (btn) {
@@ -312,6 +371,7 @@
                     await postJson("/api/gold/delete", { name: cur, path: p });
                     if (el) el.remove();
                     cardByRaw.delete(p);
+                    itemByRaw.delete(p);
                     qs("#curLoaded").textContent = String(cardByRaw.size);
                     const curTot = Number(qs("#curTotal").textContent || "0");
                     if (Number.isFinite(curTot) && curTot > 0) qs("#curTotal").textContent = String(curTot - 1);

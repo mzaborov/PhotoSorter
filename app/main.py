@@ -10,6 +10,7 @@ import mimetypes
 import urllib.parse
 import subprocess
 import json
+from json import JSONDecodeError
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
@@ -168,6 +169,49 @@ def _gold_write_lines(path: Path, lines: list[str]) -> None:
     path.write_text(txt, encoding="utf-8")
 
 
+def _gold_faces_manual_rects_path() -> Path:
+    # Рядом с faces_gold — отдельный файл с manual-rectangles (NDJSON, 1 JSON per line).
+    return _gold_cases_dir() / "faces_manual_rects_gold.ndjson"
+
+
+def _gold_read_ndjson_by_path(path: Path) -> dict[str, dict[str, Any]]:
+    """
+    Читает NDJSON и возвращает mapping: path -> record.
+    Формат записи ожидаем: {"path": "...", ...}.
+    """
+    if not path.exists():
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = (line or "").strip()
+        if not s or s.startswith("#"):
+            continue
+        try:
+            obj = json.loads(s)
+        except JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        p = str(obj.get("path") or "").strip()
+        if not p:
+            continue
+        out[p] = obj
+    return out
+
+
+def _gold_write_ndjson_by_path(path: Path, items_by_path: dict[str, dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    for p in sorted(items_by_path.keys()):
+        obj = items_by_path[p]
+        # гарантируем, что path совпадает с ключом
+        obj2 = dict(obj)
+        obj2["path"] = p
+        lines.append(json.dumps(obj2, ensure_ascii=False))
+    txt = "\n".join(lines) + ("\n" if lines else "")
+    path.write_text(txt, encoding="utf-8")
+
+
 def _gold_merge_append_only(path: Path, new_items: list[str]) -> int:
     existing = _gold_read_lines(path)
     seen = set(existing)
@@ -221,7 +265,6 @@ def _gold_expected_tab_by_path() -> dict[str, str]:
         ("people_no_face_gold", "people_no_face"),
         ("cats_gold", "animals"),
         ("quarantine_gold", "quarantine"),
-        ("drawn_faces_gold", "faces"),
     ]
     out: dict[str, str] = {}
     for name, tab in order:
@@ -2677,6 +2720,14 @@ def api_gold_list(
     limit_i = max(10, min(300, int(limit or 80)))
     chunk = items[start_idx : start_idx + limit_i]
 
+    # Для faces_gold показываем ручные прямоугольники (если есть) из NDJSON-фиxла.
+    rects_by_path: dict[str, dict[str, Any]] | None = None
+    if name == "faces_gold":
+        try:
+            rects_by_path = _gold_read_ndjson_by_path(_gold_faces_manual_rects_path())
+        except Exception:
+            rects_by_path = None
+
     out_items: list[dict[str, Any]] = []
     for raw in chunk:
         nm = _gold_normalize_path(raw)
@@ -2684,6 +2735,34 @@ def api_gold_list(
         path = nm["path"]
         mime_type, media_type = _guess_mime_media_for_path(path)
         meta = _faces_preview_meta(path=path, mime_type=mime_type, media_type=media_type, pipeline_run_id=pipeline_run_id)
+        manual_rects: list[dict[str, int]] | None = None
+        manual_rects_run_id: int | None = None
+        if rects_by_path is not None:
+            obj = rects_by_path.get(path)
+            if isinstance(obj, dict):
+                rects = obj.get("rects")
+                if isinstance(rects, list) and rects:
+                    # sanitize
+                    clean: list[dict[str, int]] = []
+                    for r in rects:
+                        if not isinstance(r, dict):
+                            continue
+                        try:
+                            x = int(r.get("x") or 0)
+                            y = int(r.get("y") or 0)
+                            w = int(r.get("w") or 0)
+                            h = int(r.get("h") or 0)
+                        except Exception:
+                            continue
+                        if w <= 0 or h <= 0:
+                            continue
+                        clean.append({"x": x, "y": y, "w": w, "h": h})
+                    if clean:
+                        manual_rects = clean
+                        try:
+                            manual_rects_run_id = int(obj.get("run_id") or 0) or None
+                        except Exception:
+                            manual_rects_run_id = None
         out_items.append(
             {
                 "raw_path": raw_path,
@@ -2691,6 +2770,8 @@ def api_gold_list(
                 "path_short": _short_path_for_ui(path) if path.startswith("disk:") else raw_path,
                 "mime_type": mime_type,
                 "media_type": media_type,
+                "manual_rects": manual_rects,
+                "manual_rects_run_id": manual_rects_run_id,
                 **meta,
             }
         )
@@ -2803,6 +2884,29 @@ def api_gold_update_from_db(payload: dict[str, Any] = Body(...)) -> dict[str, An
             """,
             list(base_params),
         )
+
+        # --- manual rectangles export (NDJSON, overwrite by path) ---
+        # Берём только ручные прямоугольники (is_manual=1), относящиеся к текущему faces_run_id файла.
+        cur.execute(
+            f"""
+            SELECT
+              fr.file_path AS path,
+              fr.run_id AS run_id,
+              fr.bbox_x AS x,
+              fr.bbox_y AS y,
+              fr.bbox_w AS w,
+              fr.bbox_h AS h
+            FROM face_rectangles fr
+            JOIN files f ON f.path = fr.file_path
+            WHERE {base_where_sql}
+              AND COALESCE(fr.is_manual, 0) = 1
+              AND f.faces_run_id IS NOT NULL
+              AND fr.run_id = f.faces_run_id
+            ORDER BY fr.file_path ASC, fr.face_index ASC, fr.id ASC
+            """,
+            list(base_params),
+        )
+        rect_rows = [dict(r) for r in cur.fetchall()]
     finally:
         ds.close()
 
@@ -2815,6 +2919,52 @@ def api_gold_update_from_db(payload: dict[str, Any] = Body(...)) -> dict[str, An
     results["quarantine_gold"] = {"added": _gold_merge_append_only(m["quarantine_gold"], quarantine_gold), "db_total": len(quarantine_gold)}
     # drawn_faces_gold: пока не обновляем автоматически (источник/семантика могут отличаться)
     results["drawn_faces_gold"] = {"added": 0, "db_total": len(_gold_read_lines(m["drawn_faces_gold"]))}
+
+    # Export manual rectangles: overwrite-by-path (перерисовка -> перезапись).
+    # Если для path в БД сейчас нет manual-rects, запись удаляем из NDJSON (чтобы gold отражал текущее).
+    rects_path = _gold_faces_manual_rects_path()
+    existing_rects = _gold_read_ndjson_by_path(rects_path)
+    by_path: dict[str, list[dict[str, int]]] = {}
+    run_by_path: dict[str, int] = {}
+    for r in rect_rows:
+        p = str(r.get("path") or "")
+        if not p:
+            continue
+        run_by_path[p] = int(r.get("run_id") or 0) or run_by_path.get(p, 0)
+        by_path.setdefault(p, []).append(
+            {
+                "x": int(r.get("x") or 0),
+                "y": int(r.get("y") or 0),
+                "w": int(r.get("w") or 0),
+                "h": int(r.get("h") or 0),
+            }
+        )
+
+    # update/overwrite existing
+    for p, rects in by_path.items():
+        existing_rects[p] = {"path": p, "run_id": int(run_by_path.get(p) or 0), "rects": rects}
+
+    # delete those that no longer have manual rects in DB (within current scope)
+    # NB: scope is limited by base_where (root_like if provided).
+    to_delete: list[str] = []
+    for p in list(existing_rects.keys()):
+        if p in by_path:
+            continue
+        # if scope is restricted by root_like, we should only delete if p is within that scope.
+        if root_like and not p.startswith("disk:") and not p.startswith("local:"):
+            continue
+        if root_like:
+            # best-effort scope check: SQL uses LIKE; we approximate via prefix for local:, and for disk: exact prefix.
+            if root_like.endswith("%"):
+                pref = root_like[:-1]
+                if not p.startswith(pref):
+                    continue
+        to_delete.append(p)
+    for p in to_delete:
+        existing_rects.pop(p, None)
+
+    _gold_write_ndjson_by_path(rects_path, existing_rects)
+    results["faces_manual_rects_gold"] = {"updated": len(by_path), "file": str(rects_path)}
     return {"ok": True, "pipeline_run_id": pipeline_run_id, "root_like": root_like, "results": results}
 
 
