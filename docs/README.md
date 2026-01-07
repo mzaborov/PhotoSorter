@@ -150,18 +150,20 @@
 
 ```text
 PhotoSorter/
-  photosorter/                # основной код (ядро), импортируемый из UI/CLI
+  logic/                      # основной код (ядро), импортируемый из UI/CLI
     pipeline/
       local_sort.py           # локальный конвейер: dedup -> faces -> split
-  app/
+  web_api/
     main.py                  # FastAPI-приложение: роуты страниц и API
+    routers/                 # Роутеры (presentation layer)
     templates/               # Jinja2-шаблоны страниц (CSS/JS встроены в HTML)
       index.html
       folders.html
       browse.html
       duplicates.html
-  DB/
+  common/
     db.py                    # SQLite-схема + доступ к данным (folders, dedup, faces)
+    yadisk_client.py         # создание клиента YaDisk + загрузка токена из env
   data/
     photosorter.db           # Локальная SQLite БД (состояние/кэш)
     models/                  # Кэш моделей (например YuNet onnx для face-scan) (НЕ коммитить)
@@ -174,7 +176,7 @@ PhotoSorter/
   scripts/
     tools/                   # Утилиты (скан/дамп/загрузка папок в БД)
       face_scan.py           # MVP: скан лиц для YaDisk папки (пишет bbox/presence/thumbnail в SQLite)
-      local_sort_by_faces.py # thin-wrapper: запускает photosorter.pipeline.local_sort (backward compat)
+      local_sort_by_faces.py # thin-wrapper: запускает logic.pipeline.local_sort (backward compat)
     debug/                   # Отладочные скрипты для YaDisk/папок
     regression/              # экспорт/проверки регресса
     run_server.ps1           # “одной кнопкой” запустить uvicorn --reload
@@ -183,7 +185,6 @@ PhotoSorter/
     render_diagrams.ps1      # Обёртка для render_diagrams.py
   regression/
     cases/                   # регрессионные списки путей (append-only)
-  yadisk_client.py           # Создание клиента YaDisk + загрузка токена из env
   requirements.txt           # Python-зависимости (фиксированные версии)
   requirements-face.txt      # Отдельные зависимости для .venv-face (Python 3.12) под распознавание лиц
   README.md
@@ -193,11 +194,12 @@ PhotoSorter/
 
 **Ключевые модули**
 
-- **`photosorter/`**: основной код сортера. `scripts/` остаётся для запускалок/дебага/экспорта.
-- **`app/main.py`**: FastAPI `app`, HTML-страницы (`/`, `/folders`, `/browse`, `/duplicates`) и JSON API (`/api/...`), плюс вспомогательная логика (ретраи/таймауты YaDisk, превью-redirect, дедуп-сканы).
-- **`app/templates/*.html`**: UI-страницы на Jinja2; стили и JS (fetch/рендер/прогресс) — инлайном.
-- **`DB/db.py`**: инициализация схемы SQLite, чтение справочника папок (`list_folders`), и слой для дедупа (`DedupStore`: прогоны, инвентарь файлов, хэши, пометки deleted/ignore, reconcile).
-- **`yadisk_client.py`**: загрузка `YADISK_ACCESS_TOKEN` из `secrets.env/.env` и создание `yadisk.YaDisk`.
+- **`logic/`**: основной код сортера (pipeline + gold-helpers). `scripts/` остаётся для запускалок/дебага/экспорта.
+- **`web_api/main.py`**: FastAPI `app`, HTML-страницы (`/`, `/folders`, `/browse`, `/duplicates`, `/faces`, `/gold`) и JSON API (`/api/...`).
+- **`web_api/routers/*`**: слой “presentation”: роуты страниц и API, минимум логики.
+- **`web_api/templates/*.html`**: UI-страницы на Jinja2; стили и JS (fetch/рендер/прогресс) — инлайном.
+- **`common/db.py`**: инициализация схемы SQLite, чтение справочника папок (`list_folders`), и слой для дедупа/конвейера (`DedupStore`, `FaceStore`, `PipelineStore`).
+- **`common/yadisk_client.py`**: загрузка `YADISK_ACCESS_TOKEN` из `secrets.env/.env` и создание `yadisk.YaDisk`.
 - **`scripts/tools/*`**: разовые утилиты, например скан первых уровней `/Фото` в таблицу `folders`.
 - **`scripts/debug/*`**: отладка проблемных путей/метаданных на Я.Диске.
 - **`regression/cases/*`**: регресс в виде списков путей (append-only). Экспорт из БД — `scripts/regression/export_cases_from_db.py`.
@@ -288,13 +290,13 @@ pip install -r requirements.txt
 Запуск сервера (локально, рекомендуемый — без `--reload`):
 
 ```bash
-uvicorn --app-dir . app.main:app --port 8000
+uvicorn --app-dir . web_api.main:app --port 8000
 ```
 
 Рекомендуемый режим разработки (Windows / PowerShell) — с авто‑reload:
 
 ```powershell
-C:\Users\mzaborov\AppData\Local\Python\pythoncore-3.14-64\python.exe -m uvicorn --reload --app-dir . app.main:app --host 127.0.0.1 --port 8000
+C:\Users\mzaborov\AppData\Local\Python\pythoncore-3.14-64\python.exe -m uvicorn --reload --app-dir . web_api.main:app --host 127.0.0.1 --port 8000
 ```
 
 Проверка, что сервер “свежий” (после reload/рестарта):
@@ -400,7 +402,7 @@ netstat -ano | findstr :8000
 
 ```bash
 cd "C:\\Users\\mzaborov\\YandexDisk\\Работы, тексты, презентации\\PhotoSorter"
-C:\\Users\\mzaborov\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe -m uvicorn --app-dir . app.main:app --port 8000
+C:\\Users\\mzaborov\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe -m uvicorn --app-dir . web_api.main:app --port 8000
 ```
 
 4) Открыть:

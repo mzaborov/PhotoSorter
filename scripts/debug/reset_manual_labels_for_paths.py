@@ -13,12 +13,12 @@ import argparse
 import sys
 from pathlib import Path
 
-# Ensure repo root is importable (so `from DB.db import ...` works even when running from scripts/).
+# Ensure repo root is importable (so `from common.db import ...` works even when running from scripts/).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from DB.db import DedupStore  # noqa: E402
+from common.db import DedupStore  # noqa: E402
 
 
 def main() -> int:

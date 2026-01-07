@@ -10,7 +10,8 @@ if (-not (Test-Path $python)) {
 }
 
 Write-Host "Starting uvicorn with --reload..."
-& $python -m uvicorn --reload --app-dir . app.main:app --host 127.0.0.1 --port 8000
+& $python -m uvicorn --reload --app-dir . web_api.main:app --host 127.0.0.1 --port 8000
+
 
 
 

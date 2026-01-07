@@ -18,7 +18,7 @@ import cv2  # type: ignore[import-untyped]
 import numpy as np  # type: ignore[import-untyped]
 from PIL import Image, ExifTags, ImageOps  # type: ignore[import-untyped]
 
-from DB.db import DedupStore, FaceStore, PipelineStore
+from common.db import DedupStore, FaceStore, PipelineStore
 
 
 EXCLUDE_DIR_NAMES_DEFAULT = ("_faces", "_no_faces", "_duplicates", "_animals")

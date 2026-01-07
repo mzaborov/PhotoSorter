@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from yadisk_client import get_disk
+from common.yadisk_client import get_disk
 
 
 def _get(item: Any, key: str) -> Optional[Any]:
@@ -95,6 +95,7 @@ if __name__ == "__main__":
     print(f"files={r.files} dirs={r.dirs} seconds={r.seconds:.2f}")
     if r.error:
         print(f"ERROR at {r.error_path}: {r.error}")
+
 
 
 

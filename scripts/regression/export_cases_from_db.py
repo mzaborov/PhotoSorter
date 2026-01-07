@@ -11,7 +11,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 
-from DB.db import DedupStore, PipelineStore  # noqa: E402
+from common.db import DedupStore, PipelineStore  # noqa: E402
 
 
 def _root_like_for_pipeline_run(pipeline_run_id: int) -> str | None:

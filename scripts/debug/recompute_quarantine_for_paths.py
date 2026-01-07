@@ -14,7 +14,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from DB.db import DedupStore, PipelineStore, FaceStore  # noqa: E402
+from common.db import DedupStore, PipelineStore, FaceStore  # noqa: E402
 
 
 def _looks_like_screen_ui(img_bgr_full: np.ndarray) -> bool:

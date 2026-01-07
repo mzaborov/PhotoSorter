@@ -4,8 +4,8 @@ import argparse
 import re
 from typing import Any, Optional
 
-from DB.db import get_connection, init_db
-from yadisk_client import get_disk
+from common.db import get_connection, init_db
+from common.yadisk_client import get_disk
 
 
 def _get(item: Any, key: str) -> Optional[Any]:
@@ -195,6 +195,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 

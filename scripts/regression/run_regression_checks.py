@@ -13,7 +13,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 
-from DB.db import DedupStore  # noqa: E402
+from common.db import DedupStore  # noqa: E402
 
 
 @dataclass(frozen=True)

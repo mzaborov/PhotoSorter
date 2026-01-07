@@ -21,7 +21,7 @@ if (-not (Test-Path $py)) {
   Write-Error "Не найден python в .venv-face: $py. Сначала создай .venv-face (Python 3.12)."
 }
 
-# Гарантируем импорт модулей из корня проекта (чтобы работали 'import yadisk_client', 'from DB.db ...').
+# Гарантируем импорт модулей из корня проекта (чтобы работали 'from common.yadisk_client ...', 'from common.db ...').
 $env:PYTHONPATH = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 
 # Важно для UI: печатать прогресс сразу, без буферизации stdout (иначе прогресс-бары "висят" на заглушке).

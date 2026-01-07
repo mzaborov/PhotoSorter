@@ -13,8 +13,8 @@ from typing import Any, Optional
 import cv2  # type: ignore[import-untyped]
 from PIL import Image  # type: ignore[import-untyped]
 
-from DB.db import FaceStore
-from yadisk_client import get_disk
+from common.db import FaceStore
+from common.yadisk_client import get_disk
 
 
 def _get(item: Any, key: str) -> Optional[Any]:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from DB.db import get_connection, init_db
+from common.db import get_connection, init_db
 
 
 def main() -> int:
@@ -33,6 +33,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 

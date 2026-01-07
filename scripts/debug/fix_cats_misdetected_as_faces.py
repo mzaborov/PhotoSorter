@@ -14,7 +14,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from DB.db import DedupStore, FaceStore, PipelineStore  # noqa: E402
+from common.db import DedupStore, FaceStore, PipelineStore  # noqa: E402
 
 
 def _letterbox(img_bgr: np.ndarray, *, new_size: int = 640, color: tuple[int, int, int] = (114, 114, 114)) -> tuple[np.ndarray, float, int, int]:
@@ -208,6 +208,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 

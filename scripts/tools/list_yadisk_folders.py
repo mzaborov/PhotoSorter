@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from typing import Any, Optional
 
-from yadisk_client import get_disk
+from common.yadisk_client import get_disk
 
 
 def _get(item: Any, key: str) -> Optional[Any]:
@@ -36,6 +36,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 
