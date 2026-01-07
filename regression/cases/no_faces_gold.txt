@@ -1,5 +1,4 @@
 local:C:\tmp\Photo\IMG-20240522-WA0005.jpg
-local:C:\tmp\Photo\IMG-20240620-WA0009.jpg
 local:C:\tmp\Photo\IMG-20240605-WA0018.jpg
 local:C:\tmp\Photo\IMG-20240606-WA0000.jpg
 local:C:\tmp\Photo\IMG-20240609-WA0001.jpg
@@ -33,14 +32,12 @@ local:C:\tmp\Photo\IMG-20240618-WA0182.jpg
 local:C:\tmp\Photo\IMG-20240618-WA0183.jpg
 local:C:\tmp\Photo\IMG-20240618-WA0209.jpg
 local:C:\tmp\Photo\IMG-20240618-WA0220.jpg
-local:C:\tmp\Photo\IMG-20240618-WA0248.jpg
 local:C:\tmp\Photo\IMG-20240618-WA0267.jpeg
 local:C:\tmp\Photo\IMG-20240618-WA0268.jpg
 local:C:\tmp\Photo\IMG-20240618-WA0269.jpeg
 local:C:\tmp\Photo\IMG-20240618-WA0270.jpg
 local:C:\tmp\Photo\IMG-20240618-WA0271.jpg
 local:C:\tmp\Photo\IMG-20240621-WA0026.jpg
-local:C:\tmp\Photo\IMG-20240621-WA0028.jpg
 local:C:\tmp\Photo\IMG-20240621-WA0030.jpg
 local:C:\tmp\Photo\IMG-20240621-WA0031.jpg
 local:C:\tmp\Photo\IMG-20240625-WA0001.jpg
@@ -54,8 +51,6 @@ local:C:\tmp\Photo\IMG-20240709-WA0000.jpeg
 local:C:\tmp\Photo\IMG-20240709-WA0001.jpg
 local:C:\tmp\Photo\IMG-20240710-WA0000.jpg
 local:C:\tmp\Photo\IMG-20240710-WA0001.jpg
-local:C:\tmp\Photo\IMG-20240711-WA0006.jpeg
-local:C:\tmp\Photo\IMG-20240711-WA0007.jpg
 local:C:\tmp\Photo\IMG-20240713-WA0000.jpg
 local:C:\tmp\Photo\IMG-20240715-WA0001.jpeg
 local:C:\tmp\Photo\IMG-20240715-WA0002.jpg

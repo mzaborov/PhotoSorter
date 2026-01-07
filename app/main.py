@@ -36,6 +36,30 @@ _STARTED_AT = time.time()
 STARTED_AT_UTC_ISO = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_STARTED_AT))
 BUILD_ID = time.strftime("%Y%m%d-%H%M%S", time.gmtime(_STARTED_AT)) + f"-pid{os.getpid()}"
 
+# #region agent log
+def _agent_dbg(*, hypothesis_id: str, location: str, message: str, data: dict[str, Any] | None = None, run_id: str = "pre-fix") -> None:
+    """
+    Tiny NDJSON logger for debug-mode evidence. Writes to .cursor/debug.log.
+    Never log secrets/PII.
+    """
+    try:
+        p = _repo_root() / ".cursor" / "debug.log"
+        payload = {
+            "sessionId": "debug-session",
+            "runId": str(run_id),
+            "hypothesisId": str(hypothesis_id),
+            "location": str(location),
+            "message": str(message),
+            "data": data or {},
+            "timestamp": int(time.time() * 1000),
+        }
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.open("a", encoding="utf-8").write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+# #endregion agent log
+
 
 def _now_utc_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -108,6 +132,152 @@ _LOCAL_PIPELINE_STATE: dict[str, Any] = {
 def _repo_root() -> Path:
     # app/main.py -> repo root
     return APP_DIR.parent
+
+
+def _gold_cases_dir() -> Path:
+    return _repo_root() / "regression" / "cases"
+
+
+def _gold_file_map() -> dict[str, Path]:
+    d = _gold_cases_dir()
+    return {
+        "cats_gold": d / "cats_gold.txt",
+        "quarantine_gold": d / "quarantine_gold.txt",
+        "no_faces_gold": d / "no_faces_gold.txt",
+        "people_no_face_gold": d / "people_no_face_gold.txt",
+        "faces_gold": d / "faces_gold.txt",
+        "drawn_faces_gold": d / "drawn_faces_gold.txt",
+    }
+
+
+def _gold_read_lines(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    out: list[str] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = (line or "").strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(s)
+    return out
+
+
+def _gold_write_lines(path: Path, lines: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    txt = "\n".join(lines) + ("\n" if lines else "")
+    path.write_text(txt, encoding="utf-8")
+
+
+def _gold_merge_append_only(path: Path, new_items: list[str]) -> int:
+    existing = _gold_read_lines(path)
+    seen = set(existing)
+    added = 0
+    for it in new_items:
+        s = (it or "").strip()
+        if not s or s in seen:
+            continue
+        existing.append(s)
+        seen.add(s)
+        added += 1
+    _gold_write_lines(path, existing)
+    return added
+
+
+def _is_windows_abs_path(p: str) -> bool:
+    # C:\... or C:/...
+    return bool(p) and len(p) >= 3 and p[1] == ":" and (p[2] == "\\" or p[2] == "/")
+
+
+def _gold_normalize_path(raw_path: str) -> dict[str, str]:
+    """
+    gold txt может содержать:
+    - disk:/... (как в YaDisk)
+    - local:C:\\... (как в БД)
+    - C:\\... (старые записи)
+    Возвращаем:
+      raw_path: как в файле (для delete)
+      path: нормализованный (для preview)
+    """
+    raw = (raw_path or "").strip()
+    if raw.startswith("disk:") or raw.startswith("local:"):
+        return {"raw_path": raw, "path": raw}
+    if _is_windows_abs_path(raw) or raw.startswith("\\\\"):
+        return {"raw_path": raw, "path": "local:" + raw}
+    return {"raw_path": raw, "path": raw}
+
+
+def _gold_expected_tab_by_path() -> dict[str, str]:
+    """
+    Для подсветки "sorted past gold" на /faces:
+    если путь есть в gold, но попал в другую эффективную вкладку — подсветим.
+
+    Возвращает mapping: normalized_path -> expected_tab (faces|no_faces|people_no_face|animals|quarantine).
+    """
+    m = _gold_file_map()
+    # порядок важен: если вдруг дубли, берём более "сильный" сигнал (ручные категории выше)
+    order: list[tuple[str, str]] = [
+        ("faces_gold", "faces"),
+        ("no_faces_gold", "no_faces"),
+        ("people_no_face_gold", "people_no_face"),
+        ("cats_gold", "animals"),
+        ("quarantine_gold", "quarantine"),
+        ("drawn_faces_gold", "faces"),
+    ]
+    out: dict[str, str] = {}
+    for name, tab in order:
+        p = m.get(name)
+        if not p:
+            continue
+        for raw in _gold_read_lines(p):
+            nm = _gold_normalize_path(raw)
+            path = nm["path"]
+            if path and path not in out:
+                out[path] = tab
+    return out
+
+
+def _guess_mime_media_for_path(path: str) -> tuple[str | None, str | None]:
+    """
+    Для gold у нас обычно нет mime_type/media_type — угадываем по расширению.
+    """
+    guess_name = None
+    if path.startswith("local:"):
+        guess_name = _strip_local_prefix(path)
+    elif path.startswith("disk:"):
+        guess_name = _basename_from_disk_path(path)
+    else:
+        guess_name = path
+
+    mt, _enc = mimetypes.guess_type(guess_name)
+    mime_type = mt or None
+    media_type = None
+    if mime_type:
+        if mime_type.startswith("image/"):
+            media_type = "image"
+        elif mime_type.startswith("video/"):
+            media_type = "video"
+    return mime_type, media_type
+
+
+def _root_like_for_pipeline_run_id(pipeline_run_id: int) -> str | None:
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        return None
+    root_path = str(pr.get("root_path") or "")
+    if not root_path:
+        return None
+    if root_path.startswith("disk:"):
+        rp = root_path.rstrip("/")
+        return rp + "/%"
+    try:
+        rp_abs = os.path.abspath(root_path).rstrip("\\/") + "\\"
+        return "local:" + rp_abs + "%"
+    except Exception:
+        return None
 
 
 def _local_pipeline_log_append(line: str) -> None:
@@ -1155,7 +1325,7 @@ def _reconcile_archive_inventory(*, run_id: int, root_path: str) -> None:
         cur.execute(
             """
             SELECT path, resource_id
-            FROM yd_files
+            FROM files
             WHERE path LIKE ? AND status != 'deleted'
             """,
             (prefix,),
@@ -1323,7 +1493,7 @@ def api_dedup_archive_start(max_download_gb: int = 5) -> dict[str, Any]:
 @app.post("/api/archive/reconcile/start")
 def api_archive_reconcile_start() -> dict[str, Any]:
     """
-    Запускает фоновую сверку архива (актуализация списка файлов в yd_files),
+    Запускает фоновую сверку архива (актуализация списка файлов в files),
     чтобы "догонять" редкие ручные изменения в веб-интерфейсе Я.Диска.
     """
     global _RECONCILE_FUTURE, _RECONCILE_RUN_ID  # noqa: PLW0603
@@ -1421,7 +1591,7 @@ def api_dedup_source_start(path: str = r"C:\tmp\Photo", max_download_gb: int = 5
     - YaDisk: используем sha256/md5 из метаданных, иначе (опционально) докачиваем и считаем sha256
 
     Важно: для YaDisk source запрещаем выбирать папку внутри disk:/Фото, чтобы не смешивать "archive" и "source"
-    (в таблице yd_files путь уникален).
+    (в таблице files путь уникален).
     """
     global _DEDUP_FUTURES, _DEDUP_RUN_IDS  # noqa: PLW0603
 
@@ -2459,6 +2629,358 @@ def faces_results_page(request: Request, pipeline_run_id: int | None = None):
     return templates.TemplateResponse("faces.html", {"request": request, "pipeline_run_id": pipeline_run_id})
 
 
+@app.get("/gold", response_class=HTMLResponse)
+def gold_debug_page(request: Request):
+    """
+    Debug UI для редактирования gold-списков (regression/cases/*_gold.txt) и обновления их из SQLite.
+    """
+    return templates.TemplateResponse("gold.html", {"request": request})
+
+
+@app.get("/api/gold/names")
+def api_gold_names() -> dict[str, Any]:
+    m = _gold_file_map()
+    counts: dict[str, int] = {}
+    for k, p in m.items():
+        try:
+            counts[k] = len(_gold_read_lines(p))
+        except Exception:
+            counts[k] = 0
+    return {"ok": True, "names": list(m.keys()), "counts": counts}
+
+
+@app.get("/api/gold/list")
+def api_gold_list(
+    name: str,
+    q: str = "",
+    cursor: str | None = None,
+    limit: int = 80,
+    pipeline_run_id: int | None = None,
+) -> dict[str, Any]:
+    m = _gold_file_map()
+    if name not in m:
+        raise HTTPException(status_code=400, detail="unknown gold name")
+    items = _gold_read_lines(m[name])
+    qq = (q or "").strip().lower()
+    if qq:
+        items = [x for x in items if qq in x.lower()]
+
+    # Infinite-scroll cursor: cursor is raw_path of the last returned item (exclusive).
+    # This avoids page jumps when deleting items on the client.
+    start_idx = 0
+    cur_s = (cursor or "").strip()
+    if cur_s:
+        try:
+            start_idx = items.index(cur_s) + 1
+        except ValueError:
+            start_idx = 0
+    limit_i = max(10, min(300, int(limit or 80)))
+    chunk = items[start_idx : start_idx + limit_i]
+
+    out_items: list[dict[str, Any]] = []
+    for raw in chunk:
+        nm = _gold_normalize_path(raw)
+        raw_path = nm["raw_path"]
+        path = nm["path"]
+        mime_type, media_type = _guess_mime_media_for_path(path)
+        meta = _faces_preview_meta(path=path, mime_type=mime_type, media_type=media_type, pipeline_run_id=pipeline_run_id)
+        out_items.append(
+            {
+                "raw_path": raw_path,
+                "path": path,
+                "path_short": _short_path_for_ui(path) if path.startswith("disk:") else raw_path,
+                "mime_type": mime_type,
+                "media_type": media_type,
+                **meta,
+            }
+        )
+
+    next_cursor = out_items[-1]["raw_path"] if out_items else None
+    has_more = bool(start_idx + limit_i < len(items))
+
+    return {
+        "ok": True,
+        "name": name,
+        "q": qq,
+        "total": len(items),
+        "count": len(out_items),
+        "cursor": cur_s or None,
+        "next_cursor": next_cursor if has_more else None,
+        "has_more": bool(has_more),
+        "limit": limit_i,
+        "items": out_items,
+    }
+
+
+@app.post("/api/gold/delete")
+def api_gold_delete(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    name = str(payload.get("name") or "").strip()
+    path_s = str(payload.get("path") or "").strip()
+    m = _gold_file_map()
+    if name not in m:
+        raise HTTPException(status_code=400, detail="unknown gold name")
+    if not path_s:
+        raise HTTPException(status_code=400, detail="path is required")
+    p = m[name]
+    lines = _gold_read_lines(p)
+    new_lines = [x for x in lines if x != path_s]
+    _gold_write_lines(p, new_lines)
+    return {"ok": True, "name": name, "removed": 1 if len(new_lines) != len(lines) else 0}
+
+
+@app.post("/api/gold/update-from-db")
+def api_gold_update_from_db(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Append-only обновление gold из SQLite по текущим (ручным) меткам/флагам.
+    Если передан pipeline_run_id — ограничиваем выборку root этого прогона.
+    """
+    pipeline_run_id = payload.get("pipeline_run_id")
+    root_like = None
+    if pipeline_run_id is not None:
+        if not isinstance(pipeline_run_id, int):
+            raise HTTPException(status_code=400, detail="pipeline_run_id must be int or null")
+        root_like = _root_like_for_pipeline_run_id(pipeline_run_id)
+        if root_like is None:
+            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+
+    base_where = ["status != 'deleted'"]
+    base_params: list[Any] = []
+    if root_like:
+        base_where.append("path LIKE ?")
+        base_params.append(root_like)
+    base_where_sql = " AND ".join(base_where)
+
+    ds = DedupStore()
+    try:
+        cur = ds.conn.cursor()
+
+        def q(sql: str, params: list[Any]) -> list[str]:
+            cur.execute(sql, params)
+            return [str(r[0]) for r in cur.fetchall()]
+
+        cats = q(
+            f"SELECT path FROM files WHERE {base_where_sql} AND COALESCE(animals_auto,0)=1 ORDER BY path ASC",
+            list(base_params),
+        )
+        faces_gold = q(
+            f"""
+            SELECT path
+            FROM files
+            WHERE {base_where_sql}
+              AND lower(trim(coalesce(faces_manual_label,''))) = 'faces'
+            ORDER BY path ASC
+            """,
+            list(base_params),
+        )
+        no_faces = q(
+            f"""
+            SELECT path
+            FROM files
+            WHERE {base_where_sql}
+              AND lower(trim(coalesce(faces_manual_label,''))) = 'no_faces'
+            ORDER BY path ASC
+            """,
+            list(base_params),
+        )
+        people_no_face = q(
+            f"""
+            SELECT path
+            FROM files
+            WHERE {base_where_sql}
+              AND COALESCE(people_no_face_manual,0) = 1
+            ORDER BY path ASC
+            """,
+            list(base_params),
+        )
+        quarantine_gold = q(
+            f"""
+            SELECT path
+            FROM files
+            WHERE {base_where_sql}
+              AND COALESCE(faces_auto_quarantine,0) = 1
+              AND lower(trim(coalesce(faces_quarantine_reason,''))) = 'manual'
+            ORDER BY path ASC
+            """,
+            list(base_params),
+        )
+    finally:
+        ds.close()
+
+    m = _gold_file_map()
+    results: dict[str, Any] = {}
+    results["cats_gold"] = {"added": _gold_merge_append_only(m["cats_gold"], cats), "db_total": len(cats)}
+    results["faces_gold"] = {"added": _gold_merge_append_only(m["faces_gold"], faces_gold), "db_total": len(faces_gold)}
+    results["no_faces_gold"] = {"added": _gold_merge_append_only(m["no_faces_gold"], no_faces), "db_total": len(no_faces)}
+    results["people_no_face_gold"] = {"added": _gold_merge_append_only(m["people_no_face_gold"], people_no_face), "db_total": len(people_no_face)}
+    results["quarantine_gold"] = {"added": _gold_merge_append_only(m["quarantine_gold"], quarantine_gold), "db_total": len(quarantine_gold)}
+    # drawn_faces_gold: пока не обновляем автоматически (источник/семантика могут отличаться)
+    results["drawn_faces_gold"] = {"added": 0, "db_total": len(_gold_read_lines(m["drawn_faces_gold"]))}
+    return {"ok": True, "pipeline_run_id": pipeline_run_id, "root_like": root_like, "results": results}
+
+
+@app.post("/api/gold/apply-to-db")
+def api_gold_apply_to_db(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Append-only заполнение ручной разметки в БД из gold-файлов.
+    Принцип: НЕ перетирать уже проставленные ручные поля/решения, а только дополнять пустые.
+    """
+    pipeline_run_id = payload.get("pipeline_run_id")
+    root_like = None
+    if pipeline_run_id is not None:
+        if not isinstance(pipeline_run_id, int):
+            raise HTTPException(status_code=400, detail="pipeline_run_id must be int or null")
+        root_like = _root_like_for_pipeline_run_id(pipeline_run_id)
+        if root_like is None:
+            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+
+    m = _gold_file_map()
+
+    # gold name -> operation type
+    ops: list[tuple[str, str]] = [
+        ("faces_gold", "faces"),
+        ("no_faces_gold", "no_faces"),
+        ("people_no_face_gold", "people_no_face"),
+        ("cats_gold", "cat"),
+        ("quarantine_gold", "quarantine_manual"),
+    ]
+
+    ds = DedupStore()
+    try:
+        cur = ds.conn.cursor()
+        out: dict[str, Any] = {}
+        total_applied = 0
+        for gold_name, op in ops:
+            p = m.get(gold_name)
+            raw_lines = _gold_read_lines(p) if p else []
+            paths = []
+            for raw in raw_lines:
+                nm = _gold_normalize_path(raw)
+                pp = nm["path"]
+                if pp and (pp.startswith("local:") or pp.startswith("disk:")):
+                    paths.append(pp)
+            # dedupe + stable order
+            seen = set()
+            uniq = []
+            for x in paths:
+                if x in seen:
+                    continue
+                seen.add(x)
+                uniq.append(x)
+
+            # existence check (for reporting only)
+            existing: set[str] = set()
+            if uniq:
+                # SQLite has parameter limits; chunk
+                step = 400
+                for i in range(0, len(uniq), step):
+                    chunk = uniq[i : i + step]
+                    q = ",".join(["?"] * len(chunk))
+                    if root_like:
+                        cur.execute(
+                            f"SELECT path FROM files WHERE status != 'deleted' AND path LIKE ? AND path IN ({q})",
+                            [root_like] + chunk,
+                        )
+                    else:
+                        cur.execute(f"SELECT path FROM files WHERE status != 'deleted' AND path IN ({q})", chunk)
+                    existing.update([str(r[0]) for r in cur.fetchall()])
+
+            applied = 0
+            skipped = 0
+            missing = 0
+
+            for path in uniq:
+                if path not in existing:
+                    missing += 1
+                    continue
+
+                # append-only: ставим только если "пусто"
+                where_extra = ""
+                params: list[Any] = []
+                if root_like:
+                    where_extra = " AND path LIKE ?"
+                    params.append(root_like)
+
+                if op in ("faces", "no_faces"):
+                    # не перетираем ручную метку + не мешаем people_no_face_manual
+                    cur.execute(
+                        f"""
+                        UPDATE files
+                        SET faces_manual_label = ?, faces_manual_at = ?
+                        WHERE path = ?
+                          AND status != 'deleted'
+                          AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
+                          AND COALESCE(people_no_face_manual, 0) = 0
+                          {where_extra}
+                        """,
+                        [op, _now_utc_iso(), path] + params,
+                    )
+                elif op == "people_no_face":
+                    cur.execute(
+                        f"""
+                        UPDATE files
+                        SET people_no_face_manual = 1
+                        WHERE path = ?
+                          AND status != 'deleted'
+                          AND COALESCE(people_no_face_manual, 0) = 0
+                          AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
+                          {where_extra}
+                        """,
+                        [path] + params,
+                    )
+                elif op == "cat":
+                    # gold "кот": ставим animals_auto и убираем конфликтующий авто-карантин (best-effort)
+                    cur.execute(
+                        f"""
+                        UPDATE files
+                        SET animals_auto = 1, animals_kind = 'cat',
+                            faces_auto_quarantine = 0, faces_quarantine_reason = NULL
+                        WHERE path = ?
+                          AND status != 'deleted'
+                          AND COALESCE(animals_auto, 0) = 0
+                          AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
+                          AND COALESCE(people_no_face_manual, 0) = 0
+                          {where_extra}
+                        """,
+                        [path] + params,
+                    )
+                elif op == "quarantine_manual":
+                    # ручной карантин из gold (append-only): ставим только если карантина ещё нет и нет ручных решений
+                    cur.execute(
+                        f"""
+                        UPDATE files
+                        SET faces_auto_quarantine = 1, faces_quarantine_reason = 'manual'
+                        WHERE path = ?
+                          AND status != 'deleted'
+                          AND COALESCE(faces_auto_quarantine, 0) = 0
+                          AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
+                          AND COALESCE(people_no_face_manual, 0) = 0
+                          AND COALESCE(animals_auto, 0) = 0
+                          {where_extra}
+                        """,
+                        [path] + params,
+                    )
+
+                rc = int(cur.rowcount or 0)
+                if rc > 0:
+                    applied += rc
+                else:
+                    skipped += 1
+
+            ds.conn.commit()
+            total_applied += applied
+            out[gold_name] = {"op": op, "lines": len(raw_lines), "unique_paths": len(uniq), "applied": applied, "skipped": skipped, "missing": missing}
+
+        _agent_dbg(
+            hypothesis_id="HGOLD_APPLY",
+            location="app/main.py:api_gold_apply_to_db",
+            message="gold_apply_done",
+            data={"pipeline_run_id": pipeline_run_id, "root_like": root_like, "total_applied": total_applied},
+        )
+        return {"ok": True, "pipeline_run_id": pipeline_run_id, "root_like": root_like, "total_applied": total_applied, "results": out}
+    finally:
+        ds.close()
+
+
 def _faces_preview_meta(*, path: str, mime_type: str | None, media_type: str | None, pipeline_run_id: int | None) -> dict[str, Any]:
     preview_kind = "none"  # 'image'|'video'|'none'
     preview_url: Optional[str] = None
@@ -2490,6 +3012,7 @@ def _faces_preview_meta(*, path: str, mime_type: str | None, media_type: str | N
 def api_faces_results(
     pipeline_run_id: int,
     tab: str = "faces",
+    subtab: str | None = None,
     page: int = 1,
     page_size: int = 60,
 ) -> dict[str, Any]:
@@ -2507,6 +3030,22 @@ def api_faces_results(
     tab_n = (tab or "").strip().lower()
     if tab_n not in ("faces", "no_faces", "quarantine", "animals", "people_no_face"):
         raise HTTPException(status_code=400, detail="tab must be faces|no_faces|quarantine|animals|people_no_face")
+
+    # 2-й уровень (постепенно): пока используем только внутри tab=faces.
+    subtab_n = (subtab or "").strip().lower() or "all"
+    if tab_n == "faces":
+        if subtab_n not in ("all", "many_faces"):
+            raise HTTPException(status_code=400, detail="subtab for faces must be all|many_faces")
+    else:
+        # для остальных вкладок subtab пока не используется
+        subtab_n = "all"
+
+    _agent_dbg(
+        hypothesis_id="HUI_SUBTAB",
+        location="app/main.py:api_faces_results",
+        message="faces_results_request",
+        data={"pipeline_run_id": int(pipeline_run_id), "tab": tab_n, "subtab": subtab_n, "page": int(page or 1), "page_size": int(page_size or 0)},
+    )
     page_i = max(1, int(page or 1))
     size_i = max(10, min(200, int(page_size or 60)))
     offset = (page_i - 1) * size_i
@@ -2551,17 +3090,39 @@ def api_faces_results(
       WHEN lower(trim(coalesce(faces_manual_label, ''))) = 'faces' THEN 'faces'
       WHEN lower(trim(coalesce(faces_manual_label, ''))) = 'no_faces' THEN 'no_faces'
       WHEN COALESCE(animals_auto, 0) = 1 THEN 'animals'
-      WHEN COALESCE(faces_auto_quarantine, 0) = 1 THEN 'quarantine'
+      -- Карантин только для "подозрительных лиц": если лиц нет (faces_count=0), не показываем в quarantine.
+      WHEN COALESCE(faces_auto_quarantine, 0) = 1
+           AND COALESCE(faces_count, 0) > 0
+           -- backward-compat: старый маркер "many_small_faces" раньше был через quarantine_reason
+           AND lower(trim(coalesce(faces_quarantine_reason, ''))) != 'many_small_faces'
+        THEN 'quarantine'
       ELSE (CASE WHEN COALESCE(faces_count, 0) > 0 THEN 'faces' ELSE 'no_faces' END)
     END
     """
+
+    sub_where = "1=1"
+    sub_params: list[Any] = []
+    if tab_n == "faces" and subtab_n == "many_faces":
+        # 2-й уровень (по правилу пользователя): "много лиц" = faces_count >= 8
+        # ВАЖНО: фильтруем только внутри эффективной вкладки 'faces' (см. ({eff_sql}) = ? выше).
+        sub_where = "COALESCE(faces_count, 0) >= 8"
+    elif tab_n == "faces" and subtab_n == "all":
+        # Variant B: "Неотсортировано" = всё, что НЕ many_faces
+        sub_where = "COALESCE(faces_count, 0) < 8"
+
+    _agent_dbg(
+        hypothesis_id="HAPI_FILTER",
+        location="app/main.py:api_faces_results",
+        message="faces_results_filter",
+        data={"tab": tab_n, "subtab": subtab_n, "sub_where": sub_where},
+    )
 
     ds = DedupStore()
     try:
         cur = ds.conn.cursor()
         cur.execute(
-            f"SELECT COUNT(*) AS cnt FROM yd_files WHERE {where_sql} AND ({eff_sql}) = ?",
-            params + [tab_n],
+            f"SELECT COUNT(*) AS cnt FROM files WHERE {where_sql} AND ({eff_sql}) = ? AND ({sub_where})",
+            params + [tab_n] + sub_params,
         )
         total = int(cur.fetchone()[0] or 0)
 
@@ -2577,16 +3138,18 @@ def api_faces_results(
               COALESCE(animals_kind, '') AS animals_kind,
               COALESCE(people_no_face_manual, 0) AS people_no_face_manual,
               COALESCE(people_no_face_person, '') AS people_no_face_person
-            FROM yd_files
-            WHERE {where_sql} AND ({eff_sql}) = ?
+            FROM files
+            WHERE {where_sql} AND ({eff_sql}) = ? AND ({sub_where})
             ORDER BY path ASC
             LIMIT ? OFFSET ?
             """,
-            params + [tab_n, size_i, offset],
+            params + [tab_n] + sub_params + [size_i, offset],
         )
         rows = [dict(r) for r in cur.fetchall()]
     finally:
         ds.close()
+
+    gold_expected = _gold_expected_tab_by_path()
 
     items: list[dict[str, Any]] = []
     for r in rows:
@@ -2619,6 +3182,9 @@ def api_faces_results(
                 "animals_kind": (str(r.get("animals_kind") or "") or "") or None,
                 "people_no_face_manual": int(r.get("people_no_face_manual") or 0),
                 "people_no_face_person": (str(r.get("people_no_face_person") or "") or "") or None,
+                # Вариант A: подсветка "мимо gold" — если файл есть в gold, но его эффективная вкладка сейчас другая.
+                "sorted_past_gold": bool(gold_expected.get(path) is not None and gold_expected.get(path) != tab_n),
+                "gold_expected_tab": gold_expected.get(path),
                 **_faces_preview_meta(path=path, mime_type=mime_type, media_type=media_type, pipeline_run_id=int(pipeline_run_id)),
             }
         )
@@ -2629,6 +3195,7 @@ def api_faces_results(
         "face_run_id": face_run_id_i,
         "root_path": root_path,
         "tab": tab_n,
+        "subtab": subtab_n,
         "page": page_i,
         "page_size": size_i,
         "total": total,
@@ -2653,6 +3220,13 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="face_run_id is not set yet (step 2 not started)")
     face_run_id_i = int(face_run_id)
     root_path = str(pr.get("root_path") or "")
+
+    _agent_dbg(
+        hypothesis_id="HTAB_COUNTS",
+        location="app/main.py:api_faces_tab_counts",
+        message="faces_tab_counts_request",
+        data={"pipeline_run_id": int(pipeline_run_id), "root_path": root_path},
+    )
 
     root_like = None
     if root_path.startswith("disk:"):
@@ -2679,7 +3253,12 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
       WHEN lower(trim(coalesce(faces_manual_label, ''))) = 'faces' THEN 'faces'
       WHEN lower(trim(coalesce(faces_manual_label, ''))) = 'no_faces' THEN 'no_faces'
       WHEN COALESCE(animals_auto, 0) = 1 THEN 'animals'
-      WHEN COALESCE(faces_auto_quarantine, 0) = 1 THEN 'quarantine'
+      -- Карантин только для "подозрительных лиц": если лиц нет (faces_count=0), не показываем в quarantine.
+      WHEN COALESCE(faces_auto_quarantine, 0) = 1
+           AND COALESCE(faces_count, 0) > 0
+           -- backward-compat: старый маркер "many_small_faces" раньше был через quarantine_reason
+           AND lower(trim(coalesce(faces_quarantine_reason, ''))) != 'many_small_faces'
+        THEN 'quarantine'
       ELSE (CASE WHEN COALESCE(faces_count, 0) > 0 THEN 'faces' ELSE 'no_faces' END)
     END
     """
@@ -2690,13 +3269,40 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
         cur.execute(
             f"""
             SELECT ({eff_sql}) AS tab, COUNT(*) AS cnt
-            FROM yd_files
+            FROM files
             WHERE {where_sql}
             GROUP BY ({eff_sql})
             """,
             params,
         )
         rows = cur.fetchall()
+
+        # 2-й уровень (пока только для tab=faces): variant B
+        # - many_faces: faces_count >= 8
+        # - unsorted:   faces_count < 8
+        cur.execute(
+            f"""
+            SELECT COUNT(*) AS cnt
+            FROM files
+            WHERE {where_sql}
+              AND ({eff_sql}) = 'faces'
+              AND COALESCE(faces_count, 0) >= 8
+            """,
+            params,
+        )
+        many_faces_cnt = int(cur.fetchone()[0] or 0)
+
+        cur.execute(
+            f"""
+            SELECT COUNT(*) AS cnt
+            FROM files
+            WHERE {where_sql}
+              AND ({eff_sql}) = 'faces'
+              AND COALESCE(faces_count, 0) < 8
+            """,
+            params,
+        )
+        unsorted_cnt = int(cur.fetchone()[0] or 0)
     finally:
         ds.close()
 
@@ -2705,7 +3311,12 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
         t = str(r["tab"] or "")
         if t in counts:
             counts[t] = int(r["cnt"] or 0)
-    return {"ok": True, "pipeline_run_id": int(pipeline_run_id), "counts": counts}
+    return {
+        "ok": True,
+        "pipeline_run_id": int(pipeline_run_id),
+        "counts": counts,
+        "subcounts": {"faces": {"many_faces": many_faces_cnt, "unsorted": unsorted_cnt}},
+    }
 
 
 @app.get("/api/faces/rectangles")
@@ -2743,6 +3354,18 @@ def api_faces_manual_label(payload: dict[str, Any] = Body(...)) -> dict[str, Any
         raise HTTPException(status_code=400, detail="person must be string")
     if lab not in ("faces", "no_faces", "people_no_face", "quarantine", "cat", ""):
         raise HTTPException(status_code=400, detail="label must be faces|no_faces|people_no_face|quarantine|cat|''")
+
+    # #region agent log
+    try:
+        _agent_dbg(
+            hypothesis_id="HNOFACES_CAT",
+            location="app/main.py:api_faces_manual_label",
+            message="faces_manual_label_request",
+            data={"pipeline_run_id": int(pipeline_run_id), "label": lab, "path_sha1": hashlib.sha1(path.encode("utf-8", errors="ignore")).hexdigest()[:12]},
+        )
+    except Exception:
+        pass
+    # #endregion agent log
 
     ds = DedupStore()
     try:

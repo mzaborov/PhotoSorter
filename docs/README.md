@@ -239,7 +239,7 @@ PhotoSorter/
   - открытие файла в веб-интерфейсе Я.Диска в режиме просмотра (slider).
 - Превью дублей: `/api/yadisk/preview-image` отдаёт 307 redirect на YaDisk preview URL (без проксирования байтов через сервер).
 - Исправление 403 на превью: `no-referrer` для картинок.
-- Длительность видео: асинхронный `ffprobe` + кеш в SQLite (`yd_files.duration_sec`).
+- Длительность видео: асинхронный `ffprobe` + кеш в SQLite (`files.duration_sec`).
 - Сверка архива (Reconcile Archive): кнопка на `/folders` и API, чтобы догонять ручные изменения на Я.Диске (перемещения/удаления/изменения).
 - Основная “рабочая форма сортировки” на `/` (one-page):
   - выбор источника: Я.Диск (`disk:/...`, любая папка) или локальная папка (`C:\...`),
@@ -312,6 +312,7 @@ curl.exe -i --connect-timeout 1 --max-time 5 http://127.0.0.1:8000/api/debug/bui
 - `http://127.0.0.1:8000/duplicates` — просмотр дублей архива (архив= `disk:/Фото`)
 - `http://127.0.0.1:8000/dedup-results?pipeline_run_id=6` — результаты шага 1 (вкладки 1.1/1.2) для конкретного `pipeline_run_id`
 - `http://127.0.0.1:8000/faces?pipeline_run_id=6` — результаты шага 2 (вкладки “Есть лица/Нет лиц”) для конкретного `pipeline_run_id`
+- `http://127.0.0.1:8000/gold?pipeline_run_id=6` — отладочная страница gold-эталона (кейсы регресса) для конкретного `pipeline_run_id`
 - `http://127.0.0.1:8000/docs` — список API
 
 ## Результаты шагов конвейера (Web UI)
@@ -332,6 +333,8 @@ curl.exe -i --connect-timeout 1 --max-time 5 http://127.0.0.1:8000/api/debug/bui
   - **Животные**
   - **Есть люди (без лиц)**
   - **Нет лиц**
+- Дополнительно (отладка/регресс):
+  - `/gold?pipeline_run_id=...` — просмотр gold-эталона (списки путей) + действия: обновить gold из БД и “append-only” перенести разметку из gold в БД
 - UX:
   - **double click** по превью — открыть просмотр bbox (авто + ручные)
   - бесконечная подгрузка (infinite scroll)
@@ -350,15 +353,15 @@ curl.exe -i --connect-timeout 1 --max-time 5 http://127.0.0.1:8000/api/debug/bui
   - кнопки **“Нормальные лица”** / **“Кот”** снимают карантин/переопределяют категорию
 
 Данные сохраняются в SQLite:
-- `yd_files.faces_manual_label` / `yd_files.faces_manual_at`
-- `yd_files.faces_auto_quarantine` / `yd_files.faces_quarantine_reason` (в т.ч. `manual`)
-- `yd_files.animals_auto` / `yd_files.animals_kind` (в т.ч. `cat`)
-- `yd_files.people_no_face_manual` / `yd_files.people_no_face_person`
+- `files.faces_manual_label` / `files.faces_manual_at`
+- `files.faces_auto_quarantine` / `files.faces_quarantine_reason` (в т.ч. `manual`)
+- `files.animals_auto` / `files.animals_kind` (в т.ч. `cat`)
+- `files.people_no_face_manual` / `files.people_no_face_person`
 - `face_rectangles.is_manual` / `face_rectangles.manual_created_at`
 
 ## Регресс: списки путей + экспорт из БД
 
-Регресс хранится в `regression/cases/*.txt` (append-only, ничего не затираем).
+Регресс хранится в `regression/cases/*_gold.txt` (append-only, ничего не затираем).
 
 Экспорт из БД по конкретному прогону:
 
@@ -371,6 +374,12 @@ C:\Users\mzaborov\AppData\Local\Python\pythoncore-3.14-64\python.exe scripts/reg
 ```powershell
 C:\Users\mzaborov\AppData\Local\Python\pythoncore-3.14-64\python.exe scripts/regression/run_regression_checks.py --cases-dir regression/cases --mode effective
 ```
+
+### Gold: обновление из БД и перенос разметки в БД (append-only)
+
+- Обновить gold-файлы из БД: `POST /api/gold/update-from-db`
+- Заполнить ручную разметку в БД из gold (append-only: не перетирает уже размеченные записи): `POST /api/gold/apply-to-db`
+- UI-страница для этого: `/gold?pipeline_run_id=...`
 
 ## Важно про DRY_RUN vs apply
 

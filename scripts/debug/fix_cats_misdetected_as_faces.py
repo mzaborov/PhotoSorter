@@ -193,7 +193,7 @@ def main() -> int:
                 fs.conn.commit()
                 # 2) set faces_count=0, keep faces_run_id/scanned_at as is
                 cur2 = ds.conn.cursor()
-                cur2.execute("UPDATE yd_files SET faces_count = 0 WHERE path = ?", (str(p),))
+                cur2.execute("UPDATE files SET faces_count = 0 WHERE path = ?", (str(p),))
                 ds.conn.commit()
                 # 3) set animals
                 ds.set_animals_auto(path=str(p), is_animal=True, kind="cat")
@@ -208,5 +208,9 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
 
 

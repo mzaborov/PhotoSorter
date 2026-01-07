@@ -52,6 +52,43 @@ def init_db():
     conn = get_connection()
     cur = conn.cursor()
 
+    # --- Миграция имени таблицы: yd_files -> files ---
+    # Исторически таблица называлась yd_files, но давно хранит и local: пути.
+    # Переименовываем безопасно при старте, чтобы старые базы не ломались после рефакторинга.
+    try:
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('yd_files','files')")
+        existing_tables = {str(r[0]) for r in cur.fetchall()}
+        if "files" not in existing_tables and "yd_files" in existing_tables:
+            cur.execute("ALTER TABLE yd_files RENAME TO files;")
+            conn.commit()
+        elif "files" in existing_tables and "yd_files" in existing_tables:
+            # Возможна промежуточная ситуация, если код уже успел создать пустую `files`,
+            # а реальные данные остались в `yd_files`.
+            try:
+                cur.execute("SELECT COUNT(*) FROM files")
+                files_cnt = int(cur.fetchone()[0] or 0)
+            except Exception:
+                files_cnt = -1
+            try:
+                cur.execute("SELECT COUNT(*) FROM yd_files")
+                yd_cnt = int(cur.fetchone()[0] or 0)
+            except Exception:
+                yd_cnt = -1
+
+            if files_cnt == 0 and yd_cnt > 0:
+                # Считаем `files` мусорной/пустой, восстанавливаем данные.
+                cur.execute("DROP TABLE files;")
+                cur.execute("ALTER TABLE yd_files RENAME TO files;")
+                conn.commit()
+            elif yd_cnt == 0 and files_cnt > 0:
+                # Старую таблицу можно убрать (best-effort).
+                cur.execute("DROP TABLE yd_files;")
+                conn.commit()
+    except Exception:
+        # best-effort: не валим приложение из-за миграции имени;
+        # если rename не прошёл, дальнейшие запросы покажут проблему явно.
+        pass
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS folders (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,7 +145,7 @@ def init_db():
     )
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS yd_files (
+        CREATE TABLE IF NOT EXISTS files (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             path            TEXT UNIQUE NOT NULL,    -- 'disk:/...'
             resource_id     TEXT,                   -- устойчивый ID ресурса Я.Диска (не зависит от пути)
@@ -137,7 +174,7 @@ def init_db():
 
     _ensure_columns(
         conn,
-        "yd_files",
+        "files",
         {
             "resource_id": "resource_id TEXT",
             "inventory_scope": "inventory_scope TEXT",
@@ -158,6 +195,9 @@ def init_db():
             # Авто-карантин (экраны/технические фото/сомнительные кейсы)
             "faces_auto_quarantine": "faces_auto_quarantine INTEGER NOT NULL DEFAULT 0",
             "faces_quarantine_reason": "faces_quarantine_reason TEXT",
+            # Авто-группы (2-й уровень вкладок /faces), НЕ связанные с карантином.
+            # Пример: 'many_faces' (>=8 лиц).
+            "faces_auto_group": "faces_auto_group TEXT",
             # Авто-детект животных (MVP: кошки)
             "animals_auto": "animals_auto INTEGER NOT NULL DEFAULT 0",
             "animals_kind": "animals_kind TEXT",
@@ -208,11 +248,11 @@ def init_db():
     )
 
     # Индексы для быстрых группировок дублей.
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_yd_files_hash ON yd_files(hash_alg, hash_value);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_yd_files_parent ON yd_files(parent_path);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash_alg, hash_value);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent_path);")
     # Устойчивый идентификатор: уникален, если известен (partial unique index).
     cur.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_yd_files_resource_id ON yd_files(resource_id) WHERE resource_id IS NOT NULL;"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_files_resource_id ON files(resource_id) WHERE resource_id IS NOT NULL;"
     )
 
     conn.commit()
@@ -429,6 +469,18 @@ class FaceStore:
     def clear_run_detections_for_file(self, *, run_id: int, file_path: str) -> None:
         cur = self.conn.cursor()
         cur.execute("DELETE FROM face_rectangles WHERE run_id = ? AND file_path = ?", (run_id, file_path))
+        self.conn.commit()
+
+    def clear_run_auto_rectangles_for_file(self, *, run_id: int, file_path: str) -> None:
+        """
+        Удаляет только авто-прямоугольники (is_manual=0) для файла в рамках прогона.
+        Ручные прямоугольники (is_manual=1) сохраняем.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            "DELETE FROM face_rectangles WHERE run_id = ? AND file_path = ? AND COALESCE(is_manual, 0) = 0",
+            (int(run_id), str(file_path)),
+        )
         self.conn.commit()
 
     def insert_detection(
@@ -653,7 +705,7 @@ class DedupStore:
         row = cur.fetchone()
         return dict(row) if row else None
 
-    # --- yd_files helpers (инвентарь/хэши/дубли) ---
+    # --- files helpers (инвентарь/хэши/дубли) ---
     #
     # Эти методы нужны и Web UI (дедуп архива/источника), и локальному конвейеру
     # (dedup локальной папки + idempotent update_path). Ранее они оказались
@@ -684,14 +736,14 @@ class DedupStore:
         cur = self.conn.cursor()
         cur.execute(
             """
-            INSERT INTO yd_files(
+            INSERT INTO files(
               path, resource_id, inventory_scope, name, parent_path, size, created, modified, mime_type, media_type,
               hash_alg, hash_value, hash_source, status, error, scanned_at, hashed_at, last_run_id
             )
             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
-              resource_id = COALESCE(excluded.resource_id, yd_files.resource_id),
-              inventory_scope = COALESCE(excluded.inventory_scope, yd_files.inventory_scope),
+              resource_id = COALESCE(excluded.resource_id, files.resource_id),
+              inventory_scope = COALESCE(excluded.inventory_scope, files.inventory_scope),
               name = excluded.name,
               parent_path = excluded.parent_path,
               size = excluded.size,
@@ -699,13 +751,13 @@ class DedupStore:
               modified = excluded.modified,
               mime_type = excluded.mime_type,
               media_type = excluded.media_type,
-              hash_alg = COALESCE(excluded.hash_alg, yd_files.hash_alg),
-              hash_value = COALESCE(excluded.hash_value, yd_files.hash_value),
-              hash_source = COALESCE(excluded.hash_source, yd_files.hash_source),
+              hash_alg = COALESCE(excluded.hash_alg, files.hash_alg),
+              hash_value = COALESCE(excluded.hash_value, files.hash_value),
+              hash_source = COALESCE(excluded.hash_source, files.hash_source),
               status = excluded.status,
               error = excluded.error,
               scanned_at = excluded.scanned_at,
-              hashed_at = COALESCE(excluded.hashed_at, yd_files.hashed_at),
+              hashed_at = COALESCE(excluded.hashed_at, files.hashed_at),
               last_run_id = excluded.last_run_id
             """,
             (
@@ -733,7 +785,7 @@ class DedupStore:
 
     def get_existing_hash(self, *, path: str) -> tuple[str | None, str | None]:
         cur = self.conn.cursor()
-        cur.execute("SELECT hash_alg, hash_value FROM yd_files WHERE path = ? LIMIT 1", (path,))
+        cur.execute("SELECT hash_alg, hash_value FROM files WHERE path = ? LIMIT 1", (path,))
         row = cur.fetchone()
         if not row:
             return None, None
@@ -751,7 +803,7 @@ class DedupStore:
               hash_alg,
               hash_value,
               COUNT(*) AS cnt
-            FROM yd_files
+            FROM files
             WHERE
               hash_value IS NOT NULL
               AND COALESCE(inventory_scope, 'archive') = 'archive'
@@ -776,7 +828,7 @@ class DedupStore:
         cur.execute(
             f"""
             SELECT path, name, parent_path, size, modified, mime_type, media_type, hash_source
-            FROM yd_files
+            FROM files
             WHERE {' AND '.join(where)}
             ORDER BY path ASC
             """,
@@ -795,7 +847,7 @@ class DedupStore:
         q = ",".join(["?"] * len(paths))
         cur.execute(
             f"""
-            UPDATE yd_files
+            UPDATE files
             SET ignore_archive_dup_run_id = ?
             WHERE path IN ({q})
             """,
@@ -825,8 +877,8 @@ class DedupStore:
               a.size AS archive_size,
               a.mime_type AS archive_mime_type,
               a.media_type AS archive_media_type
-            FROM yd_files s
-            JOIN yd_files a
+            FROM files s
+            JOIN files a
               ON a.hash_alg = s.hash_alg AND a.hash_value = s.hash_value
             WHERE
               s.inventory_scope = 'source'
@@ -855,7 +907,7 @@ class DedupStore:
               hash_alg,
               hash_value,
               COUNT(*) AS cnt
-            FROM yd_files
+            FROM files
             WHERE
               hash_value IS NOT NULL
               AND inventory_scope = ?
@@ -871,7 +923,7 @@ class DedupStore:
 
     def path_exists(self, *, path: str) -> bool:
         cur = self.conn.cursor()
-        cur.execute("SELECT 1 FROM yd_files WHERE path = ? LIMIT 1", (path,))
+        cur.execute("SELECT 1 FROM files WHERE path = ? LIMIT 1", (path,))
         return cur.fetchone() is not None
 
     def mark_deleted(self, *, paths: list[str]) -> int:
@@ -883,7 +935,7 @@ class DedupStore:
             return 0
         cur = self.conn.cursor()
         q = ",".join(["?"] * len(paths))
-        cur.execute(f"UPDATE yd_files SET status = 'deleted', error = NULL WHERE path IN ({q})", paths)
+        cur.execute(f"UPDATE files SET status = 'deleted', error = NULL WHERE path IN ({q})", paths)
         self.conn.commit()
         return int(cur.rowcount or 0)
 
@@ -891,7 +943,7 @@ class DedupStore:
         cur = self.conn.cursor()
         cur.execute(
             """
-            UPDATE yd_files
+            UPDATE files
             SET path = ?, name = COALESCE(?, name), parent_path = COALESCE(?, parent_path)
             WHERE path = ?
             """,
@@ -903,7 +955,7 @@ class DedupStore:
         cur = self.conn.cursor()
         cur.execute(
             """
-            UPDATE yd_files
+            UPDATE files
             SET faces_count = ?, faces_run_id = ?, faces_scanned_at = ?
             WHERE path = ?
             """,
@@ -925,7 +977,7 @@ class DedupStore:
         if lab == "":
             cur.execute(
                 """
-                UPDATE yd_files
+                UPDATE files
                 SET faces_manual_label = NULL, faces_manual_at = NULL
                 WHERE path = ?
                 """,
@@ -934,7 +986,7 @@ class DedupStore:
         else:
             cur.execute(
                 """
-                UPDATE yd_files
+                UPDATE files
                 SET faces_manual_label = ?, faces_manual_at = ?
                 WHERE path = ?
                 """,
@@ -951,7 +1003,7 @@ class DedupStore:
         if bool(is_quarantine):
             cur.execute(
                 """
-                UPDATE yd_files
+                UPDATE files
                 SET faces_auto_quarantine = 1, faces_quarantine_reason = ?
                 WHERE path = ?
                 """,
@@ -960,11 +1012,40 @@ class DedupStore:
         else:
             cur.execute(
                 """
-                UPDATE yd_files
+                UPDATE files
                 SET faces_auto_quarantine = 0, faces_quarantine_reason = NULL
                 WHERE path = ?
                 """,
                 (path,),
+            )
+        self.conn.commit()
+
+    def set_faces_auto_group(self, *, path: str, group: str | None) -> None:
+        """
+        Авто-группа для 2-го уровня вкладок /faces (НЕ карантин).
+        group: None | '' -> сброс, иначе строка (например 'many_faces').
+        """
+        g = (group or "").strip().lower()
+        if g == "":
+            g = ""
+        cur = self.conn.cursor()
+        if g == "":
+            cur.execute(
+                """
+                UPDATE files
+                SET faces_auto_group = NULL
+                WHERE path = ?
+                """,
+                (path,),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE files
+                SET faces_auto_group = ?
+                WHERE path = ?
+                """,
+                (g, path),
             )
         self.conn.commit()
 
@@ -976,7 +1057,7 @@ class DedupStore:
         if bool(is_animal):
             cur.execute(
                 """
-                UPDATE yd_files
+                UPDATE files
                 SET animals_auto = 1, animals_kind = ?
                 WHERE path = ?
                 """,
@@ -985,7 +1066,7 @@ class DedupStore:
         else:
             cur.execute(
                 """
-                UPDATE yd_files
+                UPDATE files
                 SET animals_auto = 0, animals_kind = NULL
                 WHERE path = ?
                 """,
@@ -1001,7 +1082,7 @@ class DedupStore:
         if bool(is_people_no_face):
             cur.execute(
                 """
-                UPDATE yd_files
+                UPDATE files
                 SET people_no_face_manual = 1, people_no_face_person = ?
                 WHERE path = ?
                 """,
@@ -1010,7 +1091,7 @@ class DedupStore:
         else:
             cur.execute(
                 """
-                UPDATE yd_files
+                UPDATE files
                 SET people_no_face_manual = 0, people_no_face_person = NULL
                 WHERE path = ?
                 """,
@@ -1020,13 +1101,13 @@ class DedupStore:
 
     def get_row_by_resource_id(self, *, resource_id: str) -> dict[str, Any] | None:
         cur = self.conn.cursor()
-        cur.execute("SELECT * FROM yd_files WHERE resource_id = ? LIMIT 1", (resource_id,))
+        cur.execute("SELECT * FROM files WHERE resource_id = ? LIMIT 1", (resource_id,))
         row = cur.fetchone()
         return dict(row) if row else None
 
     def get_row_by_path(self, *, path: str) -> dict[str, Any] | None:
         cur = self.conn.cursor()
-        cur.execute("SELECT * FROM yd_files WHERE path = ? LIMIT 1", (path,))
+        cur.execute("SELECT * FROM files WHERE path = ? LIMIT 1", (path,))
         row = cur.fetchone()
         return dict(row) if row else None
 
@@ -1066,7 +1147,7 @@ class DedupStore:
         if not existing:
             cur.execute(
                 """
-                INSERT INTO yd_files(
+                INSERT INTO files(
                   path, resource_id, inventory_scope, name, parent_path, size, created, modified, mime_type, media_type,
                   hash_alg, hash_value, hash_source, status, error, scanned_at, hashed_at, last_run_id
                 )
@@ -1085,11 +1166,11 @@ class DedupStore:
 
         # Если путь изменился, но новый путь уже занят другой строкой — пометим конфликтную строку deleted.
         if existing_path != path:
-            cur.execute("SELECT id, resource_id, status FROM yd_files WHERE path = ? LIMIT 1", (path,))
+            cur.execute("SELECT id, resource_id, status FROM files WHERE path = ? LIMIT 1", (path,))
             other = cur.fetchone()
             if other and int(other["id"]) != existing_id:
                 cur.execute(
-                    "UPDATE yd_files SET status='deleted', error=NULL WHERE id = ?",
+                    "UPDATE files SET status='deleted', error=NULL WHERE id = ?",
                     (int(other["id"]),),
                 )
 
@@ -1101,7 +1182,7 @@ class DedupStore:
             # Содержимое могло поменяться -> сбрасываем хэш и (на всякий случай) длительность.
             cur.execute(
                 """
-                UPDATE yd_files
+                UPDATE files
                 SET
                   path = ?,
                   resource_id = COALESCE(?, resource_id),
@@ -1148,7 +1229,7 @@ class DedupStore:
                 new_status = "hashed" if existing_hash_value else "new"
             cur.execute(
                 """
-                UPDATE yd_files
+                UPDATE files
                 SET
                   path = ?,
                   resource_id = COALESCE(?, resource_id),
@@ -1187,7 +1268,7 @@ class DedupStore:
 
     def get_duration(self, *, path: str) -> int | None:
         cur = self.conn.cursor()
-        cur.execute("SELECT duration_sec FROM yd_files WHERE path = ? LIMIT 1", (path,))
+        cur.execute("SELECT duration_sec FROM files WHERE path = ? LIMIT 1", (path,))
         row = cur.fetchone()
         if not row:
             return None
@@ -1198,7 +1279,7 @@ class DedupStore:
         cur = self.conn.cursor()
         cur.execute(
             """
-            UPDATE yd_files
+            UPDATE files
             SET duration_sec = ?, duration_source = ?, duration_at = ?
             WHERE path = ?
             """,
@@ -1364,14 +1445,14 @@ class PipelineStore:
         cur = self.conn.cursor()
         cur.execute(
             """
-            INSERT INTO yd_files(
+            INSERT INTO files(
               path, resource_id, inventory_scope, name, parent_path, size, created, modified, mime_type, media_type,
               hash_alg, hash_value, hash_source, status, error, scanned_at, hashed_at, last_run_id
             )
             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
-              resource_id = COALESCE(excluded.resource_id, yd_files.resource_id),
-              inventory_scope = COALESCE(excluded.inventory_scope, yd_files.inventory_scope),
+              resource_id = COALESCE(excluded.resource_id, files.resource_id),
+              inventory_scope = COALESCE(excluded.inventory_scope, files.inventory_scope),
               name = excluded.name,
               parent_path = excluded.parent_path,
               size = excluded.size,
@@ -1379,13 +1460,13 @@ class PipelineStore:
               modified = excluded.modified,
               mime_type = excluded.mime_type,
               media_type = excluded.media_type,
-              hash_alg = COALESCE(excluded.hash_alg, yd_files.hash_alg),
-              hash_value = COALESCE(excluded.hash_value, yd_files.hash_value),
-              hash_source = COALESCE(excluded.hash_source, yd_files.hash_source),
+              hash_alg = COALESCE(excluded.hash_alg, files.hash_alg),
+              hash_value = COALESCE(excluded.hash_value, files.hash_value),
+              hash_source = COALESCE(excluded.hash_source, files.hash_source),
               status = excluded.status,
               error = excluded.error,
               scanned_at = excluded.scanned_at,
-              hashed_at = COALESCE(excluded.hashed_at, yd_files.hashed_at),
+              hashed_at = COALESCE(excluded.hashed_at, files.hashed_at),
               last_run_id = excluded.last_run_id
             """,
             (
@@ -1413,7 +1494,7 @@ class PipelineStore:
 
     def get_existing_hash(self, *, path: str) -> tuple[str | None, str | None]:
         cur = self.conn.cursor()
-        cur.execute("SELECT hash_alg, hash_value FROM yd_files WHERE path = ? LIMIT 1", (path,))
+        cur.execute("SELECT hash_alg, hash_value FROM files WHERE path = ? LIMIT 1", (path,))
         row = cur.fetchone()
         if not row:
             return None, None
@@ -1431,7 +1512,7 @@ class PipelineStore:
               hash_alg,
               hash_value,
               COUNT(*) AS cnt
-            FROM yd_files
+            FROM files
             WHERE
               hash_value IS NOT NULL
               AND COALESCE(inventory_scope, 'archive') = 'archive'
@@ -1456,7 +1537,7 @@ class PipelineStore:
         cur.execute(
             f"""
             SELECT path, name, parent_path, size, modified, mime_type, media_type, hash_source
-            FROM yd_files
+            FROM files
             WHERE {' AND '.join(where)}
             ORDER BY path ASC
             """,
@@ -1475,7 +1556,7 @@ class PipelineStore:
         q = ",".join(["?"] * len(paths))
         cur.execute(
             f"""
-            UPDATE yd_files
+            UPDATE files
             SET ignore_archive_dup_run_id = ?
             WHERE path IN ({q})
             """,
@@ -1505,8 +1586,8 @@ class PipelineStore:
               a.size AS archive_size,
               a.mime_type AS archive_mime_type,
               a.media_type AS archive_media_type
-            FROM yd_files s
-            JOIN yd_files a
+            FROM files s
+            JOIN files a
               ON a.hash_alg = s.hash_alg AND a.hash_value = s.hash_value
             WHERE
               s.inventory_scope = 'source'
@@ -1535,7 +1616,7 @@ class PipelineStore:
               hash_alg,
               hash_value,
               COUNT(*) AS cnt
-            FROM yd_files
+            FROM files
             WHERE
               hash_value IS NOT NULL
               AND inventory_scope = ?
@@ -1551,7 +1632,7 @@ class PipelineStore:
 
     def path_exists(self, *, path: str) -> bool:
         cur = self.conn.cursor()
-        cur.execute("SELECT 1 FROM yd_files WHERE path = ? LIMIT 1", (path,))
+        cur.execute("SELECT 1 FROM files WHERE path = ? LIMIT 1", (path,))
         return cur.fetchone() is not None
 
     def mark_deleted(self, *, paths: list[str]) -> int:
@@ -1563,7 +1644,7 @@ class PipelineStore:
             return 0
         cur = self.conn.cursor()
         q = ",".join(["?"] * len(paths))
-        cur.execute(f"UPDATE yd_files SET status = 'deleted', error = NULL WHERE path IN ({q})", paths)
+        cur.execute(f"UPDATE files SET status = 'deleted', error = NULL WHERE path IN ({q})", paths)
         self.conn.commit()
         return int(cur.rowcount or 0)
 
@@ -1571,7 +1652,7 @@ class PipelineStore:
         cur = self.conn.cursor()
         cur.execute(
             """
-            UPDATE yd_files
+            UPDATE files
             SET path = ?, name = COALESCE(?, name), parent_path = COALESCE(?, parent_path)
             WHERE path = ?
             """,
@@ -1583,7 +1664,7 @@ class PipelineStore:
         cur = self.conn.cursor()
         cur.execute(
             """
-            UPDATE yd_files
+            UPDATE files
             SET faces_count = ?, faces_run_id = ?, faces_scanned_at = ?
             WHERE path = ?
             """,
@@ -1593,13 +1674,13 @@ class PipelineStore:
 
     def get_row_by_resource_id(self, *, resource_id: str) -> dict[str, Any] | None:
         cur = self.conn.cursor()
-        cur.execute("SELECT * FROM yd_files WHERE resource_id = ? LIMIT 1", (resource_id,))
+        cur.execute("SELECT * FROM files WHERE resource_id = ? LIMIT 1", (resource_id,))
         row = cur.fetchone()
         return dict(row) if row else None
 
     def get_row_by_path(self, *, path: str) -> dict[str, Any] | None:
         cur = self.conn.cursor()
-        cur.execute("SELECT * FROM yd_files WHERE path = ? LIMIT 1", (path,))
+        cur.execute("SELECT * FROM files WHERE path = ? LIMIT 1", (path,))
         row = cur.fetchone()
         return dict(row) if row else None
 
@@ -1639,7 +1720,7 @@ class PipelineStore:
         if not existing:
             cur.execute(
                 """
-                INSERT INTO yd_files(
+                INSERT INTO files(
                   path, resource_id, inventory_scope, name, parent_path, size, created, modified, mime_type, media_type,
                   hash_alg, hash_value, hash_source, status, error, scanned_at, hashed_at, last_run_id
                 )
@@ -1658,11 +1739,11 @@ class PipelineStore:
 
         # Если путь изменился, но новый путь уже занят другой строкой — пометим конфликтную строку deleted.
         if existing_path != path:
-            cur.execute("SELECT id, resource_id, status FROM yd_files WHERE path = ? LIMIT 1", (path,))
+            cur.execute("SELECT id, resource_id, status FROM files WHERE path = ? LIMIT 1", (path,))
             other = cur.fetchone()
             if other and int(other["id"]) != existing_id:
                 cur.execute(
-                    "UPDATE yd_files SET status='deleted', error=NULL WHERE id = ?",
+                    "UPDATE files SET status='deleted', error=NULL WHERE id = ?",
                     (int(other["id"]),),
                 )
 
@@ -1674,7 +1755,7 @@ class PipelineStore:
             # Содержимое могло поменяться -> сбрасываем хэш и (на всякий случай) длительность.
             cur.execute(
                 """
-                UPDATE yd_files
+                UPDATE files
                 SET
                   path = ?,
                   resource_id = COALESCE(?, resource_id),
@@ -1721,7 +1802,7 @@ class PipelineStore:
                 new_status = "hashed" if existing_hash_value else "new"
             cur.execute(
                 """
-                UPDATE yd_files
+                UPDATE files
                 SET
                   path = ?,
                   resource_id = COALESCE(?, resource_id),
@@ -1760,7 +1841,7 @@ class PipelineStore:
 
     def get_duration(self, *, path: str) -> int | None:
         cur = self.conn.cursor()
-        cur.execute("SELECT duration_sec FROM yd_files WHERE path = ? LIMIT 1", (path,))
+        cur.execute("SELECT duration_sec FROM files WHERE path = ? LIMIT 1", (path,))
         row = cur.fetchone()
         if not row:
             return None
@@ -1771,7 +1852,7 @@ class PipelineStore:
         cur = self.conn.cursor()
         cur.execute(
             """
-            UPDATE yd_files
+            UPDATE files
             SET duration_sec = ?, duration_source = ?, duration_at = ?
             WHERE path = ?
             """,

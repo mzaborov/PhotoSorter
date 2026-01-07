@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PhotoSorter — Gold (debug)</title>
+    <style>
+      :root { color-scheme: light; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      a { color: #0b57d0; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+      .muted { color: #6b7280; }
+      .wrap { max-width: 1200px; }
+      .header { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
+      .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+      .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#f3f4f6; color:#374151; font-size:12px; }
+      .btn { appearance:none; border:1px solid #d1d5db; background:#fff; padding:8px 10px; border-radius:10px; cursor:pointer; font-weight:700; }
+      .btn:hover { background:#f9fafb; }
+      .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+      .btn.primary { border-color:#0b57d0; background:#0b57d0; color:#fff; }
+      .btn.primary:hover { background:#0948b3; border-color:#0948b3; }
+      .btn.danger { border-color:#fecaca; background:#fff5f5; color:#991b1b; }
+      .btn.danger:hover { background:#ffecec; }
+      .tabs { display:flex; gap:8px; margin-top: 14px; flex-wrap:wrap; }
+      .tab { appearance:none; border:1px solid #d1d5db; background:#fff; padding:8px 10px; border-radius:999px; cursor:pointer; font-weight:700; }
+      .tab.active { background:#111827; color:#fff; border-color:#111827; }
+      .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top: 12px; }
+      input[type="text"], input[type="number"] { padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 10px; min-width: 280px; }
+      /* like /faces */
+      .grid { display:flex; gap:10px; flex-wrap:wrap; margin-top: 14px; }
+      .card { width: 240px; border:1px solid #e5e7eb; border-radius:12px; overflow:hidden; background:#fff; }
+      .thumb { height: 140px; background:#fff; display:flex; align-items:center; justify-content:center; position:relative; cursor: zoom-in; }
+      .thumb img { width: 100%; height: 100%; object-fit: contain; display:block; background:#fff; }
+      .thumb .noimg { color:#6b7280; font-size:12px; padding:10px; text-align:center; }
+      .card-body { padding: 10px 10px 12px 10px; }
+      .path { font-size: 12px; word-break: break-all; }
+      .kv { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; font-size:12px; color:#374151; }
+      .actions { display:flex; gap:8px; align-items:center; margin-top: 10px; flex-wrap: wrap; }
+      .toast { font-size: 13px; }
+      .toast.err { color: #991b1b; }
+      .small { font-size: 12px; }
+      .pager { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top: 12px; }
+      .sentinel { height: 1px; }
+
+      /* Lightbox */
+      .lb { position: fixed; inset: 0; background: rgba(17,24,39,0.82); display: none; align-items: center; justify-content: center; padding: 18px; z-index: 9999; }
+      .lb.open { display: flex; }
+      .lb-panel { background: #fff; border-radius: 14px; max-width: 94vw; max-height: 94vh; width: min(1200px, 94vw); overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,0.35); }
+      .lb-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #e5e7eb; }
+      .lb-top code { font-size: 11px; }
+      .lb-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+      .lb-body { background: #111827; display: flex; align-items: center; justify-content: center; padding: 10px; }
+      .lb-body img { max-width: 92vw; max-height: calc(92vh - 90px); width: auto; height: auto; display: block; background: #111827; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="header">
+        <div>
+          <h2 style="margin:0;">Gold (debug)</h2>
+          <div class="muted" style="margin-top:6px;">
+            Тут редактируем `regression/cases/*_gold.txt` и можем обновить gold из SQLite по ручным правкам (append-only).
+          </div>
+        </div>
+        <div class="muted">
+          <a href="/">← на главную</a>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <span class="pill">файл: <b id="curName">—</b></span>
+        <span class="pill">строк: <b id="curCount">—</b></span>
+        <button class="btn primary" id="btnReload" type="button">Обновить список</button>
+        <button class="btn primary" id="btnUpdateFromDb" type="button" title="Append-only: дописывает новые пути из БД, старые не трогает.">
+          Обновить gold из базы
+        </button>
+        <button class="btn primary" id="btnApplyToDb" type="button" title="Append-only: переносит разметку из gold в БД, НЕ перетирая уже размеченные файлы.">
+          Заполнить ручную разметку из gold
+        </button>
+        <span class="muted" id="toast"></span>
+      </div>
+
+      <div class="tabs" id="tabs"></div>
+
+      <div class="toolbar">
+        <input id="q" type="text" placeholder="поиск по подстроке (например IMG-2024)" />
+        <input id="pipelineRunId" type="number" min="0" step="1" placeholder="pipeline_run_id (опционально)" />
+        <input id="limit" type="number" min="20" step="20" value="120" style="min-width:120px;" title="Размер пачки для дочитки (infinite scroll)" />
+      </div>
+
+      <div class="muted small" style="margin-top:6px;">
+        Подсказка: `pipeline_run_id` ограничивает обновление только файлами из root этого прогона (если указан).
+      </div>
+
+      <div class="pager">
+        <span class="pill">всего: <b id="curTotal">—</b></span>
+        <span class="pill">загружено: <b id="curLoaded">0</b></span>
+        <button class="btn" id="btnLoadMore" type="button">Дочитать ещё</button>
+      </div>
+
+      <div class="grid" id="grid"></div>
+      <div class="sentinel" id="sentinel"></div>
+    </div>
+
+    <div class="lb" id="lightbox" aria-hidden="true">
+      <div class="lb-panel" role="dialog" aria-modal="true">
+        <div class="lb-top">
+          <code id="lbPath">—</code>
+          <div class="lb-actions">
+            <button class="btn" id="lbClose" type="button">Закрыть</button>
+          </div>
+        </div>
+        <div class="lb-body">
+          <img id="lbImg" alt="preview" />
+        </div>
+      </div>
+    </div>
+
+    <script>
+      function qs(sel, el=document) { return el.querySelector(sel); }
+      function qsa(sel, el=document) { return Array.from(el.querySelectorAll(sel)); }
+      function escapeHtml(s) {
+        return (s ?? "").toString()
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll("\"", "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+      async function fetchJson(url, opts={}) {
+        const r = await fetch(url, { cache:"no-store", ...opts });
+        const t = await r.text();
+        let j = null;
+        try { j = t ? JSON.parse(t) : null; } catch (e) { j = null; }
+        if (!r.ok) throw new Error((j && (j.detail || j.error || j.message)) ? (j.detail || j.error || j.message) : (t || `HTTP ${r.status}`));
+        return j;
+      }
+      async function postJson(url, payload) {
+        return await fetchJson(url, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(payload ?? {}) });
+      }
+      function setToast(msg, isErr=false) {
+        const el = qs("#toast");
+        el.textContent = msg || "";
+        el.classList.toggle("err", !!isErr);
+      }
+      function getIntVal(id) {
+        const v = Number(qs(id)?.value ?? "");
+        return Number.isFinite(v) && v > 0 ? Math.floor(v) : null;
+      }
+
+      let names = [];
+      let nameCounts = {};
+      let cur = null;
+      let nextCursor = null;
+      let hasMore = false;
+      let loading = false;
+      const cardByRaw = new Map();
+
+      // lightbox
+      const lb = qs("#lightbox");
+      const lbImg = qs("#lbImg");
+      const lbPath = qs("#lbPath");
+      function closeLb() {
+        lb.classList.remove("open");
+        lb.setAttribute("aria-hidden","true");
+        lbImg.src = "";
+        lbPath.textContent = "—";
+      }
+      function openLb(it) {
+        const pv = it?.preview_url || "";
+        if (!pv) return;
+        lbImg.src = pv;
+        lbPath.textContent = it?.raw_path || it?.path || "—";
+        lb.classList.add("open");
+        lb.setAttribute("aria-hidden","false");
+      }
+      qs("#lbClose").onclick = () => closeLb();
+      lb.addEventListener("click", (e) => { if (e.target === lb) closeLb(); });
+      document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeLb(); });
+
+      function renderTabs() {
+        const el = qs("#tabs");
+        el.innerHTML = names.map(n => {
+          const active = (n === cur) ? "active" : "";
+          const cnt = Number(nameCounts?.[n] ?? 0);
+          const badge = Number.isFinite(cnt) ? ` <span class="pill" style="margin-left:6px;">${cnt}</span>` : "";
+          return `<button class="tab ${active}" data-name="${escapeHtml(n)}" type="button">${escapeHtml(n)}${badge}</button>`;
+        }).join("");
+        el.querySelectorAll("button.tab[data-name]").forEach(b => {
+          b.addEventListener("click", () => {
+            cur = b.getAttribute("data-name");
+            resetList();
+            renderTabs();
+            loadList();
+          });
+        });
+      }
+
+      async function loadNames() {
+        const data = await fetchJson("/api/gold/names");
+        names = Array.isArray(data?.names) ? data.names : [];
+        nameCounts = (data?.counts && typeof data.counts === "object") ? data.counts : {};
+        if (!cur && names.length) cur = names[0];
+        if (cur && !names.includes(cur)) cur = names[0] || null;
+        renderTabs();
+      }
+
+      function cardHtml(it) {
+        const raw = it?.raw_path || "";
+        const path = it?.path || raw;
+        const display = it?.path_short || raw;
+        const kind = it?.preview_kind || "none";
+        const pv = it?.preview_url || "";
+        const mt = it?.mime_type ? `${escapeHtml(it.mime_type)}` : "—";
+        const thumb = (kind === "image" && pv) ? `<img loading="lazy" src="${escapeHtml(pv)}" alt="preview" />` : `<div class="noimg">—</div>`;
+        return `
+          <div class="card" data-raw="${escapeHtml(raw)}">
+            <div class="thumb" data-act="lb">
+              ${thumb}
+            </div>
+            <div class="card-body">
+              <div class="path"><code title="${escapeHtml(raw)}">${escapeHtml(display)}</code></div>
+              <div class="kv">
+                <span class="pill">${mt}</span>
+              </div>
+              <div class="actions">
+                <button class="btn danger" data-act="del" data-path="${escapeHtml(raw)}" type="button">Удалить</button>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      function resetList() {
+        nextCursor = null;
+        hasMore = false;
+        loading = false;
+        cardByRaw.clear();
+        qs("#curLoaded").textContent = "0";
+        qs("#curTotal").textContent = "—";
+        qs("#grid").innerHTML = `<div class="muted">Загрузка…</div>`;
+        qs("#btnLoadMore").disabled = true;
+      }
+
+      function updateLoadMoreUi() {
+        qs("#btnLoadMore").disabled = loading || !hasMore;
+      }
+
+      async function loadList(reset=false) {
+        if (!cur) return;
+        if (loading) return;
+        loading = true;
+        updateLoadMoreUi();
+        if (reset) resetList();
+        setToast("");
+        qs("#curName").textContent = cur;
+        try {
+          const q = (qs("#q")?.value || "").trim();
+          const rid = getIntVal("#pipelineRunId");
+          const lim = getIntVal("#limit") || 120;
+          const curParam = nextCursor ? `&cursor=${encodeURIComponent(String(nextCursor))}` : "";
+          const url = `/api/gold/list?name=${encodeURIComponent(cur)}&q=${encodeURIComponent(q)}${curParam}&limit=${encodeURIComponent(String(lim))}${rid ? `&pipeline_run_id=${encodeURIComponent(String(rid))}` : ""}`;
+          const data = await fetchJson(url);
+          const items = Array.isArray(data?.items) ? data.items : [];
+          const total = Number(data?.total ?? 0);
+          qs("#curTotal").textContent = String(total);
+          qs("#curCount").textContent = String(data?.count ?? items.length ?? 0);
+
+          nextCursor = data?.next_cursor || null;
+          hasMore = !!data?.has_more;
+
+          const grid = qs("#grid");
+          if (cardByRaw.size === 0) grid.innerHTML = "";
+          if (!items.length && cardByRaw.size === 0) {
+            grid.innerHTML = `<div class="muted">Пусто.</div>`;
+          } else {
+            const html = [];
+            for (const it of items) {
+              const raw = it?.raw_path || "";
+              if (!raw || cardByRaw.has(raw)) continue;
+              html.push(cardHtml(it));
+            }
+            if (html.length) {
+              grid.insertAdjacentHTML("beforeend", html.join(""));
+            }
+            // bind new cards
+            qsa("#grid .card").forEach(card => {
+              const raw = card.getAttribute("data-raw") || "";
+              if (!raw || cardByRaw.has(raw)) return;
+              cardByRaw.set(raw, card);
+              const pvImg = card.querySelector(".thumb img");
+              const pvUrl = pvImg ? pvImg.getAttribute("src") : "";
+              const thumb = card.querySelector(".thumb[data-act='lb']");
+              if (thumb) {
+                // double click like /faces
+                thumb.addEventListener("dblclick", () => openLb({ raw_path: raw, preview_url: pvUrl }));
+              }
+              const btn = card.querySelector("button[data-act='del'][data-path]");
+              if (btn) {
+                btn.addEventListener("click", async () => {
+                  const p = btn.getAttribute("data-path") || "";
+                  if (!p) return;
+                  if (!confirm(`Удалить из ${cur}?\n\n${p}`)) return;
+                  const el = card;
+                  let adjust = 0;
+                  if (el) {
+                    const r = el.getBoundingClientRect();
+                    if (r.bottom < 0) adjust = el.offsetHeight || 0;
+                  }
+                  try {
+                    await postJson("/api/gold/delete", { name: cur, path: p });
+                    if (el) el.remove();
+                    cardByRaw.delete(p);
+                    qs("#curLoaded").textContent = String(cardByRaw.size);
+                    const curTot = Number(qs("#curTotal").textContent || "0");
+                    if (Number.isFinite(curTot) && curTot > 0) qs("#curTotal").textContent = String(curTot - 1);
+                    if (adjust > 0) window.scrollBy(0, adjust);
+                    setToast("Удалено.");
+                  } catch (e) {
+                    setToast(e?.message || String(e), true);
+                  }
+                });
+              }
+            });
+          }
+
+          qs("#curLoaded").textContent = String(cardByRaw.size);
+        } catch (e) {
+          qs("#grid").innerHTML = `<div class="muted"><span class="toast err">Ошибка: ${escapeHtml(e?.message || e)}</span></div>`;
+          qs("#curCount").textContent = "—";
+          qs("#curTotal").textContent = "—";
+          qs("#curLoaded").textContent = "0";
+          nextCursor = null;
+          hasMore = false;
+          cardByRaw.clear();
+        } finally {
+          loading = false;
+          updateLoadMoreUi();
+        }
+      }
+
+      async function updateFromDb() {
+        setToast("");
+        try {
+          const rid = getIntVal("#pipelineRunId");
+          qs("#btnUpdateFromDb").disabled = true;
+          const data = await postJson("/api/gold/update-from-db", { pipeline_run_id: rid });
+          const notes = [];
+          const r = data?.results || {};
+          for (const k of Object.keys(r)) {
+            const rr = r[k] || {};
+            notes.push(`${k}: +${Number(rr.added ?? 0)} (db_total=${Number(rr.db_total ?? 0)})`);
+          }
+          setToast(`Готово. ${notes.join(" · ")}`);
+          await loadNames();
+          await loadList(true);
+        } catch (e) {
+          setToast(e?.message || String(e), true);
+        } finally {
+          qs("#btnUpdateFromDb").disabled = false;
+        }
+      }
+
+      async function applyToDb() {
+        setToast("");
+        try {
+          const rid = getIntVal("#pipelineRunId");
+          const msg = [
+            "Заполнить ручную разметку из gold (append-only)?",
+            "",
+            "Правило: не перетираем уже размеченные файлы; только дополняем пустые поля.",
+            rid ? `Ограничение: только root прогона pipeline_run_id=${rid}` : "Ограничение: нет (вся БД).",
+          ].join("\n");
+          if (!confirm(msg)) return;
+          qs("#btnApplyToDb").disabled = true;
+          const data = await postJson("/api/gold/apply-to-db", { pipeline_run_id: rid });
+          const notes = [];
+          const r = data?.results || {};
+          for (const k of Object.keys(r)) {
+            const rr = r[k] || {};
+            notes.push(`${k}: applied=${Number(rr.applied ?? 0)} skipped=${Number(rr.skipped ?? 0)} missing=${Number(rr.missing ?? 0)}`);
+          }
+          setToast(`Готово. total_applied=${Number(data?.total_applied ?? 0)} · ${notes.join(" · ")}`);
+        } catch (e) {
+          setToast(e?.message || String(e), true);
+        } finally {
+          qs("#btnApplyToDb").disabled = false;
+        }
+      }
+
+      qs("#btnReload").onclick = () => loadList(true);
+      qs("#btnUpdateFromDb").onclick = () => updateFromDb();
+      qs("#btnApplyToDb").onclick = () => applyToDb();
+      qs("#q").addEventListener("input", () => { loadList(true); });
+      qs("#limit").addEventListener("change", () => { loadList(true); });
+      qs("#btnLoadMore").onclick = () => loadList(false);
+
+      // infinite scroll: auto-load when sentinel becomes visible
+      const io = new IntersectionObserver((entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting && hasMore && !loading) loadList(false);
+        }
+      }, { root: null, rootMargin: "1200px 0px", threshold: 0.01 });
+      io.observe(qs("#sentinel"));
+
+      // init
+      loadNames().then(() => loadList(true)).catch(e => setToast(e?.message || String(e), true));
+    </script>
+  </body>
+</html>
+
+
+

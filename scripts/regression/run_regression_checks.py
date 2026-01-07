@@ -57,11 +57,14 @@ def _effective_tab_for_row(row: dict) -> str:
     # auto
     if (row.get("animals_auto") or 0) == 1:
         return "animals"
-    if (row.get("faces_auto_quarantine") or 0) == 1:
+    # many_small_faces показываем внутри tab=faces (2-й уровень), не как отдельный top-tab quarantine
+    q_reason = (row.get("faces_quarantine_reason") or "").strip().lower()
+    # quarantine only if there are faces (faces_count>0); otherwise treat as no_faces
+    fc = int(row.get("faces_count") or 0)
+    if (row.get("faces_auto_quarantine") or 0) == 1 and q_reason != "many_small_faces" and fc > 0:
         return "quarantine"
 
     # fallback: by faces_count
-    fc = int(row.get("faces_count") or 0)
     return "faces" if fc > 0 else "no_faces"
 
 
@@ -79,9 +82,10 @@ def _auto_tab_for_row(row: dict) -> str:
     """
     if _bool01(row.get("animals_auto")) == 1:
         return "animals"
-    if _bool01(row.get("faces_auto_quarantine")) == 1:
-        return "quarantine"
+    q_reason = (row.get("faces_quarantine_reason") or "").strip().lower()
     fc = int(row.get("faces_count") or 0)
+    if _bool01(row.get("faces_auto_quarantine")) == 1 and q_reason != "many_small_faces" and fc > 0:
+        return "quarantine"
     return "faces" if fc > 0 else "no_faces"
 
 
@@ -99,7 +103,7 @@ def _fetch_rows_by_paths(ds: DedupStore, paths: list[str]) -> dict[str, dict]:
           animals_auto,
           animals_kind,
           people_no_face_manual
-        FROM yd_files
+        FROM files
         WHERE path IN ({placeholders})
     """
     rows = ds.conn.execute(sql, paths).fetchall()
@@ -128,11 +132,12 @@ def main() -> int:
 
     # map file name -> expected tab (positive expectations only)
     expected_by_file = {
-        "cats.txt": "animals",
-        "quarantine_manual.txt": "quarantine",
-        "no_faces.txt": "no_faces",
-        "people_no_face.txt": "people_no_face",
-        "drawn_faces.txt": "quarantine",
+        "cats_gold.txt": "animals",
+        "quarantine_gold.txt": "quarantine",
+        "faces_gold.txt": "faces",
+        "no_faces_gold.txt": "no_faces",
+        "people_no_face_gold.txt": "people_no_face",
+        "drawn_faces_gold.txt": "quarantine",
     }
 
     files = sorted([p for p in cases_dir.glob("*.txt") if p.is_file()])

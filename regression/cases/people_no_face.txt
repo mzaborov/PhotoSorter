@@ -1,3 +1,0 @@
-local:C:\tmp\Photo\20250205_214234.jpg
-local:C:\tmp\Photo\IMG-20240331-WA0005.jpg
-local:C:\tmp\Photo\IMG-20240402-WA0013.jpeg

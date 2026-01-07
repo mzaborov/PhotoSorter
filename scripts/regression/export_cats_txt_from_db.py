@@ -61,9 +61,9 @@ def _merge_append_only(path: Path, new_items: list[str]) -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Export cats list (animals_auto=1) from SQLite to regression/cases/cats.txt")
+    ap = argparse.ArgumentParser(description="Export cats list (animals_auto=1) from SQLite to regression/cases/cats_gold.txt")
     ap.add_argument("--pipeline-run-id", type=int, required=True)
-    ap.add_argument("--out", default=str(_REPO_ROOT / "regression" / "cases" / "cats.txt"))
+    ap.add_argument("--out", default=str(_REPO_ROOT / "regression" / "cases" / "cats_gold.txt"))
     args = ap.parse_args()
 
     root_like = _detect_root_like(int(args.pipeline_run_id))
@@ -78,7 +78,7 @@ def main() -> int:
         cur.execute(
             f"""
             SELECT path
-            FROM yd_files
+            FROM files
             WHERE {' AND '.join(where)}
             ORDER BY path ASC
             """,

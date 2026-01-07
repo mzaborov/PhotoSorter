@@ -1,0 +1,17 @@
+local:C:\tmp\Photo\20240829_155138.jpg
+local:C:\tmp\Photo\20241224_094306.jpg
+local:C:\tmp\Photo\20250621_162513.jpg
+local:C:\tmp\Photo\IMG-20231106-WA0026.jpg
+local:C:\tmp\Photo\IMG-20240331-WA0001.jpg
+local:C:\tmp\Photo\IMG-20240331-WA0004.jpg
+local:C:\tmp\Photo\IMG-20240601-WA0012.jpg
+local:C:\tmp\Photo\IMG-20240609-WA0016.jpg
+local:C:\tmp\Photo\IMG-20240716-WA0019.jpg
+local:C:\tmp\Photo\IMG-20240823-WA0008.jpg
+local:C:\tmp\Photo\IMG-20240920-WA0020.jpg
+local:C:\tmp\Photo\IMG-20240923-WA0005.jpg
+local:C:\tmp\Photo\IMG-20240925-WA0003.jpg
+local:C:\tmp\Photo\IMG-20241010-WA0030.jpg
+local:C:\tmp\Photo\IMG-20241017-WA0015.jpg
+local:C:\tmp\Photo\IMG-20241022-WA0005.jpg
+

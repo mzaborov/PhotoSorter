@@ -25,6 +25,9 @@
       .tabs { display:flex; gap:8px; margin-top: 14px; }
       .tab { appearance:none; border:1px solid #d1d5db; background:#fff; padding:8px 10px; border-radius:999px; cursor:pointer; font-weight:700; }
       .tab.active { background:#111827; color:#fff; border-color:#111827; }
+      .subtabs { display:flex; gap:8px; margin-top: 10px; }
+      .subtab { appearance:none; border:1px solid #e5e7eb; background:#fff; padding:6px 10px; border-radius:999px; cursor:pointer; font-weight:700; font-size: 12px; color:#111827; }
+      .subtab.active { background:#eef2ff; border-color:#c7d2fe; }
       .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top: 12px; }
       .grid { display:flex; gap:10px; flex-wrap:wrap; margin-top: 14px; }
       .card { width: 240px; border:1px solid #e5e7eb; border-radius:12px; overflow:hidden; background:#fff; }
@@ -36,6 +39,12 @@
       .kv { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; font-size:12px; color:#374151; }
       .path { font-size: 12px; word-break: break-all; }
       .actions { display:flex; gap:8px; align-items:center; margin-top: 10px; }
+      /* Вариант A: "мимо gold" — делаем заметно */
+      .card.past-gold {
+        background: #ffe4e6;         /* rose-200 */
+        border-color: #fb7185;       /* rose-400 */
+        box-shadow: 0 0 0 2px rgba(244, 63, 94, 0.35); /* rose-500 ring */
+      }
 
       /* Modal viewer + drawing */
       .lb { position: fixed; inset: 0; background: rgba(17,24,39,0.82); display: none; align-items: center; justify-content: center; padding: 18px; z-index: 9999; }
@@ -77,6 +86,12 @@
         <button class="tab" id="tabAnimals" type="button">Животные</button>
         <button class="tab" id="tabPeopleNoFace" type="button">Есть люди (без лиц)</button>
         <button class="tab" id="tabNoFaces" type="button">Нет лиц</button>
+      </div>
+
+      <!-- 2-й уровень (постепенно): пока только для "Есть лица" -->
+      <div class="subtabs" id="subtabsFaces" style="display:none;">
+        <button class="subtab active" id="subFacesAll" type="button">Неотсортировано</button>
+        <button class="subtab" id="subFacesMany" type="button">Много лиц</button>
       </div>
 
       <div class="toolbar">
@@ -149,6 +164,7 @@
 
       let pipelineRunId = null;
       let tab = "faces";
+      let subtab = "all"; // 2-й уровень (используем пока только для tab=faces)
       let page = 1;
       const pageSize = 60;
       let loading = false;
@@ -156,13 +172,62 @@
       let totalCount = null;
       let loadedCount = 0;
 
+      // init tab/subtab from query (до первого load)
+      tab = (getParam("tab") || tab || "faces").toString().trim().toLowerCase() || "faces";
+      if (!["faces","quarantine","animals","people_no_face","no_faces"].includes(tab)) tab = "faces";
+      subtab = (getParam("subtab") || subtab || "all").toString().trim().toLowerCase() || "all";
+      if (!["all","many_faces"].includes(subtab)) subtab = "all";
+      if (tab !== "faces") subtab = "all";
+
+      function updateUrlParams() {
+        const u = new URL(window.location.href);
+        u.searchParams.set("tab", tab);
+        if (tab === "faces" && subtab && subtab !== "all") {
+          u.searchParams.set("subtab", subtab);
+        } else {
+          u.searchParams.delete("subtab");
+        }
+        window.history.replaceState({}, "", u.toString());
+      }
+
+      function updateSubtabsVisibility() {
+        const row = qs("#subtabsFaces");
+        if (!row) return;
+        row.style.display = (tab === "faces") ? "flex" : "none";
+        const bAll = qs("#subFacesAll");
+        const bMany = qs("#subFacesMany");
+        if (bAll) bAll.classList.toggle("active", tab === "faces" && subtab === "all");
+        if (bMany) bMany.classList.toggle("active", tab === "faces" && subtab === "many_faces");
+      }
+
+      function applyTabUI() {
+        qs("#tabFaces").classList.toggle("active", tab === "faces");
+        qs("#tabQuarantine").classList.toggle("active", tab === "quarantine");
+        qs("#tabAnimals").classList.toggle("active", tab === "animals");
+        qs("#tabPeopleNoFace").classList.toggle("active", tab === "people_no_face");
+        qs("#tabNoFaces").classList.toggle("active", tab === "no_faces");
+        updateSubtabsVisibility();
+      }
+
+      function setSubtab(st) {
+        if (tab !== "faces") return;
+        subtab = st;
+        if (!["all","many_faces"].includes(subtab)) subtab = "all";
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/6ba4f132-2ab7-473c-8c73-3e4f328ef941',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app/templates/faces.html:setSubtab',message:'ui_set_subtab',data:{tab:tab,subtab:subtab},timestamp:Date.now(),sessionId:'debug-session',runId:'pre-fix',hypothesisId:'HUI_SUBTAB'})}).catch(()=>{});
+        // #endregion agent log
+        updateSubtabsVisibility();
+        updateUrlParams();
+        page = 1;
+        load(true);
+      }
+
       function setTab(t) {
         tab = t;
-        qs("#tabFaces").classList.toggle("active", t === "faces");
-        qs("#tabQuarantine").classList.toggle("active", t === "quarantine");
-        qs("#tabAnimals").classList.toggle("active", t === "animals");
-        qs("#tabPeopleNoFace").classList.toggle("active", t === "people_no_face");
-        qs("#tabNoFaces").classList.toggle("active", t === "no_faces");
+        if (!["faces","quarantine","animals","people_no_face","no_faces"].includes(tab)) tab = "faces";
+        if (tab !== "faces") subtab = "all";
+        applyTabUI();
+        updateUrlParams();
         page = 1;
         load(true);
       }
@@ -171,6 +236,8 @@
       qs("#tabAnimals").onclick = () => setTab("animals");
       qs("#tabPeopleNoFace").onclick = () => setTab("people_no_face");
       qs("#tabNoFaces").onclick = () => setTab("no_faces");
+      qs("#subFacesAll").onclick = () => setSubtab("all");
+      qs("#subFacesMany").onclick = () => setSubtab("many_faces");
       // Пагинацию заменяем на бесконечную подгрузку при скролле.
       qs("#btnPrev").style.display = "none";
       qs("#btnNext").style.display = "none";
@@ -182,11 +249,18 @@
         try {
           const data = await fetchJson(`/api/faces/tab-counts?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}`);
           const c = data?.counts || {};
+          const scFaces = data?.subcounts?.faces || {};
+          const manyCnt = Number(scFaces.many_faces ?? 0);
+          const unsortedCnt = Number(scFaces.unsorted ?? 0);
           qs("#tabFaces").textContent = `Есть лица (${Number(c.faces ?? 0)})`;
           qs("#tabQuarantine").textContent = `Карантин (${Number(c.quarantine ?? 0)})`;
           qs("#tabAnimals").textContent = `Животные (${Number(c.animals ?? 0)})`;
           qs("#tabPeopleNoFace").textContent = `Есть люди (без лиц) (${Number(c.people_no_face ?? 0)})`;
           qs("#tabNoFaces").textContent = `Нет лиц (${Number(c.no_faces ?? 0)})`;
+          const bMany = qs("#subFacesMany");
+          if (bMany) bMany.textContent = `Много лиц (${manyCnt})`;
+          const bAll = qs("#subFacesAll");
+          if (bAll) bAll.textContent = `Неотсортировано (${unsortedCnt})`;
         } catch (e) {
           // best-effort
         }
@@ -220,6 +294,7 @@
         } else if (tab === "no_faces") {
           btn = `
             <button class="btn" data-action="annotate_faces">Лица есть (разметить)</button>
+            <button class="btn" data-action="mark_cat">Кот</button>
             <button class="btn" data-action="people_no_face">Есть люди (без лиц)</button>
           `;
         } else if (tab === "quarantine") {
@@ -233,8 +308,10 @@
         } else if (tab === "people_no_face") {
           btn = `<button class="btn" data-action="reset">Сброс</button>`;
         }
+        const pastGold = !!it.sorted_past_gold;
+        const cls = pastGold ? "card past-gold" : "card";
         return `
-          <div class="card" data-path="${escapeHtml(path)}">
+          <div class="${cls}" data-path="${escapeHtml(path)}">
             <div class="thumb" data-path="${escapeHtml(path)}" data-kind="${escapeHtml(kind)}" data-src="${escapeHtml(pv)}">
               ${thumb}
             </div>
@@ -272,7 +349,10 @@
           } else if (page === 1 && loadedCount === 0) {
             qs("#grid").innerHTML = `<div class="muted">Загрузка…</div>`;
           }
-          const data = await fetchJson(`/api/faces/results?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}&tab=${encodeURIComponent(tab)}&page=${encodeURIComponent(String(page))}&page_size=${encodeURIComponent(String(pageSize))}`);
+          const data = await fetchJson(`/api/faces/results?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}&tab=${encodeURIComponent(tab)}&subtab=${encodeURIComponent(subtab)}&page=${encodeURIComponent(String(page))}&page_size=${encodeURIComponent(String(pageSize))}`);
+          // #region agent log
+          fetch('http://127.0.0.1:7242/ingest/6ba4f132-2ab7-473c-8c73-3e4f328ef941',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app/templates/faces.html:load',message:'ui_load_result',data:{tab:tab,subtab:subtab,total:Number(data?.total??-1),items_len:Array.isArray(data?.items)?data.items.length:-1},timestamp:Date.now(),sessionId:'debug-session',runId:'pre-fix',hypothesisId:'HAPI_FILTER'})}).catch(()=>{});
+          // #endregion agent log
           qs("#prId").textContent = String(data.pipeline_run_id);
           qs("#frId").textContent = String(data.face_run_id);
           qs("#rootPath").textContent = data.root_path || "—";
@@ -326,8 +406,15 @@
                     await load(true);
                   }
                 } else if (action === "mark_cat") {
+                  // #region agent log
+                  try {
+                    const bn = (p || "").split(/[\\\\/]/).pop();
+                    fetch('http://127.0.0.1:7242/ingest/6ba4f132-2ab7-473c-8c73-3e4f328ef941',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app/templates/faces.html:mark_cat',message:'ui_click_mark_cat',data:{tab:tab,basename:bn||""},timestamp:Date.now(),sessionId:'debug-session',runId:'pre-fix',hypothesisId:'HNOFACES_CAT'})}).catch(()=>{});
+                  } catch (e) {}
+                  // #endregion agent log
                   await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "cat" });
-                  if (tab === "faces" || tab === "quarantine") {
+                  // Потоковое действие: без прыжков/перезагрузки списка
+                  if (tab === "faces" || tab === "quarantine" || tab === "no_faces") {
                     removeCard();
                     await refreshTabCounts();
                   } else {
@@ -598,6 +685,8 @@
       const rid = getParam("pipeline_run_id");
       if (rid && /^\d+$/.test(rid)) pipelineRunId = Number(rid);
       qs("#prId").textContent = pipelineRunId != null ? String(pipelineRunId) : "—";
+      applyTabUI();
+      updateUrlParams();
       // sentinel for infinite scroll
       const sentinel = document.createElement("div");
       sentinel.id = "sentinel";

@@ -88,17 +88,29 @@ def main() -> int:
             base_params.append(root_like)
         base_where_sql = " AND ".join(base_where)
 
-        # cats.txt: animals_auto=1
+        # cats_gold.txt: animals_auto=1 (gold)
         cats = q(
-            f"SELECT path FROM yd_files WHERE {base_where_sql} AND COALESCE(animals_auto,0)=1 ORDER BY path ASC",
+            f"SELECT path FROM files WHERE {base_where_sql} AND COALESCE(animals_auto,0)=1 ORDER BY path ASC",
             list(base_params),
         )
 
-        # no_faces.txt: manual no_faces
+        # faces_gold.txt: manually marked as "faces" (Нормальные лица)
+        faces_gold = q(
+            f"""
+            SELECT path
+            FROM files
+            WHERE {base_where_sql}
+              AND lower(trim(coalesce(faces_manual_label,''))) = 'faces'
+            ORDER BY path ASC
+            """,
+            list(base_params),
+        )
+
+        # no_faces_gold.txt: gold: no faces (auto semantics depends on regression strategy)
         no_faces = q(
             f"""
             SELECT path
-            FROM yd_files
+            FROM files
             WHERE {base_where_sql}
               AND lower(trim(coalesce(faces_manual_label,''))) = 'no_faces'
             ORDER BY path ASC
@@ -106,11 +118,11 @@ def main() -> int:
             list(base_params),
         )
 
-        # people_no_face.txt: manual people-no-face
+        # people_no_face_gold.txt: gold: people no face (manual list for now)
         people_no_face = q(
             f"""
             SELECT path
-            FROM yd_files
+            FROM files
             WHERE {base_where_sql}
               AND COALESCE(people_no_face_manual,0) = 1
             ORDER BY path ASC
@@ -118,11 +130,11 @@ def main() -> int:
             list(base_params),
         )
 
-        # quarantine_manual.txt: manual quarantine marks (faces_auto_quarantine + reason='manual')
-        quarantine_manual = q(
+        # quarantine_gold.txt: gold quarantine list (currently sourced from manual quarantine marks in DB)
+        quarantine_gold = q(
             f"""
             SELECT path
-            FROM yd_files
+            FROM files
             WHERE {base_where_sql}
               AND COALESCE(faces_auto_quarantine,0) = 1
               AND lower(trim(coalesce(faces_quarantine_reason,''))) = 'manual'
@@ -133,15 +145,17 @@ def main() -> int:
     finally:
         ds.close()
 
-    a_cats = _merge_append_only(out_dir / "cats.txt", cats)
-    a_no_faces = _merge_append_only(out_dir / "no_faces.txt", no_faces)
-    a_people_no_face = _merge_append_only(out_dir / "people_no_face.txt", people_no_face)
-    a_quarantine_manual = _merge_append_only(out_dir / "quarantine_manual.txt", quarantine_manual)
+    a_cats = _merge_append_only(out_dir / "cats_gold.txt", cats)
+    a_faces = _merge_append_only(out_dir / "faces_gold.txt", faces_gold)
+    a_no_faces = _merge_append_only(out_dir / "no_faces_gold.txt", no_faces)
+    a_people_no_face = _merge_append_only(out_dir / "people_no_face_gold.txt", people_no_face)
+    a_quarantine_gold = _merge_append_only(out_dir / "quarantine_gold.txt", quarantine_gold)
 
-    print(f"UPDATED {out_dir}\\cats.txt +{a_cats} (db_total={len(cats)})")
-    print(f"UPDATED {out_dir}\\no_faces.txt +{a_no_faces} (db_total={len(no_faces)})")
-    print(f"UPDATED {out_dir}\\people_no_face.txt +{a_people_no_face} (db_total={len(people_no_face)})")
-    print(f"UPDATED {out_dir}\\quarantine_manual.txt +{a_quarantine_manual} (db_total={len(quarantine_manual)})")
+    print(f"UPDATED {out_dir}\\cats_gold.txt +{a_cats} (db_total={len(cats)})")
+    print(f"UPDATED {out_dir}\\faces_gold.txt +{a_faces} (db_total={len(faces_gold)})")
+    print(f"UPDATED {out_dir}\\no_faces_gold.txt +{a_no_faces} (db_total={len(no_faces)})")
+    print(f"UPDATED {out_dir}\\people_no_face_gold.txt +{a_people_no_face} (db_total={len(people_no_face)})")
+    print(f"UPDATED {out_dir}\\quarantine_gold.txt +{a_quarantine_gold} (db_total={len(quarantine_gold)})")
     return 0
 
 

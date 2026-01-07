@@ -11,7 +11,7 @@ def _db_path() -> Path:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Debug helper: dump yd_files fields for provided local:/disk: paths.")
+    ap = argparse.ArgumentParser(description="Debug helper: dump files fields for provided local:/disk: paths.")
     ap.add_argument("--db", default=str(_db_path()), help="Path to photosorter.db")
     ap.add_argument("--paths-file", required=True, help="Text file with one path per line (local:... or disk:...)")
     args = ap.parse_args()
@@ -52,7 +52,7 @@ def main() -> int:
       COALESCE(animals_kind, '') AS animals_kind,
       COALESCE(people_no_face_manual, 0) AS people_no_face_manual,
       COALESCE(people_no_face_person, '') AS people_no_face_person
-    FROM yd_files
+    FROM files
     WHERE path IN ({",".join(["?"] * len(paths))})
     """
     rows = cur.execute(q, paths).fetchall()
@@ -89,5 +89,9 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
 
 

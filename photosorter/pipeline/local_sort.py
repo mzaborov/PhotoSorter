@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
+import math
 import mimetypes
 import os
 import shutil
+import sys
 import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 import cv2  # type: ignore[import-untyped]
 import numpy as np  # type: ignore[import-untyped]
@@ -380,32 +383,23 @@ def _looks_like_screen_ui(img_bgr_full: np.ndarray) -> bool:
     er_top = float(np.count_nonzero(top)) / float(top.size)
     er_bot = float(np.count_nonzero(bot)) / float(bot.size)
 
-    # UI/экран обычно даёт заметные границы текста/иконок.
-    # Для "фото экрана" часто есть шапка (top), но бывает и без неё; поэтому допускаем разные режимы.
-    if er_total >= 0.085:
+    # ВАЖНО: по реальным данным прежняя эвристика была слишком агрессивной и ловила обычные фото как "screen_like".
+    # Делаем более строгую версию: реагируем в первую очередь на "много текста"/страницу,
+    # либо на ярко выраженную "страницу/экран" (много белого и есть границы), либо на тёмный UI.
+    text_heavy = _looks_like_text_heavy(g)
+    if text_heavy and er_total >= 0.015:
         return True
-    if er_total >= 0.040 and (er_top >= 0.040 or er_bot >= 0.030):
+    # Белая "страница"/слайд/документ с рамками/текстом
+    if white_ratio >= 0.18 and er_total >= 0.030:
         return True
-    if er_total >= 0.035 and er_bot >= 0.050:
+    # Экран/страница с контрастными рамками (например, телефон/ноутбук в кадре)
+    if (white_ratio >= 0.10 and black_ratio >= 0.08) and er_total >= 0.030:
         return True
-    # Некоторые экраны (особенно светлые страницы) дают малый total, но заметные полосы сверху/снизу.
-    if er_total >= 0.010 and (er_top >= 0.040 and er_bot >= 0.030):
+    # Тёмный интерфейс (мессенджер/музыка): много чёрных пикселей + заметные edges
+    if black_ratio >= 0.20 and er_total >= 0.055:
         return True
-    # Экран/страница с ярким контентом и темными рамками (например, ноутбук/телефон в кадре)
-    if er_total >= 0.025 and (white_ratio >= 0.10 and black_ratio >= 0.05):
-        return True
-    # Белая "страница"/слайд в кадре (часто экран/почта/документ)
-    if er_total >= 0.025 and white_ratio >= 0.18:
-        return True
-    # Тёмный экран/интерфейс (музыка/мессенджер) — много почти чёрных пикселей
-    if er_total >= 0.045 and black_ratio >= 0.15:
-        return True
-    # Экраны/страницы без выраженной шапки/подвала: высокий общий edge + широкий формат
-    if er_total >= 0.055 and ar >= 1.60 and black_ratio >= 0.03:
-        return True
-    # Много текста (без OCR): характерно для писем/страниц/чатов/документов.
-    # Комбинируем с минимумом edges, чтобы не ловить "шумные" фото.
-    if er_total >= 0.020 and _looks_like_text_heavy(g):
+    # Широкий формат + высокий общий edge + тёмные рамки
+    if ar >= 1.60 and black_ratio >= 0.06 and er_total >= 0.085:
         return True
     return False
 
@@ -527,6 +521,9 @@ def _detect_faces(detector, img_bgr) -> list[tuple[int, int, int, int, float]]:
     out: list[tuple[int, int, int, int, float]] = []
     for row in faces:
         x, y, ww, hh, score = float(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4])
+        # OpenCV иногда отдаёт мусор/inf (видели OverflowError при int(round(inf))).
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(ww) and math.isfinite(hh) and math.isfinite(score)):
+            continue
         # YuNet score expected ~[0..1], but we clamp for robustness (and to avoid garbage values in DB).
         if score < 0.0:
             score = 0.0
@@ -584,6 +581,33 @@ class Stats:
     moved_faces_named: int = 0
     moved_faces_unassigned: int = 0
     moved_no_faces_by_geo_year: int = 0
+
+
+# region agent log (debug mode)
+def _dbg_log(*, hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
+    """
+    Writes one NDJSON line to .cursor/debug.log (repo-relative). Best-effort; never raises.
+    """
+    try:
+        root = Path(__file__).resolve().parents[2]
+        p = root / ".cursor" / "debug.log"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "sessionId": "debug-session",
+            "runId": "pre-fix",
+            "hypothesisId": str(hypothesis_id),
+            "location": str(location),
+            "message": str(message),
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+# endregion agent log (debug mode)
 
 
 def _move_file(*, src: str, dst: str, dry_run: bool) -> None:
@@ -770,6 +794,7 @@ def scan_faces_local(
     model_path: Path,
     model_url: str,
     exclude_dir_names: tuple[str, ...],
+    enable_qr: bool = False,
     run_id: int | None = None,
     pipeline: PipelineStore | None = None,
     pipeline_run_id: int | None = None,
@@ -782,18 +807,20 @@ def scan_faces_local(
     detector_recreate_every = 200  # снижает шанс нативных крэшей внутри detect()
     max_dim = 2000  # safety: не гоняем гигантские картинки через YuNet
     quarantine_max_face_dim_px = 44
-    quarantine_many_faces_min = 6
-    quarantine_many_faces_max_dim_px = 80
+    many_faces_min = 8  # >=8 лиц считаем "много лиц" (2-й уровень вкладок /faces)
     quarantine_max_face_area_ratio = 0.003  # ~0.3% кадра: типично "лицо на экране/миниатюра"
     qr_max_dim = 1200  # для QR детектора не нужен full-res
 
     store = FaceStore()
     dedup = DedupStore()
     qr = None
-    try:
-        qr = cv2.QRCodeDetector()
-    except Exception:
-        qr = None
+    # Важно: QR-детектор OpenCV иногда "подвисает" на отдельных изображениях (внутри нативного вызова),
+    # из-за чего прогресс может застрять на 0/.. надолго. Поэтому по умолчанию отключаем QR-эвристику.
+    if bool(enable_qr):
+        try:
+            qr = cv2.QRCodeDetector()
+        except Exception:
+            qr = None
     # YOLO (COCO) for cat detection: init lazily, only when faces==0.
     # Важно: используем yolov5s.onnx из релизов (URL стабильнее, чем assets), и он хорошо ловит кошек в профиль.
     yolo_model_path = Path("data") / "models" / "yolov5s.onnx"
@@ -824,16 +851,72 @@ def scan_faces_local(
             pipeline.update_run(run_id=int(pipeline_run_id), face_run_id=run_id_i)
         total_images = len(image_files)
 
+        _dbg_log(
+            hypothesis_id="H0",
+            location="photosorter/pipeline/local_sort.py:scan_faces_local",
+            message="scan_faces_local_start",
+            data={
+                "run_id": int(run_id_i),
+                "pipeline_run_id": int(pipeline_run_id) if pipeline_run_id is not None else None,
+                "root_dir": str(root_dir),
+                "total_images": int(total_images),
+                "enable_qr": bool(qr is not None),
+                "python_exe": str(getattr(sys, "executable", "")),
+                "module_file": str(__file__),
+            },
+        )
+
         for abspath in image_files:
             stats.images_scanned += 1
             db_path = _as_local_path(abspath)
+            stage = "loop_start"
+
+            if stats.images_scanned <= 3:
+                _dbg_log(
+                    hypothesis_id="H2",
+                    location="photosorter/pipeline/local_sort.py:scan_faces_local",
+                    message="scan_loop_begin",
+                    data={"i": int(stats.images_scanned), "abspath": str(abspath), "db_path": str(db_path)},
+                )
+
+            # В самом начале прогресс обновляем ДО тяжёлой обработки изображения,
+            # иначе UI может долго показывать 0/.. и выглядеть как "зависло" (особенно если первый файл проблемный).
+            if stats.images_scanned <= 20:
+                try:
+                    stage = "early_progress_count"
+                    faces_found_db0 = _rectangles_count_db()
+                    stage = "early_progress_update"
+                    store.update_run_progress(
+                        run_id=run_id_i,
+                        processed_files=stats.images_scanned,
+                        faces_found=faces_found_db0,
+                        last_path=db_path,
+                    )
+                    _pipe_log(
+                        pipeline,
+                        pipeline_run_id,
+                        f"faces_progress images={stats.images_scanned} total={total_images} "
+                        f"faces={faces_found_db0} errors={stats.errors}\n",
+                    )
+                except Exception:
+                    pass
+
             # Resume-friendly: если уже есть сводка лиц для этого файла под этим run_id — пропускаем.
+            stage = "dedup_get_row"
             row = dedup.get_row_by_path(path=db_path)
+            if stats.images_scanned <= 3:
+                _dbg_log(
+                    hypothesis_id="H1",
+                    location="photosorter/pipeline/local_sort.py:scan_faces_local",
+                    message="dedup_row_loaded",
+                    data={"i": int(stats.images_scanned), "has_row": bool(row), "row_keys": sorted(list(row.keys())) if row else None},
+                )
             if row and row.get("faces_run_id") is not None and int(row.get("faces_run_id")) == run_id_i and row.get("faces_scanned_at"):
                 continue
             try:
                 # Важно: браузер показывает JPEG с учётом EXIF orientation.
                 # Значит и детект, и сохранённые bbox должны быть в той же системе координат.
+                stage = "image_open"
                 with Image.open(abspath) as pil0:
                     try:
                         pil = ImageOps.exif_transpose(pil0)
@@ -845,6 +928,7 @@ def scan_faces_local(
                     except Exception:
                         pass
 
+                    stage = "np_convert"
                     img_rgb = np.asarray(pil)
                     # safety: гарантируем ожидаемый формат (H,W,3) uint8
                     if img_rgb.ndim != 3 or img_rgb.shape[2] != 3:
@@ -855,6 +939,7 @@ def scan_faces_local(
                     img_bgr_full = img_rgb[:, :, ::-1].copy()
 
                     # safety: ограничим размер (иногда именно на огромных кадрах detect() падает нативно)
+                    stage = "resize_if_needed"
                     h0, w0 = img_bgr_full.shape[:2]
                     m = max(h0, w0)
                     scale = 1.0
@@ -866,8 +951,10 @@ def scan_faces_local(
                         img_bgr = cv2.resize(img_bgr_full, (nw, nh), interpolation=cv2.INTER_AREA)
                 # периодически пересоздаём детектор (best-effort от нативных крэшей/утечек)
                 if detector_recreate_every > 0 and (stats.images_scanned % detector_recreate_every == 0):
+                    stage = "detector_recreate"
                     detector = _create_face_detector(str(model), score_threshold=float(score_threshold))
 
+                stage = "detect_faces"
                 faces_det = _detect_faces(detector, img_bgr)
                 # Второй проход (только если 0 лиц): снижаем порог, чтобы уменьшить ложные "нет лиц".
                 if not faces_det:
@@ -920,8 +1007,11 @@ def scan_faces_local(
                 cat_overrides_faces = False
                 try:
                     # 1) QR code -> карантин
-                    qr_found = _qr_found_best_effort(img_bgr_full, qr=qr, qr_max_dim=qr_max_dim)
-                    screen_like = _looks_like_screen_ui(img_bgr_full)
+                    qr_found = False
+                    if qr is not None:
+                        qr_found = _qr_found_best_effort(img_bgr_full, qr=qr, qr_max_dim=qr_max_dim)
+                    # screen_like: применяем только если лиц НЕТ, иначе слишком много ложных карантинов на обычных фото
+                    screen_like = (not faces) and _looks_like_screen_ui(img_bgr_full)
                     if qr_found:
                         is_quarantine = True
                         quarantine_reason = "qr"
@@ -929,27 +1019,17 @@ def scan_faces_local(
                         is_quarantine = True
                         quarantine_reason = "screen_like"
                     else:
-                        # 2) мелкие лица / много мелких лиц (типично для скринов/аватарок)
+                        # 2) Строгий "tiny_face" (качество лица слишком низкое):
+                        # карантин только если лицо реально крошечное (чтобы не вернуть старые ложные карантины).
+                        # Подходит для случаев "размытый маленький кусочек лица".
                         if faces:
                             max_face_dim = max(int(max(w, h)) for (_x, _y, w, h, _s) in faces)
                             max_area = max(float(w * h) for (_x, _y, w, h, _s) in faces) if faces else 0.0
                             area_ratio = (max_area / float(w0 * h0)) if (w0 > 0 and h0 > 0) else 0.0
-                            many_small = (len(faces) >= int(quarantine_many_faces_min) and max_face_dim <= int(quarantine_many_faces_max_dim_px))
-                            if len(faces) >= int(quarantine_many_faces_min) and max_face_dim <= int(quarantine_many_faces_max_dim_px):
+                            if max_face_dim <= 32 and area_ratio <= 0.0012:
                                 is_quarantine = True
-                                quarantine_reason = "many_small_faces"
-                            else:
-                                # Строгий "tiny_face" (качество лица слишком низкое):
-                                # карантин только если лицо реально крошечное (чтобы не вернуть старые ложные карантины).
-                                # Подходит для случаев "размытый маленький кусочек лица".
-                                if max_face_dim <= 32 and area_ratio <= 0.0012:
-                                    is_quarantine = True
-                                    quarantine_reason = "tiny_face"
-                            # Раньше здесь был карантин по "tiny_face"/"tiny_face_ratio".
-                            # На реальных фото (дальние планы/дети на расстоянии) это даёт слишком много ложных срабатываний,
-                            # поэтому отключаем этот триггер и оставляем карантин только для QR и many_small_faces.
+                                quarantine_reason = "tiny_face"
                         else:
-                            many_small = False
                             # 3) если людей/лиц нет — попробуем найти кошку (MVP)
                             try:
                                 if yolo_err is None:
@@ -1022,6 +1102,7 @@ def scan_faces_local(
                     cat_overrides_faces = False
 
                 # Важно: при пересканах не затираем ручную разметку.
+                stage = "db_clear_auto_rects"
                 store.clear_run_auto_rectangles_for_file(run_id=run_id_i, file_path=db_path)
 
                 # Если YOLO подтвердил кота и не нашёл человека — не считаем YuNet-детект "лицами".
@@ -1036,6 +1117,7 @@ def scan_faces_local(
                 for i, (x, y, w, h, score) in enumerate(faces):
                     pres = (areas[i] / denom) if (denom > 0.0 and i < len(areas)) else None
                     thumb = _crop_thumb_jpeg(img=pil, bbox=(x, y, w, h), thumb_size=int(thumb_size))
+                    stage = "db_insert_detection"
                     store.insert_detection(
                         run_id=run_id_i,
                         file_path=db_path,
@@ -1050,8 +1132,35 @@ def scan_faces_local(
                     )
                     stats.faces_found += 1
 
-                # Пишем сводку "лица/не лица" в yd_files, чтобы сортировка могла работать без повторного скана.
-                dedup.set_faces_summary(path=db_path, faces_run_id=run_id_i, faces_count=len(faces))
+                # Пишем сводку "лица/не лица" в files так, чтобы faces_count совпадал
+                # с количеством прямоугольников (auto+manual) в face_rectangles.
+                stage = "db_faces_count_recompute"
+                try:
+                    cur1 = store.conn.cursor()
+                    cur1.execute(
+                        """
+                        SELECT COUNT(*) FROM face_rectangles
+                        WHERE run_id = ? AND file_path = ? AND COALESCE(ignore_flag, 0) = 0
+                        """,
+                        (int(run_id_i), db_path),
+                    )
+                    v = cur1.fetchone()
+                    faces_count_db_file = int(v[0] or 0) if v else int(len(faces))
+                except Exception:
+                    faces_count_db_file = int(len(faces))
+
+                stage = "db_set_faces_summary"
+                dedup.set_faces_summary(path=db_path, faces_run_id=run_id_i, faces_count=int(faces_count_db_file))
+
+                # 2-й уровень (variant 2): авто-группа "many_faces" НЕ через карантин.
+                stage = "db_set_faces_auto_group"
+                try:
+                    dedup.set_faces_auto_group(
+                        path=db_path,
+                        group=("many_faces" if int(faces_count_db_file) >= int(many_faces_min) else None),
+                    )
+                except Exception:
+                    pass
                 # Пишем авто-карантин (если включился)
                 try:
                     dedup.set_faces_auto_quarantine(path=db_path, is_quarantine=bool(is_quarantine), reason=quarantine_reason)
@@ -1059,11 +1168,13 @@ def scan_faces_local(
                     pass
                 # Пишем авто-животных (только когда нет лиц)
                 try:
-                    dedup.set_animals_auto(path=db_path, is_animal=bool(is_animal and (len(faces) == 0)), kind=animal_kind)
+                    dedup.set_animals_auto(path=db_path, is_animal=bool(is_animal and (int(faces_count_db_file) == 0)), kind=animal_kind)
                 except Exception:
                     pass
 
-                if stats.images_scanned % 50 == 0:
+                # Прогресс: после первых 20 (которые апдейтим до обработки) продолжаем апдейты пачками.
+                step = 10 if stats.images_scanned <= 200 else 50
+                if stats.images_scanned > 20 and stats.images_scanned % step == 0:
                     # Важно для resume: не затираем счётчик лиц нулём, если файлы были пропущены как уже просканированные.
                     faces_found_db = _rectangles_count_db()
                     store.update_run_progress(
@@ -1081,6 +1192,20 @@ def scan_faces_local(
             except Exception as e:  # noqa: BLE001
                 store.update_run_progress(run_id=run_id_i, last_path=db_path, last_error=f"{type(e).__name__}: {e}")
                 stats.errors += 1
+                if stats.images_scanned <= 50:
+                    _dbg_log(
+                        hypothesis_id="H1",
+                        location="photosorter/pipeline/local_sort.py:scan_faces_local",
+                        message="scan_loop_exception",
+                        data={
+                            "i": int(stats.images_scanned),
+                            "stage": str(stage),
+                            "exc_type": type(e).__name__,
+                            "exc_msg": str(e)[:400],
+                            "db_path": str(db_path),
+                            "abspath": str(abspath),
+                        },
+                    )
 
         faces_found_db = _rectangles_count_db()
         stats.faces_found = faces_found_db
@@ -1112,7 +1237,7 @@ def sort_by_faces(
     store = FaceStore()
     dedup = DedupStore()
     try:
-        # Берём список из yd_files по faces_run_id — чтобы включить и "0 лиц".
+        # Берём список из files по faces_run_id — чтобы включить и "0 лиц".
         cur = dedup.conn.cursor()
         cur.execute(
             """
@@ -1124,7 +1249,7 @@ def sort_by_faces(
               COALESCE(animals_auto, 0) AS animals_auto,
               COALESCE(animals_kind, '') AS animals_kind,
               COALESCE(people_no_face_manual, 0) AS people_no_face_manual
-            FROM yd_files
+            FROM files
             WHERE
               faces_run_id = ?
               AND path LIKE 'local:%'
@@ -1188,7 +1313,7 @@ def sort_by_faces(
                 pipeline.update_run(run_id=int(pipeline_run_id), last_src_path=src_abs, last_dst_path=dst_abs)
             _move_file(src=src_abs, dst=dst_abs, dry_run=dry_run)
 
-            # update DB paths (yd_files + face_rectangles) ONLY when не dry-run
+            # update DB paths (files + face_rectangles) ONLY when не dry-run
             if not dry_run:
                 new_db_path = _as_local_path(dst_abs)
                 dedup.update_path(
@@ -1463,6 +1588,7 @@ def main() -> int:
     p.add_argument("--skip-dedup", action="store_true", help="Skip step 1 (dedup) and use existing inventory")
     p.add_argument("--pipeline-run-id", type=int, default=None, help="Pipeline run id in SQLite (for resume)")
     p.add_argument("--no-dedup-move", action="store_true", help="Do NOT move duplicates into _duplicates")
+    p.add_argument("--enable-qr", action="store_true", help="Enable QR-based quarantine heuristic (disabled by default)")
     p.add_argument("--duplicates-dirname", default="_duplicates")
     p.add_argument("--faces-dirname", default="_faces")
     p.add_argument("--faces-quarantine-dirname", default="_quarantine")
@@ -1584,6 +1710,7 @@ def main() -> int:
             model_path=Path(str(args.model_path)),
             model_url=str(args.model_url),
             exclude_dir_names=exclude,
+            enable_qr=bool(args.enable_qr),
             run_id=existing_face_run_id,
             pipeline=pipeline,
             pipeline_run_id=pipeline_run_id,

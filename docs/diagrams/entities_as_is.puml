@@ -59,7 +59,7 @@ class pipeline_runs <<table>> {
   finished_at: TEXT
 }
 
-class yd_files <<table>> {
+class files <<table>> {
   +id: INTEGER <<PK>>
   path: TEXT <<UNIQUE>>         ' disk:/... or local:...
   resource_id: TEXT             ' YaDisk stable id (optional)
@@ -96,8 +96,8 @@ class yd_files <<table>> {
   people_no_face_person: TEXT
 }
 
-folders "0..1" -- "*" yd_files : файлы в папке (parent_path, логически)
-dedup_runs "1" -- "*" yd_files : прогон дедупа
+folders "0..1" -- "*" files : файлы в папке (parent_path, логически)
+dedup_runs "1" -- "*" files : прогон дедупа
 pipeline_runs "0..1" -- "0..1" dedup_runs : шаг 1 (дедуп)
 
 class face_runs <<table>> {

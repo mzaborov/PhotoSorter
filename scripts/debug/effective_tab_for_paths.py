@@ -24,7 +24,9 @@ def _effective_tab(r: sqlite3.Row) -> str:
         return "people_no_face"
     if faces_count <= 0 and int(r["animals_auto"] or 0) == 1 and (r["animals_kind"] or "").strip():
         return "animals"
-    if int(r["faces_auto_quarantine"] or 0) == 1 and faces_count > 0:
+    # many_small_faces показываем внутри tab=faces (2-й уровень), не как отдельный top-tab quarantine
+    q_reason = (r["faces_quarantine_reason"] or "").strip().lower()
+    if int(r["faces_auto_quarantine"] or 0) == 1 and q_reason != "many_small_faces":
         return "quarantine"
     return "faces" if faces_count > 0 else "no_faces"
 
@@ -64,7 +66,7 @@ def main() -> int:
       COALESCE(animals_kind, '') AS animals_kind,
       COALESCE(people_no_face_manual, 0) AS people_no_face_manual,
       COALESCE(people_no_face_person, '') AS people_no_face_person
-    FROM yd_files
+    FROM files
     WHERE path IN ({",".join(["?"] * len(paths))})
     """
     rows = cur.execute(q, paths).fetchall()
@@ -91,5 +93,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
