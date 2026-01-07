@@ -99,3 +99,4 @@ local:C:\tmp\Photo\IMG-20250311-WA0026.jpg
 local:C:\tmp\Photo\IMG-20250311-WA0032.jpg
 local:C:\tmp\Photo\IMG-20250311-WA0033.jpg
 local:C:\tmp\Photo\IMG-20250311-WA0059.jpg
+local:C:\tmp\Photo\IMG-20240405-WA0006.jpg
