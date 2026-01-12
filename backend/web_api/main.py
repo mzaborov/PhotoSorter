@@ -2916,6 +2916,19 @@ def api_local_preview(path: str, pipeline_run_id: int | None = None) -> Response
     except Exception:
         raise HTTPException(status_code=400, detail="Bad path") from None
 
+    # Если файл не найден по указанному пути, пытаемся найти его по имени в других папках внутри root
+    if not os.path.isfile(abs_path) and root_path:
+        root_abs = os.path.abspath(root_path)
+        file_name = os.path.basename(abs_path)
+        # Ищем файл по имени в корне и всех подпапках
+        if os.path.exists(root_abs) and os.path.isdir(root_abs):
+            for root_dir, dirs, files in os.walk(root_abs):
+                if file_name in files:
+                    potential_path = os.path.join(root_dir, file_name)
+                    if os.path.isfile(potential_path):
+                        abs_path = potential_path
+                        break
+
     if not os.path.isfile(abs_path):
         raise HTTPException(status_code=404, detail="File not found")
 

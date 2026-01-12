@@ -17,7 +17,7 @@ from fastapi.templating import Jinja2Templates
 
 from common.db import DedupStore, FaceStore, PipelineStore, list_folders
 from common.yadisk_client import get_disk
-from logic.gold.store import gold_expected_tab_by_path
+from logic.gold.store import gold_expected_tab_by_path, gold_file_map, gold_read_lines, gold_write_lines, gold_read_ndjson_by_path, gold_write_ndjson_by_path, gold_faces_manual_rects_path, gold_faces_video_frames_path
 
 router = APIRouter()
 
@@ -1229,5 +1229,392 @@ def api_faces_sort_into_folders(payload: dict[str, Any] = Body(...)) -> dict[str
         "dry_run": bool(dry_run),
         "moved_count": moved_count,
         "errors": errors,
+    }
+
+
+def _delete_from_all_gold_files(path: str) -> int:
+    """
+    Удаляет путь из всех gold файлов (txt и ndjson).
+    Возвращает количество удалённых записей.
+    """
+    removed_count = 0
+    path_normalized = path.strip()
+    # Варианты пути для поиска (с префиксом и без)
+    path_variants = {path_normalized}
+    if path_normalized.startswith("local:"):
+        path_variants.add(path_normalized[6:])  # без "local:"
+    elif not path_normalized.startswith("disk:"):
+        path_variants.add("local:" + path_normalized)  # с "local:"
+
+    # Удаляем из всех txt gold файлов
+    gold_map = gold_file_map()
+    for name, gold_path in gold_map.items():
+        if not gold_path.exists():
+            continue
+        lines = gold_read_lines(gold_path)
+        original_count = len(lines)
+        # Удаляем все варианты пути
+        new_lines = []
+        for line in lines:
+            line_stripped = line.strip()
+            if line_stripped in path_variants:
+                removed_count += 1
+                continue
+            new_lines.append(line)
+        if len(new_lines) != original_count:
+            gold_write_lines(gold_path, new_lines)
+
+    # Удаляем из NDJSON gold файлов (faces_manual_rects_gold.ndjson, faces_video_frames_gold.ndjson)
+    for ndjson_path in [gold_faces_manual_rects_path(), gold_faces_video_frames_path()]:
+        if not ndjson_path.exists():
+            continue
+        items = gold_read_ndjson_by_path(ndjson_path)
+        modified = False
+        # Удаляем все варианты пути
+        for variant in path_variants:
+            if variant in items:
+                del items[variant]
+                removed_count += 1
+                modified = True
+        if modified:
+            gold_write_ndjson_by_path(ndjson_path, items)
+
+    return removed_count
+
+
+@router.post("/api/faces/delete")
+def api_faces_delete(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Удаляет файл: перемещает в _delete, помечает как deleted в БД, удаляет из gold.
+
+    Параметры:
+    - pipeline_run_id: int (обязательно)
+    - path: str (обязательно)
+
+    Возвращает информацию об удалении и данные для undo.
+    """
+    pipeline_run_id = payload.get("pipeline_run_id")
+    path = payload.get("path")
+
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required")
+    if not isinstance(path, str) or not (path.startswith("local:") or path.startswith("disk:")):
+        raise HTTPException(status_code=400, detail="path must start with local: or disk:")
+
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+
+    root_path = str(pr.get("root_path") or "")
+
+    # Получаем текущее состояние файла для undo
+    ds = DedupStore()
+    fs = FaceStore()
+    undo_data: dict[str, Any] = {
+        "path": path,
+        "action": "delete",
+    }
+    try:
+        # Получаем информацию о файле
+        cur = ds.conn.cursor()
+        cur.execute(
+            """
+            SELECT
+              f.path, f.name, f.parent_path,
+              COALESCE(m.faces_manual_label, '') AS faces_manual_label,
+              COALESCE(m.quarantine_manual, 0) AS quarantine_manual,
+              COALESCE(m.animals_manual, 0) AS animals_manual,
+              COALESCE(m.people_no_face_manual, 0) AS people_no_face_manual,
+              COALESCE(m.people_no_face_person, '') AS people_no_face_person,
+              COALESCE(f.faces_count, 0) AS faces_count
+            FROM files f
+            LEFT JOIN files_manual_labels m
+              ON m.pipeline_run_id = ? AND m.path = f.path
+            WHERE f.path = ? AND f.status != 'deleted'
+            LIMIT 1
+            """,
+            (int(pipeline_run_id), path),
+        )
+        row = cur.fetchone()
+        if row:
+            r = dict(row)
+            # Определяем effective_tab для undo
+            effective_tab = "no_faces"
+            if r.get("people_no_face_manual"):
+                effective_tab = "people_no_face"
+            elif (r.get("faces_manual_label") or "").lower().strip() == "faces":
+                effective_tab = "faces"
+            elif (r.get("faces_manual_label") or "").lower().strip() == "no_faces":
+                effective_tab = "no_faces"
+            elif r.get("quarantine_manual") and r.get("faces_count", 0) > 0:
+                effective_tab = "quarantine"
+            elif r.get("animals_manual"):
+                effective_tab = "animals"
+            elif r.get("faces_count", 0) > 0:
+                effective_tab = "faces"
+
+            undo_data.update(
+                {
+                    "original_path": path,
+                    "original_name": str(r.get("name") or ""),
+                    "original_parent_path": str(r.get("parent_path") or ""),
+                    "original_effective_tab": effective_tab,
+                    "original_faces_manual_label": str(r.get("faces_manual_label") or ""),
+                    "original_quarantine_manual": bool(r.get("quarantine_manual")),
+                    "original_animals_manual": bool(r.get("animals_manual")),
+                    "original_people_no_face_manual": bool(r.get("people_no_face_manual")),
+                    "original_people_no_face_person": str(r.get("people_no_face_person") or ""),
+                }
+            )
+    finally:
+        ds.close()
+        fs.close()
+
+    # Определяем путь к папке _delete
+    if root_path.startswith("disk:"):
+        delete_folder = f"{root_path.rstrip('/')}/_delete"
+    elif root_path.startswith("local:"):
+        delete_folder = f"local:{os.path.join(root_path[6:], '_delete')}"
+    else:
+        delete_folder = f"local:{os.path.join(root_path, '_delete')}"
+
+    # Формируем путь назначения
+    file_name = undo_data.get("original_name") or os.path.basename(path)
+    if not file_name:
+        file_name = "file"
+
+    # Перемещаем файл в _delete
+    moved = False
+    delete_path = None
+    if path.startswith("disk:"):
+        # YaDisk
+        disk = get_disk()
+        try:
+            dst_path = f"{delete_folder}/{file_name}"
+            src_norm = _normalize_yadisk_path(path)
+            dst_norm = _normalize_yadisk_path(dst_path)
+            disk.move(src_norm, dst_norm, overwrite=False)
+            delete_path = dst_path
+            moved = True
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"Cannot move file to _delete: {type(e).__name__}: {e}") from e
+    elif path.startswith("local:"):
+        # Локальный файл
+        local_path = path[6:]  # убираем "local:"
+        actual_local_path = None
+        
+        # Проверяем, существует ли файл по указанному пути
+        if os.path.exists(local_path) and os.path.isfile(local_path):
+            actual_local_path = local_path
+        else:
+            # Файл не найден по указанному пути - возможно, он был перемещён
+            # Пытаемся найти файл по имени в родительской директории или в корне прогона
+            parent_dir = os.path.dirname(local_path)
+            if os.path.exists(parent_dir) and os.path.isdir(parent_dir):
+                # Ищем файл с таким же именем в родительской директории
+                potential_path = os.path.join(parent_dir, file_name)
+                if os.path.exists(potential_path) and os.path.isfile(potential_path):
+                    actual_local_path = potential_path
+            # Если не нашли, пробуем поискать в корне прогона
+            if not actual_local_path and root_path.startswith("local:"):
+                root_local = root_path[6:]
+                if os.path.exists(root_local) and os.path.isdir(root_local):
+                    # Рекурсивно ищем файл по имени в корне
+                    for root, dirs, files in os.walk(root_local):
+                        if file_name in files:
+                            actual_local_path = os.path.join(root, file_name)
+                            break
+        
+        if not actual_local_path:
+            # Файл физически не найден - просто помечаем как deleted в БД
+            # Это может быть, если файл уже был удалён вручную или перемещён
+            delete_path = None
+            moved = False
+        else:
+            # Файл найден - перемещаем в _delete
+            if delete_folder.startswith("local:"):
+                dst_local = os.path.join(delete_folder[6:], file_name)
+            else:
+                dst_local = os.path.join(delete_folder, file_name)
+            dst_dir = os.path.dirname(dst_local)
+            try:
+                os.makedirs(dst_dir, exist_ok=True)
+            except Exception as e:  # noqa: BLE001
+                raise HTTPException(status_code=500, detail=f"Cannot create _delete directory: {type(e).__name__}: {e}") from e
+            try:
+                os.rename(actual_local_path, dst_local)
+                delete_path = "local:" + dst_local
+                moved = True
+            except Exception as e:  # noqa: BLE001
+                raise HTTPException(status_code=500, detail=f"Cannot move file to _delete: {type(e).__name__}: {e}") from e
+
+    # Обновляем путь в БД и помечаем как deleted
+    ds = DedupStore()
+    try:
+        if delete_path:
+            # Файл был перемещён в _delete - обновляем путь в БД
+            ds.update_path(
+                old_path=path,
+                new_path=delete_path,
+                new_name=file_name,
+                new_parent_path=delete_folder,
+            )
+            # Обновляем пути в manual labels
+            ds.update_run_manual_labels_path(
+                pipeline_run_id=int(pipeline_run_id),
+                old_path=path,
+                new_path=delete_path,
+            )
+            # Помечаем как deleted
+            ds.mark_deleted(paths=[delete_path])
+        else:
+            # Файл физически не найден - просто помечаем как deleted по исходному пути
+            ds.mark_deleted(paths=[path])
+    finally:
+        ds.close()
+
+    # Обновляем пути в face_rectangles
+    if delete_path:
+        fs = FaceStore()
+        try:
+            face_run_id = pr.get("face_run_id")
+            if face_run_id:
+                # Обновляем пути в face_rectangles
+                cur = fs.conn.cursor()
+                cur.execute(
+                    "UPDATE face_rectangles SET file_path = ? WHERE run_id = ? AND file_path = ?",
+                    (delete_path, int(face_run_id), path),
+                )
+                fs.conn.commit()
+        finally:
+            fs.close()
+
+    # Удаляем из всех gold файлов
+    removed_from_gold = _delete_from_all_gold_files(path)
+
+    undo_data["delete_path"] = delete_path
+
+    return {
+        "ok": True,
+        "pipeline_run_id": int(pipeline_run_id),
+        "path": path,
+        "delete_path": delete_path,
+        "removed_from_gold": removed_from_gold,
+        "undo_data": undo_data,
+    }
+
+
+@router.post("/api/faces/restore-from-delete")
+def api_faces_restore_from_delete(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Восстанавливает файл из _delete обратно в исходное место.
+
+    Параметры:
+    - pipeline_run_id: int (обязательно)
+    - delete_path: str (путь в _delete)
+    - original_path: str (исходный путь)
+    - original_name: str (исходное имя)
+    - original_parent_path: str (исходная родительская папка)
+    """
+    pipeline_run_id = payload.get("pipeline_run_id")
+    delete_path = payload.get("delete_path")
+    original_path = payload.get("original_path")
+    original_name = payload.get("original_name")
+    original_parent_path = payload.get("original_parent_path")
+
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required")
+    if not isinstance(delete_path, str) or not (delete_path.startswith("local:") or delete_path.startswith("disk:")):
+        raise HTTPException(status_code=400, detail="delete_path must start with local: or disk:")
+    if not isinstance(original_path, str) or not (original_path.startswith("local:") or original_path.startswith("disk:")):
+        raise HTTPException(status_code=400, detail="original_path must start with local: or disk:")
+
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+
+    # Перемещаем файл обратно
+    restored = False
+    if delete_path.startswith("disk:"):
+        # YaDisk
+        disk = get_disk()
+        try:
+            src_norm = _normalize_yadisk_path(delete_path)
+            dst_norm = _normalize_yadisk_path(original_path)
+            disk.move(src_norm, dst_norm, overwrite=False)
+            restored = True
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"Cannot restore file from _delete: {type(e).__name__}: {e}") from e
+    elif delete_path.startswith("local:"):
+        # Локальный файл
+        local_delete_path = delete_path[6:]  # убираем "local:"
+        if not os.path.exists(local_delete_path):
+            raise HTTPException(status_code=404, detail="File not found in _delete")
+        local_original_path = original_path[6:] if original_path.startswith("local:") else original_path
+        # Создаём родительскую директорию, если нужно
+        dst_dir = os.path.dirname(local_original_path)
+        try:
+            os.makedirs(dst_dir, exist_ok=True)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"Cannot create directory: {type(e).__name__}: {e}") from e
+        try:
+            os.rename(local_delete_path, local_original_path)
+            restored = True
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"Cannot restore file from _delete: {type(e).__name__}: {e}") from e
+
+    if not restored:
+        raise HTTPException(status_code=500, detail="File was not restored")
+
+    # Обновляем путь в БД и снимаем статус deleted
+    ds = DedupStore()
+    try:
+        # Обновляем путь в БД
+        ds.update_path(
+            old_path=delete_path,
+            new_path=original_path,
+            new_name=original_name,
+            new_parent_path=original_parent_path,
+        )
+        # Обновляем пути в manual labels
+        ds.update_run_manual_labels_path(
+            pipeline_run_id=int(pipeline_run_id),
+            old_path=delete_path,
+            new_path=original_path,
+        )
+        # Снимаем статус deleted
+        cur = ds.conn.cursor()
+        cur.execute("UPDATE files SET status = 'new', error = NULL WHERE path = ?", (original_path,))
+        ds.conn.commit()
+    finally:
+        ds.close()
+
+    # Обновляем пути в face_rectangles
+    fs = FaceStore()
+    try:
+        face_run_id = pr.get("face_run_id")
+        if face_run_id:
+            cur = fs.conn.cursor()
+            cur.execute(
+                "UPDATE face_rectangles SET file_path = ? WHERE run_id = ? AND file_path = ?",
+                (original_path, int(face_run_id), delete_path),
+            )
+            fs.conn.commit()
+    finally:
+        fs.close()
+
+    return {
+        "ok": True,
+        "pipeline_run_id": int(pipeline_run_id),
+        "delete_path": delete_path,
+        "restored_path": original_path,
     }
 

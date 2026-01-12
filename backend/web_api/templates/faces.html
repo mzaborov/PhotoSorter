@@ -145,7 +145,7 @@
           <button class="btn" id="btnNext" type="button">→</button>
           <span class="pill">всего: <b id="total">—</b></span>
           <button class="btn" id="btnReload" type="button">Обновить</button>
-          <button class="btn" id="btnUndo" type="button" style="display:none;" title="Undo: отменить последнее нажатие кнопки разметки (1 шаг).">Undo</button>
+          <button class="btn" id="btnUndo" type="button" style="display:none;" title="Undo: отменить последнее действие (поддерживается несколько последних действий).">Undo</button>
           <button class="btn" id="btnSortIntoFolders" type="button" title="Переместить файлы в папки по категориям: _non_media, _broken_media, _faces, _quarantine, _animals, _people_no_face, _no_faces">Переместить файлы в папки</button>
         </div>
 
@@ -481,26 +481,33 @@
             <button class="btn" data-action="mark_quarantine">Карантин</button>
             <button class="btn" data-action="people_no_face">Люди без лиц</button>
             <button class="btn danger" data-action="no_faces">Лиц нет</button>
+            <button class="btn danger" data-action="delete" title="Удалить файл (переместить в _delete)">🗑️</button>
           `;
         } else if (tab === "no_faces") {
           btn = `
             <button class="btn" data-action="annotate_faces">Лица есть (разметить)</button>
             <button class="btn" data-action="mark_cat">Кот</button>
             <button class="btn" data-action="people_no_face">Есть люди (без лиц)</button>
+            <button class="btn danger" data-action="delete" title="Удалить файл (переместить в _delete)">🗑️</button>
           `;
         } else if (tab === "quarantine") {
           btn = `
             <button class="btn" data-action="mark_faces">Нормальные лица</button>
             <button class="btn" data-action="mark_cat">Кот</button>
             <button class="btn danger" data-action="no_faces">Лиц нет</button>
+            <button class="btn danger" data-action="delete" title="Удалить файл (переместить в _delete)">🗑️</button>
           `;
         } else if (tab === "animals") {
           btn = `
             <button class="btn" data-action="mark_faces">Это не животное (лица)</button>
             <button class="btn danger" data-action="not_animal_no_faces">Это не животное (нет лиц)</button>
+            <button class="btn danger" data-action="delete" title="Удалить файл (переместить в _delete)">🗑️</button>
           `;
         } else if (tab === "people_no_face") {
-          btn = `<button class="btn" data-action="reset">Сброс</button>`;
+          btn = `
+            <button class="btn" data-action="reset">Сброс</button>
+            <button class="btn danger" data-action="delete" title="Удалить файл (переместить в _delete)">🗑️</button>
+          `;
         }
         const pastGold = !!it.sorted_past_gold;
         const cls = pastGold ? "card past-gold" : "card";
@@ -634,21 +641,47 @@
                   return { label: "", person: null };
                 }
 
-                function _setUndo(state) {
-                  window.__lastUndo = state || null;
+                function _pushUndo(state) {
+                  if (!window.__undoStack) {
+                    window.__undoStack = [];
+                  }
+                  if (state && state.path) {
+                    window.__undoStack.push(state);
+                    // Ограничиваем стек 10 последними действиями
+                    if (window.__undoStack.length > 10) {
+                      window.__undoStack.shift();
+                    }
+                  }
                   const b = qs("#btnUndo");
                   if (!b) return;
-                  if (window.__lastUndo && window.__lastUndo.path) {
+                  if (window.__undoStack && window.__undoStack.length > 0) {
                     b.style.display = "";
                   } else {
                     b.style.display = "none";
                   }
                 }
 
-                if (action === "no_faces") {
+                if (action === "delete") {
+                  try {
+                    const res = await postJson("/api/faces/delete", { pipeline_run_id: Number(pipelineRunId), path: p });
+                    if (res.ok && res.undo_data) {
+                      _pushUndo({
+                        action: "delete",
+                        path: res.undo_data.original_path,
+                        delete_path: res.undo_data.delete_path,
+                        undo_data: res.undo_data,
+                      });
+                    }
+                    removeCard();
+                    await refreshTabCounts();
+                    setToast(`Файл удалён. Удалено из gold: ${res.removed_from_gold || 0} записей.`);
+                  } catch (e) {
+                    setToast(e?.message || String(e), true);
+                  }
+                } else if (action === "no_faces") {
                   const prev = _getPrevManualFromCard(card);
                   await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "no_faces" });
-                  _setUndo({ path: p, prev_label: prev.label, prev_person: prev.person });
+                  _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
                   if (tab === "faces" || tab === "quarantine") {
                     removeCard();
                     await refreshTabCounts();
@@ -658,7 +691,7 @@
                 } else if (action === "mark_faces") {
                   const prev = _getPrevManualFromCard(card);
                   await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "faces" });
-                  _setUndo({ path: p, prev_label: prev.label, prev_person: prev.person });
+                  _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
                   // В карантине/животных разметка идёт потоком: без перезагрузки списка.
                   if (tab === "quarantine" || tab === "animals") {
                     removeCard();
@@ -669,7 +702,7 @@
                 } else if (action === "not_animal_no_faces") {
                   const prev = _getPrevManualFromCard(card);
                   await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "not_animal_no_faces" });
-                  _setUndo({ path: p, prev_label: prev.label, prev_person: prev.person });
+                  _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
                   // Потоковая чистка ложных котов: без reload списка, просто убираем карточку.
                   if (tab === "animals") {
                     removeCard();
@@ -686,7 +719,7 @@
                   // #endregion agent log
                   const prev = _getPrevManualFromCard(card);
                   await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "cat" });
-                  _setUndo({ path: p, prev_label: prev.label, prev_person: prev.person });
+                  _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
                   // Потоковое действие: без прыжков/перезагрузки списка
                   if (tab === "faces" || tab === "quarantine" || tab === "no_faces") {
                     removeCard();
@@ -697,7 +730,7 @@
                 } else if (action === "mark_quarantine") {
                   const prev = _getPrevManualFromCard(card);
                   await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "quarantine" });
-                  _setUndo({ path: p, prev_label: prev.label, prev_person: prev.person });
+                  _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
                   // На вкладке Faces не хотим дёргать список/скролл — просто убираем карточку.
                   if (tab === "faces") {
                     removeCard();
@@ -712,14 +745,14 @@
                 } else if (action === "people_no_face") {
                   const prev = _getPrevManualFromCard(card);
                   await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "people_no_face" });
-                  _setUndo({ path: p, prev_label: prev.label, prev_person: prev.person });
+                  _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
                   // Потоковая разметка: уводим карточку без reload (иначе прыгает список).
                   removeCard();
                   await refreshTabCounts();
                 } else if (action === "reset") {
                   const prev = _getPrevManualFromCard(card);
                   await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "" });
-                  _setUndo({ path: p, prev_label: prev.label, prev_person: prev.person });
+                  _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
                   // На вкладке people_no_face это "потоковый" сброс: просто убираем карточку.
                   removeCard();
                   await refreshTabCounts();
@@ -1172,22 +1205,87 @@
       refreshTabCounts();
       load(true);
 
-      // one-step Undo (last manual-label action)
+      // Undo (последние несколько действий)
       qs("#btnUndo").onclick = async () => {
-        const st = window.__lastUndo || null;
-        if (!st || !st.path) return;
+        if (!window.__undoStack || window.__undoStack.length === 0) return;
+        const st = window.__undoStack.pop(); // Берём последнее действие
+        if (!st || !st.path) {
+          if (window.__undoStack.length === 0) {
+            qs("#btnUndo").style.display = "none";
+          }
+          return;
+        }
         try {
           qs("#btnUndo").disabled = true;
-          const payload = { pipeline_run_id: Number(pipelineRunId), path: String(st.path), label: String(st.prev_label || "") };
-          if (String(st.prev_label || "") === "people_no_face" && st.prev_person) {
-            payload.person = String(st.prev_person);
+          if (st.action === "delete") {
+            // Откат удаления: восстанавливаем файл из _delete
+            const undoData = st.undo_data;
+            if (!undoData || !undoData.delete_path || !undoData.original_path) {
+              setToast("Недостаточно данных для отката удаления", true);
+              return;
+            }
+            // Перемещаем файл обратно
+            const res = await postJson("/api/faces/restore-from-delete", {
+              pipeline_run_id: Number(pipelineRunId),
+              delete_path: undoData.delete_path,
+              original_path: undoData.original_path,
+              original_name: undoData.original_name,
+              original_parent_path: undoData.original_parent_path,
+            });
+            if (res.ok) {
+              // Сначала сбрасываем все manual labels
+              await postJson("/api/faces/manual-label", {
+                pipeline_run_id: Number(pipelineRunId),
+                path: undoData.original_path,
+                label: "",
+              });
+              // Затем восстанавливаем manual labels в правильном порядке
+              if (undoData.original_people_no_face_manual) {
+                await postJson("/api/faces/manual-label", {
+                  pipeline_run_id: Number(pipelineRunId),
+                  path: undoData.original_path,
+                  label: "people_no_face",
+                  person: undoData.original_people_no_face_person || "",
+                });
+              } else if (undoData.original_faces_manual_label) {
+                await postJson("/api/faces/manual-label", {
+                  pipeline_run_id: Number(pipelineRunId),
+                  path: undoData.original_path,
+                  label: undoData.original_faces_manual_label,
+                });
+              }
+              if (undoData.original_quarantine_manual) {
+                await postJson("/api/faces/manual-label", {
+                  pipeline_run_id: Number(pipelineRunId),
+                  path: undoData.original_path,
+                  label: "quarantine",
+                });
+              }
+              if (undoData.original_animals_manual) {
+                await postJson("/api/faces/manual-label", {
+                  pipeline_run_id: Number(pipelineRunId),
+                  path: undoData.original_path,
+                  label: "cat",
+                });
+              }
+              setToast("Undo: файл восстановлен из _delete.");
+            } else {
+              setToast(`Ошибка восстановления: ${res.detail || "unknown"}`, true);
+            }
+          } else if (st.action === "manual_label") {
+            // Откат manual label
+            const payload = { pipeline_run_id: Number(pipelineRunId), path: String(st.path), label: String(st.prev_label || "") };
+            if (String(st.prev_label || "") === "people_no_face" && st.prev_person) {
+              payload.person = String(st.prev_person);
+            }
+            await postJson("/api/faces/manual-label", payload);
+            setToast("Undo: откатил последнее действие.");
           }
-          await postJson("/api/faces/manual-label", payload);
-          window.__lastUndo = null;
-          qs("#btnUndo").style.display = "none";
+          if (window.__undoStack.length === 0) {
+            qs("#btnUndo").style.display = "none";
+          }
           await refreshTabCounts();
           await load(true);
-          setToast("Undo: откатил последнее действие.");
         } catch (e) {
           setToast(e?.message || String(e), true);
         } finally {
