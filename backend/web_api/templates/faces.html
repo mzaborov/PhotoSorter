@@ -1152,6 +1152,17 @@
       const rid = getParam("pipeline_run_id");
       if (rid && /^\d+$/.test(rid)) pipelineRunId = Number(rid);
       qs("#prId").textContent = pipelineRunId != null ? String(pipelineRunId) : "—";
+      // Управление доступностью кнопки "Переместить файлы в папки"
+      const btnSort = qs("#btnSortIntoFolders");
+      if (btnSort) {
+        if (pipelineRunId != null) {
+          btnSort.disabled = false;
+          btnSort.style.display = "";
+        } else {
+          btnSort.disabled = true;
+          btnSort.title = "Переместить файлы в папки (требуется pipeline_run_id)";
+        }
+      }
       applyTabUI();
       updateUrlParams();
       // open video modal directly (used by /gold "Кадры" button)

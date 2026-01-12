@@ -1148,6 +1148,8 @@ def api_faces_sort_into_folders(payload: dict[str, Any] = Body(...)) -> dict[str
                         )
                     finally:
                         ds.close()
+                    # Обновляем пути в gold файлах
+                    _update_gold_file_paths(old_path=path, new_path=dst_path)
                 moved_count += 1
             except Exception as e:  # noqa: BLE001
                 errors.append({"path": path, "error": f"{type(e).__name__}: {e}"})
@@ -1218,6 +1220,10 @@ def api_faces_sort_into_folders(payload: dict[str, Any] = Body(...)) -> dict[str
                         fs.update_file_path(old_file_path=path, new_file_path=new_db_path)
                     finally:
                         fs.close()
+                    # Обновляем пути в gold файлах
+                    _update_gold_file_paths(old_path=path, new_path=new_db_path)
+                    # Обновляем пути в gold файлах
+                    _update_gold_file_paths(old_path=path, new_path=new_db_path)
                 except Exception as e:  # noqa: BLE001
                     errors.append({"path": path, "error": f"{type(e).__name__}: {e}"})
                     continue
@@ -1230,6 +1236,64 @@ def api_faces_sort_into_folders(payload: dict[str, Any] = Body(...)) -> dict[str
         "moved_count": moved_count,
         "errors": errors,
     }
+
+
+def _update_gold_file_paths(old_path: str, new_path: str) -> int:
+    """
+    Обновляет пути в gold файлах при перемещении файла.
+    Заменяет старый путь на новый во всех gold файлах (txt и ndjson).
+    Возвращает количество обновлённых записей.
+    """
+    updated_count = 0
+    old_path_normalized = old_path.strip()
+    new_path_normalized = new_path.strip()
+    
+    # Варианты старого пути для поиска (с префиксом и без)
+    old_path_variants = {old_path_normalized}
+    if old_path_normalized.startswith("local:"):
+        old_path_variants.add(old_path_normalized[6:])  # без "local:"
+    elif not old_path_normalized.startswith("disk:"):
+        old_path_variants.add("local:" + old_path_normalized)  # с "local:"
+    
+    # Обновляем во всех txt gold файлах
+    gold_map = gold_file_map()
+    for name, gold_path in gold_map.items():
+        if not gold_path.exists():
+            continue
+        lines = gold_read_lines(gold_path)
+        modified = False
+        new_lines = []
+        for line in lines:
+            line_stripped = line.strip()
+            if line_stripped in old_path_variants:
+                # Заменяем старый путь на новый
+                new_lines.append(new_path_normalized)
+                updated_count += 1
+                modified = True
+            else:
+                new_lines.append(line)
+        if modified:
+            gold_write_lines(gold_path, new_lines)
+    
+    # Обновляем в NDJSON gold файлах (faces_manual_rects_gold.ndjson, faces_video_frames_gold.ndjson)
+    for ndjson_path in [gold_faces_manual_rects_path(), gold_faces_video_frames_path()]:
+        if not ndjson_path.exists():
+            continue
+        items = gold_read_ndjson_by_path(ndjson_path)
+        modified = False
+        # Обновляем все варианты старого пути
+        for old_variant in old_path_variants:
+            if old_variant in items:
+                # Сохраняем данные, но с новым путём
+                item_data = items[old_variant]
+                del items[old_variant]
+                items[new_path_normalized] = item_data
+                updated_count += 1
+                modified = True
+        if modified:
+            gold_write_ndjson_by_path(ndjson_path, items)
+    
+    return updated_count
 
 
 def _delete_from_all_gold_files(path: str) -> int:
