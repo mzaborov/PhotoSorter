@@ -2249,7 +2249,12 @@ def _try_exif_gps_segment(img: Image.Image) -> Optional[str]:
         return None
     if not exif:
         return None
-    gps = exif.get(34853)
+    # Получаем GPS IFD через get_ifd (правильный способ в Pillow)
+    try:
+        gps = exif.get_ifd(0x8825)  # GPS IFD tag (34853 в десятичной системе)
+    except Exception:
+        # Fallback: пробуем через get
+        gps = exif.get(34853)
     if not gps:
         return None
     # gps is a dict-like with numeric keys (Pillow)
@@ -2283,14 +2288,19 @@ def _try_exif_gps_latlon(img: Image.Image) -> tuple[float, float] | None:
         return None
     if not exif:
         return None
-    gps = exif.get(34853)
+    # Получаем GPS IFD через get_ifd (правильный способ в Pillow)
+    try:
+        gps = exif.get_ifd(0x8825)  # GPS IFD tag (34853 в десятичной системе)
+    except Exception:
+        # Fallback: пробуем через get
+        gps = exif.get(34853)
     if not gps:
         return None
     try:
-        lat = gps.get(2)
-        lat_ref = gps.get(1)
-        lon = gps.get(4)
-        lon_ref = gps.get(3)
+        lat = gps.get(2)      # GPSLatitude
+        lat_ref = gps.get(1)   # GPSLatitudeRef: 'N' or 'S'
+        lon = gps.get(4)       # GPSLongitude
+        lon_ref = gps.get(3)   # GPSLongitudeRef: 'E' or 'W'
     except Exception:
         return None
     if not lat or not lon:

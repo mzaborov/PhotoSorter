@@ -157,16 +157,6 @@
           <span class="muted" id="jumpHint"></span>
         </div>
 
-        <!-- Filters for tab=no_faces -->
-        <div class="toolbar" id="noFacesFilters" style="display:none;">
-          <span class="pill">Сортировка: <b>место → дата</b></span>
-          <span class="muted">период:</span>
-          <input class="inp" id="nfFrom" type="date" style="width: 150px;" />
-          <span class="muted">—</span>
-          <input class="inp" id="nfTo" type="date" style="width: 150px;" />
-          <button class="btn" id="btnNfApply" type="button">Применить</button>
-          <button class="btn" id="btnNfClear" type="button">Сброс</button>
-        </div>
       </div>
 
       <div class="grid" id="grid"></div>
@@ -322,11 +312,7 @@
       if (!["all","many_faces"].includes(subtab)) subtab = "all";
       if (tab !== "faces") subtab = "all";
 
-      // init no_faces filters from URL (only used when tab=no_faces)
-      nfFrom = (getParam("from") || "").toString().trim() || null;
-      nfTo = (getParam("to") || "").toString().trim() || null;
-      if (nfFrom && nfFrom.length > 10) nfFrom = nfFrom.slice(0, 10);
-      if (nfTo && nfTo.length > 10) nfTo = nfTo.slice(0, 10);
+      // no_faces filters removed - сортировка по place_date работает автоматически
 
       function updateUrlParams() {
         const u = new URL(window.location.href);
@@ -338,14 +324,8 @@
         }
         if (tab === "no_faces") {
           u.searchParams.set("sort", nfSort);
-          if (nfFrom) u.searchParams.set("from", nfFrom);
-          else u.searchParams.delete("from");
-          if (nfTo) u.searchParams.set("to", nfTo);
-          else u.searchParams.delete("to");
         } else {
           u.searchParams.delete("sort");
-          u.searchParams.delete("from");
-          u.searchParams.delete("to");
         }
         window.history.replaceState({}, "", u.toString());
       }
@@ -367,8 +347,7 @@
         qs("#tabPeopleNoFace").classList.toggle("active", tab === "people_no_face");
         qs("#tabNoFaces").classList.toggle("active", tab === "no_faces");
         updateSubtabsVisibility();
-        const nf = qs("#noFacesFilters");
-        if (nf) nf.style.display = (tab === "no_faces") ? "flex" : "none";
+        // no_faces filters removed
       }
 
       function setSubtab(st) {
@@ -574,8 +553,6 @@
           let url = `/api/faces/results?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}&tab=${encodeURIComponent(tab)}&subtab=${encodeURIComponent(subtab)}&page=${encodeURIComponent(String(page))}&page_size=${encodeURIComponent(String(pageSize))}`;
           if (tab === "no_faces") {
             url += `&sort=${encodeURIComponent(nfSort)}`;
-            if (nfFrom) url += `&from=${encodeURIComponent(String(nfFrom))}`;
-            if (nfTo) url += `&to=${encodeURIComponent(String(nfTo))}`;
           }
           const data = await fetchJson(url);
           // #region agent log
@@ -592,7 +569,43 @@
           if (!items.length && loadedCount === 0) {
             qs("#grid").innerHTML = `<div class="muted">Пусто.</div>`;
           } else if (items.length) {
-            qs("#grid").insertAdjacentHTML("beforeend", items.map((it, i) => cardHtml(it, startRow + i)).join(""));
+            // Группировка по поездкам для tab=no_faces и sort=place_date
+            if (tab === "no_faces" && nfSort === "place_date") {
+              let html = "";
+              let currentTripGroup = null;
+              let rowNum = startRow;
+              let tripHeadersCount = 0;
+              for (const it of items) {
+                const tripGroup = (it.trip_group && String(it.trip_group).trim()) || null;
+                const tripLabel = (it.trip_label && String(it.trip_label).trim()) || null;
+                
+                // Если сменилась группа поездки, добавляем заголовок
+                if (tripGroup !== currentTripGroup) {
+                  if (tripLabel) {
+                    // Есть поездка - показываем её название
+                    html += `<div class="trip-header" style="width: 100%; padding: 12px 8px 8px; font-weight: 600; font-size: 14px; color: #374151; border-bottom: 2px solid #e5e7eb; margin-bottom: 8px; background: #f9fafb;">${escapeHtml(tripLabel)}</div>`;
+                    tripHeadersCount += 1;
+                  } else {
+                    // Нет группы - показываем заголовок "Нет группы"
+                    html += `<div class="trip-header" style="width: 100%; padding: 12px 8px 8px; font-weight: 600; font-size: 14px; color: #6b7280; border-bottom: 2px solid #e5e7eb; margin-bottom: 8px; background: #f3f4f6;">Нет группы</div>`;
+                    tripHeadersCount += 1;
+                  }
+                  currentTripGroup = tripGroup;
+                }
+                
+                html += cardHtml(it, rowNum);
+                rowNum += 1;
+              }
+              // Отладочная информация (можно убрать позже)
+              if (tripHeadersCount === 0 && items.length > 0) {
+                console.warn("[trip-grouping] Заголовки поездок не найдены. Проверьте, есть ли у файлов place_country и trip_group/trip_label в ответе API.");
+                console.log("[trip-grouping] Пример первого файла:", items[0]);
+              }
+              qs("#grid").insertAdjacentHTML("beforeend", html);
+            } else {
+              // Обычное отображение без группировки
+              qs("#grid").insertAdjacentHTML("beforeend", items.map((it, i) => cardHtml(it, startRow + i)).join(""));
+            }
           }
           loadedCount += items.length;
           hasMore = items.length === pageSize && (totalCount == null || loadedCount < totalCount);
@@ -1175,26 +1188,7 @@
         }
       } catch (e) {}
       // wire no_faces filters
-      try {
-        if (nfFrom) qs("#nfFrom").value = nfFrom;
-        if (nfTo) qs("#nfTo").value = nfTo;
-        qs("#btnNfApply").onclick = () => {
-          nfFrom = (qs("#nfFrom")?.value || "").toString().trim() || null;
-          nfTo = (qs("#nfTo")?.value || "").toString().trim() || null;
-          updateUrlParams();
-          page = 1;
-          load(true);
-        };
-        qs("#btnNfClear").onclick = () => {
-          nfFrom = null;
-          nfTo = null;
-          if (qs("#nfFrom")) qs("#nfFrom").value = "";
-          if (qs("#nfTo")) qs("#nfTo").value = "";
-          updateUrlParams();
-          page = 1;
-          load(true);
-        };
-      } catch (e) {}
+      // no_faces filters removed
       // sentinel for infinite scroll
       const sentinel = document.createElement("div");
       sentinel.id = "sentinel";

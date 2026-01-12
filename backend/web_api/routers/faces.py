@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import time
 import urllib.parse
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -414,6 +415,161 @@ def _faces_preview_meta(*, path: str, mime_type: str | None, media_type: str | N
     return {"preview_kind": preview_kind, "preview_url": preview_url, "open_url": open_url}
 
 
+def _group_into_trips(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Группирует файлы в поездки для вкладки "Нет лиц" с сортировкой по месту и дате.
+    
+    Логика:
+    - Страна обязательна для группировки по месту
+    - Город только для России
+    - Окно - максимальный разрыв между соседними датами (10 дней)
+    - Файлы без GPS/геокодирования группируются только по дате (временные поездки)
+    
+    Возвращает список строк с добавленным полем trip_group для группировки.
+    """
+    TRIP_WINDOW_DAYS = 10
+    
+    # Разделяем на файлы с местом и без
+    with_place: list[dict[str, Any]] = []
+    without_place: list[dict[str, Any]] = []
+    
+    for r in rows:
+        country = (str(r.get("place_country") or "")).strip()
+        city = (str(r.get("place_city") or "")).strip()
+        taken_at = (str(r.get("taken_at") or "")).strip()
+        
+        if not country:
+            # Нет места - будем группировать по дате
+            without_place.append(r)
+        else:
+            # Есть страна - группируем в поездки по месту
+            with_place.append(r)
+    
+    # Группируем файлы с местом в поездки
+    trips: list[list[dict[str, Any]]] = []
+    current_trip: list[dict[str, Any]] | None = None
+    
+    # Сортируем по стране, городу (только для России), дате
+    with_place_sorted = sorted(
+        with_place,
+        key=lambda x: (
+            str(x.get("place_country") or ""),
+            str(x.get("place_city") or "") if str(x.get("place_country") or "").lower() == "россия" else "",
+            str(x.get("taken_at") or ""),
+        ),
+    )
+    
+    for r in with_place_sorted:
+        country = (str(r.get("place_country") or "")).strip()
+        city = (str(r.get("place_city") or "")).strip()
+        taken_at = (str(r.get("taken_at") or "")).strip()
+        
+        # Формируем ключ места: страна + город (только для России)
+        # Определяем год из даты
+        year = ""
+        if taken_at and len(taken_at) >= 4:
+            year = taken_at[:4]
+        
+        if country.lower() == "россия" and city:
+            place_key = f"{country}|{city}"
+            # Формат: "Год Город" (например, "2023 Екатеринбург")
+            trip_label = f"{year} {city}" if year else city
+        else:
+            place_key = country
+            # Формат: "Год Страна" (например, "2023 Турция")
+            trip_label = f"{year} {country}" if year else country
+        
+        # Парсим дату
+        trip_date = None
+        if taken_at and len(taken_at) >= 10:
+            try:
+                trip_date = datetime.fromisoformat(taken_at[:10].replace("Z", "+00:00"))
+            except Exception:
+                pass
+        
+        # Определяем, начинать ли новую поездку
+        if current_trip is None:
+            # Первая поездка
+            current_trip = [r]
+            r["trip_group"] = place_key
+            r["trip_label"] = trip_label
+            r["trip_date"] = trip_date
+        else:
+            # Проверяем, относится ли файл к текущей поездке
+            prev_place_key = current_trip[0].get("trip_group", "")
+            # Берём дату последнего файла в поездке для проверки разрыва
+            last_file_in_trip = current_trip[-1]
+            prev_date = last_file_in_trip.get("trip_date")
+            
+            # Новая поездка, если:
+            # 1. Другое место (страна или город для России)
+            # 2. Разрыв в датах > 10 дней (от последнего файла в поездке)
+            is_new_trip = False
+            if place_key != prev_place_key:
+                is_new_trip = True
+            elif trip_date and prev_date:
+                days_diff = abs((trip_date - prev_date).days)
+                if days_diff > TRIP_WINDOW_DAYS:
+                    is_new_trip = True
+            
+            if is_new_trip:
+                # Сохраняем текущую поездку и начинаем новую
+                trips.append(current_trip)
+                current_trip = [r]
+                r["trip_group"] = place_key
+                r["trip_label"] = trip_label
+                r["trip_date"] = trip_date
+            else:
+                # Добавляем к текущей поездке
+                r["trip_group"] = place_key
+                r["trip_label"] = trip_label
+                r["trip_date"] = trip_date
+                current_trip.append(r)
+    
+    # Добавляем последнюю поездку
+    if current_trip:
+        trips.append(current_trip)
+    
+    # Файлы без места не группируем в поездки - оставляем как есть, без trip_group и trip_label
+    # Они будут отображаться с заголовком "Нет группы" на UI
+    
+    # Объединяем все поездки и сортируем по дате первой фотографии в поездке
+    result: list[dict[str, Any]] = []
+    
+    # Собираем все поездки с их первой датой для сортировки
+    all_trips_with_date: list[tuple[datetime | None, list[dict[str, Any]]]] = []
+    
+    # Поездки с местом
+    for trip in trips:
+        # Сортируем файлы внутри поездки по дате
+        trip_sorted = sorted(trip, key=lambda x: str(x.get("taken_at") or ""))
+        # Берём дату первого файла для сортировки
+        first_date_str = trip_sorted[0].get("taken_at", "") if trip_sorted else ""
+        first_date = None
+        if first_date_str and len(first_date_str) >= 10:
+            try:
+                first_date = datetime.fromisoformat(first_date_str[:10].replace("Z", "+00:00"))
+            except Exception:
+                pass
+        all_trips_with_date.append((first_date, trip_sorted))
+    
+    # Сортируем поездки по дате (от старых к новым)
+    all_trips_with_date.sort(key=lambda x: x[0] if x[0] else datetime.min)
+    
+    # Объединяем отсортированные поездки
+    for _date, trip_sorted in all_trips_with_date:
+        result.extend(trip_sorted)
+    
+    # Добавляем файлы без места в конец (без группировки, просто отсортированные по дате)
+    without_place_sorted = sorted(
+        without_place,
+        key=lambda x: str(x.get("taken_at") or ""),
+    )
+    result.extend(without_place_sorted)
+    
+    return result
+
+
 @router.get("/api/faces/results")
 def api_faces_results(
     pipeline_run_id: int,
@@ -582,6 +738,11 @@ def api_faces_results(
         ds.close()
 
     gold_expected = gold_expected_tab_by_path(include_drawn_faces=False)
+    
+    # Группировка в поездки для tab=no_faces и sort=place_date
+    if tab_n == "no_faces" and sort_n == "place_date":
+        rows = _group_into_trips(rows)
+    
     items: list[dict[str, Any]] = []
     for r in rows:
         path = str(r.get("path") or "")
@@ -618,6 +779,8 @@ def api_faces_results(
                 "animals_manual_kind": (str(r.get("animals_manual_kind") or "") or "") or None,
                 "people_no_face_manual": int(r.get("people_no_face_manual") or 0),
                 "people_no_face_person": (str(r.get("people_no_face_person") or "") or "") or None,
+                "trip_group": str(r.get("trip_group") or "") or None,  # Группа поездки для группировки на UI
+                "trip_label": str(r.get("trip_label") or "") or None,  # Название поездки для отображения
                 "sorted_past_gold": bool(gold_expected.get(path) is not None and gold_expected.get(path) != tab_n),
                 "gold_expected_tab": gold_expected.get(path),
                 **_faces_preview_meta(path=path, mime_type=mime_type, media_type=media_type, pipeline_run_id=int(pipeline_run_id)),
