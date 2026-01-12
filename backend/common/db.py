@@ -1,4 +1,6 @@
+import os
 import sqlite3
+import json
 from pathlib import Path
 from typing import Any
 from datetime import datetime, timezone
@@ -8,8 +10,19 @@ DB_PATH = Path(__file__).resolve().parents[2] / "data" / "photosorter.db"
 
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+    # ВАЖНО (Windows/SQLite): при параллельной работе web-сервера и worker-процесса
+    # возможны кратковременные write-lock. Даем коннекту шанс "подождать", а не падать.
+    try:
+        timeout_sec = float(os.getenv("PHOTOSORTER_SQLITE_TIMEOUT_SEC") or "5")
+    except Exception:
+        timeout_sec = 5.0
+    timeout_sec = max(0.1, min(60.0, timeout_sec))
+    conn = sqlite3.connect(DB_PATH, timeout=timeout_sec)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute(f"PRAGMA busy_timeout={int(timeout_sec * 1000)}")
+    except Exception:
+        pass
     return conn
 
 
@@ -201,10 +214,41 @@ def init_db():
             # Авто-детект животных (MVP: кошки)
             "animals_auto": "animals_auto INTEGER NOT NULL DEFAULT 0",
             "animals_kind": "animals_kind TEXT",
+            # Ручная разметка животных (ground truth для метрик; не смешивать с animals_auto)
+            "animals_manual": "animals_manual INTEGER NOT NULL DEFAULT 0",
+            "animals_manual_kind": "animals_manual_kind TEXT",
+            "animals_manual_at": "animals_manual_at TEXT",
             # Люди, но лица не найдены (пока в основном manual)
             "people_no_face_manual": "people_no_face_manual INTEGER NOT NULL DEFAULT 0",
             "people_no_face_person": "people_no_face_person TEXT",
+
+            # --- Photo geo/time metadata for UI sorting (No Faces) ---
+            # taken_at: ISO string (best-effort, from EXIF DateTimeOriginal; fallback: mtime in UTC)
+            "taken_at": "taken_at TEXT",
+            "gps_lat": "gps_lat REAL",
+            "gps_lon": "gps_lon REAL",
+            # normalized place (from geocoder)
+            "place_country": "place_country TEXT",
+            "place_city": "place_city TEXT",
+            "place_source": "place_source TEXT",   # 'yandex'|'manual'|...
+            "place_at": "place_at TEXT",           # when updated (UTC ISO)
         },
+    )
+
+    # --- Geocode cache (lat/lon -> country/city) ---
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS geocode_cache (
+            key          TEXT PRIMARY KEY,   -- e.g. "55.7558,37.6173" (rounded)
+            lat          REAL,
+            lon          REAL,
+            country      TEXT,
+            city         TEXT,
+            source       TEXT,               -- 'yandex'
+            updated_at   TEXT NOT NULL,
+            raw_json     TEXT                -- optional (debug)
+        );
+        """
     )
 
     # --- Pipeline: единый конвейер сортировки локальной папки с resume ---
@@ -246,6 +290,107 @@ def init_db():
             "updated_at": "updated_at TEXT",
         },
     )
+
+    # --- Pipeline run metrics snapshots (gold-based) ---
+    # Храним агрегаты "мимо gold" по каждому pipeline_run_id, чтобы они не "плыли" после следующего прогона
+    # (так как авто-результаты в files.* перезаписываются).
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pipeline_run_metrics (
+            pipeline_run_id        INTEGER PRIMARY KEY,
+            computed_at            TEXT NOT NULL,
+            face_run_id            INTEGER,
+            step0_checked          INTEGER,
+            step0_non_media        INTEGER,
+            step0_broken_media     INTEGER,
+            step2_total            INTEGER,
+            step2_processed        INTEGER,
+            cats_total             INTEGER,
+            cats_mism              INTEGER,
+            faces_total            INTEGER,
+            faces_mism             INTEGER,
+            no_faces_total         INTEGER,
+            no_faces_mism          INTEGER
+        );
+        """
+    )
+
+    # --- Preclean (шаг 1: предочистка): results + resume state ---
+    # ВАЖНО: в DRY_RUN ничего не перемещаем, поэтому "результат" шага 1 — это список планируемых перемещений.
+    # Для resume шага 1 сохраняем last_path и счётчики, чтобы после перезапуска продолжить.
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS preclean_state (
+            pipeline_run_id      INTEGER PRIMARY KEY,
+            root_path            TEXT NOT NULL,
+            dry_run              INTEGER NOT NULL,
+            checked              INTEGER NOT NULL DEFAULT 0,
+            non_media            INTEGER NOT NULL DEFAULT 0,
+            broken_media         INTEGER NOT NULL DEFAULT 0,
+            last_path            TEXT,
+            updated_at           TEXT NOT NULL
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_preclean_state_root ON preclean_state(root_path);")
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS preclean_moves (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            pipeline_run_id  INTEGER NOT NULL,
+            kind             TEXT NOT NULL, -- 'non_media'|'broken_media'
+            src_path         TEXT NOT NULL,
+            dst_path         TEXT NOT NULL,
+            is_applied       INTEGER NOT NULL DEFAULT 0,
+            created_at       TEXT NOT NULL
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_preclean_moves_run_kind ON preclean_moves(pipeline_run_id, kind);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_preclean_moves_run_src ON preclean_moves(pipeline_run_id, src_path);")
+
+    # --- Run-scoped manual labels (pipeline_run_id + path) ---
+    #
+    # ВАЖНО: ручные метки должны быть привязаны к прогону, иначе они "утекают" между разными папками/прогонами
+    # и портят отладку. Перенос ручных решений между прогонами делаем только через gold.
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS files_manual_labels (
+            pipeline_run_id       INTEGER NOT NULL,
+            path                  TEXT NOT NULL,
+            faces_manual_label    TEXT,                      -- 'faces'|'no_faces'|NULL
+            faces_manual_at       TEXT,
+            people_no_face_manual INTEGER NOT NULL DEFAULT 0,
+            people_no_face_person TEXT,
+            animals_manual        INTEGER NOT NULL DEFAULT 0,
+            animals_manual_kind   TEXT,
+            animals_manual_at     TEXT,
+            quarantine_manual     INTEGER NOT NULL DEFAULT 0,
+            quarantine_manual_at  TEXT,
+            PRIMARY KEY (pipeline_run_id, path)
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_files_manual_labels_run ON files_manual_labels(pipeline_run_id);")
+
+    # --- Run-scoped manual rectangles for VIDEO frames (3 frames per video) ---
+    # ВАЖНО: для видео нам нужны прямоугольники с привязкой к кадру/таймкоду.
+    # Храним отдельной таблицей, чтобы не смешивать с face_rectangles (она про фото/одно изображение).
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS video_manual_frames (
+            pipeline_run_id   INTEGER NOT NULL,
+            path              TEXT NOT NULL,
+            frame_idx         INTEGER NOT NULL, -- 1..3
+            t_sec             REAL,             -- таймкод кадра (секунды), best-effort
+            rects_json        TEXT,             -- JSON: [{"x":..,"y":..,"w":..,"h":..}, ...]
+            updated_at        TEXT NOT NULL,
+            PRIMARY KEY (pipeline_run_id, path, frame_idx)
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_video_manual_frames_path ON video_manual_frames(path);")
 
     # Индексы для быстрых группировок дублей.
     cur.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash_alg, hash_value);")
@@ -856,14 +1001,23 @@ class DedupStore:
         self.conn.commit()
         return int(cur.rowcount or 0)
 
-    def list_source_dups_in_archive(self, *, source_run_id: int, archive_prefix: str = "disk:/Фото") -> list[dict[str, Any]]:
+    def list_source_dups_in_archive(
+        self,
+        *,
+        source_run_id: int,
+        archive_prefixes: tuple[str, ...] = ("disk:/Фото",),
+    ) -> list[dict[str, Any]]:
         """
         Возвращает пары (source file -> archive matches) по совпадающему хэшу.
         Источник ограничиваем last_run_id=source_run_id, чтобы не смешивать разные выборы папки.
         """
         cur = self.conn.cursor()
+        prefixes = [str(p or "").rstrip("/") + "/%" for p in (archive_prefixes or ()) if str(p or "").strip()]
+        if not prefixes:
+            return []
+        like_sql = " OR ".join(["a.path LIKE ?"] * len(prefixes))
         cur.execute(
-            """
+            f"""
             SELECT
               s.path AS source_path,
               s.name AS source_name,
@@ -889,10 +1043,10 @@ class DedupStore:
               AND COALESCE(a.inventory_scope, 'archive') = 'archive'
               AND a.status != 'deleted'
               AND a.hash_value IS NOT NULL
-              AND a.path LIKE ?
+              AND ({like_sql})
             ORDER BY s.path ASC, a.path ASC
             """,
-            (source_run_id, source_run_id, f"{archive_prefix.rstrip('/')}/%"),
+            (source_run_id, source_run_id, *prefixes),
         )
         return [dict(r) for r in cur.fetchall()]
 
@@ -994,6 +1148,338 @@ class DedupStore:
             )
         self.conn.commit()
 
+    # --- run-scoped manual labels (pipeline_run_id + path) ---
+    def _ensure_run_manual_row(self, *, pipeline_run_id: int, path: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO files_manual_labels(pipeline_run_id, path) VALUES (?, ?)",
+            (int(pipeline_run_id), str(path)),
+        )
+
+    def delete_run_manual_labels(self, *, pipeline_run_id: int, path: str) -> None:
+        """
+        Полный сброс ручных меток для конкретного прогона и пути.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            "DELETE FROM files_manual_labels WHERE pipeline_run_id = ? AND path = ?",
+            (int(pipeline_run_id), str(path)),
+        )
+        self.conn.commit()
+
+    def set_run_faces_manual_label(self, *, pipeline_run_id: int, path: str, label: str | None) -> None:
+        """
+        Ручная правка результата "лица/нет лиц" для файла В РАМКАХ ПРОГОНА.
+        label: 'faces' | 'no_faces' | None (сброс)
+        """
+        lab = (label or "").strip().lower()
+        if lab == "":
+            lab = ""
+        if lab not in ("", "faces", "no_faces"):
+            raise ValueError("label must be one of: faces, no_faces, (empty)")
+        self._ensure_run_manual_row(pipeline_run_id=int(pipeline_run_id), path=str(path))
+        cur = self.conn.cursor()
+        if lab == "":
+            cur.execute(
+                """
+                UPDATE files_manual_labels
+                SET faces_manual_label = NULL, faces_manual_at = NULL
+                WHERE pipeline_run_id = ? AND path = ?
+                """,
+                (int(pipeline_run_id), str(path)),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE files_manual_labels
+                SET faces_manual_label = ?, faces_manual_at = ?
+                WHERE pipeline_run_id = ? AND path = ?
+                """,
+                (lab, _now_utc_iso(), int(pipeline_run_id), str(path)),
+            )
+        self.conn.commit()
+
+    def update_run_manual_labels_path(self, *, pipeline_run_id: int, old_path: str, new_path: str) -> None:
+        """
+        При перемещении файла (и обновлении files.path) нужно переносить run-scoped manual метки,
+        иначе они "теряются" после move (labels привязаны к path).
+
+        Поведение:
+        - если old_path отсутствует в files_manual_labels для этого прогона — ничего не делаем
+        - если new_path уже есть — сливаем значения (бережно) и удаляем old_path
+        - иначе просто обновляем path -> new_path
+        """
+        oldp = str(old_path or "")
+        newp = str(new_path or "")
+        if not oldp or not newp or oldp == newp:
+            return
+        rid = int(pipeline_run_id)
+        cur = self.conn.cursor()
+
+        cur.execute(
+            "SELECT * FROM files_manual_labels WHERE pipeline_run_id = ? AND path = ? LIMIT 1",
+            (rid, oldp),
+        )
+        old_row = cur.fetchone()
+        if not old_row:
+            return
+
+        cur.execute(
+            "SELECT * FROM files_manual_labels WHERE pipeline_run_id = ? AND path = ? LIMIT 1",
+            (rid, newp),
+        )
+        new_row = cur.fetchone()
+
+        if not new_row:
+            # Simple rename
+            cur.execute(
+                "UPDATE files_manual_labels SET path = ? WHERE pipeline_run_id = ? AND path = ?",
+                (newp, rid, oldp),
+            )
+            self.conn.commit()
+            return
+
+        # Merge (new wins if it has a value; otherwise take old)
+        o = dict(old_row)
+        n = dict(new_row)
+
+        def _nz_str(v: Any) -> str | None:
+            s = (str(v) if v is not None else "").strip()
+            return s if s else None
+
+        merged: dict[str, Any] = {}
+
+        # faces_manual_label + at
+        n_fml = _nz_str(n.get("faces_manual_label"))
+        o_fml = _nz_str(o.get("faces_manual_label"))
+        if n_fml is not None:
+            merged["faces_manual_label"] = n_fml
+            merged["faces_manual_at"] = n.get("faces_manual_at")
+        else:
+            merged["faces_manual_label"] = o_fml
+            merged["faces_manual_at"] = o.get("faces_manual_at")
+
+        # people_no_face
+        n_pnf = int(n.get("people_no_face_manual") or 0)
+        o_pnf = int(o.get("people_no_face_manual") or 0)
+        merged["people_no_face_manual"] = 1 if (n_pnf or o_pnf) else 0
+        merged["people_no_face_person"] = _nz_str(n.get("people_no_face_person")) or _nz_str(o.get("people_no_face_person"))
+
+        # animals_manual
+        n_am = int(n.get("animals_manual") or 0)
+        o_am = int(o.get("animals_manual") or 0)
+        merged["animals_manual"] = 1 if (n_am or o_am) else 0
+        merged["animals_manual_kind"] = _nz_str(n.get("animals_manual_kind")) or _nz_str(o.get("animals_manual_kind"))
+        merged["animals_manual_at"] = n.get("animals_manual_at") or o.get("animals_manual_at")
+
+        # quarantine_manual
+        n_qm = int(n.get("quarantine_manual") or 0)
+        o_qm = int(o.get("quarantine_manual") or 0)
+        merged["quarantine_manual"] = 1 if (n_qm or o_qm) else 0
+        merged["quarantine_manual_at"] = n.get("quarantine_manual_at") or o.get("quarantine_manual_at")
+
+        cur.execute(
+            """
+            UPDATE files_manual_labels
+            SET
+              faces_manual_label = ?,
+              faces_manual_at = ?,
+              people_no_face_manual = ?,
+              people_no_face_person = ?,
+              animals_manual = ?,
+              animals_manual_kind = ?,
+              animals_manual_at = ?,
+              quarantine_manual = ?,
+              quarantine_manual_at = ?
+            WHERE pipeline_run_id = ? AND path = ?
+            """,
+            (
+                merged.get("faces_manual_label"),
+                merged.get("faces_manual_at"),
+                int(merged.get("people_no_face_manual") or 0),
+                merged.get("people_no_face_person"),
+                int(merged.get("animals_manual") or 0),
+                merged.get("animals_manual_kind"),
+                merged.get("animals_manual_at"),
+                int(merged.get("quarantine_manual") or 0),
+                merged.get("quarantine_manual_at"),
+                rid,
+                newp,
+            ),
+        )
+        # Drop old row (we merged it)
+        cur.execute("DELETE FROM files_manual_labels WHERE pipeline_run_id = ? AND path = ?", (rid, oldp))
+        self.conn.commit()
+
+    # --- video manual frames (run-scoped) ---
+    def get_video_manual_frames(self, *, pipeline_run_id: int, path: str) -> dict[int, dict[str, Any]]:
+        """
+        Returns mapping: frame_idx -> {frame_idx, t_sec, rects:[...], updated_at}
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT frame_idx, t_sec, rects_json, updated_at
+            FROM video_manual_frames
+            WHERE pipeline_run_id = ? AND path = ?
+            ORDER BY frame_idx ASC
+            """,
+            (int(pipeline_run_id), str(path)),
+        )
+        out: dict[int, dict[str, Any]] = {}
+        for r in cur.fetchall():
+            idx = int(r["frame_idx"] or 0)
+            if idx <= 0:
+                continue
+            rects: list[dict[str, int]] = []
+            try:
+                raw = r["rects_json"]
+                if raw:
+                    obj = json.loads(raw)
+                    if isinstance(obj, list):
+                        for it in obj:
+                            if not isinstance(it, dict):
+                                continue
+                            x = int(it.get("x") or 0)
+                            y = int(it.get("y") or 0)
+                            w = int(it.get("w") or 0)
+                            h = int(it.get("h") or 0)
+                            if w > 0 and h > 0:
+                                rects.append({"x": x, "y": y, "w": w, "h": h})
+            except Exception:
+                rects = []
+            out[idx] = {
+                "frame_idx": idx,
+                "t_sec": (float(r["t_sec"]) if r["t_sec"] is not None else None),
+                "rects": rects,
+                "updated_at": str(r["updated_at"] or ""),
+            }
+        return out
+
+    def upsert_video_manual_frame(
+        self,
+        *,
+        pipeline_run_id: int,
+        path: str,
+        frame_idx: int,
+        t_sec: float | None,
+        rects: list[dict[str, int]],
+    ) -> None:
+        """
+        Upsert one frame's manual rectangles for a video.
+        """
+        idx = int(frame_idx)
+        if idx not in (1, 2, 3):
+            raise ValueError("frame_idx must be 1..3")
+        clean: list[dict[str, int]] = []
+        for r in rects or []:
+            if not isinstance(r, dict):
+                continue
+            x = int(r.get("x") or 0)
+            y = int(r.get("y") or 0)
+            w = int(r.get("w") or 0)
+            h = int(r.get("h") or 0)
+            if w > 0 and h > 0:
+                clean.append({"x": x, "y": y, "w": w, "h": h})
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO video_manual_frames(pipeline_run_id, path, frame_idx, t_sec, rects_json, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?)
+            ON CONFLICT(pipeline_run_id, path, frame_idx) DO UPDATE SET
+              t_sec = excluded.t_sec,
+              rects_json = excluded.rects_json,
+              updated_at = excluded.updated_at
+            """,
+            (
+                int(pipeline_run_id),
+                str(path),
+                idx,
+                float(t_sec) if t_sec is not None else None,
+                json.dumps(clean, ensure_ascii=False),
+                _now_utc_iso(),
+            ),
+        )
+        self.conn.commit()
+
+    def set_run_people_no_face_manual(self, *, pipeline_run_id: int, path: str, is_people_no_face: bool, person: str | None = None) -> None:
+        """
+        Ручная пометка: "есть люди, но лица не найдены" В РАМКАХ ПРОГОНА.
+        """
+        self._ensure_run_manual_row(pipeline_run_id=int(pipeline_run_id), path=str(path))
+        cur = self.conn.cursor()
+        if bool(is_people_no_face):
+            cur.execute(
+                """
+                UPDATE files_manual_labels
+                SET people_no_face_manual = 1, people_no_face_person = ?
+                WHERE pipeline_run_id = ? AND path = ?
+                """,
+                ((person or "").strip() or None, int(pipeline_run_id), str(path)),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE files_manual_labels
+                SET people_no_face_manual = 0, people_no_face_person = NULL
+                WHERE pipeline_run_id = ? AND path = ?
+                """,
+                (int(pipeline_run_id), str(path)),
+            )
+        self.conn.commit()
+
+    def set_run_animals_manual(self, *, pipeline_run_id: int, path: str, is_animal: bool, kind: str | None = None) -> None:
+        """
+        Ручная разметка животных (ground truth) В РАМКАХ ПРОГОНА.
+        """
+        self._ensure_run_manual_row(pipeline_run_id=int(pipeline_run_id), path=str(path))
+        cur = self.conn.cursor()
+        if bool(is_animal):
+            cur.execute(
+                """
+                UPDATE files_manual_labels
+                SET animals_manual = 1, animals_manual_kind = ?, animals_manual_at = ?
+                WHERE pipeline_run_id = ? AND path = ?
+                """,
+                ((kind or "").strip() or None, _now_utc_iso(), int(pipeline_run_id), str(path)),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE files_manual_labels
+                SET animals_manual = 0, animals_manual_kind = NULL, animals_manual_at = NULL
+                WHERE pipeline_run_id = ? AND path = ?
+                """,
+                (int(pipeline_run_id), str(path)),
+            )
+        self.conn.commit()
+
+    def set_run_quarantine_manual(self, *, pipeline_run_id: int, path: str, is_quarantine: bool) -> None:
+        """
+        Ручная пометка "карантин" В РАМКАХ ПРОГОНА.
+        """
+        self._ensure_run_manual_row(pipeline_run_id=int(pipeline_run_id), path=str(path))
+        cur = self.conn.cursor()
+        if bool(is_quarantine):
+            cur.execute(
+                """
+                UPDATE files_manual_labels
+                SET quarantine_manual = 1, quarantine_manual_at = ?
+                WHERE pipeline_run_id = ? AND path = ?
+                """,
+                (_now_utc_iso(), int(pipeline_run_id), str(path)),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE files_manual_labels
+                SET quarantine_manual = 0, quarantine_manual_at = NULL
+                WHERE pipeline_run_id = ? AND path = ?
+                """,
+                (int(pipeline_run_id), str(path)),
+            )
+        self.conn.commit()
+
     def set_faces_auto_quarantine(self, *, path: str, is_quarantine: bool, reason: str | None = None) -> None:
         """
         Авто-карантин для локальной сортировки (экраны/технические кейсы).
@@ -1068,6 +1554,120 @@ class DedupStore:
                 """
                 UPDATE files
                 SET animals_auto = 0, animals_kind = NULL
+                WHERE path = ?
+                """,
+                (path,),
+            )
+        self.conn.commit()
+
+    # --- geo/time metadata + place (for UI sorting) ---
+    def set_taken_at_and_gps(self, *, path: str, taken_at: str | None, gps_lat: float | None, gps_lon: float | None) -> None:
+        """
+        Stores best-effort taken_at (ISO string) and GPS coordinates for a file.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            UPDATE files
+            SET taken_at = COALESCE(?, taken_at),
+                gps_lat = COALESCE(?, gps_lat),
+                gps_lon = COALESCE(?, gps_lon)
+            WHERE path = ?
+            """,
+            ((taken_at or None), gps_lat, gps_lon, str(path)),
+        )
+        self.conn.commit()
+
+    def set_place(self, *, path: str, country: str | None, city: str | None, source: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            UPDATE files
+            SET place_country = ?, place_city = ?, place_source = ?, place_at = ?
+            WHERE path = ?
+            """,
+            ((country or "").strip() or None, (city or "").strip() or None, (source or "").strip() or None, _now_utc_iso(), str(path)),
+        )
+        self.conn.commit()
+
+    def get_place(self, *, path: str) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT place_country, place_city, place_source, place_at, gps_lat, gps_lon, taken_at
+            FROM files
+            WHERE path = ?
+            LIMIT 1
+            """,
+            (str(path),),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def geocode_cache_get(self, *, key: str) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM geocode_cache WHERE key = ? LIMIT 1", (str(key),))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def geocode_cache_upsert(
+        self,
+        *,
+        key: str,
+        lat: float | None,
+        lon: float | None,
+        country: str | None,
+        city: str | None,
+        source: str,
+        raw_json: str | None = None,
+    ) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO geocode_cache(key, lat, lon, country, city, source, updated_at, raw_json)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+              lat = excluded.lat,
+              lon = excluded.lon,
+              country = excluded.country,
+              city = excluded.city,
+              source = excluded.source,
+              updated_at = excluded.updated_at,
+              raw_json = COALESCE(excluded.raw_json, geocode_cache.raw_json)
+            """,
+            (
+                str(key),
+                float(lat) if lat is not None else None,
+                float(lon) if lon is not None else None,
+                (country or "").strip() or None,
+                (city or "").strip() or None,
+                (source or "").strip() or None,
+                _now_utc_iso(),
+                raw_json,
+            ),
+        )
+        self.conn.commit()
+
+    def set_animals_manual(self, *, path: str, is_animal: bool, kind: str | None = None) -> None:
+        """
+        Ручная разметка животных (ground truth для метрик).
+        ВАЖНО: не смешивать с animals_auto (который пишет автоматика).
+        """
+        cur = self.conn.cursor()
+        if bool(is_animal):
+            cur.execute(
+                """
+                UPDATE files
+                SET animals_manual = 1, animals_manual_kind = ?, animals_manual_at = ?
+                WHERE path = ?
+                """,
+                ((kind or "").strip() or None, _now_utc_iso(), path),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE files
+                SET animals_manual = 0, animals_manual_kind = NULL, animals_manual_at = NULL
                 WHERE path = ?
                 """,
                 (path,),
@@ -1409,6 +2009,62 @@ class PipelineStore:
         cur.execute(f"UPDATE pipeline_runs SET {', '.join(fields)} WHERE id = ?", params)
         self.conn.commit()
 
+    def upsert_metrics(self, *, pipeline_run_id: int, metrics: dict[str, Any]) -> None:
+        """
+        Upsert aggregated metrics snapshot for a pipeline run.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO pipeline_run_metrics(
+              pipeline_run_id, computed_at, face_run_id,
+              step0_checked, step0_non_media, step0_broken_media,
+              step2_total, step2_processed,
+              cats_total, cats_mism,
+              faces_total, faces_mism,
+              no_faces_total, no_faces_mism
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(pipeline_run_id) DO UPDATE SET
+              computed_at = excluded.computed_at,
+              face_run_id = excluded.face_run_id,
+              step0_checked = excluded.step0_checked,
+              step0_non_media = excluded.step0_non_media,
+              step0_broken_media = excluded.step0_broken_media,
+              step2_total = excluded.step2_total,
+              step2_processed = excluded.step2_processed,
+              cats_total = excluded.cats_total,
+              cats_mism = excluded.cats_mism,
+              faces_total = excluded.faces_total,
+              faces_mism = excluded.faces_mism,
+              no_faces_total = excluded.no_faces_total,
+              no_faces_mism = excluded.no_faces_mism
+            """,
+            (
+                int(pipeline_run_id),
+                str(metrics.get("computed_at") or _now_utc_iso()),
+                metrics.get("face_run_id"),
+                metrics.get("step0_checked"),
+                metrics.get("step0_non_media"),
+                metrics.get("step0_broken_media"),
+                metrics.get("step2_total"),
+                metrics.get("step2_processed"),
+                metrics.get("cats_total"),
+                metrics.get("cats_mism"),
+                metrics.get("faces_total"),
+                metrics.get("faces_mism"),
+                metrics.get("no_faces_total"),
+                metrics.get("no_faces_mism"),
+            ),
+        )
+        self.conn.commit()
+
+    def get_metrics_for_run(self, *, pipeline_run_id: int) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM pipeline_run_metrics WHERE pipeline_run_id = ? LIMIT 1", (int(pipeline_run_id),))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
     def append_log(self, *, run_id: int, line: str, max_chars: int = 120_000) -> None:
         cur = self.conn.cursor()
         cur.execute("SELECT log_tail FROM pipeline_runs WHERE id = ? LIMIT 1", (int(run_id),))
@@ -1565,14 +2221,23 @@ class PipelineStore:
         self.conn.commit()
         return int(cur.rowcount or 0)
 
-    def list_source_dups_in_archive(self, *, source_run_id: int, archive_prefix: str = "disk:/Фото") -> list[dict[str, Any]]:
+    def list_source_dups_in_archive(
+        self,
+        *,
+        source_run_id: int,
+        archive_prefixes: tuple[str, ...] = ("disk:/Фото",),
+    ) -> list[dict[str, Any]]:
         """
         Возвращает пары (source file -> archive matches) по совпадающему хэшу.
         Источник ограничиваем last_run_id=source_run_id, чтобы не смешивать разные выборы папки.
         """
         cur = self.conn.cursor()
+        prefixes = [str(p or "").rstrip("/") + "/%" for p in (archive_prefixes or ()) if str(p or "").strip()]
+        if not prefixes:
+            return []
+        like_sql = " OR ".join(["a.path LIKE ?"] * len(prefixes))
         cur.execute(
-            """
+            f"""
             SELECT
               s.path AS source_path,
               s.name AS source_name,
@@ -1598,10 +2263,10 @@ class PipelineStore:
               AND COALESCE(a.inventory_scope, 'archive') = 'archive'
               AND a.status != 'deleted'
               AND a.hash_value IS NOT NULL
-              AND a.path LIKE ?
+              AND ({like_sql})
             ORDER BY s.path ASC, a.path ASC
             """,
-            (source_run_id, source_run_id, f"{archive_prefix.rstrip('/')}/%"),
+            (source_run_id, source_run_id, *prefixes),
         )
         return [dict(r) for r in cur.fetchall()]
 

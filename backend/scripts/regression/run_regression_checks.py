@@ -7,10 +7,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-# Allow running as: python scripts/regression/run_regression_checks.py ...
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+# Allow running as: python backend/scripts/regression/run_regression_checks.py ...
+# NOTE: this file is located at backend/scripts/regression/run_regression_checks.py
+# parents: [regression, scripts, backend, <repo_root>, ...]
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_BACKEND_ROOT = _REPO_ROOT / "backend"
+# Needed for "common.*" imports (common lives under backend/common)
+for p in (str(_BACKEND_ROOT), str(_REPO_ROOT)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 
 from common.db import DedupStore  # noqa: E402
@@ -53,6 +58,13 @@ def _effective_tab_for_row(row: dict) -> str:
         return "no_faces"
     if manual == "faces":
         return "faces"
+    # manual quarantine (run-scoped)
+    fc = int(row.get("faces_count") or 0)
+    if (row.get("quarantine_manual") or 0) == 1 and fc > 0:
+        return "quarantine"
+    # manual animals (ground truth)
+    if (row.get("animals_manual") or 0) == 1:
+        return "animals"
 
     # auto
     if (row.get("animals_auto") or 0) == 1:
@@ -60,7 +72,6 @@ def _effective_tab_for_row(row: dict) -> str:
     # many_small_faces показываем внутри tab=faces (2-й уровень), не как отдельный top-tab quarantine
     q_reason = (row.get("faces_quarantine_reason") or "").strip().lower()
     # quarantine only if there are faces (faces_count>0); otherwise treat as no_faces
-    fc = int(row.get("faces_count") or 0)
     if (row.get("faces_auto_quarantine") or 0) == 1 and q_reason != "many_small_faces" and fc > 0:
         return "quarantine"
 
@@ -89,24 +100,49 @@ def _auto_tab_for_row(row: dict) -> str:
     return "faces" if fc > 0 else "no_faces"
 
 
-def _fetch_rows_by_paths(ds: DedupStore, paths: list[str]) -> dict[str, dict]:
+def _fetch_rows_by_paths(ds: DedupStore, paths: list[str], pipeline_run_id: int | None) -> dict[str, dict]:
     if not paths:
         return {}
     placeholders = ",".join(["?"] * len(paths))
-    sql = f"""
-        SELECT
-          path,
-          faces_count,
-          faces_manual_label,
-          faces_auto_quarantine,
-          faces_quarantine_reason,
-          animals_auto,
-          animals_kind,
-          people_no_face_manual
-        FROM files
-        WHERE path IN ({placeholders})
-    """
-    rows = ds.conn.execute(sql, paths).fetchall()
+    if pipeline_run_id is not None:
+        sql = f"""
+            SELECT
+              f.path AS path,
+              f.faces_count AS faces_count,
+              COALESCE(m.faces_manual_label, '') AS faces_manual_label,
+              COALESCE(m.quarantine_manual, 0) AS quarantine_manual,
+              f.faces_auto_quarantine AS faces_auto_quarantine,
+              f.faces_quarantine_reason AS faces_quarantine_reason,
+              f.animals_auto AS animals_auto,
+              f.animals_kind AS animals_kind,
+              COALESCE(m.animals_manual, 0) AS animals_manual,
+              COALESCE(m.animals_manual_kind, '') AS animals_manual_kind,
+              COALESCE(m.people_no_face_manual, 0) AS people_no_face_manual
+            FROM files f
+            LEFT JOIN files_manual_labels m
+              ON m.pipeline_run_id = ? AND m.path = f.path
+            WHERE f.path IN ({placeholders})
+        """
+        rows = ds.conn.execute(sql, [int(pipeline_run_id), *paths]).fetchall()
+    else:
+        # No pipeline_run_id -> treat as "no manual labels" to avoid mixing runs.
+        sql = f"""
+            SELECT
+              path,
+              faces_count,
+              '' AS faces_manual_label,
+              0 AS quarantine_manual,
+              faces_auto_quarantine,
+              faces_quarantine_reason,
+              animals_auto,
+              animals_kind,
+              0 AS animals_manual,
+              '' AS animals_manual_kind,
+              0 AS people_no_face_manual
+            FROM files
+            WHERE path IN ({placeholders})
+        """
+        rows = ds.conn.execute(sql, paths).fetchall()
     out: dict[str, dict] = {}
     for r in rows:
         out[str(r["path"])] = dict(r)
@@ -123,6 +159,12 @@ def main() -> int:
         help="effective: like UI (manual overrides win). auto: only auto flags + faces_count.",
     )
     ap.add_argument("--fail-fast", action="store_true", help="Stop on first mismatch")
+    ap.add_argument(
+        "--pipeline-run-id",
+        type=int,
+        default=None,
+        help="If set, use run-scoped manual labels (files_manual_labels) for effective-mode checks.",
+    )
     args = ap.parse_args()
 
     cases_dir = Path(args.cases_dir)
@@ -159,7 +201,7 @@ def main() -> int:
                 continue
 
             paths = _read_cases_file(p)
-            rows = _fetch_rows_by_paths(ds, paths)
+            rows = _fetch_rows_by_paths(ds, paths, int(args.pipeline_run_id) if args.pipeline_run_id is not None else None)
 
             for path in paths:
                 total += 1

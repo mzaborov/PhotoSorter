@@ -23,6 +23,7 @@ from common.db import DedupStore  # noqa: E402
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--pipeline-run-id", type=int, default=None, help="If set, reset run-scoped labels for that run")
     ap.add_argument("--path", action="append", default=[], help="File path in DB (local:... or disk:...)")
     args = ap.parse_args()
 
@@ -34,8 +35,12 @@ def main() -> int:
     try:
         updated = 0
         for p in paths:
-            ds.set_faces_manual_label(path=p, label=None)
-            ds.set_people_no_face_manual(path=p, is_people_no_face=False, person=None)
+            if args.pipeline_run_id is not None:
+                ds.delete_run_manual_labels(pipeline_run_id=int(args.pipeline_run_id), path=p)
+            else:
+                # legacy fallback
+                ds.set_faces_manual_label(path=p, label=None)
+                ds.set_people_no_face_manual(path=p, is_people_no_face=False, person=None)
             updated += 1
     finally:
         ds.close()

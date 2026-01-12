@@ -25,4 +25,3 @@ python scripts/render_diagrams.py --in-dir docs/diagrams
 
 ## Git-правило
 PNG **коммитим** вместе с `.puml`, чтобы диаграммы были видны без локальной генерации.
-

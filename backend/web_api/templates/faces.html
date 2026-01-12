@@ -24,6 +24,16 @@
       .btn:disabled { opacity: 0.6; cursor: not-allowed; }
       .btn.danger { border-color:#fecaca; background:#fff5f5; color:#991b1b; }
       .btn.danger:hover { background:#ffecec; }
+      /* Compact buttons inside cards: 2 per row */
+      .actions .btn {
+        padding: 6px 8px;
+        border-radius: 10px;
+        font-size: 12px;
+        line-height: 1.1;
+        flex: 1 1 calc(50% - 8px);
+        min-width: 0;
+      }
+      .actions { display:flex; gap:8px; align-items:center; margin-top: 10px; flex-wrap: wrap; }
       .tabs { display:flex; gap:8px; margin-top: 14px; }
       .tab { appearance:none; border:1px solid #d1d5db; background:#fff; padding:8px 10px; border-radius:999px; cursor:pointer; font-weight:700; }
       .tab.active { background:#111827; color:#fff; border-color:#111827; }
@@ -36,11 +46,27 @@
       .thumb { height: 140px; background:#fff; display:flex; align-items:center; justify-content:center; position:relative; cursor: zoom-in; }
       .thumb img { width: 100%; height: 100%; object-fit: contain; display:block; background:#fff; }
       .thumb video { width: 100%; height: 100%; object-fit: contain; display:block; background:#111827; }
+      .vfbtn {
+        position: absolute;
+        right: 8px;
+        top: 8px;
+        z-index: 5;
+        padding: 4px 8px;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,0.55);
+        background: rgba(17,24,39,0.72);
+        color: #fff;
+        font-size: 12px;
+        font-weight: 800;
+        cursor: pointer;
+        user-select: none;
+      }
+      .vfbtn:hover { background: rgba(17,24,39,0.85); }
       .thumb .noimg { color:#6b7280; font-size:12px; padding:10px; text-align:center; }
       .card-body { padding: 10px 10px 12px 10px; }
       .kv { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; font-size:12px; color:#374151; }
       .path { font-size: 12px; word-break: break-all; }
-      .actions { display:flex; gap:8px; align-items:center; margin-top: 10px; }
+      /* .actions updated above */
       /* Вариант A: "мимо gold" — делаем заметно */
       .card.past-gold {
         background: #ffe4e6;         /* rose-200 */
@@ -55,9 +81,13 @@
       .lb-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #e5e7eb; }
       .lb-top code { font-size: 11px; }
       .lb-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+      .lb-tabs { display:flex; gap:8px; padding: 10px 12px; border-bottom: 1px solid #e5e7eb; background:#f9fafb; flex-wrap:wrap; }
+      .lb-tab { appearance:none; border:1px solid #e5e7eb; background:#fff; padding:6px 10px; border-radius:999px; cursor:pointer; font-weight:800; font-size: 12px; color:#111827; }
+      .lb-tab.active { background:#eef2ff; border-color:#c7d2fe; }
       .lb-body { background: #111827; display: flex; align-items: center; justify-content: center; padding: 10px; }
       .imgwrap { position: relative; display: inline-block; }
       .imgwrap img { max-width: 92vw; max-height: calc(92vh - 130px); width: auto; height: auto; display: block; background: #111827; }
+      .imgwrap video { max-width: 92vw; max-height: calc(92vh - 130px); width: auto; height: auto; display: block; background: #111827; }
       .imgwrap canvas { position: absolute; left: 0; top: 0; pointer-events: auto; }
       .lb-bottom { padding: 10px 12px; border-top: 1px solid #e5e7eb; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
       .rectlist { display:flex; gap:8px; flex-wrap:wrap; }
@@ -115,6 +145,8 @@
           <button class="btn" id="btnNext" type="button">→</button>
           <span class="pill">всего: <b id="total">—</b></span>
           <button class="btn" id="btnReload" type="button">Обновить</button>
+          <button class="btn" id="btnUndo" type="button" style="display:none;" title="Undo: отменить последнее нажатие кнопки разметки (1 шаг).">Undo</button>
+          <button class="btn" id="btnSortIntoFolders" type="button" title="Переместить файлы в папки по категориям: _non_media, _broken_media, _faces, _quarantine, _animals, _people_no_face, _no_faces">Переместить файлы в папки</button>
         </div>
 
         <div class="toolbar">
@@ -123,6 +155,17 @@
           <input class="inp" id="jumpRow" type="number" inputmode="numeric" min="1" step="1" placeholder="№" />
           <button class="btn" id="btnJump" type="button">Перейти</button>
           <span class="muted" id="jumpHint"></span>
+        </div>
+
+        <!-- Filters for tab=no_faces -->
+        <div class="toolbar" id="noFacesFilters" style="display:none;">
+          <span class="pill">Сортировка: <b>место → дата</b></span>
+          <span class="muted">период:</span>
+          <input class="inp" id="nfFrom" type="date" style="width: 150px;" />
+          <span class="muted">—</span>
+          <input class="inp" id="nfTo" type="date" style="width: 150px;" />
+          <button class="btn" id="btnNfApply" type="button">Применить</button>
+          <button class="btn" id="btnNfClear" type="button">Сброс</button>
         </div>
       </div>
 
@@ -141,9 +184,16 @@
             <button class="btn" id="lbClose" type="button">Закрыть</button>
           </div>
         </div>
+        <div class="lb-tabs" id="lbTabs" style="display:none;">
+          <button class="lb-tab" id="lbTabVideo" type="button">Видео</button>
+          <button class="lb-tab" id="lbTabF1" type="button">Кадр 1</button>
+          <button class="lb-tab" id="lbTabF2" type="button">Кадр 2</button>
+          <button class="lb-tab" id="lbTabF3" type="button">Кадр 3</button>
+        </div>
         <div class="lb-body">
           <div class="imgwrap" id="imgWrap">
             <img id="lbImg" alt="preview" />
+            <video id="lbVideo" controls preload="metadata" style="display:none;"></video>
             <canvas id="lbCanvas"></canvas>
           </div>
         </div>
@@ -196,6 +246,11 @@
       let totalCount = null;
       let loadedCount = 0;
       let jumpTargetRow = null; // 1-based
+
+      // no_faces filters
+      let nfFrom = null; // 'YYYY-MM-DD' or null
+      let nfTo = null;
+      const nfSort = "place_date";
 
       // visible-range tracking (for "где я?")
       const visibleRows = new Set();
@@ -267,6 +322,12 @@
       if (!["all","many_faces"].includes(subtab)) subtab = "all";
       if (tab !== "faces") subtab = "all";
 
+      // init no_faces filters from URL (only used when tab=no_faces)
+      nfFrom = (getParam("from") || "").toString().trim() || null;
+      nfTo = (getParam("to") || "").toString().trim() || null;
+      if (nfFrom && nfFrom.length > 10) nfFrom = nfFrom.slice(0, 10);
+      if (nfTo && nfTo.length > 10) nfTo = nfTo.slice(0, 10);
+
       function updateUrlParams() {
         const u = new URL(window.location.href);
         u.searchParams.set("tab", tab);
@@ -274,6 +335,17 @@
           u.searchParams.set("subtab", subtab);
         } else {
           u.searchParams.delete("subtab");
+        }
+        if (tab === "no_faces") {
+          u.searchParams.set("sort", nfSort);
+          if (nfFrom) u.searchParams.set("from", nfFrom);
+          else u.searchParams.delete("from");
+          if (nfTo) u.searchParams.set("to", nfTo);
+          else u.searchParams.delete("to");
+        } else {
+          u.searchParams.delete("sort");
+          u.searchParams.delete("from");
+          u.searchParams.delete("to");
         }
         window.history.replaceState({}, "", u.toString());
       }
@@ -295,6 +367,8 @@
         qs("#tabPeopleNoFace").classList.toggle("active", tab === "people_no_face");
         qs("#tabNoFaces").classList.toggle("active", tab === "no_faces");
         updateSubtabsVisibility();
+        const nf = qs("#noFacesFilters");
+        if (nf) nf.style.display = (tab === "no_faces") ? "flex" : "none";
       }
 
       function setSubtab(st) {
@@ -385,6 +459,16 @@
         const aPill = aKind ? `<span class="pill">animal: ${escapeHtml(aKind)}</span>` : ``;
         const pnfPerson = it.people_no_face_person || "";
         const pnfPill = (tab === "people_no_face" && pnfPerson) ? `<span class="pill">person: ${escapeHtml(pnfPerson)}</span>` : ``;
+        const placeC = (it.place_country || "").toString().trim();
+        const placeCity = (it.place_city || "").toString().trim();
+        const placeLabel = (placeC || placeCity) ? [placeC, placeCity].filter(Boolean).join(", ") : "";
+        const takenAt = (it.taken_at || "").toString();
+        const takenDate = (takenAt && takenAt.length >= 10) ? takenAt.slice(0, 10) : "";
+        const placePill = (tab === "no_faces" && placeLabel) ? `<span class="pill">место: ${escapeHtml(placeLabel)}</span>` : ``;
+        const datePill = (tab === "no_faces" && takenDate) ? `<span class="pill">дата: ${escapeHtml(takenDate)}</span>` : ``;
+        const framesBtn = (kind === "video" && pv)
+          ? `<button class="vfbtn" type="button" data-act="frames" data-path="${escapeHtml(path)}" data-src="${escapeHtml(pv)}">Кадры</button>`
+          : ``;
         const thumb = (kind === "image" && pv)
           ? `<img loading="lazy" alt="preview" referrerpolicy="no-referrer" src="${escapeHtml(pv)}" />`
           : (kind === "video" && pv)
@@ -395,6 +479,7 @@
           btn = `
             <button class="btn" data-action="mark_cat">Кот</button>
             <button class="btn" data-action="mark_quarantine">Карантин</button>
+            <button class="btn" data-action="people_no_face">Люди без лиц</button>
             <button class="btn danger" data-action="no_faces">Лиц нет</button>
           `;
         } else if (tab === "no_faces") {
@@ -410,15 +495,32 @@
             <button class="btn danger" data-action="no_faces">Лиц нет</button>
           `;
         } else if (tab === "animals") {
-          btn = `<button class="btn" data-action="mark_faces">Это не животное (лица)</button>`;
+          btn = `
+            <button class="btn" data-action="mark_faces">Это не животное (лица)</button>
+            <button class="btn danger" data-action="not_animal_no_faces">Это не животное (нет лиц)</button>
+          `;
         } else if (tab === "people_no_face") {
           btn = `<button class="btn" data-action="reset">Сброс</button>`;
         }
         const pastGold = !!it.sorted_past_gold;
         const cls = pastGold ? "card past-gold" : "card";
+        const qMan = Number(it.quarantine_manual || 0);
+        const pnfMan = Number(it.people_no_face_manual || 0);
+        const aMan = Number(it.animals_manual || 0);
+        const aManKind = (it.animals_manual_kind || "").toString();
+        const pnfPerson2 = (it.people_no_face_person || "").toString();
         return `
-          <div class="${cls}" data-path="${escapeHtml(path)}" data-row="${Number(rowNum || 0) || ""}">
+          <div class="${cls}"
+               data-path="${escapeHtml(path)}"
+               data-row="${Number(rowNum || 0) || ""}"
+               data-faces-manual="${escapeHtml(manual)}"
+               data-quarantine-manual="${escapeHtml(String(qMan))}"
+               data-people-no-face-manual="${escapeHtml(String(pnfMan))}"
+               data-people-no-face-person="${escapeHtml(pnfPerson2)}"
+               data-animals-manual="${escapeHtml(String(aMan))}"
+               data-animals-manual-kind="${escapeHtml(aManKind)}">
             <div class="thumb" data-path="${escapeHtml(path)}" data-kind="${escapeHtml(kind)}" data-src="${escapeHtml(pv)}">
+              ${framesBtn}
               ${thumb}
             </div>
             <div class="card-body">
@@ -430,6 +532,8 @@
                 ${qPill}
                 ${aPill}
                 ${pnfPill}
+                ${placePill}
+                ${datePill}
                 ${it.size_human ? `<span class="pill">${escapeHtml(it.size_human)}</span>` : ``}
               </div>
               <div class="actions">
@@ -460,7 +564,13 @@
           } else if (page === 1 && loadedCount === 0) {
             qs("#grid").innerHTML = `<div class="muted">Загрузка…</div>`;
           }
-          const data = await fetchJson(`/api/faces/results?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}&tab=${encodeURIComponent(tab)}&subtab=${encodeURIComponent(subtab)}&page=${encodeURIComponent(String(page))}&page_size=${encodeURIComponent(String(pageSize))}`);
+          let url = `/api/faces/results?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}&tab=${encodeURIComponent(tab)}&subtab=${encodeURIComponent(subtab)}&page=${encodeURIComponent(String(page))}&page_size=${encodeURIComponent(String(pageSize))}`;
+          if (tab === "no_faces") {
+            url += `&sort=${encodeURIComponent(nfSort)}`;
+            if (nfFrom) url += `&from=${encodeURIComponent(String(nfFrom))}`;
+            if (nfTo) url += `&to=${encodeURIComponent(String(nfTo))}`;
+          }
+          const data = await fetchJson(url);
           // #region agent log
           fetch('http://127.0.0.1:7242/ingest/6ba4f132-2ab7-473c-8c73-3e4f328ef941',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app/templates/faces.html:load',message:'ui_load_result',data:{tab:tab,subtab:subtab,total:Number(data?.total??-1),items_len:Array.isArray(data?.items)?data.items.length:-1},timestamp:Date.now(),sessionId:'debug-session',runId:'pre-fix',hypothesisId:'HAPI_FILTER'})}).catch(()=>{});
           // #endregion agent log
@@ -507,8 +617,38 @@
               try {
                 const removeCard = () => removeCardByPath(p);
 
+                function _getPrevManualFromCard(cardEl) {
+                  const c = cardEl || {};
+                  const facesManual = (c.getAttribute?.("data-faces-manual") || "").toString().trim().toLowerCase();
+                  const qMan = Number(c.getAttribute?.("data-quarantine-manual") || 0);
+                  const pnfMan = Number(c.getAttribute?.("data-people-no-face-manual") || 0);
+                  const pnfPerson = (c.getAttribute?.("data-people-no-face-person") || "").toString() || "";
+                  const aMan = Number(c.getAttribute?.("data-animals-manual") || 0);
+                  const aManKind = (c.getAttribute?.("data-animals-manual-kind") || "").toString().trim().toLowerCase();
+                  // precedence for UNDO snapshot: pick current run-scoped manual state
+                  if (pnfMan === 1) return { label: "people_no_face", person: (pnfPerson || null) };
+                  if (facesManual === "faces") return { label: "faces", person: null };
+                  if (facesManual === "no_faces") return { label: "no_faces", person: null };
+                  if (qMan === 1) return { label: "quarantine", person: null };
+                  if (aMan === 1) return { label: (aManKind === "cat" ? "cat" : "cat"), person: null };
+                  return { label: "", person: null };
+                }
+
+                function _setUndo(state) {
+                  window.__lastUndo = state || null;
+                  const b = qs("#btnUndo");
+                  if (!b) return;
+                  if (window.__lastUndo && window.__lastUndo.path) {
+                    b.style.display = "";
+                  } else {
+                    b.style.display = "none";
+                  }
+                }
+
                 if (action === "no_faces") {
+                  const prev = _getPrevManualFromCard(card);
                   await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "no_faces" });
+                  _setUndo({ path: p, prev_label: prev.label, prev_person: prev.person });
                   if (tab === "faces" || tab === "quarantine") {
                     removeCard();
                     await refreshTabCounts();
@@ -516,9 +656,22 @@
                     await load(true);
                   }
                 } else if (action === "mark_faces") {
+                  const prev = _getPrevManualFromCard(card);
                   await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "faces" });
+                  _setUndo({ path: p, prev_label: prev.label, prev_person: prev.person });
                   // В карантине/животных разметка идёт потоком: без перезагрузки списка.
                   if (tab === "quarantine" || tab === "animals") {
+                    removeCard();
+                    await refreshTabCounts();
+                  } else {
+                    await load(true);
+                  }
+                } else if (action === "not_animal_no_faces") {
+                  const prev = _getPrevManualFromCard(card);
+                  await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "not_animal_no_faces" });
+                  _setUndo({ path: p, prev_label: prev.label, prev_person: prev.person });
+                  // Потоковая чистка ложных котов: без reload списка, просто убираем карточку.
+                  if (tab === "animals") {
                     removeCard();
                     await refreshTabCounts();
                   } else {
@@ -531,7 +684,9 @@
                     fetch('http://127.0.0.1:7242/ingest/6ba4f132-2ab7-473c-8c73-3e4f328ef941',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app/templates/faces.html:mark_cat',message:'ui_click_mark_cat',data:{tab:tab,basename:bn||""},timestamp:Date.now(),sessionId:'debug-session',runId:'pre-fix',hypothesisId:'HNOFACES_CAT'})}).catch(()=>{});
                   } catch (e) {}
                   // #endregion agent log
+                  const prev = _getPrevManualFromCard(card);
                   await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "cat" });
+                  _setUndo({ path: p, prev_label: prev.label, prev_person: prev.person });
                   // Потоковое действие: без прыжков/перезагрузки списка
                   if (tab === "faces" || tab === "quarantine" || tab === "no_faces") {
                     removeCard();
@@ -540,7 +695,9 @@
                     await load(true);
                   }
                 } else if (action === "mark_quarantine") {
+                  const prev = _getPrevManualFromCard(card);
                   await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "quarantine" });
+                  _setUndo({ path: p, prev_label: prev.label, prev_person: prev.person });
                   // На вкладке Faces не хотим дёргать список/скролл — просто убираем карточку.
                   if (tab === "faces") {
                     removeCard();
@@ -553,12 +710,16 @@
                   const src = thumb?.getAttribute("data-src") || "";
                   await openAnnotate(p, src);
                 } else if (action === "people_no_face") {
+                  const prev = _getPrevManualFromCard(card);
                   await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "people_no_face" });
+                  _setUndo({ path: p, prev_label: prev.label, prev_person: prev.person });
                   // Потоковая разметка: уводим карточку без reload (иначе прыгает список).
                   removeCard();
                   await refreshTabCounts();
                 } else if (action === "reset") {
+                  const prev = _getPrevManualFromCard(card);
                   await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "" });
+                  _setUndo({ path: p, prev_label: prev.label, prev_person: prev.person });
                   // На вкладке people_no_face это "потоковый" сброс: просто убираем карточку.
                   removeCard();
                   await refreshTabCounts();
@@ -578,6 +739,17 @@
               await openViewer(p, src, { mode: "view" });
             });
           });
+
+          // video frames button (do not rely on dblclick: <video controls> eats events)
+          qsa("button.vfbtn[data-act='frames']").slice(-items.length * 1 - 2000).forEach(el => {
+            el.addEventListener("click", async (e) => {
+              try { e.preventDefault(); e.stopPropagation(); } catch (ee) {}
+              const p = el.getAttribute("data-path") || "";
+              const src = el.getAttribute("data-src") || "";
+              if (!p || !src) return;
+              await openVideoViewer(p, src);
+            });
+          });
         } catch (e) {
           setToast(e?.message || String(e), true);
           if (loadedCount === 0) qs("#grid").innerHTML = "";
@@ -590,6 +762,7 @@
       // --- viewer / annotate ---
       const lb = qs("#lightbox");
       const lbImg = qs("#lbImg");
+      const lbVideo = qs("#lbVideo");
       const lbCanvas = qs("#lbCanvas");
       const lbCtx = lbCanvas.getContext("2d");
       const lbPath = qs("#lbPath");
@@ -598,6 +771,11 @@
       const lbClear = qs("#lbClear");
       const lbSave = qs("#lbSave");
       const rectList = qs("#rectList");
+      const lbTabs = qs("#lbTabs");
+      const lbTabVideo = qs("#lbTabVideo");
+      const lbTabF1 = qs("#lbTabF1");
+      const lbTabF2 = qs("#lbTabF2");
+      const lbTabF3 = qs("#lbTabF3");
       let curPath = "";
       let curAutoRects = [];   // auto (read-only)
       let curManualRects = []; // manual (editable)
@@ -606,20 +784,32 @@
       let dragStart = null;
       let tempRect = null;
       let curSrc = "";
+      let curKind = "image"; // 'image' | 'video'
+      let curVideoSrc = "";
+      let curVideoFrameIdx = 0; // 0=video, 1..3=frame
+      let curVideoFrames = null; // {frames:[...]}
 
       function closeLb() {
         lb.classList.remove("open");
         lb.setAttribute("aria-hidden","true");
+        try { if (lbVideo) { lbVideo.pause(); lbVideo.removeAttribute("src"); lbVideo.load(); } } catch (e) {}
         curPath = "";
         curSrc = "";
         curAutoRects = [];
         curManualRects = [];
+        curKind = "image";
+        curVideoSrc = "";
+        curVideoFrameIdx = 0;
+        curVideoFrames = null;
         drawEnabled = false;
         dragging = false;
         dragStart = null;
         tempRect = null;
         lbCanvas.classList.remove("draw-on");
         if (lbAnnotate) lbAnnotate.style.display = "none";
+        if (lbTabs) lbTabs.style.display = "none";
+        if (lbImg) lbImg.style.display = "";
+        if (lbVideo) lbVideo.style.display = "none";
       }
       qs("#lbClose").onclick = closeLb;
       lb.addEventListener("click", (e) => { if (e.target === lb) closeLb(); });
@@ -643,6 +833,9 @@
         if (!lbCtx) return;
         resizeCanvasToImage();
         lbCtx.clearRect(0,0,lbCanvas.width, lbCanvas.height);
+        if (curKind === "video" && curVideoFrameIdx === 0) {
+          return; // no overlay on video playback
+        }
         const iw = lbImg.naturalWidth || 1;
         const ih = lbImg.naturalHeight || 1;
         const sx = lbCanvas.width / iw;
@@ -679,11 +872,15 @@
       }
 
       async function openViewer(path, src, opts={}) {
+        curKind = "image";
         curPath = path;
         curSrc = src || "";
         lbPath.textContent = path;
         lbImg.referrerPolicy = "no-referrer";
         lbImg.draggable = false;
+        if (lbTabs) lbTabs.style.display = "none";
+        if (lbVideo) lbVideo.style.display = "none";
+        if (lbImg) lbImg.style.display = "";
         lbImg.src = src;
         const isAnnotate = (opts.mode === "annotate");
         lbMode.textContent = isAnnotate ? "разметка" : "просмотр";
@@ -710,10 +907,103 @@
         drawOverlay();
       }
 
+      function _lbTabSetActive(which) {
+        [lbTabVideo, lbTabF1, lbTabF2, lbTabF3].forEach(b => {
+          if (!b) return;
+          b.classList.toggle("active", b === which);
+        });
+      }
+
+      async function _ensureVideoFramesLoaded() {
+        if (curVideoFrames) return curVideoFrames;
+        const data = await fetchJson(`/api/faces/video-manual-frames?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}&path=${encodeURIComponent(curPath)}`);
+        curVideoFrames = data || { frames: [] };
+        return curVideoFrames;
+      }
+
+      function _videoFrameObj(idx) {
+        const arr = (curVideoFrames && Array.isArray(curVideoFrames.frames)) ? curVideoFrames.frames : [];
+        return arr.find(x => Number(x?.frame_idx) === Number(idx)) || { frame_idx: idx, t_sec: null, rects: [] };
+      }
+
+      async function _showVideoTab() {
+        curKind = "video";
+        curVideoFrameIdx = 0;
+        drawEnabled = false;
+        lbCanvas.classList.remove("draw-on");
+        lbMode.textContent = "видео";
+        if (lbAnnotate) lbAnnotate.style.display = "none";
+        lbClear.style.display = "none";
+        lbSave.style.display = "none";
+        curAutoRects = [];
+        curManualRects = [];
+        renderRectList();
+        if (lbImg) lbImg.style.display = "none";
+        if (lbVideo) {
+          lbVideo.style.display = "";
+          lbVideo.src = curVideoSrc || "";
+        }
+        drawOverlay();
+      }
+
+      async function _showVideoFrame(idx) {
+        curKind = "video";
+        curVideoFrameIdx = Number(idx);
+        if (!(curVideoFrameIdx >= 1 && curVideoFrameIdx <= 3)) return;
+        if (lbVideo) {
+          try { lbVideo.pause(); } catch (e) {}
+          lbVideo.style.display = "none";
+        }
+        if (lbImg) lbImg.style.display = "";
+        // default mode: view (allow "Разметить")
+        lbMode.textContent = "просмотр";
+        if (lbAnnotate) lbAnnotate.style.display = "";
+        lbClear.style.display = "none";
+        lbSave.style.display = "none";
+        drawEnabled = false;
+        lbCanvas.classList.remove("draw-on");
+
+        await _ensureVideoFramesLoaded().catch(() => ({ frames: [] }));
+        const fr = _videoFrameObj(curVideoFrameIdx);
+        curAutoRects = [];
+        curManualRects = Array.isArray(fr.rects) ? fr.rects.map(r => ({ x:Number(r.x||0), y:Number(r.y||0), w:Number(r.w||0), h:Number(r.h||0) })) : [];
+
+        const frameUrl = `/api/faces/video-frame?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}&path=${encodeURIComponent(curPath)}&frame_idx=${encodeURIComponent(String(curVideoFrameIdx))}`;
+        lbImg.referrerPolicy = "no-referrer";
+        lbImg.draggable = false;
+        lbImg.src = frameUrl;
+        await new Promise((resolve) => {
+          if (lbImg.complete) return resolve();
+          lbImg.onload = () => resolve();
+          lbImg.onerror = () => resolve();
+        });
+        renderRectList();
+        drawOverlay();
+      }
+
+      async function openVideoViewer(path, src) {
+        curKind = "video";
+        curPath = path;
+        curVideoSrc = src || "";
+        curSrc = ""; // img preview is not used
+        lbPath.textContent = path;
+        if (lbTabs) lbTabs.style.display = "";
+
+        lb.classList.add("open");
+        lb.setAttribute("aria-hidden","false");
+
+        curVideoFrames = null;
+        await _ensureVideoFramesLoaded().catch(() => ({ frames: [] }));
+        _lbTabSetActive(lbTabVideo);
+        await _showVideoTab();
+      }
+
       // Переключение "просмотр" -> "разметка" прямо в модалке
       if (lbAnnotate) {
         lbAnnotate.onclick = async () => {
-          if (!curPath || !curSrc) return;
+          if (!curPath) return;
+          // Для картинок нужен src. Для видео-кадров src = /api/faces/video-frame..., он уже стоит в lbImg.
+          if (curKind === "image" && !curSrc) return;
           // Просто перевключаем UI-флаги, прямоугольники уже загружены в curAutoRects/curManualRects
           lbMode.textContent = "разметка";
           lbClear.style.display = "";
@@ -788,7 +1078,18 @@
       lbSave.onclick = async () => {
         try {
           const savedPath = curPath;
-          await postJson("/api/faces/manual-rectangles", { pipeline_run_id: Number(pipelineRunId), path: curPath, rects: curManualRects });
+          if (curKind === "video" && curVideoFrameIdx >= 1 && curVideoFrameIdx <= 3) {
+            const fr = _videoFrameObj(curVideoFrameIdx);
+            await postJson("/api/faces/video-manual-frame", {
+              pipeline_run_id: Number(pipelineRunId),
+              path: curPath,
+              frame_idx: Number(curVideoFrameIdx),
+              t_sec: fr?.t_sec ?? null,
+              rects: curManualRects
+            });
+          } else {
+            await postJson("/api/faces/manual-rectangles", { pipeline_run_id: Number(pipelineRunId), path: curPath, rects: curManualRects });
+          }
           closeLb();
           // На вкладке "Нет лиц" это потоковая операция: карточка должна уйти в "Есть лица" без прыжков списка.
           if (tab === "no_faces") {
@@ -806,12 +1107,50 @@
         await openViewer(path, src, { mode: "annotate" });
       }
 
+      // video tabs
+      try {
+        if (lbTabVideo) lbTabVideo.onclick = async () => { _lbTabSetActive(lbTabVideo); await _showVideoTab(); };
+        if (lbTabF1) lbTabF1.onclick = async () => { _lbTabSetActive(lbTabF1); await _showVideoFrame(1); };
+        if (lbTabF2) lbTabF2.onclick = async () => { _lbTabSetActive(lbTabF2); await _showVideoFrame(2); };
+        if (lbTabF3) lbTabF3.onclick = async () => { _lbTabSetActive(lbTabF3); await _showVideoFrame(3); };
+      } catch (e) {}
+
       // init from query
       const rid = getParam("pipeline_run_id");
       if (rid && /^\d+$/.test(rid)) pipelineRunId = Number(rid);
       qs("#prId").textContent = pipelineRunId != null ? String(pipelineRunId) : "—";
       applyTabUI();
       updateUrlParams();
+      // open video modal directly (used by /gold "Кадры" button)
+      try {
+        const ovp = getParam("open_video_path");
+        if (ovp && pipelineRunId != null && String(ovp).startsWith("local:")) {
+          const src = `/api/local/preview?path=${encodeURIComponent(String(ovp))}&pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}`;
+          // small delay so modal elements are ready
+          setTimeout(() => { openVideoViewer(String(ovp), src).catch(() => {}); }, 50);
+        }
+      } catch (e) {}
+      // wire no_faces filters
+      try {
+        if (nfFrom) qs("#nfFrom").value = nfFrom;
+        if (nfTo) qs("#nfTo").value = nfTo;
+        qs("#btnNfApply").onclick = () => {
+          nfFrom = (qs("#nfFrom")?.value || "").toString().trim() || null;
+          nfTo = (qs("#nfTo")?.value || "").toString().trim() || null;
+          updateUrlParams();
+          page = 1;
+          load(true);
+        };
+        qs("#btnNfClear").onclick = () => {
+          nfFrom = null;
+          nfTo = null;
+          if (qs("#nfFrom")) qs("#nfFrom").value = "";
+          if (qs("#nfTo")) qs("#nfTo").value = "";
+          updateUrlParams();
+          page = 1;
+          load(true);
+        };
+      } catch (e) {}
       // sentinel for infinite scroll
       const sentinel = document.createElement("div");
       sentinel.id = "sentinel";
@@ -832,6 +1171,64 @@
 
       refreshTabCounts();
       load(true);
+
+      // one-step Undo (last manual-label action)
+      qs("#btnUndo").onclick = async () => {
+        const st = window.__lastUndo || null;
+        if (!st || !st.path) return;
+        try {
+          qs("#btnUndo").disabled = true;
+          const payload = { pipeline_run_id: Number(pipelineRunId), path: String(st.path), label: String(st.prev_label || "") };
+          if (String(st.prev_label || "") === "people_no_face" && st.prev_person) {
+            payload.person = String(st.prev_person);
+          }
+          await postJson("/api/faces/manual-label", payload);
+          window.__lastUndo = null;
+          qs("#btnUndo").style.display = "none";
+          await refreshTabCounts();
+          await load(true);
+          setToast("Undo: откатил последнее действие.");
+        } catch (e) {
+          setToast(e?.message || String(e), true);
+        } finally {
+          qs("#btnUndo").disabled = false;
+        }
+      };
+
+      // Sort into folders
+      qs("#btnSortIntoFolders").onclick = async () => {
+        if (pipelineRunId == null) {
+          setToast("pipeline_run_id не задан", true);
+          return;
+        }
+        if (!confirm("Переместить файлы в папки по категориям?\n\nШаг 1: _non_media, _broken_media\nШаг 3: _faces, _quarantine, _animals, _people_no_face, _no_faces\n\nЭто действие переместит файлы на YaDisk (или локально) в соответствующие папки.")) {
+          return;
+        }
+        try {
+          qs("#btnSortIntoFolders").disabled = true;
+          setToast("Сортировка файлов...");
+          const payload = { pipeline_run_id: Number(pipelineRunId), dry_run: false };
+          const resp = await postJson("/api/faces/sort-into-folders", payload);
+          if (resp.ok) {
+            const moved = resp.moved_count || 0;
+            const errors = resp.errors || [];
+            if (errors.length > 0) {
+              setToast(`Перенесено: ${moved}, ошибок: ${errors.length}`, true);
+              console.error("Sort errors:", errors);
+            } else {
+              setToast(`Успешно перенесено файлов: ${moved}`);
+            }
+            await refreshTabCounts();
+            await load(true);
+          } else {
+            setToast("Ошибка при сортировке", true);
+          }
+        } catch (e) {
+          setToast(e?.message || String(e), true);
+        } finally {
+          qs("#btnSortIntoFolders").disabled = false;
+        }
+      };
     </script>
   </body>
 </html>

@@ -32,7 +32,24 @@
       .card { width: 240px; border:1px solid #e5e7eb; border-radius:12px; overflow:hidden; background:#fff; }
       .thumb { height: 140px; background:#fff; display:flex; align-items:center; justify-content:center; position:relative; cursor: zoom-in; }
       .thumb img { width: 100%; height: 100%; object-fit: contain; display:block; background:#fff; }
+      .thumb video { width: 100%; height: 100%; object-fit: contain; display:block; background:#111827; }
       .thumb .noimg { color:#6b7280; font-size:12px; padding:10px; text-align:center; }
+      .vfbtn {
+        position: absolute;
+        right: 8px;
+        top: 8px;
+        z-index: 5;
+        padding: 4px 8px;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,0.55);
+        background: rgba(17,24,39,0.72);
+        color: #fff;
+        font-size: 12px;
+        font-weight: 800;
+        cursor: pointer;
+        user-select: none;
+      }
+      .vfbtn:hover { background: rgba(17,24,39,0.85); }
       .card-body { padding: 10px 10px 12px 10px; }
       .path { font-size: 12px; word-break: break-all; }
       .kv { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; font-size:12px; color:#374151; }
@@ -86,26 +103,92 @@
         <span class="muted" id="toast"></span>
       </div>
 
-      <div class="tabs" id="tabs"></div>
-
-      <div class="toolbar">
-        <input id="q" type="text" placeholder="поиск по подстроке (например IMG-2024)" />
-        <input id="pipelineRunId" type="number" min="0" step="1" placeholder="pipeline_run_id (опционально)" />
-        <input id="limit" type="number" min="20" step="20" value="120" style="min-width:120px;" title="Размер пачки для дочитки (infinite scroll)" />
+      <!-- 1st-level tabs -->
+      <div class="tabs" id="level1Tabs">
+        <button class="tab active" data-view="lists" type="button">Списки</button>
+        <button class="tab" data-view="reports" type="button">Отчёты</button>
       </div>
 
-      <div class="muted small" style="margin-top:6px;">
-        Подсказка: `pipeline_run_id` ограничивает обновление только файлами из root этого прогона (если указан).
+      <div id="viewLists">
+        <div class="tabs" id="tabs"></div>
       </div>
 
-      <div class="pager">
-        <span class="pill">всего: <b id="curTotal">—</b></span>
-        <span class="pill">загружено: <b id="curLoaded">0</b></span>
-        <button class="btn" id="btnLoadMore" type="button">Дочитать ещё</button>
+      <div id="viewReports" style="display:none;">
+        <div class="tabs" id="reportTabs">
+          <button class="tab active" data-report="duplicates" type="button">Дубли</button>
+          <button class="tab" data-report="runs" type="button">Статистика прогонов</button>
+        </div>
+
+        <div class="section" id="reportsDuplicates" style="margin-top:14px; border:1px solid #e5e7eb; border-radius:14px; padding:12px 14px; background:#fff;">
+          <div class="row" style="justify-content: space-between;">
+            <div>
+              <div style="font-weight:800;">Duplicates в gold</div>
+              <div class="muted small" style="margin-top:6px;">Пути, которые встречаются в нескольких `*_gold.txt` одновременно.</div>
+            </div>
+            <div class="muted small">Кнопки “Оставить в …” удаляют путь из остальных gold‑списков.</div>
+          </div>
+        </div>
+
+        <div class="section" id="reportsRuns" style="display:none; margin-top:14px; border:1px solid #e5e7eb; border-radius:14px; padding:12px 14px; background:#fff;">
+          <div class="row" style="justify-content: space-between;">
+            <div>
+              <div style="font-weight:800;">Прогоны и метрики (по gold)</div>
+              <div class="muted small" style="margin-top:6px;">
+                Метрики считаются “как в UI” (effective). Для старых прогонов без снапшота может быть “—”.
+              </div>
+            </div>
+            <div class="row">
+              <input id="runsLimit" type="number" min="5" step="5" value="20" style="min-width:120px;" title="Сколько последних прогонов показать" />
+              <label class="muted small" style="display:flex; align-items:center; gap:6px; user-select:none;">
+                <input id="runsIncludeFailed" type="checkbox" />
+                показывать failed
+              </label>
+              <button class="btn" id="btnRunsReload" type="button">Обновить</button>
+            </div>
+          </div>
+          <div style="overflow:auto; margin-top:10px;">
+            <table style="border-collapse: collapse; width: 100%; min-width: 980px;">
+              <thead>
+                <tr>
+                  <th style="border-bottom:1px solid #e5e7eb; padding:8px 6px;">Прогон</th>
+                  <th style="border-bottom:1px solid #e5e7eb; padding:8px 6px;">Статус</th>
+                  <th style="border-bottom:1px solid #e5e7eb; padding:8px 6px;">Начало</th>
+                  <th style="border-bottom:1px solid #e5e7eb; padding:8px 6px;">Окончание</th>
+                  <th style="border-bottom:1px solid #e5e7eb; padding:8px 6px;">Отсортировано (шаг 2)</th>
+                  <th style="border-bottom:1px solid #e5e7eb; padding:8px 6px;">Коты мимо</th>
+                  <th style="border-bottom:1px solid #e5e7eb; padding:8px 6px;">Лица мимо</th>
+                  <th style="border-bottom:1px solid #e5e7eb; padding:8px 6px;">Нет лиц мимо</th>
+                </tr>
+              </thead>
+              <tbody id="runsTbody">
+                <tr><td colspan="8" class="muted" style="padding:10px 6px;">—</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
       </div>
 
-      <div class="grid" id="grid"></div>
-      <div class="sentinel" id="sentinel"></div>
+      <!-- shared list UI (used by: Lists + Reports/Duplicates) -->
+      <div id="listUi">
+        <div class="toolbar" style="margin-top:12px;">
+          <input id="q" type="text" placeholder="поиск по подстроке (например IMG-2024)" />
+          <input id="pipelineRunId" type="number" min="0" step="1" placeholder="pipeline_run_id (по умолчанию: последний)" />
+          <input id="limit" type="number" min="20" step="20" value="120" style="min-width:120px;" title="Размер пачки для дочитки (infinite scroll)" />
+        </div>
+
+        <div class="muted small" style="margin-top:6px;">
+          Подсказка: если `pipeline_run_id` пустой — берём последний прогон. Если указан — ограничиваем только root этого прогона.
+        </div>
+
+        <div class="pager">
+          <span class="pill">всего: <b id="curTotal">—</b></span>
+          <span class="pill">загружено: <b id="curLoaded">0</b></span>
+          <button class="btn" id="btnLoadMore" type="button">Дочитать ещё</button>
+        </div>
+
+        <div class="grid" id="grid"></div>
+        <div class="sentinel" id="sentinel"></div>
+      </div>
     </div>
 
     <div class="lb" id="lightbox" aria-hidden="true">
@@ -162,6 +245,7 @@
       }
 
       let names = [];
+      let listNames = [];
       let nameCounts = {};
       let cur = null;
       let nextCursor = null;
@@ -169,6 +253,70 @@
       let loading = false;
       const cardByRaw = new Map();
       const itemByRaw = new Map();
+      let view = "lists";      // 'lists'|'reports'
+      let report = "duplicates"; // 'duplicates'|'runs'
+
+      function fmtMiss(obj) {
+        if (obj && obj.total === null) return "—";
+        const total = Number(obj?.total ?? 0);
+        const mism = Number(obj?.mism ?? 0);
+        if (!Number.isFinite(total) || total <= 0) return "—";
+        const pct = (100.0 * mism / total);
+        return `${mism}/${total} (${pct.toFixed(1)}%)`;
+      }
+
+      function fmtSorted(proc, total) {
+        const t = (total == null) ? null : Number(total);
+        const p = (proc == null) ? null : Number(proc);
+        if (t == null || !Number.isFinite(t) || t <= 0) return "—";
+        if (p == null || !Number.isFinite(p)) return `${t}`;
+        return `${p}/${t}`;
+      }
+
+      async function loadRunsMetrics() {
+        const tb = qs("#runsTbody");
+        if (!tb) return;
+        const lim = Number(qs("#runsLimit")?.value ?? 20);
+        const limit = Number.isFinite(lim) ? Math.max(5, Math.min(200, Math.floor(lim))) : 20;
+        const includeFailed = !!qs("#runsIncludeFailed")?.checked;
+        tb.innerHTML = `<tr><td colspan="8" class="muted" style="padding:10px 6px;">загрузка…</td></tr>`;
+        try {
+          const q = `limit=${encodeURIComponent(String(limit))}&include_failed=${includeFailed ? "1" : "0"}`;
+          const j = await fetchJson(`/api/gold/runs-metrics?${q}`, { cache:"no-store" });
+          const items = Array.isArray(j?.items) ? j.items : [];
+          if (!items.length) {
+            tb.innerHTML = `<tr><td colspan="8" class="muted" style="padding:10px 6px;">нет прогонов</td></tr>`;
+            return;
+          }
+          tb.innerHTML = items.map(r => {
+            const rid = r?.pipeline_run_id ?? "—";
+            const st = (r?.status ?? "—").toString();
+            const sa = (r?.started_at ?? "—").toString();
+            const fa = (r?.finished_at ?? "—").toString();
+            const sorted = fmtSorted(r?.sorted_step2_processed, r?.sorted_step2_total);
+            const src = (r?.metrics_source ?? "").toString();
+            const hint = (src === "snapshot")
+              ? "снапшот (стабильно)"
+              : ((src === "pending")
+                ? "прогон ещё идёт: метрики появятся после завершения (снапшот)"
+                : "нет снапшота для этого прогона");
+            return `
+              <tr>
+                <td style="border-bottom:1px solid #f3f4f6; padding:8px 6px;"><a href="/faces?pipeline_run_id=${encodeURIComponent(String(rid))}" target="_blank" rel="noopener noreferrer">${escapeHtml(String(rid))}</a></td>
+                <td style="border-bottom:1px solid #f3f4f6; padding:8px 6px;">${escapeHtml(st)}</td>
+                <td style="border-bottom:1px solid #f3f4f6; padding:8px 6px;"><code>${escapeHtml(sa)}</code></td>
+                <td style="border-bottom:1px solid #f3f4f6; padding:8px 6px;"><code>${escapeHtml(fa)}</code></td>
+                <td style="border-bottom:1px solid #f3f4f6; padding:8px 6px;">${escapeHtml(String(sorted))}</td>
+                <td style="border-bottom:1px solid #f3f4f6; padding:8px 6px;" title="${escapeHtml(hint)}">${escapeHtml(fmtMiss(r?.cats))}</td>
+                <td style="border-bottom:1px solid #f3f4f6; padding:8px 6px;" title="${escapeHtml(hint)}">${escapeHtml(fmtMiss(r?.faces))}</td>
+                <td style="border-bottom:1px solid #f3f4f6; padding:8px 6px;" title="${escapeHtml(hint)}">${escapeHtml(fmtMiss(r?.no_faces))}</td>
+              </tr>
+            `;
+          }).join("");
+        } catch (e) {
+          tb.innerHTML = `<tr><td colspan="8" class="muted" style="padding:10px 6px;">ошибка: ${escapeHtml(e?.message || String(e))}</td></tr>`;
+        }
+      }
 
       // lightbox
       const lb = qs("#lightbox");
@@ -236,7 +384,8 @@
 
       function renderTabs() {
         const el = qs("#tabs");
-        el.innerHTML = names.map(n => {
+        const show = (view === "lists") ? (listNames || []) : [];
+        el.innerHTML = show.map(n => {
           const active = (n === cur) ? "active" : "";
           const cnt = Number(nameCounts?.[n] ?? 0);
           const badge = Number.isFinite(cnt) ? ` <span class="pill" style="margin-left:6px;">${cnt}</span>` : "";
@@ -256,10 +405,79 @@
         const data = await fetchJson("/api/gold/names");
         names = Array.isArray(data?.names) ? data.names : [];
         nameCounts = (data?.counts && typeof data.counts === "object") ? data.counts : {};
-        if (!cur && names.length) cur = names[0];
-        if (cur && !names.includes(cur)) cur = names[0] || null;
+        listNames = (names || []).filter(n => n !== "duplicates");
+        if (view === "lists") {
+          if (!cur && listNames.length) cur = listNames[0];
+          if (cur && !listNames.includes(cur)) cur = listNames[0] || null;
+        }
         renderTabs();
       }
+
+      function renderLevel1Tabs() {
+        qsa("#level1Tabs button.tab[data-view]").forEach(b => {
+          const v = b.getAttribute("data-view") || "";
+          b.classList.toggle("active", v === view);
+        });
+      }
+      function renderReportTabs() {
+        qsa("#reportTabs button.tab[data-report]").forEach(b => {
+          const r = b.getAttribute("data-report") || "";
+          b.classList.toggle("active", r === report);
+        });
+      }
+      function setReport(next) {
+        report = next || "duplicates";
+        renderReportTabs();
+        const dup = qs("#reportsDuplicates");
+        const runs = qs("#reportsRuns");
+        if (dup) dup.style.display = (report === "duplicates") ? "" : "none";
+        if (runs) runs.style.display = (report === "runs") ? "" : "none";
+        if (report === "runs") {
+          // hide list UI, show metrics
+          qs("#listUi").style.display = "none";
+          loadRunsMetrics();
+        } else {
+          // show list UI in duplicates mode, but without gold tabs
+          qs("#listUi").style.display = "";
+          qs("#tabs").style.display = "none";
+          cur = "duplicates";
+          resetList();
+          loadList(true);
+        }
+      }
+      function setView(next) {
+        view = next || "lists";
+        renderLevel1Tabs();
+        const vLists = qs("#viewLists");
+        const vReports = qs("#viewReports");
+        if (view === "lists") {
+          if (vReports) vReports.style.display = "none";
+          if (vLists) vLists.style.display = "";
+          qs("#listUi").style.display = "";
+          qs("#tabs").style.display = "";
+          if (!cur || !listNames.includes(cur)) cur = listNames[0] || null;
+          renderTabs();
+          resetList();
+          loadList(true);
+        } else {
+          if (vReports) vReports.style.display = "";
+          if (vLists) vLists.style.display = "none";
+          // default report tab
+          setReport(report || "duplicates");
+        }
+      }
+
+      // bind view switches
+      qsa("#level1Tabs button.tab[data-view]").forEach(b => {
+        b.addEventListener("click", () => setView(b.getAttribute("data-view")));
+      });
+      qsa("#reportTabs button.tab[data-report]").forEach(b => {
+        b.addEventListener("click", () => setReport(b.getAttribute("data-report")));
+      });
+
+      // runs metrics reload
+      const btnRunsReload = qs("#btnRunsReload");
+      if (btnRunsReload) btnRunsReload.addEventListener("click", () => loadRunsMetrics());
 
       function cardHtml(it) {
         const raw = it?.raw_path || "";
@@ -270,10 +488,28 @@
         const mt = it?.mime_type ? `${escapeHtml(it.mime_type)}` : "—";
         const rects = Array.isArray(it?.manual_rects) ? it.manual_rects : [];
         const rectPill = (cur === "faces_gold" && rects.length) ? `<span class="pill">rects: ${rects.length}</span>` : ``;
-        const thumb = (kind === "image" && pv) ? `<img loading="lazy" src="${escapeHtml(pv)}" alt="preview" />` : `<div class="noimg">—</div>`;
+        const dupNames = Array.isArray(it?.dup_names) ? it.dup_names : [];
+        const dupPills = (cur === "duplicates" && dupNames.length)
+          ? dupNames.map(n => `<span class="pill">${escapeHtml(n)}</span>`).join("")
+          : ``;
+        const framesBtn = (kind === "video" && pv)
+          ? `<button class="vfbtn" data-act="frames" data-path="${escapeHtml(path)}" type="button">Кадры</button>`
+          : ``;
+        const thumb = (kind === "image" && pv)
+          ? `<img loading="lazy" src="${escapeHtml(pv)}" alt="preview" />`
+          : (kind === "video" && pv)
+            ? `<video controls muted preload="metadata" src="${escapeHtml(pv)}"></video>`
+            : `<div class="noimg">—</div>`;
+        let actionsHtml = `<button class="btn danger" data-act="del" data-path="${escapeHtml(raw)}" type="button">Удалить</button>`;
+        if (cur === "duplicates") {
+          // Resolve: keep in exactly one gold list
+          const btns = (dupNames || []).map(n => `<button class="btn" data-act="keep" data-keep="${escapeHtml(n)}" type="button">Оставить в ${escapeHtml(n)}</button>`).join("");
+          actionsHtml = btns || `<span class="muted small">Нет дублей.</span>`;
+        }
         return `
           <div class="card" data-raw="${escapeHtml(raw)}">
             <div class="thumb" data-act="lb">
+              ${framesBtn}
               ${thumb}
             </div>
             <div class="card-body">
@@ -281,9 +517,10 @@
               <div class="kv">
                 <span class="pill">${mt}</span>
                 ${rectPill}
+                ${dupPills}
               </div>
               <div class="actions">
-                <button class="btn danger" data-act="del" data-path="${escapeHtml(raw)}" type="button">Удалить</button>
+                ${actionsHtml}
               </div>
             </div>
           </div>
@@ -320,6 +557,7 @@
           const curParam = nextCursor ? `&cursor=${encodeURIComponent(String(nextCursor))}` : "";
           const url = `/api/gold/list?name=${encodeURIComponent(cur)}&q=${encodeURIComponent(q)}${curParam}&limit=${encodeURIComponent(String(lim))}${rid ? `&pipeline_run_id=${encodeURIComponent(String(rid))}` : ""}`;
           const data = await fetchJson(url);
+          const effectiveRid = Number(data?.pipeline_run_id ?? 0) || null;
           const items = Array.isArray(data?.items) ? data.items : [];
           const total = Number(data?.total ?? 0);
           qs("#curTotal").textContent = String(total);
@@ -355,8 +593,20 @@
                 // double click like /faces
                 thumb.addEventListener("dblclick", () => openLb(itemByRaw.get(raw) || { raw_path: raw }));
               }
+              const framesBtn = card.querySelector("button.vfbtn[data-act='frames']");
+              if (framesBtn) {
+                framesBtn.addEventListener("click", (e) => {
+                  try { e.preventDefault(); e.stopPropagation(); } catch (ee) {}
+                  if (!effectiveRid) { setToast("Нужен pipeline_run_id (выбери прогон в поле pipeline_run_id).", true); return; }
+                  // Открываем /faces и сразу показываем модалку (open_video_path).
+                  const p = framesBtn.getAttribute("data-path") || "";
+                  if (!p) return;
+                  const u = `/faces?pipeline_run_id=${encodeURIComponent(String(effectiveRid))}&open_video_path=${encodeURIComponent(String(p))}`;
+                  window.open(u, "_blank", "noopener");
+                });
+              }
               const btn = card.querySelector("button[data-act='del'][data-path]");
-              if (btn) {
+              if (btn && cur !== "duplicates") {
                 btn.addEventListener("click", async () => {
                   const p = btn.getAttribute("data-path") || "";
                   if (!p) return;
@@ -380,6 +630,35 @@
                   } catch (e) {
                     setToast(e?.message || String(e), true);
                   }
+                });
+              }
+
+              // resolve duplicates
+              if (cur === "duplicates") {
+                card.querySelectorAll("button[data-act='keep'][data-keep]").forEach(b => {
+                  b.addEventListener("click", async () => {
+                    const keep = b.getAttribute("data-keep") || "";
+                    if (!keep) return;
+                    const p = (itemByRaw.get(raw)?.path) || raw;
+                    const msg = `Оставить путь только в ${keep}?\n\n${p}`;
+                    if (!confirm(msg)) return;
+                    try {
+                      b.disabled = true;
+                      await postJson("/api/gold/resolve-duplicate", { path: p, keep_name: keep });
+                      // remove from view (no longer a duplicate)
+                      card.remove();
+                      cardByRaw.delete(raw);
+                      itemByRaw.delete(raw);
+                      qs("#curLoaded").textContent = String(cardByRaw.size);
+                      setToast("Готово: дубль разрешён.");
+                      // refresh counts/tabs lazily
+                      await loadNames();
+                    } catch (e) {
+                      setToast(e?.message || String(e), true);
+                    } finally {
+                      b.disabled = false;
+                    }
+                  });
                 });
               }
             });
@@ -465,7 +744,7 @@
       io.observe(qs("#sentinel"));
 
       // init
-      loadNames().then(() => loadList(true)).catch(e => setToast(e?.message || String(e), true));
+      loadNames().then(() => { renderLevel1Tabs(); renderReportTabs(); setView("lists"); }).catch(e => setToast(e?.message || String(e), true));
     </script>
   </body>
 </html>

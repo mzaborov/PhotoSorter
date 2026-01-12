@@ -1,0 +1,22 @@
+---
+alwaysApply: true
+---
+Python запускать только из файлов (PhotoSorter)
+
+## Цель
+Минимизировать зависания терминалов/REPL и экономить время/токены: никакого inline‑Python в PowerShell.
+
+## ЖЁСТКИЕ запреты
+- НЕЛЬЗЯ использовать `python -c "..."`.
+- НЕЛЬЗЯ использовать heredoc/редиректы вида `<<` (bash‑стиль) и любые попытки “вставить” python‑код прямо в PowerShell.
+- НЕЛЬЗЯ уходить в Python REPL (`>>>`) для выполнения команд проекта. Если случайно попали в REPL — сразу выйти: `exit()`.
+
+## Как ПРАВИЛЬНО
+- Любая python‑операция выполняется **только** так:
+  - `python path/to/script.py [args...]`
+
+## Что делать вместо inline‑Python (шорткаты)
+- Для просмотра последних прогонов (pipeline_run_id / face_run_id):
+  - `python backend/scripts/debug/list_pipeline_runs.py --limit 15`
+- Для разового SQL‑запроса (только из файла, read‑only):
+  - `python backend/scripts/debug/sqlite_select.py --sql-file path/to/query.sql`

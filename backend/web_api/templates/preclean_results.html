@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PhotoSorter — Предочистка (результаты)</title>
+    <style>
+      :root { color-scheme: light; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      a { color: #0b57d0; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+      .muted { color: #6b7280; }
+      .wrap { max-width: 1400px; }
+      .header { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
+      .tabs { display:flex; gap:8px; margin-top: 14px; flex-wrap:wrap; }
+      .tab { appearance:none; border:1px solid #d1d5db; background:#fff; padding:8px 10px; border-radius:999px; cursor:pointer; font-weight:800; }
+      .tab.active { background:#111827; color:#fff; border-color:#111827; }
+      .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#f3f4f6; color:#374151; font-size:12px; }
+      .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top: 12px; }
+      .btn { appearance:none; border:1px solid #d1d5db; background:#fff; padding:8px 10px; border-radius:10px; cursor:pointer; font-weight:800; }
+      .btn:hover { background:#f9fafb; }
+      input[type="text"], input[type="number"] { border:1px solid #d1d5db; border-radius:10px; padding:8px 10px; min-width: 220px; }
+      table { border-collapse: collapse; width: 100%; }
+      th, td { border-bottom:1px solid #e5e7eb; padding:8px 6px; vertical-align: top; }
+      th { text-align:left; }
+      .right { text-align:right; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="header">
+        <div>
+          <h2 style="margin: 0;">Предочистка (шаг 1) — результаты</h2>
+          <div class="muted" style="margin-top: 6px;">
+            В DRY_RUN это “план перемещений” (src → dst). В APPLY — фактически выполненные перемещения.
+          </div>
+        </div>
+        <div class="muted">
+          <a href="/">← на главную</a>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <span class="pill">pipeline_run_id: <b id="prId">—</b></span>
+        <span class="pill">root: <code id="rootPath">—</code></span>
+        <span class="pill">режим: <b id="mode">—</b></span>
+        <span class="pill">checked: <b id="checked">—</b></span>
+        <span class="pill">non_media: <b id="nmCnt">—</b></span>
+        <span class="pill">broken_media: <b id="bmCnt">—</b></span>
+        <button class="btn" id="btnReload" type="button">Обновить</button>
+        <span class="muted" id="toast"></span>
+      </div>
+
+      <div class="tabs">
+        <button class="tab active" id="tabNM" type="button">1.1 Не‑медиа</button>
+        <button class="tab" id="tabBM" type="button">1.2 Битые медиа</button>
+      </div>
+
+      <div class="toolbar">
+        <input id="q" type="text" placeholder="поиск по подстроке (путь/имя)" />
+        <input id="pageSize" type="number" min="10" step="10" value="80" title="Размер страницы" />
+        <button class="btn" id="btnPrev" type="button">←</button>
+        <span class="pill">страница: <b id="pageNum">1</b></span>
+        <button class="btn" id="btnNext" type="button">→</button>
+        <span class="pill">всего: <b id="total">—</b></span>
+      </div>
+
+      <div style="overflow:auto; margin-top:10px;">
+        <table>
+          <thead>
+            <tr>
+              <th style="min-width:520px;">src</th>
+              <th style="min-width:520px;">dst</th>
+              <th class="right" style="min-width:120px;">applied</th>
+              <th style="min-width:190px;">at</th>
+            </tr>
+          </thead>
+          <tbody id="tb">
+            <tr><td colspan="4" class="muted">—</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <script>
+      function qs(sel, el=document) { return el.querySelector(sel); }
+      function escapeHtml(s) {
+        return (s ?? "").toString()
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll("\"", "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+      async function fetchJson(url) {
+        const r = await fetch(url, { cache:"no-store" });
+        const t = await r.text();
+        let j = null;
+        try { j = t ? JSON.parse(t) : null; } catch (e) { j = null; }
+        if (!r.ok) throw new Error((j && (j.detail || j.error)) ? (j.detail || j.error) : (t || `HTTP ${r.status}`));
+        return j;
+      }
+      function setToast(msg, isErr=false) {
+        const el = qs("#toast");
+        el.textContent = msg || "";
+        el.style.color = isErr ? "#991b1b" : "#6b7280";
+      }
+
+      const PR = (() => {
+        const u = new URL(window.location.href);
+        const v = u.searchParams.get("pipeline_run_id");
+        return (v && /^\d+$/.test(v)) ? Number(v) : ({{ pipeline_run_id|default("null") }});
+      })();
+      qs("#prId").textContent = (PR != null) ? String(PR) : "—";
+
+      let kind = "non_media";
+      let page = 1;
+
+      function setTab(k) {
+        kind = k;
+        page = 1;
+        qs("#tabNM").classList.toggle("active", k === "non_media");
+        qs("#tabBM").classList.toggle("active", k === "broken_media");
+        loadList();
+      }
+      qs("#tabNM").onclick = () => setTab("non_media");
+      qs("#tabBM").onclick = () => setTab("broken_media");
+
+      qs("#btnPrev").onclick = () => { if (page > 1) { page -= 1; loadList(); } };
+      qs("#btnNext").onclick = () => { page += 1; loadList(); };
+      qs("#btnReload").onclick = () => { loadCtx(); loadList(); };
+      qs("#q").addEventListener("keydown", (e) => { if (e.key === "Enter") { page = 1; loadList(); } });
+
+      async function loadCtx() {
+        if (PR == null) { setToast("pipeline_run_id не указан", true); return; }
+        try {
+          const ctx = await fetchJson(`/api/preclean-results/context?pipeline_run_id=${encodeURIComponent(String(PR))}`);
+          const st = ctx?.state || null;
+          const root = st?.root_path || ctx?.run?.root_path || "—";
+          qs("#rootPath").textContent = root;
+          qs("#mode").textContent = st ? (st.dry_run ? "DRY_RUN" : "APPLY") : "—";
+          qs("#checked").textContent = st?.checked ?? "—";
+          qs("#nmCnt").textContent = st?.non_media ?? "—";
+          qs("#bmCnt").textContent = st?.broken_media ?? "—";
+          setToast("");
+        } catch (e) {
+          setToast(`ошибка контекста: ${e?.message || String(e)}`, true);
+        }
+      }
+
+      async function loadList() {
+        if (PR == null) { setToast("pipeline_run_id не указан", true); return; }
+        const tb = qs("#tb");
+        const q = (qs("#q").value || "").trim();
+        const ps = Number(qs("#pageSize").value || 80);
+        const pageSize = Number.isFinite(ps) ? Math.max(10, Math.min(400, Math.floor(ps))) : 80;
+        qs("#pageNum").textContent = String(page);
+        tb.innerHTML = `<tr><td colspan="4" class="muted">загрузка…</td></tr>`;
+        try {
+          const url = `/api/preclean-results/list?pipeline_run_id=${encodeURIComponent(String(PR))}&kind=${encodeURIComponent(kind)}&q=${encodeURIComponent(q)}&page=${encodeURIComponent(String(page))}&page_size=${encodeURIComponent(String(pageSize))}`;
+          const j = await fetchJson(url);
+          const items = Array.isArray(j?.items) ? j.items : [];
+          qs("#total").textContent = String(j?.total ?? "—");
+          if (!items.length) {
+            tb.innerHTML = `<tr><td colspan="4" class="muted">пусто</td></tr>`;
+            return;
+          }
+          tb.innerHTML = items.map(it => `
+            <tr>
+              <td class="mono"><code>${escapeHtml(it.src_path || "—")}</code></td>
+              <td class="mono"><code>${escapeHtml(it.dst_path || "—")}</code></td>
+              <td class="right">${it.is_applied ? "yes" : "no"}</td>
+              <td class="mono"><code>${escapeHtml(it.created_at || "—")}</code></td>
+            </tr>
+          `).join("");
+          setToast("");
+        } catch (e) {
+          tb.innerHTML = `<tr><td colspan="4" class="muted">ошибка: ${escapeHtml(e?.message || String(e))}</td></tr>`;
+          setToast(`ошибка: ${e?.message || String(e)}`, true);
+        }
+      }
+
+      loadCtx();
+      loadList();
+    </script>
+  </body>
+</html>
+

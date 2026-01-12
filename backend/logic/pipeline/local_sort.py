@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,9 +20,16 @@ import numpy as np  # type: ignore[import-untyped]
 from PIL import Image, ExifTags, ImageOps  # type: ignore[import-untyped]
 
 from common.db import DedupStore, FaceStore, PipelineStore
+from logic.gold.store import gold_file_map, gold_normalize_path, gold_read_lines
 
 
-EXCLUDE_DIR_NAMES_DEFAULT = ("_faces", "_no_faces", "_duplicates", "_animals")
+EXCLUDE_DIR_NAMES_DEFAULT = ("_faces", "_no_faces", "_duplicates", "_animals", "_non_media", "_broken_media")
+
+# Step 1 (предочистка) folders (до дедупликации):
+# - _non_media: files that are not image/video (pdf/txt/zip/...)
+# - _broken_media: looks like media by extension, but cannot be decoded/opened
+NON_MEDIA_DIRNAME_DEFAULT = "_non_media"
+BROKEN_MEDIA_DIRNAME_DEFAULT = "_broken_media"
 
 # OpenCV иногда нестабилен на некоторых системах при многопоточности.
 # Для конвейера нам важнее устойчивость, чем скорость.
@@ -82,6 +90,339 @@ def _is_image(path: str) -> bool:
         return True
     ext = (Path(path).suffix or "").lower()
     return ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".heic")
+
+
+def _is_video(path: str) -> bool:
+    mime_type, _enc = mimetypes.guess_type(path)
+    if mime_type and mime_type.startswith("video/"):
+        return True
+    ext = (Path(path).suffix or "").lower()
+    return ext in (".mp4", ".mov", ".mkv", ".avi", ".wmv", ".m4v", ".webm", ".3gp")
+
+
+def _is_media(path: str) -> bool:
+    return _is_image(path) or _is_video(path)
+
+
+def _safe_move_unique(src: str, dst: str) -> str:
+    """
+    Move src -> dst, avoiding overwrites by adding suffix if needed.
+    Returns final destination path.
+    """
+    d = Path(dst)
+    d.parent.mkdir(parents=True, exist_ok=True)
+    if not d.exists():
+        shutil.move(src, str(d))
+        return str(d)
+    stem = d.stem
+    suf = d.suffix
+    parent = d.parent
+    for i in range(1, 10_000):
+        cand = parent / f"{stem}__dup{i}{suf}"
+        if not cand.exists():
+            shutil.move(src, str(cand))
+            return str(cand)
+    raise RuntimeError(f"failed_to_choose_unique_name_for:{dst}")
+
+
+def _is_broken_image_file(path: str) -> bool:
+    """
+    ВАЖНО: никаких "полных" декодирований через PIL здесь не делаем.
+    На некоторых повреждённых файлах декодер может падать нативно (access violation),
+    и это убьёт весь процесс конвейера.
+
+    Поэтому используем безопасные эвристики по заголовкам/магическим байтам.
+    Это не идеально, но надёжно и быстро.
+    """
+    try:
+        ext = (Path(path).suffix or "").lower()
+        with open(path, "rb") as f:
+            head = f.read(64)
+            if ext in (".jpg", ".jpeg"):
+                if len(head) < 2 or head[0:2] != b"\xff\xd8":
+                    return True
+                try:
+                    f.seek(-2, os.SEEK_END)
+                    tail = f.read(2)
+                except Exception:
+                    return True
+                return tail != b"\xff\xd9"
+            if ext == ".png":
+                return not (len(head) >= 8 and head[0:8] == b"\x89PNG\r\n\x1a\n")
+            if ext == ".webp":
+                return not (len(head) >= 12 and head[0:4] == b"RIFF" and head[8:12] == b"WEBP")
+            if ext == ".bmp":
+                return not (len(head) >= 2 and head[0:2] == b"BM")
+            if ext in (".tif", ".tiff"):
+                return not (
+                    len(head) >= 4
+                    and (head[0:4] == b"II*\x00" or head[0:4] == b"MM\x00*")
+                )
+        # неизвестный формат: не считаем битым (пусть дальше обрабатывается обычным путём)
+        return False
+    except Exception:
+        return True
+
+
+def _is_broken_video_file(path: str) -> bool:
+    try:
+        cap = cv2.VideoCapture(path)
+        try:
+            if not cap.isOpened():
+                return True
+            ok, _frame = cap.read()
+            return not bool(ok)
+        finally:
+            try:
+                cap.release()
+            except Exception:
+                pass
+    except Exception:
+        return True
+
+
+def _preclean_nonmedia_and_broken(
+    *,
+    root_dir: str,
+    dry_run: bool,
+    exclude_dir_names: tuple[str, ...],
+    non_media_dirname: str,
+    broken_media_dirname: str,
+    pipeline: PipelineStore | None,
+    pipeline_run_id: int | None,
+) -> dict[str, int]:
+    """
+    Step 1 (предочистка): до дедупликации перемещаем:
+    - non-media (not image/video) -> _non_media
+    - broken media (ext looks like image/video but cannot be decoded) -> _broken_media
+    Returns counts.
+    """
+    root = os.path.abspath(root_dir)
+    non_media_dir = os.path.join(root, non_media_dirname)
+    broken_dir = os.path.join(root, broken_media_dirname)
+
+    moved_non_media = 0
+    moved_broken = 0
+    checked = 0
+
+    # --- resume state / results in DB (best-effort) ---
+    # Храним в preclean_state + preclean_moves по pipeline_run_id.
+    # Для resume порядок файлов фиксируем сортировкой (по нормализованному пути).
+    last_seen: str | None = None
+    if pipeline_run_id is not None:
+        try:
+            cur = pipeline.conn.cursor() if pipeline is not None else None
+            if cur is not None:
+                cur.execute(
+                    "SELECT checked, non_media, broken_media, last_path, dry_run FROM preclean_state WHERE pipeline_run_id=? LIMIT 1",
+                    (int(pipeline_run_id),),
+                )
+                row = cur.fetchone()
+                if row:
+                    checked = int(row[0] or 0)
+                    moved_non_media = int(row[1] or 0)
+                    moved_broken = int(row[2] or 0)
+                    last_seen = str(row[3]) if row[3] else None
+                else:
+                    cur.execute(
+                        "INSERT OR REPLACE INTO preclean_state(pipeline_run_id, root_path, dry_run, checked, non_media, broken_media, last_path, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                        (int(pipeline_run_id), str(root), 1 if dry_run else 0, 0, 0, 0, None, _now_utc_iso()),
+                    )
+                    pipeline.conn.commit()
+        except Exception:
+            last_seen = None
+
+    def _save_state(*, last_path: str | None) -> None:
+        if pipeline is None or pipeline_run_id is None:
+            return
+        try:
+            pipeline.conn.execute(
+                "INSERT OR REPLACE INTO preclean_state(pipeline_run_id, root_path, dry_run, checked, non_media, broken_media, last_path, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (int(pipeline_run_id), str(root), 1 if dry_run else 0, int(checked), int(moved_non_media), int(moved_broken), last_path, _now_utc_iso()),
+            )
+            pipeline.conn.commit()
+        except Exception:
+            pass
+
+    def _add_move(*, kind: str, src_abs: str, dst_abs: str, is_applied: bool) -> None:
+        if pipeline is None or pipeline_run_id is None:
+            return
+        try:
+            pipeline.conn.execute(
+                "INSERT INTO preclean_moves(pipeline_run_id, kind, src_path, dst_path, is_applied, created_at) VALUES(?,?,?,?,?,?)",
+                (int(pipeline_run_id), str(kind), _as_local_path(os.path.normcase(src_abs)), _as_local_path(os.path.normcase(dst_abs)), 1 if is_applied else 0, _now_utc_iso()),
+            )
+        except Exception:
+            pass
+
+    # Стабильный порядок для resume.
+    files = list(_iter_files(root, exclude_dir_names=exclude_dir_names))
+    files.sort(key=lambda p: _as_local_path(os.path.normcase(p)))
+
+    for abspath in files:
+        norm_abs = os.path.normcase(abspath)
+        db_abs = _as_local_path(norm_abs)
+        if last_seen and db_abs <= last_seen:
+            continue
+        checked += 1
+        # Skip if already under target dirs (defensive)
+        if abspath.startswith(non_media_dir + os.sep) or abspath.startswith(broken_dir + os.sep):
+            continue
+
+        rel = os.path.relpath(abspath, root)
+        if not _is_media(abspath):
+            dst = os.path.join(non_media_dir, rel)
+            if dry_run:
+                _pipe_log(pipeline, pipeline_run_id, f"preclean: non_media -> {dst}\n")
+                _add_move(kind="non_media", src_abs=abspath, dst_abs=dst, is_applied=False)
+            else:
+                dst_final = _safe_move_unique(abspath, dst)
+                _pipe_log(pipeline, pipeline_run_id, f"preclean: moved non_media -> {dst_final}\n")
+                _add_move(kind="non_media", src_abs=abspath, dst_abs=dst_final, is_applied=True)
+            moved_non_media += 1
+            continue
+
+        # media by ext -> validate
+        is_broken = False
+        if _is_image(abspath):
+            is_broken = _is_broken_image_file(abspath)
+        elif _is_video(abspath):
+            is_broken = _is_broken_video_file(abspath)
+        if is_broken:
+            dst = os.path.join(broken_dir, rel)
+            if dry_run:
+                _pipe_log(pipeline, pipeline_run_id, f"preclean: broken_media -> {dst}\n")
+                _add_move(kind="broken_media", src_abs=abspath, dst_abs=dst, is_applied=False)
+            else:
+                dst_final = _safe_move_unique(abspath, dst)
+                _pipe_log(pipeline, pipeline_run_id, f"preclean: moved broken_media -> {dst_final}\n")
+                _add_move(kind="broken_media", src_abs=abspath, dst_abs=dst_final, is_applied=True)
+            moved_broken += 1
+
+        # прогресс/резюме (редко)
+        if checked % 200 == 0:
+            _pipe_log(
+                pipeline,
+                pipeline_run_id,
+                f"preclean: checked={checked} moved_non_media={moved_non_media} moved_broken_media={moved_broken}\n",
+            )
+            _save_state(last_path=db_abs)
+
+    _save_state(last_path=(_as_local_path(os.path.normcase(files[-1])) if files else last_seen))
+    _pipe_log(
+        pipeline,
+        pipeline_run_id,
+        f"preclean: checked={checked} moved_non_media={moved_non_media} moved_broken_media={moved_broken}\n",
+    )
+
+    return {"checked": checked, "moved_non_media": moved_non_media, "moved_broken_media": moved_broken}
+
+
+def _load_preclean_exclude_paths(*, pipeline: PipelineStore | None, pipeline_run_id: int | None) -> set[str]:
+    """
+    Возвращает множество local:-путей, которые шаг 1 (предочистка) пометил к переносу в _non_media/_broken_media.
+    Используем это в DRY-RUN, чтобы последующие шаги считали/обрабатывали файлы "как после очистки",
+    не выполняя реальных перемещений.
+    """
+    if pipeline is None or pipeline_run_id is None:
+        return set()
+    try:
+        cur = pipeline.conn.cursor()
+        cur.execute(
+            """
+            SELECT src_path
+            FROM preclean_moves
+            WHERE pipeline_run_id = ?
+              AND kind IN ('non_media', 'broken_media')
+            """,
+            (int(pipeline_run_id),),
+        )
+        rows = cur.fetchall()
+        out: set[str] = set()
+        for r in rows:
+            p = str(r[0] or "").strip()
+            if not p:
+                continue
+            # preclean записывает нормализованный local:-путь; держим его как ключ для сравнения.
+            out.add(p)
+        return out
+    except Exception:
+        return set()
+
+
+def _effective_tab_sql_for_metrics() -> str:
+    # aliases: f (files), m (files_manual_labels)
+    return """
+    CASE
+      WHEN COALESCE(m.people_no_face_manual, 0) = 1 THEN 'people_no_face'
+      WHEN lower(trim(coalesce(m.faces_manual_label, ''))) = 'faces' THEN 'faces'
+      WHEN lower(trim(coalesce(m.faces_manual_label, ''))) = 'no_faces' THEN 'no_faces'
+      WHEN COALESCE(m.quarantine_manual, 0) = 1
+           AND COALESCE(f.faces_count, 0) > 0
+        THEN 'quarantine'
+      WHEN COALESCE(m.animals_manual, 0) = 1 THEN 'animals'
+      WHEN COALESCE(f.animals_auto, 0) = 1 THEN 'animals'
+      WHEN COALESCE(f.faces_auto_quarantine, 0) = 1
+           AND COALESCE(f.faces_count, 0) > 0
+           AND lower(trim(coalesce(f.faces_quarantine_reason, ''))) != 'many_small_faces'
+        THEN 'quarantine'
+      ELSE (CASE WHEN COALESCE(f.faces_count, 0) > 0 THEN 'faces' ELSE 'no_faces' END)
+    END
+    """
+
+
+def _count_misses_for_gold(
+    *,
+    ds: DedupStore,
+    pipeline_run_id: int,
+    face_run_id: int | None,
+    root_like: str | None,
+    gold_name: str,
+    expected_tab: str,
+) -> tuple[int, int]:
+    fp = gold_file_map().get(gold_name)
+    if not fp:
+        return 0, 0
+    lines = gold_read_lines(fp)
+    paths: list[str] = []
+    for raw in lines:
+        nm = gold_normalize_path(raw)
+        pp = str(nm.get("path") or "")
+        if not pp or not (pp.startswith("local:") or pp.startswith("disk:")):
+            continue
+        if root_like and root_like.endswith("%"):
+            pref = root_like[:-1]
+            if not pp.startswith(pref):
+                continue
+        paths.append(pp)
+    # unique
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for p in paths:
+        if p in seen:
+            continue
+        seen.add(p)
+        uniq.append(p)
+    if not uniq:
+        return 0, 0
+    placeholders = ",".join(["?"] * len(uniq))
+    eff_sql = _effective_tab_sql_for_metrics()
+    sql = f"""
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN ({eff_sql}) != ? THEN 1 ELSE 0 END) AS mism
+        FROM files f
+        LEFT JOIN files_manual_labels m
+          ON m.pipeline_run_id = ? AND m.path = f.path
+        WHERE f.status != 'deleted'
+          AND (? IS NULL OR COALESCE(f.faces_run_id, -1) = ?)
+          AND f.path IN ({placeholders})
+    """
+    frid = int(face_run_id) if face_run_id else None
+    row = ds.conn.execute(sql, [expected_tab, int(pipeline_run_id), frid, frid, *uniq]).fetchone()
+    total = int(row["total"] or 0) if row else 0
+    mism = int(row["mism"] or 0) if row else 0
+    return total, mism
 
 
 def _ensure_parent_dir(p: Path) -> None:
@@ -635,6 +976,8 @@ class Stats:
     errors: int = 0
     duplicates_moved: int = 0
     images_scanned: int = 0
+    videos_scanned: int = 0
+    video_frames_scanned: int = 0
     faces_found: int = 0
     faces_files: int = 0
     no_faces_files: int = 0
@@ -691,6 +1034,7 @@ def dedup_local(
     move_duplicates: bool,
     duplicates_dirname: str,
     exclude_dir_names: tuple[str, ...],
+    exclude_paths: set[str] | None = None,
     run_id: int | None = None,
     pipeline: PipelineStore | None = None,
     pipeline_run_id: int | None = None,
@@ -710,6 +1054,14 @@ def dedup_local(
         # total
         total = 0
         for _ in _iter_files(root, exclude_dir_names=exclude_dir_names):
+            if exclude_paths is not None:
+                try:
+                    # Сравниваем по нормализованному local:-пути (Windows case-insensitive).
+                    key = _as_local_path(os.path.normcase(_))
+                    if key in exclude_paths:
+                        continue
+                except Exception:
+                    pass
             total += 1
         store.update_run_progress(run_id=run_id_i, total_files=total)
         stats.total_files = total
@@ -717,6 +1069,15 @@ def dedup_local(
         # 1) hash + upsert
         hash_to_first: dict[str, str] = {}
         for abspath in _iter_files(root, exclude_dir_names=exclude_dir_names):
+            # В DRY-RUN после предочистки исключаем мусор/битые медиа (см. preclean_moves),
+            # чтобы дедуп работал "как после очистки".
+            if exclude_paths is not None:
+                try:
+                    key = _as_local_path(os.path.normcase(abspath))
+                    if key in exclude_paths:
+                        continue
+                except Exception:
+                    pass
             stats.processed += 1
             fn = os.path.basename(abspath)
             parent = os.path.dirname(abspath)
@@ -816,6 +1177,16 @@ def dedup_local(
                     new_name=os.path.basename(dst),
                     new_parent_path=_as_local_path(os.path.dirname(dst)),
                 )
+                # ВАЖНО: переносим run-scoped manual метки вместе с файлом, иначе они "теряются" после move.
+                if pipeline_run_id is not None:
+                    try:
+                        store.update_run_manual_labels_path(
+                            pipeline_run_id=int(pipeline_run_id),
+                            old_path=_as_local_path(abspath),
+                            new_path=_as_local_path(dst),
+                        )
+                    except Exception:
+                        pass
             if pipeline is not None and pipeline_run_id is not None:
                 pipeline.update_run(run_id=int(pipeline_run_id), last_src_path="", last_dst_path="")
 
@@ -859,7 +1230,14 @@ def scan_faces_local(
     model_path: Path,
     model_url: str,
     exclude_dir_names: tuple[str, ...],
+    exclude_paths: set[str] | None = None,
     enable_qr: bool = False,
+    video_samples: int = 0,
+    video_max_dim: int = 640,
+    video_bad_mean_luma: float = 25.0,
+    video_bad_std_luma: float = 10.0,
+    video_bad_black_ratio: float = 0.85,
+    video_black_luma_threshold: int = 16,
     run_id: int | None = None,
     pipeline: PipelineStore | None = None,
     pipeline_run_id: int | None = None,
@@ -878,6 +1256,85 @@ def scan_faces_local(
 
     store = FaceStore()
     dedup = DedupStore()
+    # --- Yandex geocoder (country/city) for no_faces UI sorting ---
+    y_key = (os.getenv("YANDEX_GEOCODER_API_KEY") or "").strip()
+    y_url = (os.getenv("YANDEX_GEOCODER_URL") or "https://geocode-maps.yandex.ru/1.x/").strip()
+    y_lang = (os.getenv("YANDEX_GEOCODER_LANG") or "ru_RU").strip()
+    try:
+        y_rps = float(os.getenv("YANDEX_GEOCODER_RPS") or 3.0)
+    except Exception:
+        y_rps = 3.0
+    try:
+        y_round = int(os.getenv("YANDEX_GEOCODER_ROUND") or 4)
+    except Exception:
+        y_round = 4
+    y_last_call = 0.0
+
+    def _geo_cache_key(lat: float, lon: float) -> str:
+        rr = int(max(0, min(6, y_round)))
+        return f"{float(lat):.{rr}f},{float(lon):.{rr}f}"
+
+    def _rate_limit_geocode() -> None:
+        nonlocal y_last_call
+        if not y_key or y_rps <= 0:
+            return
+        now = time.time()
+        min_dt = 1.0 / float(y_rps)
+        dt = now - float(y_last_call)
+        if dt < min_dt:
+            time.sleep(float(min_dt - dt))
+        y_last_call = time.time()
+
+    def _yandex_country_city(lat: float, lon: float) -> tuple[str | None, str | None, str | None]:
+        """
+        Returns (country, city, raw_json_str) best-effort.
+        """
+        if not y_key:
+            return (None, None, None)
+        try:
+            q = {
+                "apikey": y_key,
+                "geocode": f"{float(lon)},{float(lat)}",
+                "format": "json",
+                "results": "1",
+                "lang": y_lang,
+            }
+            url = str(y_url).rstrip("?") + "?" + urllib.parse.urlencode(q)
+            _rate_limit_geocode()
+            req = urllib.request.Request(url, headers={"User-Agent": "PhotoSorter/1.0"})
+            with urllib.request.urlopen(req, timeout=12) as resp:  # noqa: S310
+                raw = resp.read()
+            txt = raw.decode("utf-8", errors="replace")
+            obj = json.loads(txt)
+            comps = (
+                obj.get("response", {})
+                .get("GeoObjectCollection", {})
+                .get("featureMember", [{}])[0]
+                .get("GeoObject", {})
+                .get("metaDataProperty", {})
+                .get("GeocoderMetaData", {})
+                .get("Address", {})
+                .get("Components", [])
+            )
+            country = None
+            city = None
+            if isinstance(comps, list):
+                for c in comps:
+                    if not isinstance(c, dict):
+                        continue
+                    kind = str(c.get("kind") or "").strip().lower()
+                    name = str(c.get("name") or "").strip()
+                    if not name:
+                        continue
+                    if kind == "country" and not country:
+                        country = name
+                    if kind == "locality" and not city:
+                        city = name
+                    if kind == "province" and not city:
+                        city = name
+            return (country, city, txt)
+        except Exception:
+            return (None, None, None)
     qr = None
     # Важно: QR-детектор OpenCV иногда "подвисает" на отдельных изображениях (внутри нативного вызова),
     # из-за чего прогресс может застрять на 0/.. надолго. Поэтому по умолчанию отключаем QR-эвристику.
@@ -900,9 +1357,24 @@ def scan_faces_local(
     except Exception as e:  # noqa: BLE001
         yolo_err = f"{type(e).__name__}: {e}"
     try:
-        image_files = [p for p in _iter_files(root, exclude_dir_names=exclude_dir_names) if _is_image(p)]
+        v_samples = max(0, int(video_samples or 0))
+        if v_samples > 3:
+            v_samples = 3
+        media_files: list[str] = []
+        for p in _iter_files(root, exclude_dir_names=exclude_dir_names):
+            if not (_is_image(p) or (v_samples > 0 and _is_video(p))):
+                continue
+            if exclude_paths is not None:
+                try:
+                    key = _as_local_path(os.path.normcase(p))
+                    if key in exclude_paths:
+                        continue
+                except Exception:
+                    # best-effort: если не смогли нормализовать путь — не исключаем
+                    pass
+            media_files.append(p)
         if run_id is None:
-            run_id = store.create_run(scope="local", root_path=_as_local_path(root), total_files=len(image_files))
+            run_id = store.create_run(scope="local", root_path=_as_local_path(root), total_files=len(media_files))
         run_id_i = int(run_id)
         def _rectangles_count_db() -> int:
             try:
@@ -914,7 +1386,7 @@ def scan_faces_local(
                 return 0
         if pipeline is not None and pipeline_run_id is not None:
             pipeline.update_run(run_id=int(pipeline_run_id), face_run_id=run_id_i)
-        total_images = len(image_files)
+        total_items = len(media_files)
 
         _dbg_log(
             hypothesis_id="H0",
@@ -924,15 +1396,81 @@ def scan_faces_local(
                 "run_id": int(run_id_i),
                 "pipeline_run_id": int(pipeline_run_id) if pipeline_run_id is not None else None,
                 "root_dir": str(root_dir),
-                "total_images": int(total_images),
+                "total_images": int(len([x for x in media_files if _is_image(x)])),
+                "total_videos": int(len([x for x in media_files if _is_video(x)])),
+                "video_samples": int(v_samples),
                 "enable_qr": bool(qr is not None),
                 "python_exe": str(getattr(sys, "executable", "")),
                 "module_file": str(__file__),
             },
         )
 
-        for abspath in image_files:
-            stats.images_scanned += 1
+        def _video_duration_seconds_from_cap(cap: cv2.VideoCapture) -> float | None:
+            try:
+                fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                n = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+                if fps > 0.0 and n > 0.0:
+                    return float(n) / float(fps)
+            except Exception:
+                pass
+            return None
+
+        def _pick_video_times(dur: float, *, samples: int) -> list[float]:
+            d = float(max(0.0, dur))
+            if d <= 0.0:
+                return [0.0]
+            if d < 2.0 or samples <= 1:
+                return [min(0.5 * d, max(0.0, d - 0.5))]
+            t1 = min(max(1.0, 0.05 * d), max(0.0, d - 0.5))
+            t2 = min(0.5 * d, max(0.0, d - 0.5))
+            if samples == 2:
+                return [t1, t2]
+            t3 = min(0.95 * d, max(0.0, d - 0.5))
+            # preserve order but unique-ish
+            out: list[float] = []
+            for t in (t1, t2, t3):
+                if not out or abs(out[-1] - t) > 0.05:
+                    out.append(t)
+            return out
+
+        def _is_bad_frame_bgr(frame_bgr: np.ndarray) -> bool:
+            try:
+                if frame_bgr is None or frame_bgr.size == 0:
+                    return True
+                gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                mean = float(np.mean(gray))
+                std = float(np.std(gray))
+                black_ratio = float(np.mean(gray <= int(video_black_luma_threshold)))
+                if mean < float(video_bad_mean_luma):
+                    return True
+                if std < float(video_bad_std_luma):
+                    return True
+                if black_ratio > float(video_bad_black_ratio):
+                    return True
+                return False
+            except Exception:
+                return True
+
+        def _read_video_frame_at(cap: cv2.VideoCapture, t_sec: float, *, max_dim_px: int) -> np.ndarray | None:
+            try:
+                # best-effort seek (depends on backend/codecs)
+                cap.set(cv2.CAP_PROP_POS_MSEC, float(max(0.0, t_sec)) * 1000.0)
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    return None
+                h, w = frame.shape[:2]
+                m = max(int(h), int(w))
+                if max_dim_px and m and m > int(max_dim_px):
+                    sc = float(max_dim_px) / float(m)
+                    nh = max(1, int(round(h * sc)))
+                    nw = max(1, int(round(w * sc)))
+                    frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+                return frame
+            except Exception:
+                return None
+
+        for abspath in media_files:
+            stats.images_scanned += 1  # "items scanned" (images + optional videos)
             db_path = _as_local_path(abspath)
             stage = "loop_start"
 
@@ -950,21 +1488,45 @@ def scan_faces_local(
                 try:
                     stage = "early_progress_count"
                     faces_found_db0 = _rectangles_count_db()
+                    # Resume-friendly: не даём прогрессу уменьшаться после рестарта.
+                    # Иначе UI кратковременно "падает" на 1..20/total и выглядит как баг.
+                    existing_proc = 0
+                    try:
+                        fr0 = store.get_run_by_id(run_id=int(run_id_i))
+                        existing_proc = int((fr0 or {}).get("processed_files") or 0)
+                    except Exception:
+                        existing_proc = 0
+                    proc_to_write = max(int(existing_proc), int(stats.images_scanned))
                     stage = "early_progress_update"
                     store.update_run_progress(
                         run_id=run_id_i,
-                        processed_files=stats.images_scanned,
+                        processed_files=proc_to_write,
                         faces_found=faces_found_db0,
                         last_path=db_path,
                     )
                     _pipe_log(
                         pipeline,
                         pipeline_run_id,
-                        f"faces_progress images={stats.images_scanned} total={total_images} "
+                        f"faces_progress images={proc_to_write} total={total_items} "
                         f"faces={faces_found_db0} errors={stats.errors}\n",
                     )
                 except Exception:
                     pass
+
+            # --- store taken_at + gps + place (best-effort) ---
+            try:
+                taken_at: str | None = None
+                # mtime fallback for all media
+                try:
+                    st = os.stat(abspath)
+                    taken_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime))
+                except Exception:
+                    taken_at = None
+                # Записываем mtime сразу, а EXIF/GPS (и геокодинг) сделаем позже внутри image_open,
+                # чтобы не открывать файл дважды.
+                dedup.set_taken_at_and_gps(path=db_path, taken_at=taken_at, gps_lat=None, gps_lon=None)
+            except Exception:
+                pass
 
             # Resume-friendly: если уже есть сводка лиц для этого файла под этим run_id — пропускаем.
             stage = "dedup_get_row"
@@ -979,10 +1541,145 @@ def scan_faces_local(
             if row and row.get("faces_run_id") is not None and int(row.get("faces_run_id")) == run_id_i and row.get("faces_scanned_at"):
                 continue
             try:
+                # --- VIDEO: sample 1–3 frames and aggregate ---
+                if v_samples > 0 and _is_video(abspath):
+                    stats.videos_scanned += 1
+                    stage = "video_open"
+                    cap = cv2.VideoCapture(abspath)
+                    try:
+                        if not cap.isOpened():
+                            raise RuntimeError("video_open_failed")
+                        dur = _video_duration_seconds_from_cap(cap) or 0.0
+                        times = _pick_video_times(float(dur), samples=int(v_samples))
+                        best_frame: np.ndarray | None = None
+                        # pick first non-bad frame among candidates
+                        for t in times:
+                            fr = _read_video_frame_at(cap, float(t), max_dim_px=int(video_max_dim))
+                            if fr is None:
+                                continue
+                            stats.video_frames_scanned += 1
+                            if not _is_bad_frame_bgr(fr):
+                                best_frame = fr
+                                break
+                            # keep the first frame as fallback
+                            if best_frame is None:
+                                best_frame = fr
+                        if best_frame is None:
+                            raise RuntimeError("no_video_frames")
+                    finally:
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+
+                    # run detectors on chosen frame
+                    stage = "video_detect_faces"
+                    faces_det_v = _detect_faces(detector, best_frame)
+                    # best-effort: second pass (so we don't miss obvious faces in video)
+                    if not faces_det_v:
+                        try:
+                            detector2v = _create_face_detector(str(model), score_threshold=0.65)
+                            faces_det_v2 = _detect_faces(detector2v, best_frame)
+                            hv, wv = best_frame.shape[:2]
+                            img_area_v = float(max(1, int(wv) * int(hv)))
+                            faces_det_v2 = [
+                                (x, y, w, h, s)
+                                for (x, y, w, h, s) in faces_det_v2
+                                if max(int(w), int(h)) >= 60 and (float(int(w) * int(h)) / img_area_v) >= 0.005
+                            ]
+                            if faces_det_v2:
+                                faces_det_v = faces_det_v2
+                        except Exception:
+                            pass
+
+                    faces_count_v = int(len(faces_det_v or []))
+
+                    # For video we do NOT use screen_like quarantine.
+                    is_quarantine = False
+                    quarantine_reason = None
+
+                    is_animal = False
+                    animal_kind = None
+                    if faces_count_v <= 0:
+                        try:
+                            if yolo_err is None:
+                                if yolo_sess is None:
+                                    import onnxruntime as ort  # type: ignore[import-untyped]
+
+                                    yolo_sess = ort.InferenceSession(str(yolo_model_path), providers=["CPUExecutionProvider"])
+                                    yolo_in = yolo_sess.get_inputs()[0].name
+                                if yolo_sess is not None and yolo_in:
+                                    stage = "video_detect_cat"
+                                    is_animal = _detect_cat_yolo(
+                                        sess=yolo_sess,
+                                        input_name=str(yolo_in),
+                                        img_bgr_full=best_frame,
+                                        conf_threshold=0.35,
+                                        nms_iou=0.45,
+                                        min_box_area_ratio=0.004,
+                                    )
+                                    if is_animal:
+                                        animal_kind = "cat"
+                        except Exception:
+                            pass
+
+                    # update per-file aggregates in DB (no rectangles for video yet)
+                    stage = "video_db_write"
+                    try:
+                        store.clear_run_auto_rectangles_for_file(run_id=run_id_i, file_path=db_path)
+                    except Exception:
+                        pass
+                    try:
+                        dedup.set_faces_summary(path=db_path, faces_run_id=run_id_i, faces_count=int(faces_count_v))
+                        dedup.set_faces_auto_group(path=db_path, group=("many_faces" if int(faces_count_v) >= int(many_faces_min) else None))
+                        dedup.set_faces_auto_quarantine(path=db_path, is_quarantine=False, reason=None)
+                        dedup.set_animals_auto(path=db_path, is_animal=bool(is_animal and int(faces_count_v) == 0), kind=animal_kind)
+                    except Exception:
+                        pass
+
+                    if faces_count_v > 0:
+                        stats.faces_files += 1
+                    else:
+                        stats.no_faces_files += 1
+                    continue
+
                 # Важно: браузер показывает JPEG с учётом EXIF orientation.
                 # Значит и детект, и сохранённые bbox должны быть в той же системе координат.
                 stage = "image_open"
                 with Image.open(abspath) as pil0:
+                    # EXIF meta extraction (best-effort): taken_at + GPS + geocoding.
+                    try:
+                        exif_taken = _try_exif_datetime_iso(pil0)
+                        gps = _try_exif_gps_latlon(pil0)
+                        gps_lat = float(gps[0]) if gps else None
+                        gps_lon = float(gps[1]) if gps else None
+                        if exif_taken or (gps_lat is not None and gps_lon is not None):
+                            dedup.set_taken_at_and_gps(path=db_path, taken_at=exif_taken, gps_lat=gps_lat, gps_lon=gps_lon)
+                        if gps_lat is not None and gps_lon is not None and y_key:
+                            k = _geo_cache_key(gps_lat, gps_lon)
+                            cached = dedup.geocode_cache_get(key=k)
+                            if cached and (cached.get("country") or cached.get("city")):
+                                dedup.set_place(
+                                    path=db_path,
+                                    country=str(cached.get("country") or "") or None,
+                                    city=str(cached.get("city") or "") or None,
+                                    source=str(cached.get("source") or "yandex"),
+                                )
+                            else:
+                                ctry, city, rawj = _yandex_country_city(gps_lat, gps_lon)
+                                if ctry or city:
+                                    dedup.geocode_cache_upsert(
+                                        key=k,
+                                        lat=gps_lat,
+                                        lon=gps_lon,
+                                        country=ctry,
+                                        city=city,
+                                        source="yandex",
+                                        raw_json=rawj,
+                                    )
+                                    dedup.set_place(path=db_path, country=ctry, city=city, source="yandex")
+                    except Exception:
+                        pass
                     try:
                         pil = ImageOps.exif_transpose(pil0)
                     except Exception:
@@ -1120,27 +1817,15 @@ def scan_faces_local(
                     qr_found = False
                     if qr is not None:
                         qr_found = _qr_found_best_effort(img_bgr_full, qr=qr, qr_max_dim=qr_max_dim)
-                    # screen_like: применяем только если лиц НЕТ, иначе слишком много ложных карантинов на обычных фото
-                    screen_like = (not faces) and _looks_like_screen_ui(img_bgr_full)
                     if qr_found:
                         is_quarantine = True
                         quarantine_reason = "qr"
-                    elif screen_like:
-                        is_quarantine = True
-                        quarantine_reason = "screen_like"
                     else:
-                        # 2) Строгий "tiny_face" (качество лица слишком низкое):
-                        # карантин только если лицо реально крошечное (чтобы не вернуть старые ложные карантины).
-                        # Подходит для случаев "размытый маленький кусочек лица".
-                        if faces:
-                            max_face_dim = max(int(max(w, h)) for (_x, _y, w, h, _s) in faces)
-                            max_area = max(float(w * h) for (_x, _y, w, h, _s) in faces) if faces else 0.0
-                            area_ratio = (max_area / float(w0 * h0)) if (w0 > 0 and h0 > 0) else 0.0
-                            if max_face_dim <= 32 and area_ratio <= 0.0012:
-                                is_quarantine = True
-                                quarantine_reason = "tiny_face"
-                        else:
-                            # 3) если людей/лиц нет — попробуем найти кошку (MVP)
+                        # ВАЖНО: для кадров БЕЗ лиц сначала пробуем найти кошку (MVP),
+                        # и только если кошки нет — применяем эвристику screen_like.
+                        # Это критично для "кот ↔ нет лиц": многие коты выглядят как "скрин" (мессенджер/галерея),
+                        # и раньше из-за раннего screen_like мы вообще не запускали YOLO на кота.
+                        if not faces:
                             try:
                                 if yolo_err is None:
                                     if yolo_sess is None:
@@ -1162,8 +1847,33 @@ def scan_faces_local(
                                         )
                                         if is_animal:
                                             animal_kind = "cat"
+                                            # если это кот — не считаем это screen_like карантином
+                                            is_quarantine = False
+                                            quarantine_reason = None
                             except Exception:
                                 pass
+
+                        # screen_like: применяем только если лиц НЕТ и кота тоже НЕТ,
+                        # иначе слишком много ложных карантинов на обычных фото/котах.
+                        if (not faces) and (not is_animal):
+                            try:
+                                screen_like = _looks_like_screen_ui(img_bgr_full)
+                            except Exception:
+                                screen_like = False
+                            if screen_like:
+                                is_quarantine = True
+                                quarantine_reason = "screen_like"
+
+                        # 2) Строгий "tiny_face" (качество лица слишком низкое):
+                        # карантин только если лицо реально крошечное (чтобы не вернуть старые ложные карантины).
+                        # Подходит для случаев "размытый маленький кусочек лица".
+                        if faces:
+                            max_face_dim = max(int(max(w, h)) for (_x, _y, w, h, _s) in faces)
+                            max_area = max(float(w * h) for (_x, _y, w, h, _s) in faces) if faces else 0.0
+                            area_ratio = (max_area / float(w0 * h0)) if (w0 > 0 and h0 > 0) else 0.0
+                            if max_face_dim <= 32 and area_ratio <= 0.0012:
+                                is_quarantine = True
+                                quarantine_reason = "tiny_face"
                         # 3b) Если YuNet нашёл "лица", но это может быть кошачья морда:
                         # запускаем YOLO для cat/person и, если cat==True и person==False — считаем это животным, а не лицом.
                         if faces and (len(faces) <= 2):
@@ -1296,7 +2006,7 @@ def scan_faces_local(
                     _pipe_log(
                         pipeline,
                         pipeline_run_id,
-                        f"faces_progress images={stats.images_scanned} total={total_images} "
+                        f"faces_progress images={stats.images_scanned} total={total_items} "
                         f"faces={faces_found_db} errors={stats.errors}\n",
                     )
             except Exception as e:  # noqa: BLE001
@@ -1432,6 +2142,15 @@ def sort_by_faces(
                     new_name=os.path.basename(dst_abs),
                     new_parent_path=_as_local_path(os.path.dirname(dst_abs)),
                 )
+                if pipeline_run_id is not None:
+                    try:
+                        dedup.update_run_manual_labels_path(
+                            pipeline_run_id=int(pipeline_run_id),
+                            old_path=file_path,
+                            new_path=new_db_path,
+                        )
+                    except Exception:
+                        pass
                 store.update_file_path(old_file_path=file_path, new_file_path=new_db_path)
             if pipeline is not None and pipeline_run_id is not None:
                 pipeline.update_run(run_id=int(pipeline_run_id), last_src_path="", last_dst_path="")
@@ -1482,6 +2201,37 @@ def _try_exif_datetime_year(img: Image.Image) -> Optional[str]:
     return None
 
 
+def _try_exif_datetime_iso(img: Image.Image) -> Optional[str]:
+    """
+    Returns ISO-like timestamp 'YYYY-MM-DDTHH:MM:SSZ' (best-effort).
+    EXIF DateTimeOriginal does not contain timezone; we still suffix 'Z' for stable format/sorting.
+    """
+    try:
+        exif = img.getexif()
+    except Exception:
+        return None
+    if not exif:
+        return None
+    dt = exif.get(36867) or exif.get(306)  # DateTimeOriginal or DateTime
+    if not dt or not isinstance(dt, str):
+        return None
+    s = dt.strip()
+    # "YYYY:MM:DD HH:MM:SS"
+    try:
+        if len(s) >= 19 and s[4] == ":" and s[7] == ":" and s[10] in (" ", "T"):
+            yyyy = s[0:4]
+            mm = s[5:7]
+            dd = s[8:10]
+            hh = s[11:13]
+            mi = s[14:16]
+            ss = s[17:19]
+            if yyyy.isdigit() and mm.isdigit() and dd.isdigit() and hh.isdigit() and mi.isdigit() and ss.isdigit():
+                return f"{yyyy}-{mm}-{dd}T{hh}:{mi}:{ss}Z"
+    except Exception:
+        return None
+    return None
+
+
 def _gps_to_deg(v) -> Optional[float]:
     try:
         d = float(v[0])
@@ -1521,6 +2271,39 @@ def _try_exif_gps_segment(img: Image.Image) -> Optional[str]:
     if isinstance(lon_ref, str) and lon_ref.upper() == "W":
         lon_deg = -lon_deg
     return f"gps_{lat_deg:.4f}_{lon_deg:.4f}"
+
+
+def _try_exif_gps_latlon(img: Image.Image) -> tuple[float, float] | None:
+    """
+    Returns (lat, lon) in degrees (best-effort), applying N/S/E/W refs.
+    """
+    try:
+        exif = img.getexif()
+    except Exception:
+        return None
+    if not exif:
+        return None
+    gps = exif.get(34853)
+    if not gps:
+        return None
+    try:
+        lat = gps.get(2)
+        lat_ref = gps.get(1)
+        lon = gps.get(4)
+        lon_ref = gps.get(3)
+    except Exception:
+        return None
+    if not lat or not lon:
+        return None
+    lat_deg = _gps_to_deg(lat)
+    lon_deg = _gps_to_deg(lon)
+    if lat_deg is None or lon_deg is None:
+        return None
+    if isinstance(lat_ref, str) and lat_ref.upper() == "S":
+        lat_deg = -lat_deg
+    if isinstance(lon_ref, str) and lon_ref.upper() == "W":
+        lon_deg = -lon_deg
+    return (float(lat_deg), float(lon_deg))
 
 
 def sort_faces_into_named_folders(
@@ -1597,6 +2380,15 @@ def sort_faces_into_named_folders(
                     new_name=os.path.basename(dst_abs),
                     new_parent_path=_as_local_path(os.path.dirname(dst_abs)),
                 )
+                if pipeline_run_id is not None:
+                    try:
+                        dedup.update_run_manual_labels_path(
+                            pipeline_run_id=int(pipeline_run_id),
+                            old_path=db_path,
+                            new_path=new_db_path,
+                        )
+                    except Exception:
+                        pass
                 store.update_file_path(old_file_path=db_path, new_file_path=new_db_path)
             if pipeline is not None and pipeline_run_id is not None:
                 pipeline.update_run(run_id=int(pipeline_run_id), last_src_path="", last_dst_path="")
@@ -1679,6 +2471,15 @@ def sort_no_faces_by_geo_year(
                     new_name=os.path.basename(dst_abs),
                     new_parent_path=_as_local_path(os.path.dirname(dst_abs)),
                 )
+                if pipeline_run_id is not None:
+                    try:
+                        dedup.update_run_manual_labels_path(
+                            pipeline_run_id=int(pipeline_run_id),
+                            old_path=_as_local_path(src_abs),
+                            new_path=new_db_path,
+                        )
+                    except Exception:
+                        pass
                 store.update_file_path(old_file_path=_as_local_path(src_abs), new_file_path=new_db_path)
             if pipeline is not None and pipeline_run_id is not None:
                 pipeline.update_run(run_id=int(pipeline_run_id), last_src_path="", last_dst_path="")
@@ -1708,6 +2509,14 @@ def main() -> int:
     p.add_argument("--exclude-dirname", action="append", default=list(EXCLUDE_DIR_NAMES_DEFAULT))
     p.add_argument("--score-threshold", type=float, default=0.85)
     p.add_argument("--thumb-size", type=int, default=160)
+    # Video (optional): sample 0..3 frames and run the same detectors.
+    # Default 0 => do not process videos at all (keeps existing behavior and avoids slowing down runs).
+    p.add_argument("--video-samples", type=int, default=0, help="0..3 frames per video (default 0 = disabled)")
+    p.add_argument("--video-max-dim", type=int, default=640, help="Max frame dimension for video sampling (px)")
+    p.add_argument("--video-bad-mean-luma", type=float, default=25.0, help="Reject frame if mean luma < threshold")
+    p.add_argument("--video-bad-std-luma", type=float, default=10.0, help="Reject frame if std(luma) < threshold")
+    p.add_argument("--video-bad-black-ratio", type=float, default=0.85, help="Reject frame if black pixel ratio > threshold")
+    p.add_argument("--video-black-luma-threshold", type=int, default=16, help="Luma <= this counts as 'black' for ratio")
     p.add_argument(
         "--model-path",
         default=str(Path("data") / "models" / "face_detection_yunet_2023mar.onnx"),
@@ -1759,6 +2568,14 @@ def main() -> int:
                         new_name=os.path.basename(dst0),
                         new_parent_path=_as_local_path(os.path.dirname(dst0)),
                     )
+                    try:
+                        d.update_run_manual_labels_path(
+                            pipeline_run_id=int(pipeline_run_id),
+                            old_path=_as_local_path(src0),
+                            new_path=_as_local_path(dst0),
+                        )
+                    except Exception:
+                        pass
                     f.update_file_path(old_file_path=_as_local_path(src0), new_file_path=_as_local_path(dst0))
                     pipeline.update_run(run_id=pipeline_run_id, last_src_path="", last_dst_path="")
                 finally:
@@ -1783,20 +2600,54 @@ def main() -> int:
             existing_dedup_run_id = int(pr2["dedup_run_id"]) if pr2.get("dedup_run_id") else None
             existing_face_run_id = int(pr2["face_run_id"]) if pr2.get("face_run_id") else None
 
-        # 1) dedup
+        # 1) предочистка (до дедупликации): не‑медиа и битые медиа уводим в служебные папки
+        step0_counts: dict[str, int] | None = None
+        if start_step <= 1:
+            if pipeline is not None and pipeline_run_id is not None:
+                # Внутренне у конвейера пока 2 шага (dedup + faces), но в UI мы показываем план 1..6.
+                pipeline.update_run(run_id=pipeline_run_id, step_num=1, step_total=2, step_title="предочистка")
+            _pipe_log(pipeline, pipeline_run_id, "\n== шаг 1: предочистка (не-медиа / битые медиа) ==\n")
+            pre = _preclean_nonmedia_and_broken(
+                root_dir=root,
+                dry_run=dry_run,
+                exclude_dir_names=exclude,
+                non_media_dirname=NON_MEDIA_DIRNAME_DEFAULT,
+                broken_media_dirname=BROKEN_MEDIA_DIRNAME_DEFAULT,
+                pipeline=pipeline,
+                pipeline_run_id=pipeline_run_id,
+            )
+            step0_counts = {k: int(pre.get(k) or 0) for k in ("checked", "moved_non_media", "moved_broken_media")}
+            _pipe_log(
+                pipeline,
+                pipeline_run_id,
+                f"preclean: checked={pre.get('checked')} moved_non_media={pre.get('moved_non_media')} moved_broken_media={pre.get('moved_broken_media')}\n",
+            )
+
+        # В DRY-RUN (и вообще для консистентности) считаем "эффективный" набор файлов после предочистки:
+        # исключаем всё, что было помечено к переносу в _non_media/_broken_media.
+        preclean_exclude_paths: set[str] | None = None
+        try:
+            if pipeline is not None and pipeline_run_id is not None:
+                ex = _load_preclean_exclude_paths(pipeline=pipeline, pipeline_run_id=pipeline_run_id)
+                preclean_exclude_paths = ex if ex else None
+        except Exception:
+            preclean_exclude_paths = None
+
+        # 2) дедупликация
         if start_step <= 1:
             if pipeline is not None and pipeline_run_id is not None:
                 pipeline.update_run(run_id=pipeline_run_id, step_num=1, step_total=2, step_title="дедупликация")
             if args.skip_dedup:
-                _pipe_log(pipeline, pipeline_run_id, "\n== шаг 1/2: дедупликация (SKIPPED) ==\n")
+                _pipe_log(pipeline, pipeline_run_id, "\n== шаг 2: дедупликация (SKIPPED) ==\n")
             else:
-                _pipe_log(pipeline, pipeline_run_id, "\n== шаг 1/2: дедупликация ==\n")
+                _pipe_log(pipeline, pipeline_run_id, "\n== шаг 2: дедупликация ==\n")
                 d = dedup_local(
                     root_dir=root,
                     dry_run=dry_run,
                     move_duplicates=not bool(args.no_dedup_move),
                     duplicates_dirname=str(args.duplicates_dirname),
                     exclude_dir_names=exclude,
+                    exclude_paths=preclean_exclude_paths,
                     run_id=existing_dedup_run_id,
                     pipeline=pipeline,
                     pipeline_run_id=pipeline_run_id,
@@ -1808,11 +2659,11 @@ def main() -> int:
                     f"errors={d.errors} duplicates_moved={d.duplicates_moved}\n",
                 )
 
-        # 2) лица / нет лиц = скан + разложение
+        # 3) лица / нет лиц = скан + разложение
         if pipeline is not None and pipeline_run_id is not None:
             pipeline.update_run(run_id=pipeline_run_id, step_num=2, step_total=2, step_title="лица/нет лиц: скан")
-        _pipe_log(pipeline, pipeline_run_id, "\n== шаг 2/2: лица / нет лиц ==\n")
-        _pipe_log(pipeline, pipeline_run_id, "подшаг 2.1: скан лиц (face rectangles)\n")
+        _pipe_log(pipeline, pipeline_run_id, "\n== шаг 3: лица / нет лиц ==\n")
+        _pipe_log(pipeline, pipeline_run_id, "подшаг 3.1: скан лиц (face rectangles)\n")
         run_id2, s = scan_faces_local(
             root_dir=root,
             score_threshold=float(args.score_threshold),
@@ -1820,7 +2671,14 @@ def main() -> int:
             model_path=Path(str(args.model_path)),
             model_url=str(args.model_url),
             exclude_dir_names=exclude,
+            exclude_paths=preclean_exclude_paths,
             enable_qr=bool(args.enable_qr),
+            video_samples=int(args.video_samples or 0),
+            video_max_dim=int(args.video_max_dim or 0),
+            video_bad_mean_luma=float(args.video_bad_mean_luma or 0.0),
+            video_bad_std_luma=float(args.video_bad_std_luma or 0.0),
+            video_bad_black_ratio=float(args.video_bad_black_ratio or 0.0),
+            video_black_luma_threshold=int(args.video_black_luma_threshold or 0),
             run_id=existing_face_run_id,
             pipeline=pipeline,
             pipeline_run_id=pipeline_run_id,
@@ -1858,6 +2716,76 @@ def main() -> int:
             _pipe_log(pipeline, pipeline_run_id, "\nNOTE: This was a dry-run. Re-run with --apply to actually move files.\n")
 
         if pipeline is not None and pipeline_run_id is not None:
+            # Snapshot metrics to DB so they don't "float" after next run overwrites files.*
+            try:
+                dsM = DedupStore()
+                try:
+                    prM = pipeline.get_run_by_id(run_id=int(pipeline_run_id)) or {}
+                    fridM = int(prM.get("face_run_id") or 0) or None
+                    root_likeM = None
+                    try:
+                        root_likeM = "local:" + (os.path.abspath(root).rstrip("\\/") + "\\") + "%"
+                    except Exception:
+                        root_likeM = None
+                    cats_total, cats_mism = _count_misses_for_gold(
+                        ds=dsM,
+                        pipeline_run_id=int(pipeline_run_id),
+                        face_run_id=fridM,
+                        root_like=root_likeM,
+                        gold_name="cats_gold",
+                        expected_tab="animals",
+                    )
+                    faces_total, faces_mism = _count_misses_for_gold(
+                        ds=dsM,
+                        pipeline_run_id=int(pipeline_run_id),
+                        face_run_id=fridM,
+                        root_like=root_likeM,
+                        gold_name="faces_gold",
+                        expected_tab="faces",
+                    )
+                    no_faces_total, no_faces_mism = _count_misses_for_gold(
+                        ds=dsM,
+                        pipeline_run_id=int(pipeline_run_id),
+                        face_run_id=fridM,
+                        root_like=root_likeM,
+                        gold_name="no_faces_gold",
+                        expected_tab="no_faces",
+                    )
+                finally:
+                    dsM.close()
+                # best-effort: also capture step2 totals from face_runs via FaceStore
+                step2_total = step2_processed = None
+                try:
+                    if fridM:
+                        fsM = FaceStore()
+                        try:
+                            frM = fsM.get_run_by_id(run_id=int(fridM)) or {}
+                            step2_total = frM.get("total_files")
+                            step2_processed = frM.get("processed_files")
+                        finally:
+                            fsM.close()
+                except Exception:
+                    step2_total = step2_processed = None
+                pipeline.upsert_metrics(
+                    pipeline_run_id=int(pipeline_run_id),
+                    metrics={
+                        "computed_at": _now_utc_iso(),
+                        "face_run_id": int(fridM) if fridM else None,
+                        "step0_checked": (step0_counts or {}).get("checked") if step0_counts is not None else None,
+                        "step0_non_media": (step0_counts or {}).get("moved_non_media") if step0_counts is not None else None,
+                        "step0_broken_media": (step0_counts or {}).get("moved_broken_media") if step0_counts is not None else None,
+                        "step2_total": step2_total,
+                        "step2_processed": step2_processed,
+                        "cats_total": cats_total,
+                        "cats_mism": cats_mism,
+                        "faces_total": faces_total,
+                        "faces_mism": faces_mism,
+                        "no_faces_total": no_faces_total,
+                        "no_faces_mism": no_faces_mism,
+                    },
+                )
+            except Exception:
+                pass
             pipeline.update_run(run_id=pipeline_run_id, status="completed", finished_at=_now_utc_iso())
         return 0
     except Exception as e:  # noqa: BLE001

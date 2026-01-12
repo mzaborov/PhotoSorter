@@ -17,20 +17,44 @@ from typing import Any, Callable, Optional, TypeVar
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from common.db import DedupStore, FaceStore, PipelineStore, list_folders
 from common.yadisk_client import get_disk
 from web_api.routers.gold import router as gold_router
+from web_api.routers.preclean import router as preclean_router
+from web_api.routers.dedup_results import router as dedup_results_router
+from web_api.routers.faces import router as faces_router
+from web_api.routers.local_pipeline import router as local_pipeline_router
+from web_api.routers.folders import router as folders_router
+from web_api.routers import gold as gold_api
 from logic.gold.store import gold_expected_tab_by_path
 
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
+# --- dotenv (secrets.env/.env) ---
+# ВАЖНО: uvicorn worker наследует окружение текущего процесса.
+# Если не загрузить secrets.env здесь — LOCAL_PIPELINE_VIDEO_SAMPLES и прочие env не попадут в worker.
+try:
+    from dotenv import load_dotenv  # type: ignore[import-not-found]
+
+    rr0 = Path(__file__).resolve().parents[2]
+    # приоритет: secrets.env, затем .env (без override)
+    load_dotenv(dotenv_path=str(rr0 / "secrets.env"), override=False)
+    load_dotenv(dotenv_path=str(rr0 / ".env"), override=False)
+except Exception:
+    pass
+
 app = FastAPI(title="PhotoSorter")
 app.include_router(gold_router)
+app.include_router(preclean_router)
+app.include_router(dedup_results_router)
+app.include_router(faces_router)
+app.include_router(local_pipeline_router)
+app.include_router(folders_router)
 
 _T = TypeVar("_T")
 
@@ -39,31 +63,6 @@ _T = TypeVar("_T")
 _STARTED_AT = time.time()
 STARTED_AT_UTC_ISO = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_STARTED_AT))
 BUILD_ID = time.strftime("%Y%m%d-%H%M%S", time.gmtime(_STARTED_AT)) + f"-pid{os.getpid()}"
-
-# #region agent log
-def _agent_dbg(*, hypothesis_id: str, location: str, message: str, data: dict[str, Any] | None = None, run_id: str = "pre-fix") -> None:
-    """
-    Tiny NDJSON logger for debug-mode evidence. Writes to .cursor/debug.log.
-    Never log secrets/PII.
-    """
-    try:
-        p = _repo_root() / ".cursor" / "debug.log"
-        payload = {
-            "sessionId": "debug-session",
-            "runId": str(run_id),
-            "hypothesisId": str(hypothesis_id),
-            "location": str(location),
-            "message": str(message),
-            "data": data or {},
-            "timestamp": int(time.time() * 1000),
-        }
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.open("a", encoding="utf-8").write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-
-# #endregion agent log
-
 
 def _now_utc_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -114,162 +113,7 @@ _VIDEO_LOCK = threading.Lock()
 _VIDEO_FUTURES: dict[str, Any] = {}
 _VIDEO_ERRORS: dict[str, str] = {}
 
-# Локальный "конвейер" (ML в отдельном процессе через .venv-face).
-_LOCAL_PIPELINE_EXEC = ThreadPoolExecutor(max_workers=1)
-_LOCAL_PIPELINE_LOCK = threading.Lock()
-_LOCAL_PIPELINE_FUTURE: Any = None
-_LOCAL_PIPELINE_RUN_ID: Optional[int] = None
-_LOCAL_PIPELINE_STATE: dict[str, Any] = {
-    "running": False,
-    "root_path": None,
-    "apply": False,
-    "skip_dedup": False,
-    "no_dedup_move": False,
-    "started_at": None,
-    "finished_at": None,
-    "exit_code": None,
-    "error": None,
-    "log": "",
-}
-
-
-def _repo_root() -> Path:
-    # backend/web_api/main.py -> repo root
-    return APP_DIR.parents[1]
-
-def _local_pipeline_log_append(line: str) -> None:
-    # держим хвост лога (чтобы не раздувать память)
-    with _LOCAL_PIPELINE_LOCK:
-        s = _LOCAL_PIPELINE_STATE.get("log") or ""
-        s = (s + (line or "")).replace("\r\n", "\n")
-        if len(s) > 120_000:
-            s = s[-120_000:]
-        _LOCAL_PIPELINE_STATE["log"] = s
-
-        run_id = _LOCAL_PIPELINE_RUN_ID
-    # Важно: persist в SQLite, чтобы пережить перезапуск сервера/IDE.
-    if run_id is not None:
-        ps = PipelineStore()
-        try:
-            ps.append_log(run_id=int(run_id), line=line or "")
-        finally:
-            ps.close()
-
-
-def _run_local_pipeline(*, root_path: str, apply: bool, skip_dedup: bool, no_dedup_move: bool, pipeline_run_id: int) -> None:
-    # Запускаем python из .venv-face -> scripts/tools/local_sort_by_faces.py напрямую (без .ps1),
-    # чтобы не упираться в ExecutionPolicy/подписи PowerShell-скриптов.
-    rr = _repo_root()
-    py = rr / ".venv-face" / "Scripts" / "python.exe"
-    script = rr / "backend" / "scripts" / "tools" / "local_sort_by_faces.py"
-
-    with _LOCAL_PIPELINE_LOCK:
-        _LOCAL_PIPELINE_STATE.update(
-            {
-                "running": True,
-                "root_path": root_path,
-                "apply": bool(apply),
-                "skip_dedup": bool(skip_dedup),
-                "no_dedup_move": bool(no_dedup_move),
-                "started_at": _now_utc_iso(),
-                "finished_at": None,
-                "exit_code": None,
-                "error": None,
-                "log": "",
-            }
-        )
-        global _LOCAL_PIPELINE_RUN_ID  # noqa: PLW0603
-        _LOCAL_PIPELINE_RUN_ID = int(pipeline_run_id)
-
-    # Дополнительные проверки на всякий случай (в start мы тоже проверяем).
-    if not py.exists():
-        _local_pipeline_log_append(f"ERROR: not found: {py}\n")
-        with _LOCAL_PIPELINE_LOCK:
-            _LOCAL_PIPELINE_STATE.update({"running": False, "finished_at": _now_utc_iso(), "exit_code": 2, "error": ".venv-face python not found"})
-        return
-    if not script.exists():
-        _local_pipeline_log_append(f"ERROR: not found: {script}\n")
-        with _LOCAL_PIPELINE_LOCK:
-            _LOCAL_PIPELINE_STATE.update(
-                {"running": False, "finished_at": _now_utc_iso(), "exit_code": 2, "error": "local_sort_by_faces.py not found"}
-            )
-        return
-
-    cmd: list[str] = [
-        str(py),
-        str(script.relative_to(rr)),
-        "--root",
-        root_path,
-        "--pipeline-run-id",
-        str(int(pipeline_run_id)),
-    ]
-    if apply:
-        cmd.append("--apply")
-    if skip_dedup:
-        cmd.append("--skip-dedup")
-    if no_dedup_move:
-        cmd.append("--no-dedup-move")
-
-    _local_pipeline_log_append("RUN: " + " ".join(cmd) + "\n")
-
-    try:
-        # Важно: без этого Python часто буферизует stdout при запуске через pipe,
-        # и UI не видит прогресс (dedup_progress/faces_progress) до конца выполнения.
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-        # Гарантируем импорты из корня проекта (DB, yadisk_client и т.п.)
-        env["PYTHONPATH"] = str(rr)
-
-        p = subprocess.Popen(  # noqa: S603
-            cmd,
-            cwd=str(rr),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            env=env,
-        )
-        assert p.stdout is not None
-        # сохраняем PID процесса в БД
-        ps = PipelineStore()
-        try:
-            ps.update_run(run_id=int(pipeline_run_id), pid=int(p.pid), status="running")
-        finally:
-            ps.close()
-        for line in p.stdout:
-            _local_pipeline_log_append(line)
-        rc = int(p.wait())
-        ps2 = PipelineStore()
-        try:
-            ps2.update_run(
-                run_id=int(pipeline_run_id),
-                status="completed" if rc == 0 else "failed",
-                last_error="" if rc == 0 else f"exit_code={rc}",
-                finished_at=_now_utc_iso(),
-            )
-        finally:
-            ps2.close()
-        with _LOCAL_PIPELINE_LOCK:
-            _LOCAL_PIPELINE_STATE.update(
-                {
-                    "running": False,
-                    "finished_at": _now_utc_iso(),
-                    "exit_code": rc,
-                    "error": None if rc == 0 else f"exit_code={rc}",
-                }
-            )
-    except Exception as e:  # noqa: BLE001
-        _local_pipeline_log_append(f"ERROR: {type(e).__name__}: {e}\n")
-        ps3 = PipelineStore()
-        try:
-            ps3.update_run(run_id=int(pipeline_run_id), status="failed", last_error=f"{type(e).__name__}: {e}", finished_at=_now_utc_iso())
-        finally:
-            ps3.close()
-        with _LOCAL_PIPELINE_LOCK:
-            _LOCAL_PIPELINE_STATE.update({"running": False, "finished_at": _now_utc_iso(), "exit_code": 1, "error": f"{type(e).__name__}: {e}"})
-
-
-
+# (local pipeline endpoints moved to web_api/routers/local_pipeline.py)
 def _preview_cache_get(key: tuple[str, str]) -> Optional[str]:
     now = time.time()
     with _PREVIEW_CACHE_LOCK:
@@ -435,7 +279,7 @@ def _sha256_file(path: str, *, chunk_size: int = 1024 * 1024) -> str:
 def _dedup_scan_archive(
     *,
     run_id: int,
-    root_path: str,
+    root_paths: list[str],
     limit_files: int | None,
     max_download_bytes: int | None,
     inventory_scope: str,
@@ -454,8 +298,8 @@ def _dedup_scan_archive(
     skipped_large = 0
     errors = 0
 
-    root = _normalize_yadisk_path(root_path)
-    stack = [root]
+    roots = [_normalize_yadisk_path(r) for r in (root_paths or []) if str(r or "").strip()]
+    stack = list(roots)
     visited: set[str] = set()
 
     try:
@@ -684,6 +528,32 @@ def _dedup_scan_archive(
                     return
     finally:
         store.close()
+
+
+def _dedup_archive_roots() -> list[str]:
+    """
+    Корни "архива" для сверки дублей (YaDisk). По умолчанию: Фото + Гитара.
+    Настраивается через env `PHOTOSORTER_DEDUP_ARCHIVE_ROOTS`, разделители: ; , или перенос строки.
+    """
+    # По умолчанию оставляем прежнее поведение (только disk:/Фото).
+    # Если нужно добавить другие "архивные" корни (например disk:/Гитара) — задайте env.
+    raw = (os.getenv("PHOTOSORTER_DEDUP_ARCHIVE_ROOTS") or "disk:/Фото").strip()
+    parts: list[str] = []
+    for chunk in raw.replace("\r", "\n").replace(",", ";").split(";"):
+        s = (chunk or "").strip()
+        if not s:
+            continue
+        # Нормализуем trailing slash
+        parts.append(s.rstrip("/"))
+    # unique, preserve order
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out or ["disk:/Фото"]
 
 
 def _as_local_path(p: str) -> str:
@@ -1234,11 +1104,6 @@ def _pick_keep_indexes(items: list[dict[str, Any]], sort_order_by_folder: dict[s
     return best_idx
 
 
-@app.get("/api/folders")
-def api_folders() -> list[dict]:
-    return list_folders(location="yadisk", role="target")
-
-
 @app.get("/api/debug/module-path")
 def api_debug_module_path() -> dict[str, Any]:
     """
@@ -1288,7 +1153,9 @@ def api_dedup_archive_start(max_download_gb: int = 5) -> dict[str, Any]:
     """
     global _DEDUP_FUTURES, _DEDUP_RUN_IDS  # noqa: PLW0603
 
-    root_path = "disk:/Фото"
+    roots = _dedup_archive_roots()
+    # root_path сохраняем совместимым (первый корень), чтобы UI/старые куски кода не ломались.
+    root_path = str(roots[0] if roots else "disk:/Фото")
     max_download_bytes = None if max_download_gb <= 0 else (max_download_gb * 1024 * 1024 * 1024)
 
     with _DEDUP_LOCK:
@@ -1314,15 +1181,21 @@ def api_dedup_archive_start(max_download_gb: int = 5) -> dict[str, Any]:
                 # Всегда считаем total_files, чтобы UI мог рисовать процент.
                 try:
                     disk = get_disk()
-                    total, err, err_path = _count_files_recursive(disk, root_path)
-                    if total is not None:
-                        store2.update_run_progress(run_id=run_id, total_files=int(total))
-                    else:
-                        store2.update_run_progress(
-                            run_id=run_id,
-                            last_path=err_path,
-                            last_error=f"total_files_count_failed: {err}",
-                        )
+                    total_sum = 0
+                    any_total = False
+                    for r in roots:
+                        total, err, err_path = _count_files_recursive(disk, r)
+                        if total is not None:
+                            total_sum += int(total)
+                            any_total = True
+                        else:
+                            store2.update_run_progress(
+                                run_id=run_id,
+                                last_path=err_path,
+                                last_error=f"total_files_count_failed({r}): {err}",
+                            )
+                    if any_total:
+                        store2.update_run_progress(run_id=run_id, total_files=int(total_sum))
                 except Exception as e:  # noqa: BLE001
                     store2.update_run_progress(
                         run_id=run_id,
@@ -1331,7 +1204,7 @@ def api_dedup_archive_start(max_download_gb: int = 5) -> dict[str, Any]:
 
                 _dedup_scan_archive(
                     run_id=run_id,
-                    root_path=root_path,
+                    root_paths=roots,
                     limit_files=None,
                     max_download_bytes=max_download_bytes,
                     inventory_scope="archive",
@@ -1447,7 +1320,7 @@ def api_dedup_source_start(path: str = r"C:\tmp\Photo", max_download_gb: int = 5
     - локальная: считаем sha256 локально
     - YaDisk: используем sha256/md5 из метаданных, иначе (опционально) докачиваем и считаем sha256
 
-    Важно: для YaDisk source запрещаем выбирать папку внутри disk:/Фото, чтобы не смешивать "archive" и "source"
+    Важно: для YaDisk source запрещаем выбирать папку внутри корней архива, чтобы не смешивать "archive" и "source"
     (в таблице files путь уникален).
     """
     global _DEDUP_FUTURES, _DEDUP_RUN_IDS  # noqa: PLW0603
@@ -1457,10 +1330,20 @@ def api_dedup_source_start(path: str = r"C:\tmp\Photo", max_download_gb: int = 5
     if is_disk:
         # защитимся от пересечения с архивом
         p = root_path.rstrip("/")
-        if p == "disk:/Фото" or p.startswith("disk:/Фото/"):
+        arc_roots = _dedup_archive_roots()
+        def _is_under_any_archive_root(pp: str) -> bool:
+            s = (pp or "").rstrip("/")
+            for r in arc_roots:
+                rr = (r or "").rstrip("/")
+                if not rr:
+                    continue
+                if s == rr or s.startswith(rr + "/"):
+                    return True
+            return False
+        if _is_under_any_archive_root(p):
             raise HTTPException(
                 status_code=400,
-                detail="Нельзя выбирать source внутри disk:/Фото (архив). Выберите папку вне архива, например disk:/Загрузки или disk:/Фотокамера.",
+                detail="Нельзя выбирать source внутри архива (например disk:/Фото или disk:/Гитара). Выберите папку вне архива, например disk:/Загрузки или disk:/Фотокамера.",
             )
 
     max_download_bytes = None if max_download_gb <= 0 else (max_download_gb * 1024 * 1024 * 1024)
@@ -1501,7 +1384,7 @@ def api_dedup_source_start(path: str = r"C:\tmp\Photo", max_download_gb: int = 5
 
                     _dedup_scan_archive(
                         run_id=run_id,
-                        root_path=root_path,
+                        root_paths=[root_path],
                         limit_files=None,
                         max_download_bytes=max_download_bytes,
                         inventory_scope="source",
@@ -1584,13 +1467,14 @@ def api_sort_start(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     }
 
 
-@app.post("/api/local-pipeline/start")
+@app.post("/api/_legacy/local-pipeline/start")
 def api_local_pipeline_start(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """
     Запуск локального конвейера (ML в отдельном процессе через .venv-face).
     Запускает scripts/tools/local_sort_by_faces.py напрямую через python из .venv-face
     (без .ps1), чтобы не упираться в ExecutionPolicy/подписи PowerShell-скриптов.
     """
+    raise HTTPException(status_code=410, detail="Moved to web_api/routers/local_pipeline.py")
     root_path = str(payload.get("root_path") or "").strip()
     apply = bool(payload.get("apply") or False)
     skip_dedup = bool(payload.get("skip_dedup") or False)
@@ -1619,6 +1503,25 @@ def api_local_pipeline_start(payload: dict[str, Any] = Body(...)) -> dict[str, A
     try:
         latest = ps.get_latest_run(kind="local_sort", root_path=root_path)
         resumed = False
+        prev_run_id: int | None = None
+        prev_face_run_id: int | None = None
+        prev_root_like: str | None = None
+        prev_status: str | None = None
+        # candidate previous run (only for "new" starts)
+        if latest:
+            try:
+                prev_run_id = int(latest.get("id") or 0) or None
+            except Exception:
+                prev_run_id = None
+            try:
+                prev_face_run_id = int(latest.get("face_run_id") or 0) or None
+            except Exception:
+                prev_face_run_id = None
+            prev_status = str(latest.get("status") or "")
+            try:
+                prev_root_like = gold_api._root_like_for_pipeline_run_id(int(prev_run_id)) if prev_run_id else None
+            except Exception:
+                prev_root_like = None
         # 0) Явный resume конкретного run_id (UI кнопка "Продолжить")
         if resume_run_id is not None:
             try:
@@ -1677,6 +1580,73 @@ def api_local_pipeline_start(payload: dict[str, Any] = Body(...)) -> dict[str, A
             pipeline_run_id = ps.create_run(kind="local_sort", root_path=root_path, apply=apply, skip_dedup=skip_dedup)
     finally:
         ps.close()
+
+    # Auto-snapshot metrics for previous run (best-effort), before the new run overwrites files.* with a new face_run_id.
+    # No button: this runs automatically on every "new" start (not on resume).
+    try:
+        if not bool(resumed):
+            # Ensure we snapshot only a real previous completed/failed run, not "running".
+            if prev_run_id and int(prev_run_id) != int(pipeline_run_id) and (prev_status in ("completed", "failed")) and prev_face_run_id:
+                psm = PipelineStore()
+                try:
+                    already = psm.get_metrics_for_run(pipeline_run_id=int(prev_run_id))
+                    if not already:
+                        ds = DedupStore()
+                        fs = FaceStore()
+                        try:
+                            cats = gold_api._count_misses_for_gold(
+                                ds=ds,
+                                pipeline_run_id=int(prev_run_id),
+                                face_run_id=int(prev_face_run_id),
+                                root_like=prev_root_like,
+                                gold_name="cats_gold",
+                                expected_tab="animals",
+                            )
+                            faces = gold_api._count_misses_for_gold(
+                                ds=ds,
+                                pipeline_run_id=int(prev_run_id),
+                                face_run_id=int(prev_face_run_id),
+                                root_like=prev_root_like,
+                                gold_name="faces_gold",
+                                expected_tab="faces",
+                            )
+                            no_faces = gold_api._count_misses_for_gold(
+                                ds=ds,
+                                pipeline_run_id=int(prev_run_id),
+                                face_run_id=int(prev_face_run_id),
+                                root_like=prev_root_like,
+                                gold_name="no_faces_gold",
+                                expected_tab="no_faces",
+                            )
+                        finally:
+                            ds.close()
+                        step2_total = step2_processed = None
+                        try:
+                            fr = fs.get_run_by_id(run_id=int(prev_face_run_id)) or {}
+                            step2_total = fr.get("total_files")
+                            step2_processed = fr.get("processed_files")
+                        finally:
+                            fs.close()
+                        psm.upsert_metrics(
+                            pipeline_run_id=int(prev_run_id),
+                            metrics={
+                                "computed_at": _now_utc_iso(),
+                                "face_run_id": int(prev_face_run_id),
+                                "step2_total": step2_total,
+                                "step2_processed": step2_processed,
+                                "cats_total": cats.get("total"),
+                                "cats_mism": cats.get("mism"),
+                                "faces_total": faces.get("total"),
+                                "faces_mism": faces.get("mism"),
+                                "no_faces_total": no_faces.get("total"),
+                                "no_faces_mism": no_faces.get("mism"),
+                            },
+                        )
+                finally:
+                    psm.close()
+    except Exception:
+        # best-effort: do not block start due to snapshot failures
+        pass
 
     # Если resume происходит после старого прогона, где dedup_run уже completed,
     # но processed_files остались 0/total — "долечим" это в БД (данные, не UI).
@@ -1737,11 +1707,12 @@ def api_local_pipeline_start(payload: dict[str, Any] = Body(...)) -> dict[str, A
     }
 
 
-@app.get("/api/local-pipeline/latest")
+@app.get("/api/_legacy/local-pipeline/latest")
 def api_local_pipeline_latest(root_path: str) -> dict[str, Any]:
     """
     Возвращает последний pipeline_run для указанной папки (root_path) — чтобы UI мог показать кнопку "Продолжить".
     """
+    raise HTTPException(status_code=410, detail="Moved to web_api/routers/local_pipeline.py")
     rp = str(root_path or "").strip()
     if not rp:
         raise HTTPException(status_code=400, detail="root_path is required")
@@ -1753,8 +1724,9 @@ def api_local_pipeline_latest(root_path: str) -> dict[str, Any]:
     return {"ok": True, "latest": pr}
 
 
-@app.get("/api/local-pipeline/status")
+@app.get("/api/_legacy/local-pipeline/status")
 def api_local_pipeline_status() -> dict[str, Any]:
+    raise HTTPException(status_code=410, detail="Moved to web_api/routers/local_pipeline.py")
     ps = PipelineStore()
     try:
         pr = ps.get_latest_any(kind="local_sort")
@@ -1803,7 +1775,68 @@ def api_local_pipeline_status() -> dict[str, Any]:
     log = str(pr.get("log_tail") or "").replace("\r\n", "\n")
     log_tail = "\n".join(log.splitlines()[-160:])
 
-    # Step 1: dedup прогресс берём из dedup_runs
+    # --- debug (video env / cmd flags) ---
+    video_samples_env: int | None
+    try:
+        video_samples_env = int(os.getenv("LOCAL_PIPELINE_VIDEO_SAMPLES") or "0")
+    except Exception:
+        video_samples_env = None
+
+    def _last_run_cmd_from_log(log_text: str) -> str | None:
+        for line in reversed((log_text or "").splitlines()):
+            if line.startswith("RUN: "):
+                return line[len("RUN: ") :].strip()
+        return None
+
+    run_cmd = _last_run_cmd_from_log(log_tail)
+    cmd_has_video_samples = bool(run_cmd and "--video-samples" in run_cmd)
+    cmd_video_samples: int | None = None
+    if run_cmd and "--video-samples" in run_cmd:
+        try:
+            parts = run_cmd.split()
+            i = parts.index("--video-samples")
+            if i + 1 < len(parts):
+                cmd_video_samples = int(parts[i + 1])
+        except Exception:
+            cmd_video_samples = None
+
+    # Шаг 1 (предочистка): прогресс best-effort из log_tail (и/или preclean_state, если есть).
+    step0_checked = step0_non_media = step0_broken_media = None
+    try:
+        import re
+
+        # ВАЖНО: парсим по смысловому тегу, а не по номерам шагов (они меняются в UI).
+        m0 = re.search(r"preclean:\s*checked=(\d+)\s+moved_non_media=(\d+)\s+moved_broken_media=(\d+)", log_tail)
+        if m0:
+            step0_checked = int(m0.group(1))
+            step0_non_media = int(m0.group(2))
+            step0_broken_media = int(m0.group(3))
+    except Exception:
+        pass
+
+    # статус шага 0 определяем по step_num/title
+    title_l = (step_title or "").lower()
+    if status == "completed":
+        step0_status = "done"
+        step0_pct = 100
+    elif status == "failed":
+        step0_status = "error" if ("предочист" in title_l or step_num <= 1) else "done"
+        step0_pct = 100 if step0_status == "done" else (50 if step0_checked is not None else 0)
+    elif running:
+        if "предочист" in title_l:
+            step0_status = "running"
+            step0_pct = 50 if step0_checked is not None else 10
+        elif step_num >= 2:
+            step0_status = "done"
+            step0_pct = 100
+        else:
+            step0_status = "pending"
+            step0_pct = 0
+    else:
+        step0_status = "idle"
+        step0_pct = 0
+
+    # Шаг 2 (дедупликация): прогресс берём из dedup_runs
     dedup_proc = dedup_total = None
     dedup_run_id = pr.get("dedup_run_id")
     if dedup_run_id:
@@ -1832,7 +1865,7 @@ def api_local_pipeline_status() -> dict[str, Any]:
     else:
         step1_status = "idle"
 
-    # Step 2: лица/не лица — прогресс из face_runs, фазы 85/95 как раньше
+    # Шаг 3 (лица/нет лиц): прогресс из face_runs, фазы 85/95 как раньше
     faces_img = faces_total = None
     faces_found = None
     face_run_id = pr.get("face_run_id")
@@ -1847,9 +1880,7 @@ def api_local_pipeline_status() -> dict[str, Any]:
             faces_total = fr.get("total_files")
             faces_found = fr.get("faces_found")
 
-    # Сейчас у конвейера 2 шага:
-    # 1) дедуп
-    # 2) лица/нет лиц (скан + разложение)
+    # Сейчас у конвейера 2 шага (внутренне), но UI планируем 1..6.
     def _scan_pct() -> int:
         if faces_total and int(faces_total) > 0 and faces_img is not None:
             pct = int(round((int(faces_img) / int(faces_total)) * 90))
@@ -1882,6 +1913,21 @@ def api_local_pipeline_status() -> dict[str, Any]:
         step2_pct = 0
         step2_status = "idle"
 
+    # UI plan step (1..6) — best-effort mapping.
+    plan_total = 6
+    if "предочист" in title_l:
+        plan_num = 1
+        plan_title = "предочистка"
+    elif "дедуп" in title_l:
+        plan_num = 2
+        plan_title = "дедупликация"
+    elif "лица" in title_l:
+        plan_num = 3
+        plan_title = "лица/животные/нет людей"
+    else:
+        plan_num = max(0, int(step_num or 0))
+        plan_title = step_title
+
     return {
         "running": running,
         "exit_code": exit_code,
@@ -1894,8 +1940,11 @@ def api_local_pipeline_status() -> dict[str, Any]:
         "updated_at": pr.get("updated_at"),
         "finished_at": pr.get("finished_at"),
         "step": {"num": step_num, "total": step_total, "title": step_title},
+        "plan_step": {"num": int(plan_num), "total": int(plan_total), "title": str(plan_title or "")},
+        "step0": {"status": step0_status, "pct": step0_pct, "checked": step0_checked, "non_media": step0_non_media, "broken_media": step0_broken_media},
         "step1": {"status": step1_status, "pct": step1_pct, "processed": dedup_proc, "total": dedup_total},
         "step2": {"status": step2_status, "pct": step2_pct, "images": faces_img, "total": faces_total, "faces": faces_found},
+        "debug": {"video_samples_env": video_samples_env, "cmd_has_video_samples": cmd_has_video_samples, "cmd_video_samples": cmd_video_samples},
         "log_tail": log_tail,
     }
 
@@ -1922,7 +1971,7 @@ def api_sort_dup_in_archive(source_run_id: int | None = None) -> dict[str, Any]:
         if not run_id:
             raise HTTPException(status_code=400, detail="Нет активного source run. Сначала запустите сортировку на главной странице.")
 
-        rows = store.list_source_dups_in_archive(source_run_id=run_id)
+        rows = store.list_source_dups_in_archive(source_run_id=run_id, archive_prefixes=tuple(_dedup_archive_roots()))
         # root_path должен соответствовать выбранному run_id (а не обязательно последнему scope=source)
         dr = store.get_run_by_id(run_id=int(run_id))
         root_path = str(dr.get("root_path") or "") if dr else None
@@ -2362,18 +2411,6 @@ def api_path_count(path: str) -> dict[str, Any]:
     return {"path": path, "count": cnt, "seconds": round(dt, 2), "error": err, "error_path": err_path}
 
 
-@app.get("/folders", response_class=HTMLResponse)
-def folders_page(request: Request):
-    folders = list_folders(location="yadisk", role="target")
-    return templates.TemplateResponse(
-        "folders.html",
-        {
-            "request": request,
-            "folders": folders,
-        },
-    )
-
-
 @app.get("/duplicates", response_class=HTMLResponse)
 def duplicates_page(request: Request):
     """
@@ -2443,523 +2480,6 @@ def duplicates_page(request: Request):
 
     summary = {"groups": len(groups), "max_group_size": max_group_size}
     return templates.TemplateResponse("duplicates.html", {"request": request, "groups": groups, "summary": summary})
-
-
-@app.get("/dedup-results", response_class=HTMLResponse)
-def dedup_results_page(request: Request):
-    """
-    Результаты шага 1 (дедупликация) в отдельных вкладках:
-    1.1 дубли с архивом, 1.2 дубли внутри исходной папки.
-    Источник данных: существующие API /api/sort/dup-in-archive и /api/sort/dup-in-source.
-    """
-    return templates.TemplateResponse("dedup_results.html", {"request": request})
-
-
-@app.get("/api/dedup-results/context")
-def api_dedup_results_context(pipeline_run_id: int) -> dict[str, Any]:
-    """
-    Контекст для страницы результатов шага 1:
-    возвращает dedup_run_id и root_path для выбранного pipeline_run_id.
-    """
-    ps = PipelineStore()
-    try:
-        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
-    finally:
-        ps.close()
-    if not pr:
-        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
-    drid = pr.get("dedup_run_id")
-    return {
-        "ok": True,
-        "pipeline_run_id": int(pipeline_run_id),
-        "dedup_run_id": int(drid) if drid else None,
-        "root_path": pr.get("root_path"),
-    }
-
-
-@app.get("/faces", response_class=HTMLResponse)
-def faces_results_page(request: Request, pipeline_run_id: int | None = None):
-    """
-    Результаты шага 2 (лица/нет лиц): две вкладки и ручная корректировка.
-    pipeline_run_id нужен, чтобы брать актуальный root/run_id и безопасно отдавать local preview.
-    """
-    return templates.TemplateResponse("faces.html", {"request": request, "pipeline_run_id": pipeline_run_id})
-
-
-def _faces_preview_meta(*, path: str, mime_type: str | None, media_type: str | None, pipeline_run_id: int | None) -> dict[str, Any]:
-    preview_kind = "none"  # 'image'|'video'|'none'
-    preview_url: Optional[str] = None
-    open_url: Optional[str] = None
-    mt = (media_type or "").lower()
-    mime = (mime_type or "").lower()
-    if path.startswith("disk:"):
-        open_url = "/api/yadisk/open?path=" + urllib.parse.quote(path, safe="")
-        if mt == "image" or mime.startswith("image/"):
-            preview_kind = "image"
-            preview_url = "/api/yadisk/preview-image?size=M&path=" + urllib.parse.quote(path, safe="")
-        elif mt == "video" or mime.startswith("video/"):
-            preview_kind = "video"
-            preview_url = None
-    elif path.startswith("local:"):
-        if mt == "image" or mime.startswith("image/"):
-            preview_kind = "image"
-        elif mt == "video" or mime.startswith("video/"):
-            preview_kind = "video"
-        if preview_kind != "none":
-            q = "path=" + urllib.parse.quote(path, safe="")
-            if pipeline_run_id is not None:
-                q += "&pipeline_run_id=" + urllib.parse.quote(str(int(pipeline_run_id)), safe="")
-            preview_url = "/api/local/preview?" + q
-    return {"preview_kind": preview_kind, "preview_url": preview_url, "open_url": open_url}
-
-
-@app.get("/api/faces/results")
-def api_faces_results(
-    pipeline_run_id: int,
-    tab: str = "faces",
-    subtab: str | None = None,
-    page: int = 1,
-    page_size: int = 60,
-) -> dict[str, Any]:
-    """
-    Возвращает список файлов для UI шага 2:
-    - tab=faces: "есть лица"
-    - tab=no_faces: "нет лиц"
-    - tab=quarantine: "карантин" (авто)
-    - tab=animals: "животные" (авто)
-    - tab=people_no_face: "есть люди, но лица не найдены" (пока в основном manual)
-
-    Приоритет категорий (эффективная вкладка):
-    people_no_face_manual > faces_manual_label > animals_auto > faces_auto_quarantine > faces_count.
-    """
-    tab_n = (tab or "").strip().lower()
-    if tab_n not in ("faces", "no_faces", "quarantine", "animals", "people_no_face"):
-        raise HTTPException(status_code=400, detail="tab must be faces|no_faces|quarantine|animals|people_no_face")
-
-    # 2-й уровень (постепенно): пока используем только внутри tab=faces.
-    subtab_n = (subtab or "").strip().lower() or "all"
-    if tab_n == "faces":
-        if subtab_n not in ("all", "many_faces"):
-            raise HTTPException(status_code=400, detail="subtab for faces must be all|many_faces")
-    else:
-        # для остальных вкладок subtab пока не используется
-        subtab_n = "all"
-
-    _agent_dbg(
-        hypothesis_id="HUI_SUBTAB",
-        location="app/main.py:api_faces_results",
-        message="faces_results_request",
-        data={"pipeline_run_id": int(pipeline_run_id), "tab": tab_n, "subtab": subtab_n, "page": int(page or 1), "page_size": int(page_size or 0)},
-    )
-    page_i = max(1, int(page or 1))
-    size_i = max(10, min(200, int(page_size or 60)))
-    offset = (page_i - 1) * size_i
-
-    ps = PipelineStore()
-    try:
-        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
-    finally:
-        ps.close()
-    if not pr:
-        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
-    face_run_id = pr.get("face_run_id")
-    if not face_run_id:
-        raise HTTPException(status_code=400, detail="face_run_id is not set yet (step 2 not started)")
-    face_run_id_i = int(face_run_id)
-    root_path = str(pr.get("root_path") or "")
-
-    # Фильтр по root: только файлы внутри исходной папки прогона.
-    root_like = None
-    if root_path.startswith("disk:"):
-        rp = root_path.rstrip("/")
-        root_like = rp + "/%"
-    else:
-        try:
-            rp_abs = os.path.abspath(root_path)
-            rp_abs = rp_abs.rstrip("\\/") + "\\"
-            root_like = "local:" + rp_abs + "%"
-        except Exception:
-            root_like = None
-
-    where = ["faces_run_id = ?", "status != 'deleted'"]
-    params: list[Any] = [face_run_id_i]
-    if root_like:
-        where.append("path LIKE ?")
-        params.append(root_like)
-    where_sql = " AND ".join(where)
-
-    # Эффективная вкладка (manual приоритетнее авто).
-    eff_sql = """
-    CASE
-      WHEN COALESCE(people_no_face_manual, 0) = 1 THEN 'people_no_face'
-      WHEN lower(trim(coalesce(faces_manual_label, ''))) = 'faces' THEN 'faces'
-      WHEN lower(trim(coalesce(faces_manual_label, ''))) = 'no_faces' THEN 'no_faces'
-      WHEN COALESCE(animals_auto, 0) = 1 THEN 'animals'
-      -- Карантин только для "подозрительных лиц": если лиц нет (faces_count=0), не показываем в quarantine.
-      WHEN COALESCE(faces_auto_quarantine, 0) = 1
-           AND COALESCE(faces_count, 0) > 0
-           -- backward-compat: старый маркер "many_small_faces" раньше был через quarantine_reason
-           AND lower(trim(coalesce(faces_quarantine_reason, ''))) != 'many_small_faces'
-        THEN 'quarantine'
-      ELSE (CASE WHEN COALESCE(faces_count, 0) > 0 THEN 'faces' ELSE 'no_faces' END)
-    END
-    """
-
-    sub_where = "1=1"
-    sub_params: list[Any] = []
-    if tab_n == "faces" and subtab_n == "many_faces":
-        # 2-й уровень (по правилу пользователя): "много лиц" = faces_count >= 8
-        # ВАЖНО: фильтруем только внутри эффективной вкладки 'faces' (см. ({eff_sql}) = ? выше).
-        sub_where = "COALESCE(faces_count, 0) >= 8"
-    elif tab_n == "faces" and subtab_n == "all":
-        # Variant B: "Неотсортировано" = всё, что НЕ many_faces
-        sub_where = "COALESCE(faces_count, 0) < 8"
-
-    _agent_dbg(
-        hypothesis_id="HAPI_FILTER",
-        location="app/main.py:api_faces_results",
-        message="faces_results_filter",
-        data={"tab": tab_n, "subtab": subtab_n, "sub_where": sub_where},
-    )
-
-    ds = DedupStore()
-    try:
-        cur = ds.conn.cursor()
-        cur.execute(
-            f"SELECT COUNT(*) AS cnt FROM files WHERE {where_sql} AND ({eff_sql}) = ? AND ({sub_where})",
-            params + [tab_n] + sub_params,
-        )
-        total = int(cur.fetchone()[0] or 0)
-
-        cur.execute(
-            f"""
-            SELECT
-              path, name, parent_path, size, mime_type, media_type,
-              COALESCE(faces_count, 0) AS faces_count,
-              COALESCE(faces_manual_label, '') AS faces_manual_label,
-              COALESCE(faces_auto_quarantine, 0) AS faces_auto_quarantine,
-              COALESCE(faces_quarantine_reason, '') AS faces_quarantine_reason,
-              COALESCE(animals_auto, 0) AS animals_auto,
-              COALESCE(animals_kind, '') AS animals_kind,
-              COALESCE(people_no_face_manual, 0) AS people_no_face_manual,
-              COALESCE(people_no_face_person, '') AS people_no_face_person
-            FROM files
-            WHERE {where_sql} AND ({eff_sql}) = ? AND ({sub_where})
-            ORDER BY path ASC
-            LIMIT ? OFFSET ?
-            """,
-            params + [tab_n] + sub_params + [size_i, offset],
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-    finally:
-        ds.close()
-
-    gold_expected = gold_expected_tab_by_path(include_drawn_faces=False)
-
-    items: list[dict[str, Any]] = []
-    for r in rows:
-        path = str(r.get("path") or "")
-        mime_type = str(r.get("mime_type") or "") or None
-        media_type = str(r.get("media_type") or "") or None
-        # Fallback guess по расширению (как в дедуп UI)
-        if not mime_type:
-            guess_name = _strip_local_prefix(path) if path.startswith("local:") else _basename_from_disk_path(path)
-            mt2, _enc = mimetypes.guess_type(guess_name)
-            mime_type = mt2 or None
-        if not media_type and mime_type:
-            if mime_type.startswith("image/"):
-                media_type = "image"
-            elif mime_type.startswith("video/"):
-                media_type = "video"
-
-        items.append(
-            {
-                "path": path,
-                "path_short": _short_path_for_ui(path) if path.startswith("disk:") else path,
-                "size_human": _human_bytes(int(r["size"]) if r.get("size") is not None else None),
-                "mime_type": mime_type,
-                "media_type": media_type,
-                "faces_count": int(r.get("faces_count") or 0),
-                "faces_manual_label": (str(r.get("faces_manual_label") or "") or ""),
-                "faces_auto_quarantine": int(r.get("faces_auto_quarantine") or 0),
-                "faces_quarantine_reason": (str(r.get("faces_quarantine_reason") or "") or "") or None,
-                "animals_auto": int(r.get("animals_auto") or 0),
-                "animals_kind": (str(r.get("animals_kind") or "") or "") or None,
-                "people_no_face_manual": int(r.get("people_no_face_manual") or 0),
-                "people_no_face_person": (str(r.get("people_no_face_person") or "") or "") or None,
-                # Вариант A: подсветка "мимо gold" — если файл есть в gold, но его эффективная вкладка сейчас другая.
-                "sorted_past_gold": bool(gold_expected.get(path) is not None and gold_expected.get(path) != tab_n),
-                "gold_expected_tab": gold_expected.get(path),
-                **_faces_preview_meta(path=path, mime_type=mime_type, media_type=media_type, pipeline_run_id=int(pipeline_run_id)),
-            }
-        )
-
-    return {
-        "ok": True,
-        "pipeline_run_id": int(pipeline_run_id),
-        "face_run_id": face_run_id_i,
-        "root_path": root_path,
-        "tab": tab_n,
-        "subtab": subtab_n,
-        "page": page_i,
-        "page_size": size_i,
-        "total": total,
-        "items": items,
-    }
-
-
-@app.get("/api/faces/tab-counts")
-def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
-    """
-    Счётчики по вкладкам на странице /faces.
-    """
-    ps = PipelineStore()
-    try:
-        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
-    finally:
-        ps.close()
-    if not pr:
-        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
-    face_run_id = pr.get("face_run_id")
-    if not face_run_id:
-        raise HTTPException(status_code=400, detail="face_run_id is not set yet (step 2 not started)")
-    face_run_id_i = int(face_run_id)
-    root_path = str(pr.get("root_path") or "")
-
-    _agent_dbg(
-        hypothesis_id="HTAB_COUNTS",
-        location="app/main.py:api_faces_tab_counts",
-        message="faces_tab_counts_request",
-        data={"pipeline_run_id": int(pipeline_run_id), "root_path": root_path},
-    )
-
-    root_like = None
-    if root_path.startswith("disk:"):
-        rp = root_path.rstrip("/")
-        root_like = rp + "/%"
-    else:
-        try:
-            rp_abs = os.path.abspath(root_path)
-            rp_abs = rp_abs.rstrip("\\/") + "\\"
-            root_like = "local:" + rp_abs + "%"
-        except Exception:
-            root_like = None
-
-    where = ["faces_run_id = ?", "status != 'deleted'"]
-    params: list[Any] = [face_run_id_i]
-    if root_like:
-        where.append("path LIKE ?")
-        params.append(root_like)
-    where_sql = " AND ".join(where)
-
-    eff_sql = """
-    CASE
-      WHEN COALESCE(people_no_face_manual, 0) = 1 THEN 'people_no_face'
-      WHEN lower(trim(coalesce(faces_manual_label, ''))) = 'faces' THEN 'faces'
-      WHEN lower(trim(coalesce(faces_manual_label, ''))) = 'no_faces' THEN 'no_faces'
-      WHEN COALESCE(animals_auto, 0) = 1 THEN 'animals'
-      -- Карантин только для "подозрительных лиц": если лиц нет (faces_count=0), не показываем в quarantine.
-      WHEN COALESCE(faces_auto_quarantine, 0) = 1
-           AND COALESCE(faces_count, 0) > 0
-           -- backward-compat: старый маркер "many_small_faces" раньше был через quarantine_reason
-           AND lower(trim(coalesce(faces_quarantine_reason, ''))) != 'many_small_faces'
-        THEN 'quarantine'
-      ELSE (CASE WHEN COALESCE(faces_count, 0) > 0 THEN 'faces' ELSE 'no_faces' END)
-    END
-    """
-
-    ds = DedupStore()
-    try:
-        cur = ds.conn.cursor()
-        cur.execute(
-            f"""
-            SELECT ({eff_sql}) AS tab, COUNT(*) AS cnt
-            FROM files
-            WHERE {where_sql}
-            GROUP BY ({eff_sql})
-            """,
-            params,
-        )
-        rows = cur.fetchall()
-
-        # 2-й уровень (пока только для tab=faces): variant B
-        # - many_faces: faces_count >= 8
-        # - unsorted:   faces_count < 8
-        cur.execute(
-            f"""
-            SELECT COUNT(*) AS cnt
-            FROM files
-            WHERE {where_sql}
-              AND ({eff_sql}) = 'faces'
-              AND COALESCE(faces_count, 0) >= 8
-            """,
-            params,
-        )
-        many_faces_cnt = int(cur.fetchone()[0] or 0)
-
-        cur.execute(
-            f"""
-            SELECT COUNT(*) AS cnt
-            FROM files
-            WHERE {where_sql}
-              AND ({eff_sql}) = 'faces'
-              AND COALESCE(faces_count, 0) < 8
-            """,
-            params,
-        )
-        unsorted_cnt = int(cur.fetchone()[0] or 0)
-    finally:
-        ds.close()
-
-    counts = {"faces": 0, "no_faces": 0, "quarantine": 0, "animals": 0, "people_no_face": 0}
-    for r in rows:
-        t = str(r["tab"] or "")
-        if t in counts:
-            counts[t] = int(r["cnt"] or 0)
-    return {
-        "ok": True,
-        "pipeline_run_id": int(pipeline_run_id),
-        "counts": counts,
-        "subcounts": {"faces": {"many_faces": many_faces_cnt, "unsorted": unsorted_cnt}},
-    }
-
-
-@app.get("/api/faces/rectangles")
-def api_faces_rectangles(pipeline_run_id: int, path: str) -> dict[str, Any]:
-    ps = PipelineStore()
-    try:
-        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
-    finally:
-        ps.close()
-    if not pr:
-        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
-    face_run_id = pr.get("face_run_id")
-    if not face_run_id:
-        raise HTTPException(status_code=400, detail="face_run_id is not set yet")
-    fs = FaceStore()
-    try:
-        rects = fs.list_rectangles(run_id=int(face_run_id), file_path=str(path))
-    finally:
-        fs.close()
-    return {"ok": True, "pipeline_run_id": int(pipeline_run_id), "run_id": int(face_run_id), "path": path, "rectangles": rects}
-
-
-@app.post("/api/faces/manual-label")
-def api_faces_manual_label(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    pipeline_run_id = payload.get("pipeline_run_id")
-    path = payload.get("path")
-    label = payload.get("label")
-    if not isinstance(pipeline_run_id, int):
-        raise HTTPException(status_code=400, detail="pipeline_run_id is required")
-    if not isinstance(path, str) or not (path.startswith("local:") or path.startswith("disk:")):
-        raise HTTPException(status_code=400, detail="path must start with local: or disk:")
-    lab = (str(label) if label is not None else "").strip().lower()
-    person = payload.get("person")
-    if person is not None and not isinstance(person, str):
-        raise HTTPException(status_code=400, detail="person must be string")
-    if lab not in ("faces", "no_faces", "people_no_face", "quarantine", "cat", ""):
-        raise HTTPException(status_code=400, detail="label must be faces|no_faces|people_no_face|quarantine|cat|''")
-
-    # #region agent log
-    try:
-        _agent_dbg(
-            hypothesis_id="HNOFACES_CAT",
-            location="app/main.py:api_faces_manual_label",
-            message="faces_manual_label_request",
-            data={"pipeline_run_id": int(pipeline_run_id), "label": lab, "path_sha1": hashlib.sha1(path.encode("utf-8", errors="ignore")).hexdigest()[:12]},
-        )
-    except Exception:
-        pass
-    # #endregion agent log
-
-    ds = DedupStore()
-    try:
-        if lab == "":
-            # полный сброс ручных меток
-            ds.set_faces_manual_label(path=path, label=None)
-            ds.set_people_no_face_manual(path=path, is_people_no_face=False, person=None)
-            # сброс карантина через reset не делаем: это авто/процедурная метка
-        elif lab in ("faces", "no_faces"):
-            ds.set_people_no_face_manual(path=path, is_people_no_face=False, person=None)
-            ds.set_faces_manual_label(path=path, label=lab)
-            # если пользователь принял решение — снимаем авто-карантин
-            ds.set_faces_auto_quarantine(path=path, is_quarantine=False, reason=None)
-        elif lab == "people_no_face":
-            ds.set_faces_manual_label(path=path, label=None)
-            ds.set_people_no_face_manual(path=path, is_people_no_face=True, person=(person or None))
-            ds.set_faces_auto_quarantine(path=path, is_quarantine=False, reason=None)
-        elif lab == "quarantine":
-            # ручной карантин: очищаем manual-метки, ставим авто-флаг как "manual"
-            ds.set_faces_manual_label(path=path, label=None)
-            ds.set_people_no_face_manual(path=path, is_people_no_face=False, person=None)
-            ds.set_faces_auto_quarantine(path=path, is_quarantine=True, reason="manual")
-        elif lab == "cat":
-            # ручная пометка "кот": ставим animals_auto и очищаем конфликтующие ручные метки
-            ds.set_faces_manual_label(path=path, label=None)
-            ds.set_people_no_face_manual(path=path, is_people_no_face=False, person=None)
-            ds.set_faces_auto_quarantine(path=path, is_quarantine=False, reason=None)
-            ds.set_animals_auto(path=path, is_animal=True, kind="cat")
-    finally:
-        ds.close()
-
-    # Если руками сказали "лиц нет" — убираем ручные прямоугольники (best-effort).
-    if lab in ("no_faces", "people_no_face"):
-        ps = PipelineStore()
-        try:
-            pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
-        finally:
-            ps.close()
-        face_run_id = int(pr.get("face_run_id") or 0) if pr else 0
-        if face_run_id:
-            fs = FaceStore()
-            try:
-                fs.replace_manual_rectangles(run_id=face_run_id, file_path=path, rects=[])
-            finally:
-                fs.close()
-
-    return {"ok": True}
-
-
-@app.post("/api/faces/manual-rectangles")
-def api_faces_manual_rectangles(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    pipeline_run_id = payload.get("pipeline_run_id")
-    path = payload.get("path")
-    rects = payload.get("rects")
-    if not isinstance(pipeline_run_id, int):
-        raise HTTPException(status_code=400, detail="pipeline_run_id is required")
-    if not isinstance(path, str) or not path.startswith("local:"):
-        raise HTTPException(status_code=400, detail="path must start with local:")
-    if rects is None:
-        rects = []
-    if not isinstance(rects, list):
-        raise HTTPException(status_code=400, detail="rects must be list")
-
-    ps = PipelineStore()
-    try:
-        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
-    finally:
-        ps.close()
-    if not pr:
-        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
-    face_run_id = pr.get("face_run_id")
-    if not face_run_id:
-        raise HTTPException(status_code=400, detail="face_run_id is not set yet")
-    face_run_id_i = int(face_run_id)
-
-    fs = FaceStore()
-    try:
-        fs.replace_manual_rectangles(run_id=face_run_id_i, file_path=str(path), rects=rects)
-    finally:
-        fs.close()
-
-    # Раз есть ручные прямоугольники — считаем "лица есть" (manual override).
-    ds = DedupStore()
-    try:
-        ds.set_faces_manual_label(path=str(path), label="faces")
-    finally:
-        ds.close()
-
-    return {"ok": True}
 
 
 def _yadisk_remove_to_trash(disk, *, path: str) -> None:

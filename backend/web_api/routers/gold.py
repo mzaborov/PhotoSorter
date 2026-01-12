@@ -11,8 +11,10 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
 from common.db import DedupStore, PipelineStore
+from common.db import FaceStore
 from logic.gold.store import (
     gold_faces_manual_rects_path,
+    gold_faces_video_frames_path,
     gold_file_map,
     gold_merge_append_only,
     gold_normalize_path,
@@ -128,6 +130,201 @@ def _root_like_for_pipeline_run_id(pipeline_run_id: int) -> str | None:
         return None
 
 
+def _latest_pipeline_run_id(*, kind: str = "local_sort") -> int | None:
+    ps = PipelineStore()
+    try:
+        pr = ps.get_latest_any(kind=str(kind))
+        if not pr:
+            # Fallback: если kind отличается (или появятся другие kind), берём самый новый прогон вообще.
+            cur = ps.conn.cursor()
+            cur.execute("SELECT id FROM pipeline_runs ORDER BY id DESC LIMIT 1")
+            row = cur.fetchone()
+            if row:
+                return int(row[0] or 0) or None
+    finally:
+        ps.close()
+    if not pr:
+        return None
+    try:
+        rid = int(pr.get("id") or 0)
+        return rid or None
+    except Exception:
+        return None
+
+
+def _effective_tab_sql() -> str:
+    """
+    Keep semantics in sync with /api/faces (run-scoped manual labels).
+    Uses aliases: f (files), m (files_manual_labels).
+    """
+    return """
+    CASE
+      WHEN COALESCE(m.people_no_face_manual, 0) = 1 THEN 'people_no_face'
+      WHEN lower(trim(coalesce(m.faces_manual_label, ''))) = 'faces' THEN 'faces'
+      WHEN lower(trim(coalesce(m.faces_manual_label, ''))) = 'no_faces' THEN 'no_faces'
+      WHEN COALESCE(m.quarantine_manual, 0) = 1
+           AND COALESCE(f.faces_count, 0) > 0
+        THEN 'quarantine'
+      WHEN COALESCE(m.animals_manual, 0) = 1 THEN 'animals'
+      WHEN COALESCE(f.animals_auto, 0) = 1 THEN 'animals'
+      WHEN COALESCE(f.faces_auto_quarantine, 0) = 1
+           AND COALESCE(f.faces_count, 0) > 0
+           AND lower(trim(coalesce(f.faces_quarantine_reason, ''))) != 'many_small_faces'
+        THEN 'quarantine'
+      ELSE (CASE WHEN COALESCE(f.faces_count, 0) > 0 THEN 'faces' ELSE 'no_faces' END)
+    END
+    """
+
+
+def _count_misses_for_gold(
+    *,
+    ds: DedupStore,
+    pipeline_run_id: int,
+    face_run_id: int | None,
+    root_like: str | None,
+    gold_name: str,
+    expected_tab: str,
+) -> dict[str, Any]:
+    m = gold_file_map()
+    fp = m.get(gold_name)
+    if not fp:
+        return {"gold": gold_name, "expected": expected_tab, "total": 0, "mism": 0}
+    lines = gold_read_lines(fp)
+    paths: list[str] = []
+    for raw in lines:
+        nm = gold_normalize_path(raw)
+        pp = nm.get("path") or ""
+        if pp and (pp.startswith("local:") or pp.startswith("disk:")):
+            if root_like and root_like.endswith("%"):
+                pref = root_like[:-1]
+                if not pp.startswith(pref):
+                    continue
+            paths.append(pp)
+    # unique
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for p in paths:
+        if p in seen:
+            continue
+        seen.add(p)
+        uniq.append(p)
+    if not uniq:
+        return {"gold": gold_name, "expected": expected_tab, "total": 0, "mism": 0}
+
+    placeholders = ",".join(["?"] * len(uniq))
+    eff_sql = _effective_tab_sql()
+    sql = f"""
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN ({eff_sql}) != ? THEN 1 ELSE 0 END) AS mism
+        FROM files f
+        LEFT JOIN files_manual_labels m
+          ON m.pipeline_run_id = ? AND m.path = f.path
+        WHERE f.status != 'deleted'
+          AND (? IS NULL OR COALESCE(f.faces_run_id, -1) = ?)
+          AND f.path IN ({placeholders})
+    """
+    frid = int(face_run_id) if face_run_id else None
+    row = ds.conn.execute(sql, [expected_tab, int(pipeline_run_id), frid, frid, *uniq]).fetchone()
+    total = int(row["total"] or 0) if row else 0
+    mism = int(row["mism"] or 0) if row else 0
+    return {"gold": gold_name, "expected": expected_tab, "total": total, "mism": mism}
+
+
+@router.get("/api/gold/runs-metrics")
+def api_gold_runs_metrics(limit: int = 20, include_failed: bool = False) -> dict[str, Any]:
+    """
+    Table for /gold: last pipeline runs + a few gold-based metrics (effective).
+    """
+    lim = max(1, min(200, int(limit or 20)))
+    ps = PipelineStore()
+    try:
+        cur = ps.conn.cursor()
+        where = "WHERE kind = 'local_sort'"
+        params: list[Any] = []
+        if not bool(include_failed):
+            where += " AND status IN ('running','completed')"
+        params.append(lim)
+        cur.execute(
+            f"""
+            SELECT id, kind, status, root_path, face_run_id, started_at, finished_at
+            FROM pipeline_runs
+            {where}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        runs = [dict(r) for r in cur.fetchall()]
+    finally:
+        ps.close()
+
+    fs = FaceStore()
+    ds = DedupStore()
+    psm = PipelineStore()
+    try:
+        out: list[dict[str, Any]] = []
+        for r in runs:
+            rid = int(r.get("id") or 0)
+            root_like = _root_like_for_pipeline_run_id(rid) if rid else None
+            face_run_id = int(r.get("face_run_id") or 0)
+
+            sorted_total = None
+            processed = None
+            if face_run_id:
+                try:
+                    fr = fs.get_run_by_id(run_id=face_run_id) or {}
+                    sorted_total = int(fr.get("total_files") or 0) if fr.get("total_files") is not None else None
+                    processed = int(fr.get("processed_files") or 0) if fr.get("processed_files") is not None else None
+                except Exception:
+                    sorted_total = None
+                    processed = None
+
+            # Prefer persisted snapshot metrics (so values don't float after next run overwrites files.*).
+            snap = None
+            try:
+                snap = psm.get_metrics_for_run(pipeline_run_id=rid)
+            except Exception:
+                snap = None
+
+            if snap:
+                cats = {"gold": "cats_gold", "expected": "animals", "total": snap.get("cats_total") or 0, "mism": snap.get("cats_mism") or 0}
+                faces = {"gold": "faces_gold", "expected": "faces", "total": snap.get("faces_total") or 0, "mism": snap.get("faces_mism") or 0}
+                no_faces = {"gold": "no_faces_gold", "expected": "no_faces", "total": snap.get("no_faces_total") or 0, "mism": snap.get("no_faces_mism") or 0}
+                # step2 totals from snapshot if present
+                sorted_total = snap.get("step2_total") if snap.get("step2_total") is not None else sorted_total
+                processed = snap.get("step2_processed") if snap.get("step2_processed") is not None else processed
+                metrics_source = "snapshot"
+            else:
+                # Строго "по прогону": без снапшота метрики не показываем.
+                # Иначе для running (без face_run_id) получается "сюр": считаем по текущей базе, а не по этому прогону.
+                cats = {"gold": "cats_gold", "expected": "animals", "total": None, "mism": None}
+                faces = {"gold": "faces_gold", "expected": "faces", "total": None, "mism": None}
+                no_faces = {"gold": "no_faces_gold", "expected": "no_faces", "total": None, "mism": None}
+                metrics_source = "pending" if str(r.get("status") or "") == "running" else "unavailable"
+
+            out.append(
+                {
+                    "pipeline_run_id": rid,
+                    "status": r.get("status"),
+                    "started_at": r.get("started_at"),
+                    "finished_at": r.get("finished_at"),
+                    "sorted_step2_total": sorted_total,
+                    "sorted_step2_processed": processed,
+                    "cats": cats,
+                    "faces": faces,
+                    "no_faces": no_faces,
+                    "metrics_source": metrics_source,
+                }
+            )
+    finally:
+        fs.close()
+        ds.close()
+        psm.close()
+
+    return {"ok": True, "limit": lim, "items": out}
+
+
 @router.get("/gold", response_class=HTMLResponse)
 def gold_debug_page(request: Request):
     """
@@ -145,7 +342,43 @@ def api_gold_names() -> dict[str, Any]:
             counts[k] = len(gold_read_lines(p))
         except Exception:
             counts[k] = 0
-    return {"ok": True, "names": list(m.keys()), "counts": counts}
+    # Virtual tab: duplicates across gold files
+    try:
+        dups = _gold_duplicates_index()
+        counts["duplicates"] = len(dups)
+    except Exception:
+        counts["duplicates"] = 0
+    return {"ok": True, "names": list(m.keys()) + ["duplicates"], "counts": counts}
+
+
+def _gold_duplicates_index() -> dict[str, dict[str, Any]]:
+    """
+    Returns mapping: normalized_path -> info {names: [gold_name...], raw_by_name: {gold_name: raw_line}}
+    Only includes paths present in 2+ distinct gold files.
+    """
+    m = gold_file_map()
+    by_path: dict[str, dict[str, Any]] = {}
+    for name, p in m.items():
+        try:
+            lines = gold_read_lines(p)
+        except Exception:
+            lines = []
+        for raw in lines:
+            nm = gold_normalize_path(raw)
+            path = nm.get("path") or ""
+            raw_path = nm.get("raw_path") or raw
+            if not path:
+                continue
+            ent = by_path.setdefault(path, {"names": set(), "raw_by_name": {}})
+            ent["names"].add(name)
+            # keep first raw line per file name
+            ent["raw_by_name"].setdefault(name, raw_path)
+    out: dict[str, dict[str, Any]] = {}
+    for path, ent in by_path.items():
+        names = sorted(list(ent["names"]))
+        if len(names) >= 2:
+            out[path] = {"path": path, "names": names, "raw_by_name": dict(ent["raw_by_name"])}
+    return out
 
 
 @router.get("/api/gold/list")
@@ -157,9 +390,16 @@ def api_gold_list(
     pipeline_run_id: int | None = None,
 ) -> dict[str, Any]:
     m = gold_file_map()
-    if name not in m:
-        raise HTTPException(status_code=400, detail="unknown gold name")
-    items = gold_read_lines(m[name])
+    dup_idx: dict[str, dict[str, Any]] | None = None
+    if name == "duplicates":
+        idx = _gold_duplicates_index()
+        dup_idx = idx
+        # list of normalized paths
+        items = sorted(idx.keys())
+    else:
+        if name not in m:
+            raise HTTPException(status_code=400, detail="unknown gold name")
+        items = gold_read_lines(m[name])
     qq = (q or "").strip().lower()
     if qq:
         items = [x for x in items if qq in x.lower()]
@@ -175,22 +415,46 @@ def api_gold_list(
     chunk = items[start_idx : start_idx + limit_i]
 
     rects_by_path: dict[str, dict[str, Any]] | None = None
+    video_frames_by_path: dict[str, dict[str, Any]] | None = None
     if name == "faces_gold":
         try:
             rects_by_path = gold_read_ndjson_by_path(gold_faces_manual_rects_path())
         except Exception:
             rects_by_path = None
+        try:
+            video_frames_by_path = gold_read_ndjson_by_path(gold_faces_video_frames_path())
+        except Exception:
+            video_frames_by_path = None
+
+    # Если pipeline_run_id не передали — берём последний, чтобы:
+    # - можно было безопасно отдавать local preview через /api/local/preview (нужен pipeline_run_id для root guard)
+    # - /gold мог открывать /faces по кнопке "Кадры" с корректным run_id
+    eff_pipeline_run_id: int | None = None
+    try:
+        eff_pipeline_run_id = int(pipeline_run_id) if pipeline_run_id is not None else None
+    except Exception:
+        eff_pipeline_run_id = None
+    if eff_pipeline_run_id is None:
+        latest = _latest_pipeline_run_id()
+        eff_pipeline_run_id = int(latest) if latest is not None else None
 
     out_items: list[dict[str, Any]] = []
     for raw in chunk:
-        nm = gold_normalize_path(raw)
-        raw_path = nm["raw_path"]
-        path = nm["path"]
+        if name == "duplicates":
+            # raw is already normalized path
+            raw_path = str(raw)
+            path = str(raw)
+            nm = {"raw_path": raw_path, "path": path}
+        else:
+            nm = gold_normalize_path(raw)
+            raw_path = nm["raw_path"]
+            path = nm["path"]
         mime_type, media_type = _guess_mime_media_for_path(path)
-        meta = _faces_preview_meta(path=path, mime_type=mime_type, media_type=media_type, pipeline_run_id=pipeline_run_id)
+        meta = _faces_preview_meta(path=path, mime_type=mime_type, media_type=media_type, pipeline_run_id=eff_pipeline_run_id)
 
         manual_rects: list[dict[str, int]] | None = None
         manual_rects_run_id: int | None = None
+        video_frames: list[dict[str, Any]] | None = None
         if rects_by_path is not None:
             obj = rects_by_path.get(path)
             if isinstance(obj, dict):
@@ -217,18 +481,64 @@ def api_gold_list(
                         except Exception:
                             manual_rects_run_id = None
 
-        out_items.append(
-            {
-                "raw_path": raw_path,
-                "path": path,
-                "path_short": _short_path_for_ui(path) if path.startswith("disk:") else raw_path,
-                "mime_type": mime_type,
-                "media_type": media_type,
-                "manual_rects": manual_rects,
-                "manual_rects_run_id": manual_rects_run_id,
-                **meta,
-            }
-        )
+        if video_frames_by_path is not None:
+            objv = video_frames_by_path.get(path)
+            if isinstance(objv, dict):
+                frames = objv.get("frames")
+                if isinstance(frames, list) and frames:
+                    clean_frames: list[dict[str, Any]] = []
+                    for fr in frames:
+                        if not isinstance(fr, dict):
+                            continue
+                        try:
+                            idx = int(fr.get("idx") or 0)
+                        except Exception:
+                            idx = 0
+                        if idx not in (1, 2, 3):
+                            continue
+                        t = fr.get("t_sec")
+                        try:
+                            t_sec = float(t) if t is not None else None
+                        except Exception:
+                            t_sec = None
+                        rects = fr.get("rects")
+                        rects_out: list[dict[str, int]] = []
+                        if isinstance(rects, list):
+                            for r in rects:
+                                if not isinstance(r, dict):
+                                    continue
+                                try:
+                                    x = int(r.get("x") or 0)
+                                    y = int(r.get("y") or 0)
+                                    w = int(r.get("w") or 0)
+                                    h = int(r.get("h") or 0)
+                                except Exception:
+                                    continue
+                                if w <= 0 or h <= 0:
+                                    continue
+                                rects_out.append({"x": x, "y": y, "w": w, "h": h})
+                        clean_frames.append({"idx": idx, "t_sec": t_sec, "rects": rects_out})
+                    if clean_frames:
+                        video_frames = sorted(clean_frames, key=lambda z: int(z.get("idx") or 0))
+
+        obj: dict[str, Any] = {
+            "raw_path": raw_path,
+            "path": path,
+            "path_short": _short_path_for_ui(path) if path.startswith("disk:") else raw_path,
+            "mime_type": mime_type,
+            "media_type": media_type,
+            "manual_rects": manual_rects,
+            "manual_rects_run_id": manual_rects_run_id,
+            "video_frames": video_frames,
+            **meta,
+        }
+        if name == "duplicates":
+            try:
+                ent = (dup_idx or {}).get(path) or {}
+                obj["dup_names"] = list(ent.get("names") or [])
+            except Exception:
+                obj["dup_names"] = []
+        out_items.append(obj)
 
     next_cursor = out_items[-1]["raw_path"] if out_items else None
     has_more = bool(start_idx + limit_i < len(items))
@@ -237,6 +547,7 @@ def api_gold_list(
         "ok": True,
         "name": name,
         "q": qq,
+        "pipeline_run_id": eff_pipeline_run_id,
         "total": len(items),
         "count": len(out_items),
         "cursor": cur_s or None,
@@ -245,6 +556,65 @@ def api_gold_list(
         "limit": limit_i,
         "items": out_items,
     }
+
+
+@router.post("/api/gold/resolve-duplicate")
+def api_gold_resolve_duplicate(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Ensure a given path appears in exactly one gold list.
+    Removes it from all other gold files; keeps (or adds) it to keep_name.
+    """
+    keep_name = str(payload.get("keep_name") or "").strip()
+    path_s = str(payload.get("path") or "").strip()
+    if not keep_name:
+        raise HTTPException(status_code=400, detail="keep_name is required")
+    if not path_s:
+        raise HTTPException(status_code=400, detail="path is required")
+    m = gold_file_map()
+    if keep_name not in m:
+        raise HTTPException(status_code=400, detail="unknown keep_name")
+
+    # Normalize the requested path like gold does.
+    norm = gold_normalize_path(path_s)
+    norm_path = str(norm.get("path") or path_s).strip()
+    if not norm_path:
+        raise HTTPException(status_code=400, detail="invalid path")
+
+    changed: dict[str, int] = {}
+    kept_in = False
+
+    for name, fp in m.items():
+        lines = gold_read_lines(fp)
+        new_lines: list[str] = []
+        removed = 0
+        kept_raw: str | None = None
+
+        for raw in lines:
+            nm = gold_normalize_path(raw)
+            p2 = str(nm.get("path") or "").strip()
+            if p2 != norm_path:
+                new_lines.append(raw)
+                continue
+            # p2 matches target path
+            if name == keep_name and kept_raw is None:
+                kept_raw = raw
+                new_lines.append(raw)
+                kept_in = True
+            else:
+                removed += 1
+
+        if name == keep_name and not kept_in:
+            # Not present in keep file; add as normalized path line.
+            new_lines.append(norm_path)
+            kept_in = True
+            changed[name] = changed.get(name, 0) + 1
+
+        if removed > 0 or (name == keep_name and kept_raw is None):
+            gold_write_lines(fp, new_lines)
+        if removed > 0:
+            changed[name] = changed.get(name, 0) + removed
+
+    return {"ok": True, "path": norm_path, "keep_name": keep_name, "changed": changed}
 
 
 @router.post("/api/gold/delete")
@@ -271,6 +641,11 @@ def api_gold_update_from_db(payload: dict[str, Any] = Body(...)) -> dict[str, An
     """
     pipeline_run_id = payload.get("pipeline_run_id")
     root_like = None
+    if pipeline_run_id is None:
+        # По умолчанию — "текущий" прогон: последний pipeline_run_id (Variant A).
+        latest = _latest_pipeline_run_id()
+        if latest is not None:
+            pipeline_run_id = latest
     if pipeline_run_id is not None:
         if not isinstance(pipeline_run_id, int):
             raise HTTPException(status_code=400, detail="pipeline_run_id must be int or null")
@@ -285,6 +660,13 @@ def api_gold_update_from_db(payload: dict[str, Any] = Body(...)) -> dict[str, An
         base_params.append(root_like)
     base_where_sql = " AND ".join(base_where)
 
+    # ВАЖНО: в запросах вида "FROM files f JOIN ..." нужно квалифицировать колонки,
+    # иначе получим "ambiguous column name: path" (например, когда JOIN имеет свою колонку path).
+    base_where_f = ["f.status != 'deleted'"]
+    if root_like:
+        base_where_f.append("f.path LIKE ?")
+    base_where_sql_f = " AND ".join(base_where_f)
+
     ds = DedupStore()
     try:
         cur = ds.conn.cursor()
@@ -293,51 +675,115 @@ def api_gold_update_from_db(payload: dict[str, Any] = Body(...)) -> dict[str, An
             cur.execute(sql, params)
             return [str(r[0]) for r in cur.fetchall()]
 
-        cats = q(
-            f"SELECT path FROM files WHERE {base_where_sql} AND COALESCE(animals_auto,0)=1 ORDER BY path ASC",
-            list(base_params),
-        )
-        faces_gold = q(
-            f"""
-            SELECT path
-            FROM files
-            WHERE {base_where_sql}
-              AND lower(trim(coalesce(faces_manual_label,''))) = 'faces'
-            ORDER BY path ASC
-            """,
-            list(base_params),
-        )
-        no_faces = q(
-            f"""
-            SELECT path
-            FROM files
-            WHERE {base_where_sql}
-              AND lower(trim(coalesce(faces_manual_label,''))) = 'no_faces'
-            ORDER BY path ASC
-            """,
-            list(base_params),
-        )
-        people_no_face = q(
-            f"""
-            SELECT path
-            FROM files
-            WHERE {base_where_sql}
-              AND COALESCE(people_no_face_manual,0) = 1
-            ORDER BY path ASC
-            """,
-            list(base_params),
-        )
-        quarantine_gold = q(
-            f"""
-            SELECT path
-            FROM files
-            WHERE {base_where_sql}
-              AND COALESCE(faces_auto_quarantine,0) = 1
-              AND lower(trim(coalesce(faces_quarantine_reason,''))) = 'manual'
-            ORDER BY path ASC
-            """,
-            list(base_params),
-        )
+        if isinstance(pipeline_run_id, int):
+            # Run-scoped manual labels
+            cats = q(
+                f"""
+                SELECT f.path
+                FROM files f
+                JOIN files_manual_labels m
+                  ON m.pipeline_run_id = ? AND m.path = f.path
+                WHERE {base_where_sql_f}
+                  AND COALESCE(m.animals_manual,0)=1
+                ORDER BY f.path ASC
+                """,
+                [int(pipeline_run_id)] + list(base_params),
+            )
+            faces_gold = q(
+                f"""
+                SELECT f.path
+                FROM files f
+                JOIN files_manual_labels m
+                  ON m.pipeline_run_id = ? AND m.path = f.path
+                WHERE {base_where_sql_f}
+                  AND lower(trim(coalesce(m.faces_manual_label,''))) = 'faces'
+                ORDER BY f.path ASC
+                """,
+                [int(pipeline_run_id)] + list(base_params),
+            )
+            no_faces = q(
+                f"""
+                SELECT f.path
+                FROM files f
+                JOIN files_manual_labels m
+                  ON m.pipeline_run_id = ? AND m.path = f.path
+                WHERE {base_where_sql_f}
+                  AND lower(trim(coalesce(m.faces_manual_label,''))) = 'no_faces'
+                ORDER BY f.path ASC
+                """,
+                [int(pipeline_run_id)] + list(base_params),
+            )
+            people_no_face = q(
+                f"""
+                SELECT f.path
+                FROM files f
+                JOIN files_manual_labels m
+                  ON m.pipeline_run_id = ? AND m.path = f.path
+                WHERE {base_where_sql_f}
+                  AND COALESCE(m.people_no_face_manual,0) = 1
+                ORDER BY f.path ASC
+                """,
+                [int(pipeline_run_id)] + list(base_params),
+            )
+            quarantine_gold = q(
+                f"""
+                SELECT f.path
+                FROM files f
+                JOIN files_manual_labels m
+                  ON m.pipeline_run_id = ? AND m.path = f.path
+                WHERE {base_where_sql_f}
+                  AND COALESCE(m.quarantine_manual,0) = 1
+                ORDER BY f.path ASC
+                """,
+                [int(pipeline_run_id)] + list(base_params),
+            )
+        else:
+            # Legacy mode: manual labels stored directly in files.*
+            cats = q(
+                f"SELECT path FROM files WHERE {base_where_sql} AND COALESCE(animals_auto,0)=1 ORDER BY path ASC",
+                list(base_params),
+            )
+            faces_gold = q(
+                f"""
+                SELECT path
+                FROM files
+                WHERE {base_where_sql}
+                  AND lower(trim(coalesce(faces_manual_label,''))) = 'faces'
+                ORDER BY path ASC
+                """,
+                list(base_params),
+            )
+            no_faces = q(
+                f"""
+                SELECT path
+                FROM files
+                WHERE {base_where_sql}
+                  AND lower(trim(coalesce(faces_manual_label,''))) = 'no_faces'
+                ORDER BY path ASC
+                """,
+                list(base_params),
+            )
+            people_no_face = q(
+                f"""
+                SELECT path
+                FROM files
+                WHERE {base_where_sql}
+                  AND COALESCE(people_no_face_manual,0) = 1
+                ORDER BY path ASC
+                """,
+                list(base_params),
+            )
+            quarantine_gold = q(
+                f"""
+                SELECT path
+                FROM files
+                WHERE {base_where_sql}
+                  AND COALESCE(faces_auto_quarantine,0) = 1
+                  AND lower(trim(coalesce(faces_quarantine_reason,''))) = 'manual'
+                ORDER BY path ASC
+                """,
+                list(base_params),
+            )
 
         # --- manual rectangles export (NDJSON, overwrite by path) ---
         cur.execute(
@@ -351,7 +797,7 @@ def api_gold_update_from_db(payload: dict[str, Any] = Body(...)) -> dict[str, An
               fr.bbox_h AS h
             FROM face_rectangles fr
             JOIN files f ON f.path = fr.file_path
-            WHERE {base_where_sql}
+            WHERE {base_where_sql_f}
               AND COALESCE(fr.is_manual, 0) = 1
               AND f.faces_run_id IS NOT NULL
               AND fr.run_id = f.faces_run_id
@@ -360,6 +806,28 @@ def api_gold_update_from_db(payload: dict[str, Any] = Body(...)) -> dict[str, An
             list(base_params),
         )
         rect_rows = [dict(r) for r in cur.fetchall()]
+
+        # --- video manual frames export (NDJSON, overwrite by path) ---
+        if isinstance(pipeline_run_id, int):
+            cur.execute(
+                f"""
+                SELECT
+                  v.path AS path,
+                  v.frame_idx AS frame_idx,
+                  v.t_sec AS t_sec,
+                  v.rects_json AS rects_json,
+                  v.updated_at AS updated_at
+                FROM video_manual_frames v
+                JOIN files f ON f.path = v.path
+                WHERE {base_where_sql_f}
+                  AND v.pipeline_run_id = ?
+                ORDER BY v.path ASC, v.frame_idx ASC
+                """,
+                list(base_params) + [int(pipeline_run_id)],
+            )
+            video_rows = [dict(r) for r in cur.fetchall()]
+        else:
+            video_rows = []
     finally:
         ds.close()
 
@@ -402,6 +870,63 @@ def api_gold_update_from_db(payload: dict[str, Any] = Body(...)) -> dict[str, An
     gold_write_ndjson_by_path(rects_path, existing_rects)
     results["faces_manual_rects_gold"] = {"updated": len(by_path), "file": str(rects_path)}
 
+    # --- video frames NDJSON (by path) ---
+    vf_path = gold_faces_video_frames_path()
+    existing_vf = gold_read_ndjson_by_path(vf_path)
+    vf_by_path: dict[str, list[dict[str, Any]]] = {}
+    for r in (video_rows or []):
+        p = str(r.get("path") or "")
+        if not p:
+            continue
+        try:
+            idx = int(r.get("frame_idx") or 0)
+        except Exception:
+            idx = 0
+        if idx not in (1, 2, 3):
+            continue
+        t = r.get("t_sec")
+        try:
+            t_sec = float(t) if t is not None else None
+        except Exception:
+            t_sec = None
+        rects_out: list[dict[str, int]] = []
+        try:
+            raw = r.get("rects_json")
+            if raw:
+                obj = json.loads(raw)
+                if isinstance(obj, list):
+                    for it in obj:
+                        if not isinstance(it, dict):
+                            continue
+                        x = int(it.get("x") or 0)
+                        y = int(it.get("y") or 0)
+                        w = int(it.get("w") or 0)
+                        h = int(it.get("h") or 0)
+                        if w > 0 and h > 0:
+                            rects_out.append({"x": x, "y": y, "w": w, "h": h})
+        except Exception:
+            rects_out = []
+        vf_by_path.setdefault(p, []).append({"idx": idx, "t_sec": t_sec, "rects": rects_out})
+
+    for p, frames in vf_by_path.items():
+        existing_vf[p] = {"path": p, "frames": sorted(frames, key=lambda z: int(z.get("idx") or 0))}
+
+    # delete those that no longer have video frames in DB (within current scope)
+    to_delete_v: list[str] = []
+    for p in list(existing_vf.keys()):
+        if p in vf_by_path:
+            continue
+        if root_like and root_like.endswith("%"):
+            pref = root_like[:-1]
+            if not p.startswith(pref):
+                continue
+        to_delete_v.append(p)
+    for p in to_delete_v:
+        existing_vf.pop(p, None)
+
+    gold_write_ndjson_by_path(vf_path, existing_vf)
+    results["faces_video_frames_gold"] = {"updated": len(vf_by_path), "file": str(vf_path)}
+
     return {"ok": True, "pipeline_run_id": pipeline_run_id, "root_like": root_like, "results": results}
 
 
@@ -409,10 +934,16 @@ def api_gold_update_from_db(payload: dict[str, Any] = Body(...)) -> dict[str, An
 def api_gold_apply_to_db(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """
     Append-only заполнение ручной разметки в БД из gold-файлов.
-    Принцип: НЕ перетирать уже проставленные ручные поля/решения, а только дополнять пустые.
+    Если передан pipeline_run_id — пишем run-scoped manual labels в files_manual_labels.
+    Иначе работаем в legacy-режиме (пишем в files.*).
     """
     pipeline_run_id = payload.get("pipeline_run_id")
     root_like = None
+    if pipeline_run_id is None:
+        # По умолчанию — "текущий" прогон: последний pipeline_run_id (Variant A).
+        latest = _latest_pipeline_run_id()
+        if latest is not None:
+            pipeline_run_id = latest
     if pipeline_run_id is not None:
         if not isinstance(pipeline_run_id, int):
             raise HTTPException(status_code=400, detail="pipeline_run_id must be int or null")
@@ -482,62 +1013,137 @@ def api_gold_apply_to_db(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
                     where_extra = " AND path LIKE ?"
                     params.append(root_like)
 
-                if op in ("faces", "no_faces"):
+                if isinstance(pipeline_run_id, int):
+                    # Run-scoped mode: write to files_manual_labels
                     cur.execute(
-                        f"""
-                        UPDATE files
-                        SET faces_manual_label = ?, faces_manual_at = ?
-                        WHERE path = ?
-                          AND status != 'deleted'
-                          AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
-                          AND COALESCE(people_no_face_manual, 0) = 0
-                          {where_extra}
-                        """,
-                        [op, _now_utc_iso(), path] + params,
+                        "INSERT OR IGNORE INTO files_manual_labels(pipeline_run_id, path) VALUES (?, ?)",
+                        (int(pipeline_run_id), path),
                     )
-                elif op == "people_no_face":
-                    cur.execute(
-                        f"""
-                        UPDATE files
-                        SET people_no_face_manual = 1
-                        WHERE path = ?
-                          AND status != 'deleted'
-                          AND COALESCE(people_no_face_manual, 0) = 0
-                          AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
-                          {where_extra}
-                        """,
-                        [path] + params,
-                    )
-                elif op == "cat":
-                    cur.execute(
-                        f"""
-                        UPDATE files
-                        SET animals_auto = 1, animals_kind = 'cat',
-                            faces_auto_quarantine = 0, faces_quarantine_reason = NULL
-                        WHERE path = ?
-                          AND status != 'deleted'
-                          AND COALESCE(animals_auto, 0) = 0
-                          AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
-                          AND COALESCE(people_no_face_manual, 0) = 0
-                          {where_extra}
-                        """,
-                        [path] + params,
-                    )
-                elif op == "quarantine_manual":
-                    cur.execute(
-                        f"""
-                        UPDATE files
-                        SET faces_auto_quarantine = 1, faces_quarantine_reason = 'manual'
-                        WHERE path = ?
-                          AND status != 'deleted'
-                          AND COALESCE(faces_auto_quarantine, 0) = 0
-                          AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
-                          AND COALESCE(people_no_face_manual, 0) = 0
-                          AND COALESCE(animals_auto, 0) = 0
-                          {where_extra}
-                        """,
-                        [path] + params,
-                    )
+                    if op in ("faces", "no_faces"):
+                        cur.execute(
+                            """
+                            UPDATE files_manual_labels
+                            SET faces_manual_label = ?, faces_manual_at = ?
+                            WHERE pipeline_run_id = ?
+                              AND path = ?
+                              AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
+                              AND COALESCE(people_no_face_manual, 0) = 0
+                              AND COALESCE(animals_manual, 0) = 0
+                              AND COALESCE(quarantine_manual, 0) = 0
+                            """,
+                            [op, _now_utc_iso(), int(pipeline_run_id), path],
+                        )
+                    elif op == "people_no_face":
+                        cur.execute(
+                            """
+                            UPDATE files_manual_labels
+                            SET
+                              people_no_face_manual = 1,
+                              people_no_face_person = NULL,
+                              faces_manual_label = NULL,
+                              faces_manual_at = NULL,
+                              quarantine_manual = 0,
+                              quarantine_manual_at = NULL,
+                              animals_manual = 0,
+                              animals_manual_kind = NULL,
+                              animals_manual_at = NULL
+                            WHERE pipeline_run_id = ?
+                              AND path = ?
+                              AND (
+                                COALESCE(people_no_face_manual, 0) = 0
+                                OR (faces_manual_label IS NOT NULL AND trim(coalesce(faces_manual_label,'')) != '')
+                                OR COALESCE(animals_manual, 0) != 0
+                                OR COALESCE(quarantine_manual, 0) != 0
+                              )
+                            """,
+                            [int(pipeline_run_id), path],
+                        )
+                    elif op == "cat":
+                        cur.execute(
+                            """
+                            UPDATE files_manual_labels
+                            SET animals_manual = 1, animals_manual_kind = 'cat', animals_manual_at = ?
+                            WHERE pipeline_run_id = ?
+                              AND path = ?
+                              AND COALESCE(animals_manual, 0) = 0
+                              AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
+                              AND COALESCE(people_no_face_manual, 0) = 0
+                              AND COALESCE(quarantine_manual, 0) = 0
+                            """,
+                            [_now_utc_iso(), int(pipeline_run_id), path],
+                        )
+                    elif op == "quarantine_manual":
+                        cur.execute(
+                            """
+                            UPDATE files_manual_labels
+                            SET quarantine_manual = 1, quarantine_manual_at = ?
+                            WHERE pipeline_run_id = ?
+                              AND path = ?
+                              AND COALESCE(quarantine_manual, 0) = 0
+                              AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
+                              AND COALESCE(people_no_face_manual, 0) = 0
+                              AND COALESCE(animals_manual, 0) = 0
+                            """,
+                            [_now_utc_iso(), int(pipeline_run_id), path],
+                        )
+                else:
+                    # Legacy mode: write to files.*
+                    if op in ("faces", "no_faces"):
+                        cur.execute(
+                            f"""
+                            UPDATE files
+                            SET faces_manual_label = ?, faces_manual_at = ?
+                            WHERE path = ?
+                              AND status != 'deleted'
+                              AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
+                              AND COALESCE(people_no_face_manual, 0) = 0
+                              {where_extra}
+                            """,
+                            [op, _now_utc_iso(), path] + params,
+                        )
+                    elif op == "people_no_face":
+                        cur.execute(
+                            f"""
+                            UPDATE files
+                            SET people_no_face_manual = 1
+                            WHERE path = ?
+                              AND status != 'deleted'
+                              AND COALESCE(people_no_face_manual, 0) = 0
+                              AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
+                              {where_extra}
+                            """,
+                            [path] + params,
+                        )
+                    elif op == "cat":
+                        cur.execute(
+                            f"""
+                            UPDATE files
+                            SET animals_auto = 1, animals_kind = 'cat',
+                                faces_auto_quarantine = 0, faces_quarantine_reason = NULL
+                            WHERE path = ?
+                              AND status != 'deleted'
+                              AND COALESCE(animals_auto, 0) = 0
+                              AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
+                              AND COALESCE(people_no_face_manual, 0) = 0
+                              {where_extra}
+                            """,
+                            [path] + params,
+                        )
+                    elif op == "quarantine_manual":
+                        cur.execute(
+                            f"""
+                            UPDATE files
+                            SET faces_auto_quarantine = 1, faces_quarantine_reason = 'manual'
+                            WHERE path = ?
+                              AND status != 'deleted'
+                              AND COALESCE(faces_auto_quarantine, 0) = 0
+                              AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
+                              AND COALESCE(people_no_face_manual, 0) = 0
+                              AND COALESCE(animals_auto, 0) = 0
+                              {where_extra}
+                            """,
+                            [path] + params,
+                        )
 
                 rc = int(cur.rowcount or 0)
                 if rc > 0:
@@ -548,6 +1154,110 @@ def api_gold_apply_to_db(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             ds.conn.commit()
             total_applied += applied
             out[gold_name] = {"op": op, "lines": len(raw_lines), "unique_paths": len(uniq), "applied": applied, "skipped": skipped, "missing": missing}
+
+        # --- video manual frames import (NDJSON -> DB), run-scoped only ---
+        if isinstance(pipeline_run_id, int):
+            vf_path = gold_faces_video_frames_path()
+            vf_by_path = gold_read_ndjson_by_path(vf_path)
+            applied_v = 0
+            skipped_v = 0
+            missing_v = 0
+            bad_v = 0
+            paths_all = list(vf_by_path.keys())
+            # ограничение по root_like
+            if root_like and root_like.endswith("%"):
+                pref = root_like[:-1]
+                paths_all = [p for p in paths_all if str(p).startswith(pref)]
+
+            # check existing in files (and within scope)
+            existing: set[str] = set()
+            if paths_all:
+                step = 400
+                for i in range(0, len(paths_all), step):
+                    chunk = paths_all[i : i + step]
+                    qmarks = ",".join(["?"] * len(chunk))
+                    if root_like:
+                        cur.execute(
+                            f"SELECT path FROM files WHERE status != 'deleted' AND path LIKE ? AND path IN ({qmarks})",
+                            [root_like] + list(chunk),
+                        )
+                    else:
+                        cur.execute(f"SELECT path FROM files WHERE status != 'deleted' AND path IN ({qmarks})", list(chunk))
+                    existing.update([str(r[0]) for r in cur.fetchall()])
+
+            for p in paths_all:
+                if p not in existing:
+                    missing_v += 1
+                    continue
+                obj = vf_by_path.get(p)
+                if not isinstance(obj, dict):
+                    bad_v += 1
+                    continue
+                frames = obj.get("frames")
+                if not isinstance(frames, list) or not frames:
+                    skipped_v += 1
+                    continue
+                for fr in frames:
+                    if not isinstance(fr, dict):
+                        bad_v += 1
+                        continue
+                    try:
+                        idx = int(fr.get("idx") or 0)
+                    except Exception:
+                        idx = 0
+                    if idx not in (1, 2, 3):
+                        bad_v += 1
+                        continue
+                    t = fr.get("t_sec")
+                    try:
+                        t_sec = float(t) if t is not None else None
+                    except Exception:
+                        t_sec = None
+                    rects = fr.get("rects")
+                    rects_clean: list[dict[str, int]] = []
+                    if isinstance(rects, list):
+                        for r in rects:
+                            if not isinstance(r, dict):
+                                continue
+                            try:
+                                x = int(r.get("x") or 0)
+                                y = int(r.get("y") or 0)
+                                w = int(r.get("w") or 0)
+                                h = int(r.get("h") or 0)
+                            except Exception:
+                                continue
+                            if w > 0 and h > 0:
+                                rects_clean.append({"x": x, "y": y, "w": w, "h": h})
+                    cur.execute(
+                        """
+                        INSERT INTO video_manual_frames(pipeline_run_id, path, frame_idx, t_sec, rects_json, updated_at)
+                        VALUES(?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(pipeline_run_id, path, frame_idx) DO UPDATE SET
+                          t_sec = excluded.t_sec,
+                          rects_json = excluded.rects_json,
+                          updated_at = excluded.updated_at
+                        """,
+                        (
+                            int(pipeline_run_id),
+                            str(p),
+                            int(idx),
+                            float(t_sec) if t_sec is not None else None,
+                            json.dumps(rects_clean, ensure_ascii=False),
+                            _now_utc_iso(),
+                        ),
+                    )
+                    applied_v += 1
+
+            ds.conn.commit()
+            out["faces_video_frames_gold"] = {
+                "file": str(vf_path),
+                "paths": len(paths_all),
+                "applied_frames": applied_v,
+                "skipped_paths": skipped_v,
+                "missing_paths": missing_v,
+                "bad_records": bad_v,
+            }
+            total_applied += applied_v
 
         return {"ok": True, "pipeline_run_id": pipeline_run_id, "root_like": root_like, "total_applied": total_applied, "results": out}
     finally:

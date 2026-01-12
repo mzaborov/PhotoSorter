@@ -88,59 +88,74 @@ def main() -> int:
             base_params.append(root_like)
         base_where_sql = " AND ".join(base_where)
 
-        # cats_gold.txt: animals_auto=1 (gold)
+        # cats_gold.txt: run-scoped ground truth (animals_manual=1)
         cats = q(
-            f"SELECT path FROM files WHERE {base_where_sql} AND COALESCE(animals_auto,0)=1 ORDER BY path ASC",
-            list(base_params),
+            f"""
+            SELECT f.path
+            FROM files f
+            JOIN files_manual_labels m
+              ON m.pipeline_run_id = ? AND m.path = f.path
+            WHERE {base_where_sql}
+              AND COALESCE(m.animals_manual, 0) = 1
+            ORDER BY f.path ASC
+            """,
+            [int(args.pipeline_run_id)] + list(base_params),
         )
 
-        # faces_gold.txt: manually marked as "faces" (Нормальные лица)
+        # faces_gold.txt: run-scoped manual "faces"
         faces_gold = q(
             f"""
-            SELECT path
-            FROM files
+            SELECT f.path
+            FROM files f
+            JOIN files_manual_labels m
+              ON m.pipeline_run_id = ? AND m.path = f.path
             WHERE {base_where_sql}
-              AND lower(trim(coalesce(faces_manual_label,''))) = 'faces'
-            ORDER BY path ASC
+              AND lower(trim(coalesce(m.faces_manual_label,''))) = 'faces'
+            ORDER BY f.path ASC
             """,
-            list(base_params),
+            [int(args.pipeline_run_id)] + list(base_params),
         )
 
-        # no_faces_gold.txt: gold: no faces (auto semantics depends on regression strategy)
+        # no_faces_gold.txt: run-scoped manual "no_faces"
         no_faces = q(
             f"""
-            SELECT path
-            FROM files
+            SELECT f.path
+            FROM files f
+            JOIN files_manual_labels m
+              ON m.pipeline_run_id = ? AND m.path = f.path
             WHERE {base_where_sql}
-              AND lower(trim(coalesce(faces_manual_label,''))) = 'no_faces'
-            ORDER BY path ASC
+              AND lower(trim(coalesce(m.faces_manual_label,''))) = 'no_faces'
+            ORDER BY f.path ASC
             """,
-            list(base_params),
+            [int(args.pipeline_run_id)] + list(base_params),
         )
 
-        # people_no_face_gold.txt: gold: people no face (manual list for now)
+        # people_no_face_gold.txt: run-scoped manual "people_no_face"
         people_no_face = q(
             f"""
-            SELECT path
-            FROM files
+            SELECT f.path
+            FROM files f
+            JOIN files_manual_labels m
+              ON m.pipeline_run_id = ? AND m.path = f.path
             WHERE {base_where_sql}
-              AND COALESCE(people_no_face_manual,0) = 1
-            ORDER BY path ASC
+              AND COALESCE(m.people_no_face_manual, 0) = 1
+            ORDER BY f.path ASC
             """,
-            list(base_params),
+            [int(args.pipeline_run_id)] + list(base_params),
         )
 
-        # quarantine_gold.txt: gold quarantine list (currently sourced from manual quarantine marks in DB)
+        # quarantine_gold.txt: run-scoped manual quarantine
         quarantine_gold = q(
             f"""
-            SELECT path
-            FROM files
+            SELECT f.path
+            FROM files f
+            JOIN files_manual_labels m
+              ON m.pipeline_run_id = ? AND m.path = f.path
             WHERE {base_where_sql}
-              AND COALESCE(faces_auto_quarantine,0) = 1
-              AND lower(trim(coalesce(faces_quarantine_reason,''))) = 'manual'
-            ORDER BY path ASC
+              AND COALESCE(m.quarantine_manual, 0) = 1
+            ORDER BY f.path ASC
             """,
-            list(base_params),
+            [int(args.pipeline_run_id)] + list(base_params),
         )
     finally:
         ds.close()

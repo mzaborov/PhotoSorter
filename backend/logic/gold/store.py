@@ -20,6 +20,11 @@ def gold_faces_manual_rects_path() -> Path:
     return gold_cases_dir() / "faces_manual_rects_gold.ndjson"
 
 
+def gold_faces_video_frames_path() -> Path:
+    # Рядом с faces_gold — отдельный файл с разметкой 3 кадров видео (NDJSON, 1 JSON per line).
+    return gold_cases_dir() / "faces_video_frames_gold.ndjson"
+
+
 def gold_file_map() -> dict[str, Path]:
     d = gold_cases_dir()
     return {
