@@ -1845,3 +1845,267 @@ def api_faces_restore_from_delete(payload: dict[str, Any] = Body(...)) -> dict[s
         "restored_path": original_path,
     }
 
+
+@router.post("/api/faces/fix-clipping")
+def api_faces_fix_clipping(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Пересчитывает координаты bbox для одного файла с исправленным клиппингом.
+    
+    Параметры:
+    - pipeline_run_id: int (опционально, приоритетнее)
+    - face_run_id: int (опционально, используется если pipeline_run_id не указан)
+    - face_rectangle_id: int (опционально, используется для получения face_run_id если face_run_id не указан)
+    - path: str (обязательно, disk:/... или local:...)
+    
+    Возвращает количество обновлённых записей.
+    """
+    pipeline_run_id = payload.get("pipeline_run_id")
+    face_run_id = payload.get("face_run_id")
+    face_rectangle_id = payload.get("face_rectangle_id")
+    path = payload.get("path")
+    
+    if not isinstance(path, str) or not (path.startswith("local:") or path.startswith("disk:")):
+        raise HTTPException(status_code=400, detail="path must start with local: or disk:")
+    
+    # Нормализуем значения: если они не None и не int, пытаемся преобразовать
+    if pipeline_run_id is not None and not isinstance(pipeline_run_id, int):
+        try:
+            pipeline_run_id = int(pipeline_run_id)
+        except (ValueError, TypeError):
+            pipeline_run_id = None
+    
+    if face_run_id is not None and not isinstance(face_run_id, int):
+        try:
+            face_run_id = int(face_run_id)
+        except (ValueError, TypeError):
+            face_run_id = None
+    
+    if face_rectangle_id is not None and not isinstance(face_rectangle_id, int):
+        try:
+            face_rectangle_id = int(face_rectangle_id)
+        except (ValueError, TypeError):
+            face_rectangle_id = None
+    
+    # pipeline_run_id и face_run_id не обязательны - скрипт recalc_face_bbox.py работает напрямую с БД по path
+    # Если они указаны, пытаемся найти pipeline_run_id для логирования (опционально)
+    if not isinstance(pipeline_run_id, int):
+        # Если face_run_id не указан, но есть face_rectangle_id, получаем run_id из face_rectangle
+        if not isinstance(face_run_id, int) and isinstance(face_rectangle_id, int):
+            from common.db import FaceStore
+            fs = FaceStore()
+            try:
+                cur = fs.conn.cursor()
+                cur.execute(
+                    """
+                    SELECT run_id
+                    FROM face_rectangles
+                    WHERE id = ?
+                    """,
+                    (int(face_rectangle_id),),
+                )
+                row = cur.fetchone()
+                if row and row["run_id"] is not None:
+                    face_run_id = int(row["run_id"])
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                fs.close()
+        
+        # Если есть face_run_id, пытаемся найти pipeline_run_id (опционально, для логирования)
+        if isinstance(face_run_id, int):
+            ps = PipelineStore()
+            try:
+                cur = ps.conn.cursor()
+                cur.execute(
+                    """
+                    SELECT id 
+                    FROM pipeline_runs 
+                    WHERE face_run_id = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (int(face_run_id),),
+                )
+                row = cur.fetchone()
+                if row:
+                    pipeline_run_id = int(row["id"])
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                ps.close()
+    
+    # pipeline_run_id не обязателен - скрипт recalc_face_bbox.py работает напрямую с БД
+    # Если pipeline_run_id есть, проверяем его существование (best-effort, не критично)
+    if isinstance(pipeline_run_id, int):
+        ps = PipelineStore()
+        try:
+            pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+            if not pr:
+                _agent_dbg(
+                    hypothesis_id="FIX_CLIPPING",
+                    location="web_api/routers/faces.py:api_faces_fix_clipping",
+                    message="Pipeline run not found, but continuing anyway",
+                    data={"pipeline_run_id": pipeline_run_id},
+                )
+        except Exception:  # noqa: BLE001
+            _agent_dbg(
+                hypothesis_id="FIX_CLIPPING",
+                location="web_api/routers/faces.py:api_faces_fix_clipping",
+                message="Error checking pipeline_run, but continuing anyway",
+                data={"pipeline_run_id": pipeline_run_id},
+            )
+        finally:
+            ps.close()
+    
+    # Создаём временный файл с путём
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".txt", delete=False) as f:
+        f.write(path + "\n")
+        paths_file = f.name
+    
+    try:
+        # Запускаем скрипт пересчёта для одного файла
+        script_path = _repo_root() / "backend" / "scripts" / "debug" / "recalc_face_bbox.py"
+        if not script_path.exists():
+            raise HTTPException(status_code=500, detail=f"Script not found: {script_path}")
+        
+        # Используем Python из .venv-face, где установлены cv2 и другие зависимости
+        py_venv = _venv_face_python()
+        if not py_venv.exists():
+            raise HTTPException(status_code=500, detail=f"Missing .venv-face python: {py_venv}")
+        python_exe = str(py_venv)
+        
+        _agent_dbg(
+            hypothesis_id="FIX_CLIPPING",
+            location="web_api/routers/faces.py:api_faces_fix_clipping",
+            message="Starting script",
+            data={"script_path": str(script_path), "python_exe": python_exe, "path": path, "paths_file": paths_file},
+        )
+        
+        # Устанавливаем PYTHONPATH для импорта модулей из backend/
+        env = os.environ.copy()
+        backend_path = str(_repo_root() / "backend")
+        env["PYTHONPATH"] = backend_path
+        env["PYTHONUNBUFFERED"] = "1"  # Важно для UI: без буферизации stdout
+        
+        _agent_dbg(
+            hypothesis_id="FIX_CLIPPING",
+            location="web_api/routers/faces.py:api_faces_fix_clipping",
+            message="About to run script",
+            data={"script_path": str(script_path), "python_exe": python_exe, "paths_file": paths_file},
+        )
+        
+        result = subprocess.run(
+            [
+                python_exe,
+                str(script_path),
+                "--paths-file", paths_file,
+                "--apply",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,  # 2 минуты максимум
+            cwd=str(_repo_root()),
+            env=env,  # Передаём окружение с PYTHONPATH
+        )
+        
+        # Логируем stdout и stderr СРАЗУ после выполнения скрипта
+        _agent_dbg(
+            hypothesis_id="FIX_CLIPPING",
+            location="web_api/routers/faces.py:api_faces_fix_clipping",
+            message="Script output (immediate)",
+            data={
+                "returncode": result.returncode,
+                "stdout": (result.stdout or "")[:2000],
+                "stderr": (result.stderr or "")[:2000],
+                "stdout_len": len(result.stdout or ""),
+                "stderr_len": len(result.stderr or ""),
+            },
+        )
+        
+        _agent_dbg(
+            hypothesis_id="FIX_CLIPPING",
+            location="web_api/routers/faces.py:api_faces_fix_clipping",
+            message="Script finished",
+            data={"returncode": result.returncode, "stdout_len": len(result.stdout or ""), "stderr_len": len(result.stderr or "")},
+        )
+        
+        if result.returncode != 0:
+            error_detail = result.stderr[:2000] if result.stderr else "Unknown error"
+            stdout_preview = result.stdout[:1000] if result.stdout else ""  # Увеличил до 1000 символов
+            _agent_dbg(
+                hypothesis_id="FIX_CLIPPING",
+                location="web_api/routers/faces.py:api_faces_fix_clipping",
+                message="Script error",
+                data={"returncode": result.returncode, "stderr": error_detail, "stdout": stdout_preview, "stdout_full_len": len(result.stdout or "")},
+            )
+            # Пытаемся обработать stdout даже при ошибке, если там есть информация об обновлениях
+            output = result.stdout or ""
+            updated_count = 0
+            for line in output.splitlines():
+                if "updated" in line.lower() and "faces" in line.lower():
+                    import re
+                    match = re.search(r"updated\s+(\d+)", line.lower())
+                    if match:
+                        updated_count = int(match.group(1))
+                        break
+            # Если всё-таки обновили что-то, не бросаем ошибку
+            if updated_count > 0:
+                _agent_dbg(
+                    hypothesis_id="FIX_CLIPPING",
+                    location="web_api/routers/faces.py:api_faces_fix_clipping",
+                    message="Script had errors but updated faces",
+                    data={"updated_count": updated_count, "stderr_preview": error_detail[:200]},
+                )
+                return {
+                    "ok": True,
+                    "pipeline_run_id": int(pipeline_run_id) if isinstance(pipeline_run_id, int) else None,
+                    "path": path,
+                    "updated_count": updated_count,
+                    "warning": error_detail[:200] if error_detail else None,
+                }
+            raise HTTPException(
+                status_code=500,
+                detail=f"Script error (code {result.returncode}): {error_detail[:500]}",
+            )
+        
+        # Парсим вывод скрипта (ожидаем "updated N faces" или "would update N faces")
+        output = result.stdout or ""
+        _agent_dbg(
+            hypothesis_id="FIX_CLIPPING",
+            location="web_api/routers/faces.py:api_faces_fix_clipping",
+            message="Script stdout",
+            data={"stdout": output[:1000], "stdout_len": len(output)},
+        )
+        
+        updated_count = 0
+        for line in output.splitlines():
+            if "updated" in line.lower() and "faces" in line.lower():
+                # Ищем число после "updated"
+                import re
+                match = re.search(r"updated\s+(\d+)", line.lower())
+                if match:
+                    updated_count = int(match.group(1))
+                    break
+        
+        _agent_dbg(
+            hypothesis_id="FIX_CLIPPING",
+            location="web_api/routers/faces.py:api_faces_fix_clipping",
+            message="Parsed result",
+            data={"updated_count": updated_count, "output_preview": output[:200]},
+        )
+        
+        return {
+            "ok": True,
+            "pipeline_run_id": int(pipeline_run_id) if isinstance(pipeline_run_id, int) else None,
+            "path": path,
+            "updated_count": updated_count,
+        }
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Script timeout")
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+    finally:
+        try:
+            os.unlink(paths_file)
+        except Exception:
+            pass
