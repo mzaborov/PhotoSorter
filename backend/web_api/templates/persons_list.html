@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>PhotoSorter — Список персон</title>
+    <style>
+      :root { color-scheme: light; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      a { color: #0b57d0; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+      .muted { color: #6b7280; }
+      .wrap { max-width: 1400px; }
+      .header { display:flex; align-items:baseline; justify-content:space-between; gap:12px; margin-bottom:20px; }
+      table { border-collapse: collapse; width: 100%; max-width: 1400px; margin-top: 14px; }
+      th, td { border-bottom: 1px solid #e5e7eb; padding: 12px 10px; vertical-align: middle; text-align: left; }
+      th { font-weight: 600; color: #111827; background: #fafafa; position: sticky; top: 0; }
+      tr:hover { background: #f9fafb; }
+      .person-avatar { width: 48px; height: 48px; border-radius:50%; object-fit:cover; border:2px solid #e5e7eb; }
+      .person-avatar-placeholder { width: 48px; height: 48px; border-radius:50%; background:#e5e7eb; display:flex; align-items:center; justify-content:center; font-size:20px; color:#6b7280; }
+      .person-name { font-weight: 600; }
+      .person-name-link { color: #0b57d0; text-decoration: none; }
+      .person-name-link:hover { text-decoration: underline; }
+      .person-name.ignored { color: #6b7280; opacity: 0.7; }
+      .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f3f4f6; color: #374151; font-size: 12px; }
+      .pill-link { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #e0f2fe; color: #0369a1; font-size: 12px; text-decoration: none; cursor: pointer; transition: all 0.2s; }
+      .pill-link:hover { background: #bae6fd; color: #075985; text-decoration: none; transform: scale(1.05); }
+      .btn { appearance:none; border:1px solid #d1d5db; background:#fff; padding:8px 16px; border-radius:10px; cursor:pointer; font-weight:600; font-size:14px; }
+      .btn:hover { background:#f9fafb; }
+      .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+      .btn.primary { background:#111827; color:#fff; border-color:#111827; }
+      .btn.primary:hover { background:#374151; }
+      .toast { color:#6b7280; font-size:14px; margin-left:12px; }
+      .toast.success { color:#059669; }
+      .toast.error { color:#dc2626; }
+      .loading { opacity: 0.6; pointer-events: none; }
+      .empty { text-align: center; padding: 40px; color: #6b7280; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="header">
+        <div>
+          <h2 style="margin: 0;">Список персон</h2>
+          <div class="muted" style="margin-top: 6px;">Все персоны со статистикой кластеров и лиц</div>
+        </div>
+        <div style="display:flex; align-items:center; gap:12px;">
+          <button class="btn primary" id="btnSaveAllToGold" type="button" style="padding:6px 12px; font-size:14px;">Сохранить все в gold</button>
+          <span class="toast" id="toast"></span>
+          <span style="color:#6b7280;">·</span>
+          <a href="/face-clusters">неназначенные</a> · <a href="/">← на главную</a>
+        </div>
+      </div>
+
+      <div id="loading" class="loading">Загрузка...</div>
+      <div id="error" style="display: none; color: #991b1b; padding: 12px; background: #fff5f5; border: 1px solid #fecaca; border-radius: 12px; margin-top: 12px;"></div>
+      <table id="personsTable" style="display: none;">
+        <thead>
+          <tr>
+            <th>Аватар</th>
+            <th>Имя</th>
+            <th style="text-align: right;">Кластеры</th>
+            <th style="text-align: right;">Лица</th>
+          </tr>
+        </thead>
+        <tbody id="personsTableBody">
+        </tbody>
+      </table>
+      <div id="empty" class="empty" style="display: none;">Нет персон</div>
+    </div>
+
+    <script>
+      function escapeHtml(s) {
+        return (s ?? "").toString()
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll("\"", "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      async function getFaceThumbnail(faceId) {
+        if (!faceId) return null;
+        try {
+          const resp = await fetch(`/api/face-rectangles/${faceId}/thumbnail`);
+          if (resp.ok) {
+            const data = await resp.json();
+            return data.thumb_jpeg_base64 ? `data:image/jpeg;base64,${data.thumb_jpeg_base64}` : null;
+          }
+        } catch (e) {
+          console.error('Ошибка загрузки аватара:', e);
+        }
+        return null;
+      }
+
+      async function loadPersons() {
+        const loadingEl = document.getElementById("loading");
+        const errorEl = document.getElementById("error");
+        const tableEl = document.getElementById("personsTable");
+        const tableBodyEl = document.getElementById("personsTableBody");
+        const emptyEl = document.getElementById("empty");
+
+        try {
+          const resp = await fetch("/api/persons/stats");
+          if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+          }
+          const data = await resp.json();
+          
+          if (!data.persons || data.persons.length === 0) {
+            loadingEl.style.display = "none";
+            tableEl.style.display = "none";
+            emptyEl.style.display = "block";
+            return;
+          }
+
+          const persons = data.persons || [];
+          
+          // Сначала рендерим таблицу с плейсхолдерами
+          tableBodyEl.innerHTML = persons.map(p => {
+            const isIgnored = p.is_ignored || false;
+            const nameClass = isIgnored ? "person-name ignored" : "person-name";
+            const nameHtml = `<a href="/persons/${p.id}" class="person-name-link ${nameClass}">${escapeHtml(p.name || `Person ${p.id}`)}</a>`;
+            
+            // Плейсхолдер для аватара (будет заменён после загрузки)
+            const avatarPlaceholder = `<div class="person-avatar-placeholder" data-face-id="${p.avatar_face_id || ''}">👤</div>`;
+            
+            // Кликабельные числа для кластеров и лиц
+            const clustersCount = p.clusters_count || 0;
+            const facesCount = p.faces_count || 0;
+            const clustersHtml = clustersCount > 0 
+              ? `<a href="/persons/${p.id}/clusters" class="pill-link" title="Перейти к кластерам">${clustersCount}</a>`
+              : `<span class="pill">${clustersCount}</span>`;
+            const facesHtml = facesCount > 0
+              ? `<a href="/persons/${p.id}" class="pill-link" title="Перейти к карточке персоны">${facesCount}</a>`
+              : `<span class="pill">${facesCount}</span>`;
+            
+            return `
+              <tr ${isIgnored ? 'style="opacity: 0.7;"' : ""} data-person-id="${p.id}">
+                <td>${avatarPlaceholder}</td>
+                <td>${nameHtml}</td>
+                <td style="text-align: right;">${clustersHtml}</td>
+                <td style="text-align: right;">${facesHtml}</td>
+              </tr>
+            `;
+          }).join("");
+
+          loadingEl.style.display = "none";
+          errorEl.style.display = "none";
+          tableEl.style.display = "table";
+          emptyEl.style.display = "none";
+
+          // Загружаем аватары асинхронно
+          for (const p of persons) {
+            if (p.avatar_face_id) {
+              const row = tableBodyEl.querySelector(`tr[data-person-id="${p.id}"]`);
+              const avatarCell = row?.querySelector('td');
+              const placeholder = avatarCell?.querySelector('.person-avatar-placeholder[data-face-id]');
+              
+              if (placeholder) {
+                try {
+                  const avatarUrl = await getFaceThumbnail(p.avatar_face_id);
+                  if (avatarUrl) {
+                    const img = document.createElement('img');
+                    img.src = avatarUrl;
+                    img.alt = 'avatar';
+                    img.className = 'person-avatar';
+                    placeholder.replaceWith(img);
+                  }
+                } catch (e) {
+                  console.warn(`Не удалось загрузить аватар для персоны ${p.name} (avatar_face_id=${p.avatar_face_id}):`, e);
+                }
+              }
+            }
+          }
+        } catch (err) {
+          loadingEl.style.display = "none";
+          tableEl.style.display = "none";
+          emptyEl.style.display = "none";
+          errorEl.textContent = `Ошибка загрузки персон: ${err.message}`;
+          errorEl.style.display = "block";
+        }
+      }
+
+      function showToast(message, isError = false) {
+        const toastEl = document.getElementById('toast');
+        if (!toastEl) return;
+        toastEl.textContent = message;
+        toastEl.className = isError ? 'toast error' : 'toast success';
+        setTimeout(() => {
+          toastEl.textContent = '';
+          toastEl.className = 'toast';
+        }, 5000);
+      }
+
+      async function saveAllToGold() {
+        const btn = document.getElementById('btnSaveAllToGold');
+        if (!btn) return;
+        
+        btn.disabled = true;
+        btn.textContent = 'Сохранение...';
+        
+        try {
+          const resp = await fetch('/api/persons/save-all-to-gold', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+          });
+          
+          const data = await resp.json();
+          if (!resp.ok) {
+            throw new Error(data.detail || data.error || 'Ошибка сохранения');
+          }
+          
+          showToast(`Сохранено: ${data.persons_count} персон, ${data.faces_count} лиц, ${data.files_updated} файлов`, false);
+        } catch (e) {
+          showToast(`Ошибка: ${e.message}`, true);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = 'Сохранить все в gold';
+        }
+      }
+
+      loadPersons();
+      
+      // Инициализация обработчика кнопки
+      document.getElementById('btnSaveAllToGold')?.addEventListener('click', saveAllToGold);
+    </script>
+  </body>
+</html>

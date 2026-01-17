@@ -81,7 +81,7 @@
           <div class="muted" style="margin-top:6px;" id="clusterInfo">Загрузка...</div>
         </div>
         <div>
-          <a href="/face-clusters" class="muted">← к списку кластеров</a>
+          <a href="/face-clusters" id="backLink" class="muted">← к списку кластеров</a>
         </div>
       </div>
 
@@ -299,6 +299,19 @@
           clusterInfo = await resp.json();
           
           document.getElementById('clusterId').textContent = clusterId;
+          
+          // Обновляем ссылку "назад" в зависимости от того, назначен ли кластер персоне
+          const backLink = document.getElementById('backLink');
+          if (backLink && clusterInfo.persons && clusterInfo.persons.length > 0) {
+            // Если кластер назначен персоне, возвращаемся на страницу кластеров персоны
+            const personId = clusterInfo.persons[0].id; // Берем первую персону
+            backLink.href = `/persons/${personId}/clusters`;
+            backLink.textContent = `← к кластерам персоны`;
+          } else {
+            // Если кластер не назначен, возвращаемся на страницу неназначенных
+            backLink.href = `/face-clusters`;
+            backLink.textContent = `← к неназначенным кластерам`;
+          }
           
           const totalFaces = clusterInfo.total_faces || 0;
           const personNames = (clusterInfo.persons || []).map(p => p.name).join(', ');

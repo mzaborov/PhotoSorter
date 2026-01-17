@@ -68,6 +68,17 @@
       .lb-body { background: #111827; display: flex; align-items: center; justify-content: center; }
       .lb-body img { max-width: 92vw; max-height: calc(92vh - 56px); width: auto; height: auto; display: block; object-fit: contain; background: #111827; }
       .lb-body video { max-width: 92vw; max-height: calc(92vh - 56px); width: auto; height: auto; display: block; background: #111827; }
+      
+      /* Гамбургер-меню */
+      .menu-toggle { position: relative; }
+      .menu-btn { appearance: none; border: 1px solid #d1d5db; background: #fff; padding: 8px 12px; border-radius: 12px; cursor: pointer; font-size: 18px; line-height: 1; }
+      .menu-btn:hover { background: #f9fafb; }
+      .menu-dropdown { position: absolute; top: 100%; right: 0; margin-top: 8px; background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); min-width: 180px; display: none; z-index: 1000; }
+      .menu-dropdown.open { display: block; }
+      .menu-dropdown a { display: block; padding: 10px 14px; color: #111827; text-decoration: none; border-bottom: 1px solid #f3f4f6; }
+      .menu-dropdown a:last-child { border-bottom: none; }
+      .menu-dropdown a:hover { background: #f9fafb; }
+      .menu-dropdown a.muted { color: #6b7280; }
     </style>
   </head>
   <body>
@@ -78,8 +89,13 @@
             <h2 style="margin: 0;">PhotoSorter — основная форма сортировки</h2>
             <div class="muted" style="margin-top: 6px;" id="subtitle">Шаг 1: “уже есть в архиве” · Шаг 2: “дубли внутри папки”</div>
           </div>
-          <div class="row">
-            <a href="/folders" class="muted">Фотоархив</a>
+          <div class="menu-toggle">
+            <button class="menu-btn" type="button" id="menuToggle" aria-label="Меню">☰</button>
+            <div class="menu-dropdown" id="menuDropdown">
+              <a href="/folders">Фотоархив</a>
+              <a href="/gold">Gold</a>
+              <a href="/persons">Список персон</a>
+            </div>
           </div>
         </div>
 
@@ -1122,6 +1138,22 @@
         el.addEventListener("change", () => { updateBrowseLink(); updateLocalPipelineVisibility(); });
       });
       updateLocalPipelineVisibility();
+
+      // Гамбургер-меню
+      const menuToggle = qs("#menuToggle");
+      const menuDropdown = qs("#menuDropdown");
+      if (menuToggle && menuDropdown) {
+        menuToggle.addEventListener("click", (e) => {
+          e.stopPropagation();
+          menuDropdown.classList.toggle("open");
+        });
+        // Закрываем меню при клике вне его
+        document.addEventListener("click", (e) => {
+          if (!menuToggle.contains(e.target) && !menuDropdown.contains(e.target)) {
+            menuDropdown.classList.remove("open");
+          }
+        });
+      }
 
       loadSaved();
       refreshStatus();

@@ -216,7 +216,23 @@ secrets.env
 data/photosorter.db
 data/models/
 
+# ML models (large files, downloaded separately)
+models/
+
 # History.log теперь коммитим (вехи процесса/среды для воспроизводимости)
 
-# debug-логи (локальные артефакты)
+# debug-логи и debug данные (локальные артефакты)
 scripts/debug/_logs/
+backend/data/
+
+# debug скрипты (локальные инструменты отладки)
+backend/scripts/debug/
+**/scripts/debug/
+
+# кэш (локальные артефакты)
+data/cache/
+**/cache/
+
+# БД в корне и бэкапы БД
+photosorter.db
+data/photosorter_backup_*.db

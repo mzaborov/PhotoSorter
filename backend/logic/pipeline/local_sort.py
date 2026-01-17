@@ -443,9 +443,17 @@ def ensure_yunet_model(*, model_path: Path, model_url: str) -> Path:
         except OSError:
             pass
     print(f"Downloading YuNet model to: {model_path}")
-    urllib.request.urlretrieve(model_url, tmp)  # noqa: S310
-    tmp.replace(model_path)
-    return model_path
+    try:
+        urllib.request.urlretrieve(model_url, tmp)  # noqa: S310
+        tmp.replace(model_path)
+        return model_path
+    except Exception as e:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise RuntimeError(f"Failed to download YuNet model from {model_url}: {e}") from e
 
 
 def ensure_yolo_model(*, model_path: Path, model_urls: list[str]) -> Path:
@@ -844,6 +852,152 @@ def _create_face_detector(model_path: str, *, score_threshold: float):
     return cv2.FaceDetectorYN.create(model_path, "", (320, 320), score_threshold, 0.3, 5000)
 
 
+def _create_face_recognition_model():
+    """
+    Создаёт модель для извлечения face embeddings (распознавание лиц).
+    Использует ONNX модель ArcFace через onnxruntime (чистый Python, без компиляции C++).
+    
+    Returns:
+        dict с сессией onnxruntime и метаданными или None если модель недоступна
+    """
+    try:
+        import onnxruntime as ort  # type: ignore[import-untyped]
+        from pathlib import Path
+        
+        # Путь к модели ArcFace ONNX
+        model_dir = Path(__file__).parent.parent.parent / "models" / "face_recognition"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Пробуем найти ONNX модель ArcFace
+        onnx_path = None
+        
+        # Вариант 1: локальная модель в models/face_recognition/
+        local_models = [
+            model_dir / "w600k_r50.onnx",  # ArcFace R50 (стандартная модель)
+            model_dir / "arcface_r50_v1.onnx",
+            model_dir / "antelopev2" / "w600k_r50.onnx",  # Новая модель
+        ]
+        for path in local_models:
+            if path.exists():
+                onnx_path = path
+                break
+        
+        # Вариант 2: пробуем найти в домашней директории InsightFace (если установлен)
+        if onnx_path is None:
+            try:
+                home = Path.home()
+                insightface_models = [
+                    home / ".insightface" / "models" / "buffalo_l" / "w600k_r50.onnx",
+                    home / ".insightface" / "models" / "buffalo_s" / "w600k_r50.onnx",
+                    home / ".insightface" / "models" / "antelopev2" / "w600k_r50.onnx",
+                ]
+                for path in insightface_models:
+                    if path.exists():
+                        onnx_path = path
+                        break
+            except Exception:
+                pass
+        
+        # Вариант 3: пробуем использовать InsightFace для автоматической загрузки модели
+        if onnx_path is None:
+            try:
+                import insightface
+                from insightface.model_zoo import get_model
+                # Пробуем загрузить модель - это может автоматически скачать её
+                model = get_model('buffalo_l')
+                if model:
+                    # Проверяем, где сохранилась модель
+                    home = Path.home()
+                    insightface_dir = home / ".insightface"
+                    if insightface_dir.exists():
+                        onnx_files = list(insightface_dir.rglob("w600k_r50.onnx"))
+                        if onnx_files:
+                            onnx_path = onnx_files[0]
+            except Exception:
+                pass
+        
+        if onnx_path is None:
+            # Модель не найдена - возвращаем None (pipeline продолжит работу без embeddings)
+            # Это нормально - embeddings опциональны
+            return None
+        
+        # Загружаем ONNX модель через onnxruntime
+        sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        
+        # Получаем имена входов и выходов
+        input_name = sess.get_inputs()[0].name
+        output_name = sess.get_outputs()[0].name
+        input_shape = sess.get_inputs()[0].shape
+        
+        return {
+            "session": sess,
+            "input_name": input_name,
+            "output_name": output_name,
+            "input_shape": input_shape,
+            "model_path": str(onnx_path),
+        }
+    except ImportError:
+        return None
+    except Exception as e:
+        # Логируем ошибку, но не ломаем конвейер
+        print(f"[face_recognition] Не удалось загрузить ONNX модель: {type(e).__name__}: {e}")
+        return None
+
+
+def _extract_face_embedding(*, face_img_bgr: np.ndarray, recognition_model: Any) -> bytes | None:
+    """
+    Извлекает embedding (векторное представление) лица из изображения.
+    
+    Args:
+        face_img_bgr: изображение лица в формате BGR (numpy array)
+        recognition_model: dict с ONNX сессией (результат _create_face_recognition_model)
+    
+    Returns:
+        bytes: JSON-сериализованный массив float32 (embedding) или None при ошибке
+    """
+    if recognition_model is None:
+        return None
+    
+    try:
+        sess = recognition_model["session"]
+        input_name = recognition_model["input_name"]
+        output_name = recognition_model["output_name"]
+        input_shape = recognition_model["input_shape"]
+        
+        # ArcFace ожидает RGB и определённый размер (обычно 112x112)
+        face_img_rgb = cv2.cvtColor(face_img_bgr, cv2.COLOR_BGR2RGB)
+        
+        # Ресайзим до нужного размера (обычно [1, 3, 112, 112] для ArcFace)
+        target_size = (input_shape[3], input_shape[2]) if len(input_shape) == 4 else (112, 112)
+        face_resized = cv2.resize(face_img_rgb, target_size)
+        
+        # Нормализуем: (pixel - 127.5) / 128.0 (стандартная нормализация для ArcFace)
+        face_normalized = (face_resized.astype(np.float32) - 127.5) / 128.0
+        
+        # Транспонируем в формат [1, 3, H, W] (batch, channels, height, width)
+        face_transposed = np.transpose(face_normalized, (2, 0, 1))
+        face_batch = np.expand_dims(face_transposed, axis=0)
+        
+        # Запускаем инференс
+        outputs = sess.run([output_name], {input_name: face_batch})
+        embedding = outputs[0][0]  # Берем первый (и единственный) элемент батча
+        
+        if embedding is None or embedding.size == 0:
+            return None
+        
+        # Нормализуем embedding (L2 нормализация для лучшего сравнения)
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+        
+        # Сериализуем в JSON (массив float)
+        embedding_list = embedding.tolist()
+        return json.dumps(embedding_list).encode("utf-8")
+    except Exception:
+        # best-effort: не ломаем конвейер из-за ошибок распознавания
+        return None
+
+
 def _detect_faces(detector, img_bgr) -> list[tuple[int, int, int, int, float]]:
     h, w = img_bgr.shape[:2]
     try:
@@ -953,9 +1107,45 @@ def _unrotate_bbox_to_base(*, x: int, y: int, w: int, h: int, rot: int, w0: int,
 
 def _crop_thumb_jpeg(*, img: Image.Image, bbox: tuple[int, int, int, int], thumb_size: int, pad_ratio: float = 0.18) -> bytes:
     from io import BytesIO
+    import json
+    import time
 
     x, y, w, h = bbox
     iw, ih = img.size
+    # #region agent log
+    try:
+        with open(r'c:\Users\mzaborov\YandexDisk\Работы, тексты, презентации\PhotoSorter\.cursor\debug.log', 'a', encoding='utf-8') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"local_sort.py:_crop_thumb_jpeg:entry","message":"Crop thumb called","data":{"bbox":{"x":x,"y":y,"w":w,"h":h},"img_size":{"w":iw,"h":ih},"thumb_size":thumb_size,"bbox_valid":x>=0 and y>=0 and w>0 and h>0 and x+w<=iw and y+h<=ih},"timestamp":int(time.time()*1000)})+'\n')
+    except: pass
+    # #endregion
+    # Проверяем валидность bbox и клипируем к границам изображения
+    if x < 0 or y < 0 or w <= 0 or h <= 0:
+        # #region agent log
+        try:
+            with open(r'c:\Users\mzaborov\YandexDisk\Работы, тексты, презентации\PhotoSorter\.cursor\debug.log', 'a', encoding='utf-8') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"local_sort.py:_crop_thumb_jpeg:invalid_bbox","message":"Invalid bbox, clipping","data":{"bbox_original":{"x":x,"y":y,"w":w,"h":h},"img_size":{"w":iw,"h":ih}},"timestamp":int(time.time()*1000)})+'\n')
+        except: pass
+        # #endregion
+        x = max(0, x)
+        y = max(0, y)
+        w = max(1, w)
+        h = max(1, h)
+    if x + w > iw:
+        w = iw - x
+    if y + h > ih:
+        h = ih - y
+    if w <= 0 or h <= 0:
+        # #region agent log
+        try:
+            with open(r'c:\Users\mzaborov\YandexDisk\Работы, тексты, презентации\PhotoSorter\.cursor\debug.log', 'a', encoding='utf-8') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"local_sort.py:_crop_thumb_jpeg:zero_size","message":"Bbox has zero size after clipping","data":{"bbox_final":{"x":x,"y":y,"w":w,"h":h},"img_size":{"w":iw,"h":ih}},"timestamp":int(time.time()*1000)})+'\n')
+        except: pass
+        # #endregion
+        # Возвращаем пустой thumbnail если bbox невалиден
+        buf = BytesIO()
+        empty_img = Image.new("RGB", (thumb_size, thumb_size), color=(128, 128, 128))
+        empty_img.save(buf, format="JPEG", quality=78, optimize=True)
+        return buf.getvalue()
     pad = int(round(max(w, h) * pad_ratio))
     x0 = max(0, x - pad)
     y0 = max(0, y - pad)
@@ -965,6 +1155,12 @@ def _crop_thumb_jpeg(*, img: Image.Image, bbox: tuple[int, int, int, int], thumb
     crop.thumbnail((thumb_size, thumb_size), Image.Resampling.LANCZOS)
     buf = BytesIO()
     crop.save(buf, format="JPEG", quality=78, optimize=True)
+    # #region agent log
+    try:
+        with open(r'c:\Users\mzaborov\YandexDisk\Работы, тексты, презентации\PhotoSorter\.cursor\debug.log', 'a', encoding='utf-8') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"local_sort.py:_crop_thumb_jpeg:exit","message":"Crop thumb done","data":{"bbox_final":{"x":x,"y":y,"w":w,"h":h},"crop_area":{"x0":x0,"y0":y0,"x1":x1,"y1":y1},"crop_size":{"w":x1-x0,"h":y1-y0},"thumb_bytes":len(buf.getvalue())},"timestamp":int(time.time()*1000)})+'\n')
+    except: pass
+    # #endregion
     return buf.getvalue()
 
 
@@ -1249,6 +1445,9 @@ def scan_faces_local(
     detector = _create_face_detector(str(model), score_threshold=float(score_threshold))
     detector_recreate_every = 200  # снижает шанс нативных крэшей внутри detect()
     max_dim = 2000  # safety: не гоняем гигантские картинки через YuNet
+    
+    # Face recognition model (опционально, для извлечения embeddings)
+    recognition_model = _create_face_recognition_model()
     quarantine_max_face_dim_px = 44
     many_faces_min = 8  # >=8 лиц считаем "много лиц" (2-й уровень вкладок /faces)
     quarantine_max_face_area_ratio = 0.003  # ~0.3% кадра: типично "лицо на экране/миниатюра"
@@ -1936,19 +2135,87 @@ def scan_faces_local(
 
                 for i, (x, y, w, h, score) in enumerate(faces):
                     pres = (areas[i] / denom) if (denom > 0.0 and i < len(areas)) else None
-                    thumb = _crop_thumb_jpeg(img=pil, bbox=(x, y, w, h), thumb_size=int(thumb_size))
+                    # Координаты faces уже в размерах img_bgr_full (после пересчета на строке 1976-1993)
+                    # img_bgr_full создан из pil после exif_transpose, поэтому размеры должны совпадать
+                    # pil.size это (width, height), img_bgr_full.shape это (height, width)
+                    pil_w, pil_h = pil.size
+                    bgr_full_h, bgr_full_w = img_bgr_full.shape[:2]
+                    
+                    # #region agent log
+                    import json
+                    try:
+                        with open(r'c:\Users\mzaborov\YandexDisk\Работы, тексты, презентации\PhotoSorter\.cursor\debug.log', 'a', encoding='utf-8') as f:
+                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"local_sort.py:bbox_conversion","message":"Thumbnail bbox conversion","data":{"file_path":db_path,"face_index":i,"bbox_original":{"x":x,"y":y,"w":w,"h":h},"pil_size":{"w":pil_w,"h":pil_h},"bgr_full_size":{"w":bgr_full_w,"h":bgr_full_h},"sizes_match":pil_w==bgr_full_w and pil_h==bgr_full_h},"timestamp":int(__import__('time').time()*1000)})+'\n')
+                    except: pass
+                    # #endregion
+                    
+                    # img_bgr_full создан из pil, поэтому размеры должны совпадать
+                    # Если не совпадают - это ошибка, но на всякий случай используем координаты как есть
+                    # и клипируем к границам pil
+                    # Правильный клиппинг: сначала ограничиваем координаты начала, затем размеры так,
+                    # чтобы правая/нижняя границы не выходили за пределы изображения
+                    x_pil = max(0, x)  # x не должен быть отрицательным
+                    y_pil = max(0, y)  # y не должен быть отрицательным
+                    # Если левый/верхний край выходит за границы - сдвигаем его внутрь
+                    if x_pil >= pil_w:
+                        x_pil = max(0, pil_w - 1)
+                    if y_pil >= pil_h:
+                        y_pil = max(0, pil_h - 1)
+                    # Ограничиваем размеры так, чтобы правая и нижняя границы не выходили за пределы
+                    w_pil = max(1, min(w, pil_w - x_pil))
+                    h_pil = max(1, min(h, pil_h - y_pil))
+                    
+                    # #region agent log
+                    try:
+                        with open(r'c:\Users\mzaborov\YandexDisk\Работы, тексты, презентации\PhotoSorter\.cursor\debug.log', 'a', encoding='utf-8') as f:
+                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"local_sort.py:bbox_clipped","message":"Thumbnail bbox clipped","data":{"file_path":db_path,"face_index":i,"bbox_original":{"x":x,"y":y,"w":w,"h":h},"bbox_clipped":{"x":x_pil,"y":y_pil,"w":w_pil,"h":h_pil},"pil_size":{"w":pil_w,"h":pil_h}},"timestamp":int(__import__('time').time()*1000)})+'\n')
+                    except: pass
+                    # #endregion
+                    # #region agent log
+                    try:
+                        with open(r'c:\Users\mzaborov\YandexDisk\Работы, тексты, презентации\PhotoSorter\.cursor\debug.log', 'a', encoding='utf-8') as f:
+                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"local_sort.py:2108","message":"Thumbnail crop params","data":{"file_path":db_path,"face_index":i,"bbox_final":{"x":x_pil,"y":y_pil,"w":w_pil,"h":h_pil},"pil_size":{"w":pil_w,"h":pil_h},"thumb_size":int(thumb_size)},"timestamp":int(__import__('time').time()*1000)})+'\n')
+                    except: pass
+                    # #endregion
+                    thumb = _crop_thumb_jpeg(img=pil, bbox=(x_pil, y_pil, w_pil, h_pil), thumb_size=int(thumb_size))
+                    
+                    # Извлекаем embedding для распознавания лиц (опционально)
+                    embedding: bytes | None = None
+                    if recognition_model is not None:
+                        try:
+                            # Кроп лица в формате BGR для InsightFace
+                            pad = int(round(max(w, h) * 0.18))
+                            x0 = max(0, x - pad)
+                            y0 = max(0, y - pad)
+                            x1 = min(img_bgr_full.shape[1], x + w + pad)
+                            y1 = min(img_bgr_full.shape[0], y + h + pad)
+                            face_crop_bgr = img_bgr_full[y0:y1, x0:x1]
+                            
+                            if face_crop_bgr.size > 0:
+                                embedding = _extract_face_embedding(face_img_bgr=face_crop_bgr, recognition_model=recognition_model)
+                        except Exception:
+                            # best-effort: не ломаем конвейер из-за ошибок распознавания
+                            embedding = None
+                    
                     stage = "db_insert_detection"
+                    # Получаем размеры исходного изображения (после EXIF transpose)
+                    pil_width, pil_height = pil.size
+                    # Сохраняем координаты в системе pil (для правильной обрезки thumbnail)
+                    # x_pil, y_pil, w_pil, h_pil уже клипированы к границам pil
                     store.insert_detection(
                         run_id=run_id_i,
                         file_path=db_path,
                         face_index=i,
-                        bbox_x=x,
-                        bbox_y=y,
-                        bbox_w=w,
-                        bbox_h=h,
+                        bbox_x=x_pil,  # Используем координаты в системе pil
+                        bbox_y=y_pil,
+                        bbox_w=w_pil,
+                        bbox_h=h_pil,
                         confidence=score,
                         presence_score=pres,
                         thumb_jpeg=thumb,
+                        embedding=embedding,
+                        image_width=pil_width,
+                        image_height=pil_height,
                     )
                     stats.faces_found += 1
 
@@ -2030,6 +2297,27 @@ def scan_faces_local(
         faces_found_db = _rectangles_count_db()
         stats.faces_found = faces_found_db
         store.update_run_progress(run_id=run_id_i, processed_files=stats.images_scanned, faces_found=faces_found_db)
+        
+        # Автоматическая кластеризация embeddings после завершения детекции
+        try:
+            from backend.logic.face_recognition import cluster_face_embeddings
+            _pipe_log(pipeline, pipeline_run_id, f"clustering: starting clustering for run_id={run_id_i}\n")
+            cluster_result = cluster_face_embeddings(
+                run_id=run_id_i,
+                eps=0.4,
+                min_samples=2,
+                use_folder_context=True,
+            )
+            _pipe_log(
+                pipeline,
+                pipeline_run_id,
+                f"clustering: completed - {cluster_result['clusters_count']} clusters, "
+                f"{cluster_result['noise_count']} noise, total {cluster_result['total_faces']} faces\n",
+            )
+        except Exception as e:
+            # Не ломаем pipeline из-за ошибок кластеризации
+            _pipe_log(pipeline, pipeline_run_id, f"clustering: error - {type(e).__name__}: {e}\n")
+        
         store.finish_run(run_id=run_id_i, status="completed")
         return run_id_i, stats
     finally:

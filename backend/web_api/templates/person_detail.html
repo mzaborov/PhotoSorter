@@ -88,7 +88,8 @@
           <div class="muted" style="margin-top:6px;" id="personInfo">Загрузка...</div>
         </div>
         <div>
-          <a href="/persons" class="muted">← к списку персон</a>
+          <a href="/persons" class="muted">← к списку персон</a> · 
+          <a href="/persons/{{ person_id }}/clusters" class="muted">Кластеры персоны</a>
         </div>
       </div>
 
@@ -102,7 +103,7 @@
           </div>
         </div>
         <div style="margin-top:12px; display:flex; gap:10px; flex-wrap:wrap;">
-          <button class="btn" id="btnRefreshGold" type="button">Обновить gold</button>
+          <button class="btn primary" id="btnSaveToGold" type="button">Сохранить в gold</button>
         </div>
       </div>
 
@@ -1049,43 +1050,33 @@
         }
       }
 
-      async function refreshGold() {
-        if (!confirm('Обновить gold-файл для этой персоны? Все лица персоны будут перенесены в gold.')) {
-          return;
-        }
+      async function saveToGold() {
+        const btn = document.getElementById('btnSaveToGold');
+        if (!btn) return;
+        
+        btn.disabled = true;
+        btn.textContent = 'Сохранение...';
         
         try {
-          const resp = await fetch(`/api/persons/${personId}/refresh-gold`, {
+          const resp = await fetch(`/api/persons/${personId}/save-to-gold`, {
             method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
           });
           
+          const data = await resp.json();
           if (!resp.ok) {
-            let errorMsg = 'Ошибка обновления gold';
-            try {
-              const contentType = resp.headers.get('content-type');
-              if (contentType && contentType.includes('application/json')) {
-                const err = await resp.json();
-                errorMsg = err.detail || err.message || errorMsg;
-              } else {
-                const text = await resp.text();
-                errorMsg = `HTTP ${resp.status}: ${resp.statusText}`;
-                if (text && text.length < 200) {
-                  errorMsg += ` - ${text}`;
-                }
-              }
-            } catch (parseErr) {
-              errorMsg = `HTTP ${resp.status}: ${resp.statusText}`;
-            }
-            throw new Error(errorMsg);
+            throw new Error(data.detail || data.error || 'Ошибка сохранения');
           }
           
-          const result = await resp.json();
-          showToast(`Gold обновлён: ${result.files_updated} файлов`);
+          showToast(`Сохранено в gold: ${data.faces_count} лиц, ${data.files_updated} файлов`, false);
         } catch (e) {
-          console.error('Ошибка обновления gold:', e);
           showToast(`Ошибка: ${e.message}`, true);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = 'Сохранить в gold';
         }
       }
+
 
       async function ignoreFace(faceId) {
         if (!confirm('Пометить это лицо как "не лицо"?')) {
@@ -1323,7 +1314,7 @@
 
       // Инициализация
       document.getElementById('btnUpdateName').addEventListener('click', updatePersonName);
-      document.getElementById('btnRefreshGold').addEventListener('click', refreshGold);
+      document.getElementById('btnSaveToGold').addEventListener('click', saveToGold);
       document.getElementById('inputPersonName').addEventListener('keypress', (e) => {
         if (e.key === 'Enter') updatePersonName();
       });

@@ -126,23 +126,23 @@ def _fetch_rows_by_paths(ds: DedupStore, paths: list[str], pipeline_run_id: int 
         rows = ds.conn.execute(sql, [int(pipeline_run_id), *paths]).fetchall()
     else:
         # No pipeline_run_id -> treat as "no manual labels" to avoid mixing runs.
-        sql = f"""
-            SELECT
-              path,
-              faces_count,
+    sql = f"""
+        SELECT
+          path,
+          faces_count,
               '' AS faces_manual_label,
               0 AS quarantine_manual,
-              faces_auto_quarantine,
-              faces_quarantine_reason,
-              animals_auto,
-              animals_kind,
+          faces_auto_quarantine,
+          faces_quarantine_reason,
+          animals_auto,
+          animals_kind,
               0 AS animals_manual,
               '' AS animals_manual_kind,
               0 AS people_no_face_manual
-            FROM files
-            WHERE path IN ({placeholders})
-        """
-        rows = ds.conn.execute(sql, paths).fetchall()
+        FROM files
+        WHERE path IN ({placeholders})
+    """
+    rows = ds.conn.execute(sql, paths).fetchall()
     out: dict[str, dict] = {}
     for r in rows:
         out[str(r["path"])] = dict(r)

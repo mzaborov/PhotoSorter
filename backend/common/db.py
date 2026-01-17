@@ -232,6 +232,9 @@ def init_db():
             "place_city": "place_city TEXT",
             "place_source": "place_source TEXT",   # 'yandex'|'manual'|...
             "place_at": "place_at TEXT",           # when updated (UTC ISO)
+            # Размеры исходного изображения (для правильного масштабирования bbox координат)
+            "image_width": "image_width INTEGER",  # ширина исходного изображения (после EXIF transpose)
+            "image_height": "image_height INTEGER",  # высота исходного изображения (после EXIF transpose)
         },
     )
 
@@ -496,6 +499,91 @@ class FaceStore:
                 "manual_created_at": "manual_created_at TEXT",
             },
         )
+        
+        # Face recognition embeddings (векторное представление лица для распознавания)
+        _ensure_columns(
+            self.conn,
+            "face_rectangles",
+            {
+                "embedding": "embedding BLOB",  # JSON массив float32 (обычно 512 или 1024 элементов)
+            },
+        )
+        
+        # Archive scope для поддержки архива без привязки к прогонам
+        # NULL или '' = для прогонов (сортируемые папки), 'archive' = для архива (текущий статус)
+        _ensure_columns(
+            self.conn,
+            "face_rectangles",
+            {
+                "archive_scope": "archive_scope TEXT",  # NULL|'' для прогонов, 'archive' для архива
+            },
+        )
+
+        # Справочник персон (людей)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS persons (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                name            TEXT UNIQUE NOT NULL,
+                mode            TEXT NOT NULL DEFAULT 'active',  -- 'active'|'deferred'|'never'
+                is_me           INTEGER NOT NULL DEFAULT 0,
+                kinship         TEXT,                          -- степень родства/близости
+                avatar_face_id  INTEGER,                       -- FK к face_rectangles.id
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT
+            );
+        """)
+
+        # Кластеры лиц
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS face_clusters (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id          INTEGER NOT NULL,
+                method          TEXT NOT NULL,                  -- 'DBSCAN'|'HDBSCAN'|...
+                params_json     TEXT,                          -- JSON с параметрами кластеризации
+                created_at       TEXT NOT NULL
+            );
+        """)
+
+        # Связь лиц с кластерами
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS face_cluster_members (
+                cluster_id          INTEGER NOT NULL,
+                face_rectangle_id   INTEGER NOT NULL,
+                PRIMARY KEY (cluster_id, face_rectangle_id)
+            );
+        """)
+
+        # Метки лиц (назначение персоны лицу)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS face_labels (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                face_rectangle_id   INTEGER NOT NULL,
+                person_id           INTEGER NOT NULL,
+                cluster_id          INTEGER,                   -- optional: если source=cluster
+                source              TEXT NOT NULL,             -- 'manual'|'cluster'|'ai'
+                confidence          REAL,
+                created_at          TEXT NOT NULL
+            );
+        """)
+
+        # Archive scope для кластеров (аналогично face_rectangles)
+        _ensure_columns(
+            self.conn,
+            "face_clusters",
+            {
+                "archive_scope": "archive_scope TEXT",  # NULL|'' для прогонов, 'archive' для архива
+            },
+        )
+        
+        # Индексы
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_clusters_run ON face_clusters(run_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_rect_archive_scope ON face_rectangles(archive_scope);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_clusters_archive_scope ON face_clusters(archive_scope);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_cluster_members_cluster ON face_cluster_members(cluster_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_cluster_members_face ON face_cluster_members(face_rectangle_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_labels_face ON face_labels(face_rectangle_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_labels_person ON face_labels(person_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_labels_cluster ON face_labels(cluster_id);")
 
         self.conn.commit()
 
@@ -631,7 +719,8 @@ class FaceStore:
     def insert_detection(
         self,
         *,
-        run_id: int,
+        run_id: int | None = None,
+        archive_scope: str | None = None,
         file_path: str,
         face_index: int,
         bbox_x: int,
@@ -641,33 +730,211 @@ class FaceStore:
         confidence: float | None,
         presence_score: float | None,
         thumb_jpeg: bytes | None,
-    ) -> None:
+        embedding: bytes | None = None,
+        image_width: int | None = None,
+        image_height: int | None = None,
+    ) -> bool:
+        """
+        Вставляет детекцию лица. Для архивного режима (archive_scope='archive') 
+        проверяет дубликаты перед вставкой (append без дублирования).
+        
+        Returns:
+            True если запись была вставлена, False если была пропущена (дубликат в архиве)
+        """
         cur = self.conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO face_rectangles(
-              run_id, file_path, face_index,
-              bbox_x, bbox_y, bbox_w, bbox_h,
-              confidence, presence_score, thumb_jpeg,
-              manual_person, ignore_flag, created_at
+        
+        # Для архивного режима проверяем дубликаты (append без дублирования)
+        if archive_scope == 'archive':
+            # Проверяем существование по file_path + bbox
+            cur.execute(
+                """
+                SELECT id FROM face_rectangles
+                WHERE archive_scope = 'archive'
+                  AND file_path = ?
+                  AND bbox_x = ?
+                  AND bbox_y = ?
+                  AND bbox_w = ?
+                  AND bbox_h = ?
+                LIMIT 1
+                """,
+                (file_path, int(bbox_x), int(bbox_y), int(bbox_w), int(bbox_h)),
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?)
-            """,
-            (
-                run_id,
-                file_path,
-                int(face_index),
-                int(bbox_x),
-                int(bbox_y),
-                int(bbox_w),
-                int(bbox_h),
-                float(confidence) if confidence is not None else None,
-                float(presence_score) if presence_score is not None else None,
-                thumb_jpeg,
-                _now_utc_iso(),
-            ),
-        )
+            existing = cur.fetchone()
+            if existing is not None:
+                # Дубликат найден - пропускаем вставку
+                return False
+        
+        # Определяем колонки для INSERT в зависимости от наличия run_id и archive_scope
+        if archive_scope == 'archive':
+            # Для архива run_id может быть NULL
+            cur.execute(
+                """
+                INSERT INTO face_rectangles(
+                  run_id, archive_scope, file_path, face_index,
+                  bbox_x, bbox_y, bbox_w, bbox_h,
+                  confidence, presence_score, thumb_jpeg,
+                  embedding, manual_person, ignore_flag, created_at,
+                  is_manual, manual_created_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, 0, NULL)
+                """,
+                (
+                    run_id,  # может быть NULL для архива
+                    archive_scope,
+                    file_path,
+                    int(face_index),
+                    int(bbox_x),
+                    int(bbox_y),
+                    int(bbox_w),
+                    int(bbox_h),
+                    float(confidence) if confidence is not None else None,
+                    float(presence_score) if presence_score is not None else None,
+                    thumb_jpeg,
+                    embedding,  # может быть NULL
+                    _now_utc_iso(),
+                ),
+            )
+        else:
+            # Для прогонов run_id обязателен, archive_scope NULL
+            if run_id is None:
+                raise ValueError("run_id обязателен для неархивных записей")
+            cur.execute(
+                """
+                INSERT INTO face_rectangles(
+                  run_id, archive_scope, file_path, face_index,
+                  bbox_x, bbox_y, bbox_w, bbox_h,
+                  confidence, presence_score, thumb_jpeg,
+                  embedding, manual_person, ignore_flag, created_at,
+                  is_manual, manual_created_at
+                )
+                VALUES(?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, 0, NULL)
+                """,
+                (
+                    run_id,
+                    file_path,
+                    int(face_index),
+                    int(bbox_x),
+                    int(bbox_y),
+                    int(bbox_w),
+                    int(bbox_h),
+                    float(confidence) if confidence is not None else None,
+                    float(presence_score) if presence_score is not None else None,
+                    thumb_jpeg,
+                    embedding,  # может быть NULL
+                    _now_utc_iso(),
+                ),
+            )
+        
+        # Обновляем размеры изображения в таблице files (если они указаны)
+        if image_width is not None and image_height is not None:
+            cur.execute(
+                """
+                UPDATE files 
+                SET image_width = ?, image_height = ?
+                WHERE path = ? AND (image_width IS NULL OR image_height IS NULL)
+                """,
+                (int(image_width), int(image_height), file_path),
+            )
         self.conn.commit()
+        return True
+
+    def find_similar_faces(
+        self,
+        *,
+        embedding_json: bytes,
+        run_id: int | None = None,
+        similarity_threshold: float = 0.6,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """
+        Находит похожие лица по embedding (косинусное расстояние).
+        
+        Args:
+            embedding_json: JSON-сериализованный embedding (bytes)
+            run_id: ограничить поиск определённым run_id (опционально)
+            similarity_threshold: минимальный порог схожести (0.0-1.0, косинусное расстояние)
+            limit: максимальное количество результатов
+        
+        Returns:
+            список словарей с информацией о похожих лицах
+        """
+        try:
+            import numpy as np
+            
+            # Десериализуем query embedding
+            query_emb = np.array(json.loads(embedding_json.decode("utf-8")), dtype=np.float32)
+            query_norm = np.linalg.norm(query_emb)
+            if query_norm == 0:
+                return []
+            query_emb = query_emb / query_norm  # нормализуем
+            
+            cur = self.conn.cursor()
+            
+            # Получаем все embeddings из БД
+            if run_id is not None:
+                cur.execute(
+                    """
+                    SELECT id, run_id, file_path, face_index, bbox_x, bbox_y, bbox_w, bbox_h,
+                           confidence, embedding
+                    FROM face_rectangles
+                    WHERE run_id = ? AND embedding IS NOT NULL AND COALESCE(ignore_flag, 0) = 0
+                    """,
+                    (int(run_id),),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, run_id, file_path, face_index, bbox_x, bbox_y, bbox_w, bbox_h,
+                           confidence, embedding
+                    FROM face_rectangles
+                    WHERE embedding IS NOT NULL AND COALESCE(ignore_flag, 0) = 0
+                    """,
+                )
+            
+            results: list[tuple[float, dict[str, Any]]] = []
+            
+            for row in cur.fetchall():
+                try:
+                    db_emb_json = row[9]  # embedding column
+                    if not db_emb_json:
+                        continue
+                    
+                    # Десериализуем embedding из БД
+                    db_emb = np.array(json.loads(db_emb_json.decode("utf-8")), dtype=np.float32)
+                    db_norm = np.linalg.norm(db_emb)
+                    if db_norm == 0:
+                        continue
+                    db_emb = db_emb / db_norm  # нормализуем
+                    
+                    # Вычисляем косинусное расстояние (cosine similarity)
+                    similarity = float(np.dot(query_emb, db_emb))
+                    
+                    if similarity >= similarity_threshold:
+                        results.append((
+                            similarity,
+                            {
+                                "id": row[0],
+                                "run_id": row[1],
+                                "file_path": row[2],
+                                "face_index": row[3],
+                                "bbox_x": row[4],
+                                "bbox_y": row[5],
+                                "bbox_w": row[6],
+                                "bbox_h": row[7],
+                                "confidence": row[8],
+                                "similarity": similarity,
+                            },
+                        ))
+                except Exception:
+                    continue
+            
+            # Сортируем по similarity (от большего к меньшему)
+            results.sort(key=lambda x: x[0], reverse=True)
+            
+            # Возвращаем top-K
+            return [r[1] for r in results[:limit]]
+        except Exception:
+            return []
 
     def update_file_path(self, *, old_file_path: str, new_file_path: str) -> None:
         """

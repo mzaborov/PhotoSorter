@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>PhotoSorter — Кластеры персоны</title>
+    <style>
+      :root { color-scheme: light; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      a { color: #0b57d0; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+      .muted { color: #6b7280; }
+      .wrap { max-width: 1400px; }
+      .header { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
+      .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+      .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#f3f4f6; color:#374151; font-size:12px; }
+      .btn { appearance:none; border:1px solid #d1d5db; background:#fff; padding:8px 10px; border-radius:10px; cursor:pointer; font-weight:700; }
+      .btn:hover { background:#f9fafb; }
+      .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+      .btn.primary { background:#111827; color:#fff; border-color:#111827; }
+      .btn.primary:hover { background:#374151; }
+      .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top: 12px; }
+      .grid { display:flex; gap:10px; flex-wrap:wrap; margin-top: 14px; }
+      .person-group { margin-bottom: 24px; }
+      .person-group-header { display:flex; align-items:center; gap:12px; margin-bottom:12px; padding:12px; background:#f9fafb; border-radius:12px; }
+      .person-avatar { width: 48px; height: 48px; border-radius:50%; object-fit:cover; border:2px solid #e5e7eb; }
+      .person-avatar-placeholder { width: 48px; height: 48px; border-radius:50%; background:#e5e7eb; display:flex; align-items:center; justify-content:center; font-size:20px; color:#6b7280; }
+      .person-name { font-size:18px; font-weight:700; }
+      .person-clusters-count { color:#6b7280; font-size:14px; }
+      .card { width: 300px; border:1px solid #e5e7eb; border-radius:12px; overflow:hidden; background:#fff; }
+      .card-header { padding: 10px 12px; background:#f9fafb; border-bottom: 1px solid #e5e7eb; }
+      .card-body { padding: 10px 12px; }
+      .kv { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; font-size:12px; color:#374151; }
+      .actions { display:flex; gap:8px; margin-top: 10px; flex-wrap: wrap; }
+      .select { border:1px solid #d1d5db; border-radius:10px; padding:8px 10px; font-size:14px; }
+      .loading { opacity: 0.6; pointer-events: none; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="header">
+        <div>
+          <h2 style="margin:0;" id="pageTitle">Кластеры персоны</h2>
+          <div class="muted" style="margin-top:6px;">Кластеры лиц, назначенные этой персоне.</div>
+        </div>
+        <div class="muted">
+          <a href="/persons" id="backLink">← к списку персон</a>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <button class="btn" id="btnReload" type="button">Обновить</button>
+        <span class="muted" id="toast"></span>
+      </div>
+
+      <div class="grid" id="clustersGrid"></div>
+    </div>
+
+    <script>
+      // Получаем person_id из URL
+      const urlMatch = window.location.pathname.match(/\/persons\/(\d+)\/clusters/);
+      const personId = urlMatch ? parseInt(urlMatch[1]) : null;
+      let person = null;
+      let clusters = [];
+      
+      // Пагинация для кластеров
+      let clusterPage = 1;
+      const clusterPageSize = 50;
+      let clusterHasMore = true;
+      let clusterTotalCount = null;
+      let clusterLoading = false;
+      let allLoadedClusters = [];
+
+      function showToast(msg, duration = 3000) {
+        const el = document.getElementById("toast");
+        el.textContent = msg;
+        setTimeout(() => { el.textContent = ""; }, duration);
+      }
+
+      function updateSentinel() {
+        const sentinel = document.getElementById("clustersSentinel");
+        if (sentinel) {
+          sentinel.textContent = clusterLoading ? "Загрузка…" : (clusterHasMore ? "…" : "");
+        }
+      }
+
+      async function loadPerson() {
+        try {
+          const resp = await fetch(`/api/persons/${personId}`);
+          if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+          }
+          const data = await resp.json();
+          person = data.person;
+          
+          // Обновляем заголовок страницы
+          const title = document.getElementById("pageTitle");
+          if (title && person) {
+            title.textContent = `Кластеры персоны: ${person.name}`;
+          }
+          
+          // Обновляем ссылку назад
+          const backLink = document.getElementById("backLink");
+          if (backLink) {
+            backLink.href = `/persons/${personId}`;
+            backLink.textContent = `← к персоне: ${person.name}`;
+          }
+        } catch (e) {
+          console.error('[loadPerson] Ошибка:', e);
+          showToast(`Ошибка загрузки персоны: ${e}`);
+        }
+      }
+
+      async function getFaceThumbnail(faceId) {
+        if (!faceId) return null;
+        try {
+          const resp = await fetch(`/api/face-rectangles/${faceId}/thumbnail`);
+          if (resp.ok) {
+            const data = await resp.json();
+            return data.thumb_jpeg_base64 ? `data:image/jpeg;base64,${data.thumb_jpeg_base64}` : null;
+          }
+        } catch (e) {
+          console.error('Ошибка загрузки аватара:', e);
+        }
+        return null;
+      }
+
+      async function loadClusters(reset = false) {
+        if (clusterLoading) return;
+        if (!reset && !clusterHasMore) return;
+        
+        clusterLoading = true;
+        updateSentinel();
+        
+        const pageParam = `page=${clusterPage}`;
+        const pageSizeParam = `page_size=${clusterPageSize}`;
+        const personIdParam = `person_id=${personId}`;
+        const url = `/api/face-clusters/list?${personIdParam}&${pageParam}&${pageSizeParam}`;
+        
+        try {
+          if (reset) {
+            clusterPage = 1;
+            clusterHasMore = true;
+            clusterTotalCount = null;
+            allLoadedClusters = [];
+            const grid = document.getElementById("clustersGrid");
+            grid.innerHTML = "";
+          }
+          
+          const resp = await fetch(url);
+          if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+          }
+          const data = await resp.json();
+          const newClusters = data.clusters || [];
+          
+          console.log(`[loadClusters] Загружено кластеров: ${newClusters.length}, всего: ${data.total}, страница: ${clusterPage}`);
+          
+          clusterTotalCount = data.total || clusterTotalCount;
+          clusterHasMore = newClusters.length === clusterPageSize && (clusterTotalCount == null || allLoadedClusters.length + newClusters.length < clusterTotalCount);
+          
+          // Добавляем новые кластеры к уже загруженным
+          allLoadedClusters.push(...newClusters);
+          clusters = allLoadedClusters;
+          
+          // Добавляем кластеры в сетку
+          if (newClusters.length > 0) {
+            await appendClusters(newClusters);
+          } else if (reset && clusterTotalCount === 0) {
+            const grid = document.getElementById("clustersGrid");
+            if (grid) {
+              grid.innerHTML = '<div class="muted" style="padding: 24px; text-align: center;">У этой персоны нет кластеров.</div>';
+            }
+          }
+          
+          clusterPage += 1;
+        } catch (e) {
+          showToast(`Ошибка загрузки кластеров: ${e}`);
+        } finally {
+          clusterLoading = false;
+          updateSentinel();
+        }
+      }
+
+      async function appendClusters(newClusters) {
+        const grid = document.getElementById("clustersGrid");
+        if (!grid) return;
+        
+        for (const cluster of newClusters) {
+          const card = await createClusterCard(cluster);
+          grid.appendChild(card);
+        }
+        
+        // Обновляем счетчик в заголовке
+        updateHeaderCount();
+      }
+
+      function updateHeaderCount() {
+        const grid = document.getElementById("clustersGrid");
+        if (!grid) return;
+        const count = grid.children.length;
+        // Можно добавить счетчик в заголовок, если нужно
+      }
+
+      async function createClusterCard(cluster) {
+        const card = document.createElement("div");
+        card.className = "card";
+        
+        // Загружаем preview-лицо для кластера
+        let previewHtml = '';
+        if (cluster.preview_face_id) {
+          const previewUrl = await getFaceThumbnail(cluster.preview_face_id);
+          if (previewUrl) {
+            previewHtml = `<img src="${previewUrl}" alt="Preview" style="width:60px; height:60px; object-fit:cover; border-radius:6px; border:1px solid #e5e7eb;" />`;
+          }
+        }
+        
+        // Выпадашка для снятия назначения или переназначения
+        let optionsHtml = '<option value="">Снять назначение</option>';
+        
+        card.innerHTML = `
+          <div class="card-header" style="display:flex; gap:10px; align-items:start;">
+            ${previewHtml ? `<div>${previewHtml}</div>` : ''}
+            <div style="flex:1;">
+              <div style="font-weight:700;">Кластер #${cluster.id}</div>
+              <div class="muted" style="font-size:11px; margin-top:4px;">
+                ${cluster.faces_count} лиц | Run ${cluster.run_id}
+              </div>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="kv">
+              <span class="pill">Метод: ${cluster.method}</span>
+              <span class="pill">Создан: ${new Date(cluster.created_at).toLocaleString('ru-RU')}</span>
+            </div>
+            <div class="actions" style="display:flex; gap:8px; align-items:center;">
+              <a href="/face-clusters/${cluster.id}" class="btn" style="text-decoration:none; display:inline-block;">Просмотр</a>
+              <select class="btn" style="padding:6px 12px; cursor:pointer; border:1px solid #d1d5db; border-radius:4px; background:white; min-width:180px;" onchange="assignPersonFromDropdown(${cluster.id}, this.value, event)" id="assign-select-${cluster.id}">
+                ${optionsHtml}
+              </select>
+            </div>
+          </div>
+        `;
+        
+        return card;
+      }
+
+      async function assignPersonFromDropdown(clusterId, personId, event) {
+        if (!clusterId) return;
+        
+        if (event) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        
+        const actualPersonId = personId === '' ? null : personId;
+        
+        try {
+          const resp = await fetch(`/api/face-clusters/${clusterId}/assign-person`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ person_id: actualPersonId === null ? null : parseInt(actualPersonId) }),
+          });
+          
+          if (resp.ok) {
+            // Если назначение снято, удаляем кластер из списка
+            if (actualPersonId === null) {
+              const cardElement = document.querySelector(`[id="assign-select-${clusterId}"]`)?.closest('.card');
+              if (cardElement) {
+                cardElement.remove();
+                updateHeaderCount();
+                showToast(`Назначение снято с кластера #${clusterId}`);
+              }
+            } else {
+              showToast(`Кластер #${clusterId} переназначен`);
+            }
+          } else {
+            let errorMsg = "Неизвестная ошибка";
+            try {
+              const err = await resp.json();
+              errorMsg = err.detail || err.message || err.error || JSON.stringify(err);
+            } catch (e) {
+              errorMsg = `HTTP ${resp.status}: ${resp.statusText}`;
+            }
+            showToast(`Ошибка: ${errorMsg}`, true);
+            const select = document.getElementById(`assign-select-${clusterId}`);
+            if (select) select.value = '';
+          }
+        } catch (e) {
+          console.error(`[Assign] Исключение:`, e);
+          showToast(`Ошибка: ${e}`, true);
+          const select = document.getElementById(`assign-select-${clusterId}`);
+          if (select) select.value = '';
+        }
+      }
+
+      // Инициализация
+      document.getElementById("btnReload").onclick = () => loadClusters(true);
+      
+      // Sentinel для бесконечного скролла
+      const sentinel = document.createElement("div");
+      sentinel.id = "clustersSentinel";
+      sentinel.className = "muted";
+      sentinel.style.padding = "18px 0";
+      sentinel.style.textAlign = "center";
+      sentinel.textContent = clusterLoading ? "Загрузка…" : (clusterHasMore ? "…" : "");
+      document.getElementById("clustersGrid").after(sentinel);
+      
+      const sentinelIo = new IntersectionObserver((entries) => {
+        const e = entries && entries[0];
+        if (e && e.isIntersecting) {
+          if (!clusterLoading && clusterHasMore) {
+            loadClusters(false);
+          }
+        }
+      }, { root: null, rootMargin: "800px 0px", threshold: 0.01 });
+      sentinelIo.observe(sentinel);
+      
+      // Загружаем данные
+      async function init() {
+        try {
+          await loadPerson();
+          await loadClusters(true);
+        } catch (e) {
+          console.error('[init] Ошибка инициализации:', e);
+          showToast(`Ошибка инициализации: ${e}`, 10000);
+        }
+      }
+      
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+      } else {
+        init();
+      }
+    </script>
+  </body>
+</html>

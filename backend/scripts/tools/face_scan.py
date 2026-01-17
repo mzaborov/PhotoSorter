@@ -10,11 +10,48 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
 
+import sys
+from pathlib import Path
+
+# Добавляем корень проекта в путь
+repo_root = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(repo_root))
+
+# Загружаем secrets.env/.env
+try:
+    from dotenv import load_dotenv  # type: ignore[import-not-found]
+    load_dotenv(dotenv_path=str(repo_root / "secrets.env"), override=False)
+    load_dotenv(dotenv_path=str(repo_root / ".env"), override=False)
+except Exception:
+    pass
+
 import cv2  # type: ignore[import-untyped]
 from PIL import Image  # type: ignore[import-untyped]
+import json
+import numpy as np
 
-from common.db import FaceStore
-from common.yadisk_client import get_disk
+from backend.common.db import FaceStore
+from backend.common.yadisk_client import get_disk
+
+# #region agent log
+def _debug_log(location: str, message: str, data: dict, hypothesis_id: str = "A") -> None:
+    """Логирование для отладки проблемы с EXIF orientation."""
+    log_path = repo_root / ".cursor" / "debug.log"
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "run1",
+                "hypothesisId": hypothesis_id,
+                "location": location,
+                "message": message,
+                "data": data,
+                "timestamp": int(time.time() * 1000),
+            }
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+# #endregion
 
 
 def _get(item: Any, key: str) -> Optional[Any]:
@@ -200,6 +237,9 @@ def main() -> int:
         print("ERROR: only YaDisk disk:/... paths are supported for now")
         return 2
 
+    # Определяем, является ли путь архивным (disk:/Фото/...)
+    is_archive = root_path.startswith("disk:/Фото/") or root_path == "disk:/Фото"
+
     disk = get_disk()
     files = list_image_files_recursive_yadisk(disk, root_path)
     if args.limit_files and args.limit_files > 0:
@@ -209,10 +249,18 @@ def main() -> int:
     detector = _create_face_detector(str(model_path), score_threshold=float(args.score_threshold))
 
     store = FaceStore()
-    run_id = store.create_run(scope="yadisk", root_path=_as_disk_path(root_path), total_files=len(files))
+    # Для архива создаём run_id только для статистики (опционально)
+    # Для сортируемых папок run_id обязателен
+    run_id: int | None = None
+    if not is_archive:
+        run_id = store.create_run(scope="yadisk", root_path=_as_disk_path(root_path), total_files=len(files))
+    
     stats = ScanStats()
-
-    print(f"RUN id={run_id} root={root_path} files={len(files)}")
+    
+    if is_archive:
+        print(f"ARCHIVE MODE: root={root_path} files={len(files)}")
+    else:
+        print(f"RUN id={run_id} root={root_path} files={len(files)}")
 
     try:
         for f in files:
@@ -230,27 +278,220 @@ def main() -> int:
                     tmp_path = tmp.name
                 disk.download(remote, tmp_path)
 
-                img_bgr = cv2.imread(tmp_path)
-                if img_bgr is None:
-                    raise RuntimeError("imdecode_failed")
+                # Загружаем изображение через PIL для применения EXIF transpose
+                # Это критично: детектор и кроп должны работать с одним и тем же изображением
+                pil = Image.open(tmp_path)
+                pil_size_before = pil.size
+                # #region agent log
+                try:
+                    from PIL.ExifTags import ORIENTATION
+                    exif = pil.getexif()
+                    orientation_tag = exif.get(ORIENTATION) if exif else None
+                except Exception:
+                    orientation_tag = None
+                _debug_log(
+                    "face_scan.py:before_exif_transpose",
+                    "PIL image before EXIF transpose",
+                    {
+                        "file_path": p_disk,
+                        "pil_size_before": list(pil_size_before),
+                        "exif_orientation": orientation_tag,
+                    },
+                    hypothesis_id="A",
+                )
+                # #endregion
+                
+                # Применяем EXIF transpose для правильной ориентации
+                try:
+                    from PIL import ImageOps
+                    pil = ImageOps.exif_transpose(pil)
+                    pil_size_after = pil.size
+                    # #region agent log
+                    _debug_log(
+                        "face_scan.py:after_exif_transpose",
+                        "PIL image after EXIF transpose",
+                        {
+                            "file_path": p_disk,
+                            "pil_size_before": list(pil_size_before),
+                            "pil_size_after": list(pil_size_after),
+                            "size_changed": pil_size_before != pil_size_after,
+                        },
+                        hypothesis_id="B",
+                    )
+                    # #endregion
+                except Exception as e:
+                    # #region agent log
+                    _debug_log(
+                        "face_scan.py:exif_transpose_error",
+                        "EXIF transpose failed",
+                        {
+                            "file_path": p_disk,
+                            "error": str(e),
+                        },
+                        hypothesis_id="A",
+                    )
+                    # #endregion
+                    pass
+                
+                pil = pil.convert("RGB")
+                
+                # Конвертируем PIL в numpy array для OpenCV (BGR формат)
+                pil_array = np.array(pil)
+                # PIL использует RGB, OpenCV использует BGR
+                img_bgr = cv2.cvtColor(pil_array, cv2.COLOR_RGB2BGR)
+                
+                # #region agent log
+                _debug_log(
+                    "face_scan.py:after_cv2_conversion",
+                    "Image converted from PIL to OpenCV BGR (with EXIF applied)",
+                    {
+                        "file_path": p_disk,
+                        "img_bgr_shape": list(img_bgr.shape),
+                        "pil_size": list(pil.size),
+                        "sizes_match": (img_bgr.shape[1], img_bgr.shape[0]) == pil.size,
+                    },
+                    hypothesis_id="A",
+                )
+                # #endregion
 
                 faces = _detect_faces(detector, img_bgr)
                 # presence_score = доля среди лиц (по площади bbox)
                 areas = [float(w * h) for (_x, _y, w, h, _s) in faces]
                 denom = float(sum(areas)) if areas else 0.0
 
-                # Очищаем результаты для файла в рамках текущего прогона (на случай повтора).
+                # Для прогонов очищаем результаты для файла (на случай повтора).
+                # Для архива не очищаем - используем append без дублирования.
                 # Важно: не удаляем ручные прямоугольники (если они когда-нибудь появятся для этого run_id).
-                store.clear_run_auto_rectangles_for_file(run_id=run_id, file_path=p_disk)
+                if not is_archive and run_id is not None:
+                    store.clear_run_auto_rectangles_for_file(run_id=run_id, file_path=p_disk)
 
-                # Для thumb используем PIL (качество JPEG + быстрый resize).
-                pil = Image.open(tmp_path)
+                # PIL изображение уже загружено и повернуто выше (используем его для кропов)
 
+                # Face recognition model (опционально, для извлечения embeddings)
+                recognition_model = None
+                try:
+                    import onnxruntime as ort
+                    import json
+                    
+                    # Проверяем наличие модели
+                    repo_root = Path(__file__).resolve().parents[3]
+                    model_path = repo_root / "models" / "face_recognition" / "w600k_r50.onnx"
+                    
+                    if model_path.exists():
+                        # Создаём модель напрямую
+                        sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+                        input_name = sess.get_inputs()[0].name
+                        output_name = sess.get_outputs()[0].name
+                        input_shape = sess.get_inputs()[0].shape
+                        
+                        recognition_model = {
+                            "session": sess,
+                            "input_name": input_name,
+                            "output_name": output_name,
+                            "input_shape": input_shape,
+                        }
+                except Exception as e:
+                    # embeddings опциональны
+                    if stats.processed_files == 0:
+                        print(f"Примечание: модель распознавания не найдена, embeddings не будут извлекаться: {type(e).__name__}: {e}")
+                
                 for i, (x, y, w, h, score) in enumerate(faces):
                     pres = (areas[i] / denom) if (denom > 0.0 and i < len(areas)) else None
+                    
+                    # #region agent log
+                    _debug_log(
+                        "face_scan.py:before_crop",
+                        "Before creating crop thumbnail",
+                        {
+                            "file_path": p_disk,
+                            "face_index": i,
+                            "bbox_from_detector": {"x": x, "y": y, "w": w, "h": h},
+                            "img_bgr_shape": list(img_bgr.shape),
+                            "pil_size": list(pil.size),
+                            "bbox_in_pil_bounds": x >= 0 and y >= 0 and (x + w) <= pil.size[0] and (y + h) <= pil.size[1],
+                            "bbox_in_bgr_bounds": x >= 0 and y >= 0 and (x + w) <= img_bgr.shape[1] and (y + h) <= img_bgr.shape[0],
+                        },
+                        hypothesis_id="C",
+                    )
+                    # #endregion
+                    
                     thumb = _crop_thumb_jpeg(img=pil, bbox=(x, y, w, h), thumb_size=int(args.thumb_size))
-                    store.insert_detection(
+                    
+                    # Извлекаем embedding для распознавания лиц (опционально)
+                    embedding: bytes | None = None
+                    if recognition_model is not None:
+                        try:
+                            import json
+                            
+                            # Кроп лица в формате BGR для распознавания
+                            pad = int(round(max(w, h) * 0.18))
+                            x0 = max(0, x - pad)
+                            y0 = max(0, y - pad)
+                            x1 = min(img_bgr.shape[1], x + w + pad)
+                            y1 = min(img_bgr.shape[0], y + h + pad)
+                            face_crop_bgr = img_bgr[y0:y1, x0:x1]
+                            
+                            if face_crop_bgr.size > 0:
+                                # Извлекаем embedding
+                                sess = recognition_model["session"]
+                                input_name = recognition_model["input_name"]
+                                output_name = recognition_model["output_name"]
+                                input_shape = recognition_model["input_shape"]
+                                
+                                # ArcFace ожидает RGB и определённый размер (обычно 112x112)
+                                face_img_rgb = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
+                                
+                                # Ресайзим до нужного размера
+                                target_size = (input_shape[3], input_shape[2]) if len(input_shape) == 4 else (112, 112)
+                                face_resized = cv2.resize(face_img_rgb, target_size)
+                                
+                                # Нормализуем: (pixel - 127.5) / 128.0
+                                face_normalized = (face_resized.astype(np.float32) - 127.5) / 128.0
+                                
+                                # Транспонируем в формат [1, 3, H, W]
+                                face_transposed = np.transpose(face_normalized, (2, 0, 1))
+                                face_batch = np.expand_dims(face_transposed, axis=0)
+                                
+                                # Запускаем инференс
+                                outputs = sess.run([output_name], {input_name: face_batch})
+                                emb = outputs[0][0]
+                                
+                                # Нормализуем embedding (L2 нормализация)
+                                norm = np.linalg.norm(emb)
+                                if norm > 0:
+                                    emb = emb / norm
+                                
+                                # Сериализуем в JSON
+                                embedding = json.dumps(emb.tolist()).encode("utf-8")
+                        except Exception:
+                            embedding = None
+                    
+                    # Получаем размеры исходного изображения (после EXIF transpose)
+                    pil_width, pil_height = pil.size
+                    
+                    # #region agent log
+                    _debug_log(
+                        "face_scan.py:before_save",
+                        "Before saving to database",
+                        {
+                            "file_path": p_disk,
+                            "face_index": i,
+                            "bbox_saved": {"x": x, "y": y, "w": w, "h": h},
+                            "image_size_saved": {"width": pil_width, "height": pil_height},
+                            "img_bgr_shape": list(img_bgr.shape),
+                            "pil_size": list(pil.size),
+                            "sizes_match": (img_bgr.shape[1], img_bgr.shape[0]) == (pil_width, pil_height),
+                            "bbox_in_bounds": x >= 0 and y >= 0 and (x + w) <= pil_width and (y + h) <= pil_height,
+                        },
+                        hypothesis_id="D",
+                    )
+                    # #endregion
+                    
+                    # Для архивного режима используем archive_scope='archive' и опциональный run_id
+                    # Для прогонов используем run_id и archive_scope=None
+                    inserted = store.insert_detection(
                         run_id=run_id,
+                        archive_scope='archive' if is_archive else None,
                         file_path=p_disk,
                         face_index=i,
                         bbox_x=x,
@@ -260,21 +501,30 @@ def main() -> int:
                         confidence=score,
                         presence_score=pres,
                         thumb_jpeg=thumb,
+                        embedding=embedding,
+                        image_width=pil_width,
+                        image_height=pil_height,
                     )
-                    stats.faces_found += 1
+                    # Учитываем только вставленные (не дубликаты)
+                    if inserted:
+                        stats.faces_found += 1
 
                 stats.processed_files += 1
                 if stats.processed_files % 20 == 0:
-                    store.update_run_progress(
-                        run_id=run_id,
-                        processed_files=stats.processed_files,
-                        faces_found=stats.faces_found,
-                        last_path=p_disk,
-                    )
+                    # Обновляем прогресс только для прогонов (для архива run_id может быть None)
+                    if not is_archive and run_id is not None:
+                        store.update_run_progress(
+                            run_id=run_id,
+                            processed_files=stats.processed_files,
+                            faces_found=stats.faces_found,
+                            last_path=p_disk,
+                        )
                     print(f"progress: {stats.processed_files}/{len(files)} files, faces={stats.faces_found}")
 
             except Exception as e:  # noqa: BLE001
-                store.update_run_progress(run_id=run_id, last_path=p_disk, last_error=f"{type(e).__name__}: {e}")
+                # Обновляем прогресс только для прогонов (для архива run_id может быть None)
+                if not is_archive and run_id is not None:
+                    store.update_run_progress(run_id=run_id, last_path=p_disk, last_error=f"{type(e).__name__}: {e}")
                 # продолжаем скан, но печатаем ошибку
                 print(f"ERROR: {p_disk}: {type(e).__name__}: {e}")
             finally:
@@ -284,17 +534,61 @@ def main() -> int:
                     except OSError:
                         pass
 
-        store.update_run_progress(
-            run_id=run_id,
-            processed_files=stats.processed_files,
-            faces_found=stats.faces_found,
-            last_path=_as_disk_path(root_path),
-        )
-        store.finish_run(run_id=run_id, status="completed")
+        # Обновляем прогресс только для прогонов (для архива run_id может быть None)
+        if not is_archive and run_id is not None:
+            store.update_run_progress(
+                run_id=run_id,
+                processed_files=stats.processed_files,
+                faces_found=stats.faces_found,
+                last_path=_as_disk_path(root_path),
+            )
+        
+        # Автоматическая кластеризация embeddings после завершения детекции
+        try:
+            from backend.logic.face_recognition import cluster_face_embeddings
+            if is_archive:
+                # Для архива используем archive_scope вместо run_id
+                print(f"clustering: starting clustering for archive (root={root_path})")
+                cluster_result = cluster_face_embeddings(
+                    run_id=None,  # для архива run_id не используется
+                    archive_scope='archive',
+                    eps=0.4,
+                    min_samples=2,
+                    use_folder_context=True,
+                )
+            else:
+                # Для прогонов используем run_id
+                if run_id is None:
+                    raise ValueError("run_id обязателен для неархивных записей")
+                print(f"clustering: starting clustering for run_id={run_id}")
+                cluster_result = cluster_face_embeddings(
+                    run_id=run_id,
+                    archive_scope=None,
+                    eps=0.4,
+                    min_samples=2,
+                    use_folder_context=True,
+                )
+            clusters_count = cluster_result.get('clusters_count', 0)
+            noise_count = cluster_result.get('noise_count', 0)
+            total_faces = cluster_result.get('total_faces', 0)
+            print(
+                f"clustering: completed - {clusters_count} clusters, "
+                f"{noise_count} noise, total {total_faces} faces"
+            )
+        except Exception as e:
+            print(f"clustering: error - {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Завершаем run только для прогонов (для архива run_id может быть None)
+        if not is_archive and run_id is not None:
+            store.finish_run(run_id=run_id, status="completed")
         print(f"DONE: files={stats.processed_files}, faces={stats.faces_found}")
         return 0
     except Exception as e:  # noqa: BLE001
-        store.finish_run(run_id=run_id, status="failed", last_error=f"{type(e).__name__}: {e}")
+        # Завершаем run только для прогонов (для архива run_id может быть None)
+        if not is_archive and run_id is not None:
+            store.finish_run(run_id=run_id, status="failed", last_error=f"{type(e).__name__}: {e}")
         raise
     finally:
         store.close()

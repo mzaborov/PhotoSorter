@@ -29,6 +29,7 @@ from web_api.routers.dedup_results import router as dedup_results_router
 from web_api.routers.faces import router as faces_router
 from web_api.routers.local_pipeline import router as local_pipeline_router
 from web_api.routers.folders import router as folders_router
+from web_api.routers.face_clusters import router as face_clusters_router
 from web_api.routers import gold as gold_api
 from logic.gold.store import gold_expected_tab_by_path
 
@@ -55,6 +56,7 @@ app.include_router(dedup_results_router)
 app.include_router(faces_router)
 app.include_router(local_pipeline_router)
 app.include_router(folders_router)
+app.include_router(face_clusters_router)
 
 _T = TypeVar("_T")
 
@@ -1268,6 +1270,36 @@ def api_archive_reconcile_start() -> dict[str, Any]:
 
                 _reconcile_archive_inventory(run_id=run_id, root_path=root_path)
                 store2.finish_run(run_id=run_id, status="completed")
+                
+                # После завершения reconcile запускаем досчёт лиц для архива (в фоне)
+                def _scan_faces_runner() -> None:
+                    try:
+                        repo_root = Path(__file__).resolve().parents[2]
+                        script_path = repo_root / "backend" / "scripts" / "tools" / "face_scan_archive.py"
+                        venv_python = repo_root / ".venv-face" / "Scripts" / "python.exe"
+                        
+                        if not script_path.exists():
+                            return  # Скрипт не найден - пропускаем
+                        
+                        if venv_python.exists():
+                            subprocess.run(
+                                [str(venv_python), str(script_path)],
+                                cwd=str(repo_root),
+                                timeout=None,  # Может быть долго
+                            )
+                        else:
+                            # Fallback на системный Python
+                            subprocess.run(
+                                [sys.executable, str(script_path)],
+                                cwd=str(repo_root),
+                                timeout=None,
+                            )
+                    except Exception as e:  # noqa: BLE001
+                        # Логируем, но не блокируем reconcile
+                        print(f"face_scan_archive failed: {type(e).__name__}: {e}", file=sys.stderr)
+                
+                # Запускаем в отдельном потоке, чтобы не блокировать
+                threading.Thread(target=_scan_faces_runner, daemon=True).start()
             except Exception as e:  # noqa: BLE001
                 store2.finish_run(run_id=run_id, status="failed", last_error=f"{type(e).__name__}: {e}")
             finally:

@@ -17,6 +17,7 @@ $backendDir = (Resolve-Path (Join-Path $repo "backend")).Path
 $env:PYTHONPATH = $backendDir
 
 Write-Host "Starting uvicorn with --reload..."
+Write-Host "  Note: uvicorn watches for changes in Python files. Scripts in backend/scripts/ may trigger reloads."
 Push-Location $repo
 try {
   & $python -m uvicorn --reload --app-dir $backendDir web_api.main:app --host 127.0.0.1 --port 8000

@@ -3,6 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- YaDisk preview hotlink защита: просим браузер не слать Referer при загрузке картинок -->
+    <meta name="referrer" content="no-referrer" />
     <title>PhotoSorter — Gold (debug)</title>
     <style>
       :root { color-scheme: light; }
@@ -106,11 +108,17 @@
       <!-- 1st-level tabs -->
       <div class="tabs" id="level1Tabs">
         <button class="tab active" data-view="lists" type="button">Списки</button>
+        <button class="tab" data-view="faces" type="button">Лица</button>
         <button class="tab" data-view="reports" type="button">Отчёты</button>
       </div>
 
       <div id="viewLists">
         <div class="tabs" id="tabs"></div>
+      </div>
+
+      <div id="viewFaces" style="display:none;">
+        <div class="tabs" id="facesTabs"></div>
+        <div class="grid" id="facesGrid" style="margin-top:14px;"></div>
       </div>
 
       <div id="viewReports" style="display:none;">
@@ -405,7 +413,7 @@
         const data = await fetchJson("/api/gold/names");
         names = Array.isArray(data?.names) ? data.names : [];
         nameCounts = (data?.counts && typeof data.counts === "object") ? data.counts : {};
-        listNames = (names || []).filter(n => n !== "duplicates");
+        listNames = (names || []).filter(n => n !== "duplicates" && n !== "faces_manual_rects");
         if (view === "lists") {
           if (!cur && listNames.length) cur = listNames[0];
           if (cur && !listNames.includes(cur)) cur = listNames[0] || null;
@@ -445,13 +453,156 @@
           loadList(true);
         }
       }
+      let facesPersons = [];
+      let currentPersonId = null;
+
+      async function loadFacesByPersons() {
+        try {
+          const data = await fetchJson("/api/gold/faces-by-persons");
+          facesPersons = Array.isArray(data?.persons) ? data.persons : [];
+          // Устанавливаем первую персону (исключая "Не назначено" и "Посторонние" для первой загрузки)
+          if (facesPersons.length > 0 && currentPersonId === null) {
+            // Ищем первую персону, которая не "Не назначено" и не "Посторонние"
+            const firstRegularPerson = facesPersons.find(p => 
+              p.person_id !== null && 
+              p.person_name !== "Не назначено" && 
+              p.person_name !== "Посторонние"
+            );
+            currentPersonId = firstRegularPerson ? firstRegularPerson.person_id : facesPersons[0].person_id;
+          }
+          renderFacesTabs();
+          renderFacesGrid();
+        } catch (e) {
+          setToast(`Ошибка загрузки лиц: ${e.message}`, true);
+        }
+      }
+
+      function renderFacesTabs() {
+        const el = qs("#facesTabs");
+        if (!el) return;
+        el.innerHTML = facesPersons.map(p => {
+          // Сравниваем person_id с учетом null
+          let isActive = false;
+          if (currentPersonId === null) {
+            isActive = (p.person_id === null);
+          } else {
+            isActive = (p.person_id === currentPersonId);
+          }
+          const active = isActive ? "active" : "";
+          const count = Array.isArray(p.faces) ? p.faces.length : 0;
+          const name = escapeHtml(p.person_name || "Неизвестно");
+          return `<button class="tab ${active}" data-person-id="${p.person_id !== null ? p.person_id : 'null'}" type="button">${name} <span class="pill" style="margin-left:6px;">${count}</span></button>`;
+        }).join("");
+        el.querySelectorAll("button.tab[data-person-id]").forEach(b => {
+          b.addEventListener("click", () => {
+            const pid = b.getAttribute("data-person-id");
+            currentPersonId = (pid === "null") ? null : (pid ? Number(pid) : null);
+            renderFacesTabs();
+            renderFacesGrid();
+          });
+        });
+      }
+
+      async function renderFacesGrid() {
+        const el = qs("#facesGrid");
+        if (!el) return;
+        // Ищем персону с учетом null для "Не назначено"
+        const person = facesPersons.find(p => {
+          if (currentPersonId === null) {
+            return p.person_id === null;
+          }
+          return p.person_id === currentPersonId;
+        });
+        if (!person) {
+          el.innerHTML = `<div class="muted">Выберите персону</div>`;
+          return;
+        }
+        const faces = Array.isArray(person.faces) ? person.faces : [];
+        if (!faces.length) {
+          el.innerHTML = `<div class="muted">Нет лиц для этой персоны</div>`;
+          return;
+        }
+        // Используем тот же паттерн, что в cardHtml() - просто img с loading="lazy"
+        el.innerHTML = faces.map((face) => {
+          const raw = face.file_path || "";
+          const path = face.file_path || raw;
+          const display = face.path_short || raw;
+          const kind = face.preview_kind || "none";
+          let pv = face.preview_url || "";
+          const bbox = face.bbox || {};
+          
+          // Используем тот же паттерн, что в duplicates.html - всегда через прокси для disk: путей
+          // Для disk: путей ВСЕГДА используем прокси URL, даже если есть preview_url
+          // (прокси возвращает redirect, браузер автоматически следует за redirect)
+          if (path && path.startsWith("disk:")) {
+            pv = `/api/yadisk/preview-image?size=M&path=${encodeURIComponent(path)}`;
+          }
+          // Для других путей используем preview_url если есть
+          
+          const thumb = (kind === "image" && pv)
+            ? `<img loading="lazy" referrerpolicy="no-referrer" src="${escapeHtml(pv)}" alt="preview" />`
+            : (kind === "video" && pv)
+              ? `<video controls muted preload="metadata" src="${escapeHtml(pv)}"></video>`
+              : `<div class="noimg">—</div>`;
+          
+          return `
+            <div class="card" data-path="${escapeHtml(path)}" data-bbox-x="${bbox.x || 0}" data-bbox-y="${bbox.y || 0}" data-bbox-w="${bbox.w || 0}" data-bbox-h="${bbox.h || 0}">
+              <div class="thumb" data-act="lb">
+                ${thumb}
+              </div>
+              <div class="card-body">
+                <div class="path"><code title="${escapeHtml(raw)}">${escapeHtml(display)}</code></div>
+                <div class="kv">
+                  <span class="pill">x: ${bbox.x || 0}, y: ${bbox.y || 0}</span>
+                  <span class="pill">w: ${bbox.w || 0}, h: ${bbox.h || 0}</span>
+                </div>
+              </div>
+            </div>
+          `;
+        }).join("");
+        // Добавляем обработчики кликов для lightbox
+        el.querySelectorAll(".thumb[data-act='lb']").forEach(thumb => {
+          thumb.addEventListener("click", () => {
+            const card = thumb.closest(".card");
+            if (!card) return;
+            const path = card.getAttribute("data-path") || "";
+            const bboxX = Number(card.getAttribute("data-bbox-x") || 0);
+            const bboxY = Number(card.getAttribute("data-bbox-y") || 0);
+            const bboxW = Number(card.getAttribute("data-bbox-w") || 0);
+            const bboxH = Number(card.getAttribute("data-bbox-h") || 0);
+            const face = faces.find(f => f.file_path === path && f.bbox.x === bboxX && f.bbox.y === bboxY);
+            if (face) {
+              // Используем preview_url из face или создаем из path
+              let previewUrl = face.preview_url || "";
+              if (!previewUrl && path) {
+                if (path.startsWith("disk:")) {
+                  previewUrl = `/api/yadisk/preview-image?size=M&path=${encodeURIComponent(path)}`;
+                } else if (path.startsWith("local:")) {
+                  previewUrl = `/api/local/preview?path=${encodeURIComponent(path)}`;
+                }
+              }
+              if (previewUrl) {
+                openLb({
+                  raw_path: path,
+                  path: path,
+                  preview_url: previewUrl,
+                  manual_rects: [face.bbox],
+                });
+              }
+            }
+          });
+        });
+      }
+
       function setView(next) {
         view = next || "lists";
         renderLevel1Tabs();
         const vLists = qs("#viewLists");
+        const vFaces = qs("#viewFaces");
         const vReports = qs("#viewReports");
         if (view === "lists") {
           if (vReports) vReports.style.display = "none";
+          if (vFaces) vFaces.style.display = "none";
           if (vLists) vLists.style.display = "";
           qs("#listUi").style.display = "";
           qs("#tabs").style.display = "";
@@ -459,9 +610,16 @@
           renderTabs();
           resetList();
           loadList(true);
+        } else if (view === "faces") {
+          if (vReports) vReports.style.display = "none";
+          if (vLists) vLists.style.display = "none";
+          if (vFaces) vFaces.style.display = "";
+          if (qs("#listUi")) qs("#listUi").style.display = "none";
+          loadFacesByPersons();
         } else {
           if (vReports) vReports.style.display = "";
           if (vLists) vLists.style.display = "none";
+          if (vFaces) vFaces.style.display = "none";
           // default report tab
           setReport(report || "duplicates");
         }
@@ -487,7 +645,7 @@
         const pv = it?.preview_url || "";
         const mt = it?.mime_type ? `${escapeHtml(it.mime_type)}` : "—";
         const rects = Array.isArray(it?.manual_rects) ? it.manual_rects : [];
-        const rectPill = (cur === "faces_gold" && rects.length) ? `<span class="pill">rects: ${rects.length}</span>` : ``;
+        const rectPill = ((cur === "faces_gold" || cur === "faces_manual_rects") && rects.length) ? `<span class="pill">rects: ${rects.length}</span>` : ``;
         const dupNames = Array.isArray(it?.dup_names) ? it.dup_names : [];
         const dupPills = (cur === "duplicates" && dupNames.length)
           ? dupNames.map(n => `<span class="pill">${escapeHtml(n)}</span>`).join("")

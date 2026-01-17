@@ -90,12 +90,27 @@ def _faces_preview_meta(*, path: str, mime_type: str | None, media_type: str | N
     mime = (mime_type or "").lower()
     if path.startswith("disk:"):
         open_url = "/api/yadisk/open?path=" + urllib.parse.quote(path, safe="")
+        # Для disk: путей пробуем определить тип по расширению, если mime_type не задан
+        if not mime_type:
+            import mimetypes
+            basename = _basename_from_disk_path(path)
+            guessed_mime, _ = mimetypes.guess_type(basename)
+            if guessed_mime:
+                mime = guessed_mime.lower()
+                if guessed_mime.startswith("image/"):
+                    mt = "image"
+                elif guessed_mime.startswith("video/"):
+                    mt = "video"
         if mt == "image" or mime.startswith("image/"):
             preview_kind = "image"
             preview_url = "/api/yadisk/preview-image?size=M&path=" + urllib.parse.quote(path, safe="")
         elif mt == "video" or mime.startswith("video/"):
             preview_kind = "video"
             preview_url = None
+        # Если тип не определен, но путь выглядит как изображение, пробуем показать preview
+        elif preview_kind == "none" and path.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")):
+            preview_kind = "image"
+            preview_url = "/api/yadisk/preview-image?size=M&path=" + urllib.parse.quote(path, safe="")
     elif path.startswith("local:"):
         if mt == "image" or mime.startswith("image/"):
             preview_kind = "image"
@@ -348,7 +363,13 @@ def api_gold_names() -> dict[str, Any]:
         counts["duplicates"] = len(dups)
     except Exception:
         counts["duplicates"] = 0
-    return {"ok": True, "names": list(m.keys()) + ["duplicates"], "counts": counts}
+    # Virtual tab: faces_manual_rects (NDJSON)
+    try:
+        faces_manual_rects = gold_read_ndjson_by_path(gold_faces_manual_rects_path())
+        counts["faces_manual_rects"] = len(faces_manual_rects)
+    except Exception:
+        counts["faces_manual_rects"] = 0
+    return {"ok": True, "names": list(m.keys()) + ["duplicates", "faces_manual_rects"], "counts": counts}
 
 
 def _gold_duplicates_index() -> dict[str, dict[str, Any]]:
@@ -396,6 +417,14 @@ def api_gold_list(
         dup_idx = idx
         # list of normalized paths
         items = sorted(idx.keys())
+    elif name == "faces_manual_rects":
+        # Специальная обработка для faces_manual_rects_gold.ndjson
+        # Возвращаем список путей из NDJSON
+        try:
+            rects_by_path = gold_read_ndjson_by_path(gold_faces_manual_rects_path())
+            items = sorted(rects_by_path.keys())
+        except Exception:
+            items = []
     else:
         if name not in m:
             raise HTTPException(status_code=400, detail="unknown gold name")
@@ -416,7 +445,7 @@ def api_gold_list(
 
     rects_by_path: dict[str, dict[str, Any]] | None = None
     video_frames_by_path: dict[str, dict[str, Any]] | None = None
-    if name == "faces_gold":
+    if name == "faces_gold" or name == "faces_manual_rects":
         try:
             rects_by_path = gold_read_ndjson_by_path(gold_faces_manual_rects_path())
         except Exception:
@@ -442,6 +471,11 @@ def api_gold_list(
     for raw in chunk:
         if name == "duplicates":
             # raw is already normalized path
+            raw_path = str(raw)
+            path = str(raw)
+            nm = {"raw_path": raw_path, "path": path}
+        elif name == "faces_manual_rects":
+            # raw is already a normalized path from NDJSON keys
             raw_path = str(raw)
             path = str(raw)
             nm = {"raw_path": raw_path, "path": path}
@@ -555,6 +589,272 @@ def api_gold_list(
         "has_more": bool(has_more),
         "limit": limit_i,
         "items": out_items,
+    }
+
+
+@router.get("/api/gold/faces-by-persons")
+def api_gold_faces_by_persons() -> dict[str, Any]:
+    """
+    Возвращает лица из faces_manual_rects_gold.ndjson, сгруппированные по персонам.
+    Каждая персона - это закладка с её лицами.
+    """
+    from common.db import get_connection
+    
+    # Читаем все записи из gold
+    gold_path = gold_faces_manual_rects_path()
+    gold_data = gold_read_ndjson_by_path(gold_path)
+    
+    if not gold_data:
+        return {"ok": True, "persons": []}
+    
+    # Получаем соединение с БД для поиска персон по лицам
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    # Группируем по персонам
+    persons_dict: dict[int, dict[str, Any]] = {}  # person_id -> {name, faces: []}
+    unassigned_faces: list[dict[str, Any]] = []  # Лица без персоны
+    
+    # Сначала получаем все персоны, у которых есть лица на файлах из gold
+    # Это нужно, чтобы показать всех персон, даже если точное совпадение bbox не найдено
+    gold_file_paths = list(gold_data.keys())
+    if gold_file_paths:
+        placeholders = ",".join(["?"] * len(gold_file_paths))
+        cur.execute(
+            f"""
+            SELECT DISTINCT
+                p.id as person_id,
+                p.name as person_name
+            FROM face_labels fl
+            JOIN persons p ON fl.person_id = p.id
+            JOIN face_rectangles fr ON fl.face_rectangle_id = fr.id
+            WHERE fr.file_path IN ({placeholders})
+              AND COALESCE(fr.ignore_flag, 0) = 0
+            ORDER BY 
+              CASE WHEN p.name = ? THEN 1 ELSE 0 END,
+              p.name
+            """,
+            gold_file_paths + ["Посторонние"],
+        )
+        for row in cur.fetchall():
+            person_id = row["person_id"]
+            person_name = row["person_name"] or f"Person {person_id}"
+            if person_id not in persons_dict:
+                persons_dict[person_id] = {
+                    "person_id": person_id,
+                    "person_name": person_name,
+                    "faces": [],
+                }
+    
+    for file_path, gold_entry in gold_data.items():
+        rects = gold_entry.get("rects", [])
+        if not isinstance(rects, list):
+            continue
+        
+        # Для каждого прямоугольника ищем соответствующее лицо в БД
+        for rect in rects:
+            if not isinstance(rect, dict):
+                continue
+            try:
+                x = int(rect.get("x", 0))
+                y = int(rect.get("y", 0))
+                w = int(rect.get("w", 0))
+                h = int(rect.get("h", 0))
+            except (ValueError, TypeError):
+                continue
+            
+            if w <= 0 or h <= 0:
+                continue
+            
+            # Ищем лицо в БД по file_path и bbox (с небольшой погрешностью)
+            # Сначала пробуем точное совпадение, затем более широкое
+            # Важно: берем только одно лицо (LIMIT 1) и сортируем по точности совпадения
+            cur.execute(
+                """
+                SELECT 
+                    fr.id as face_id,
+                    fr.file_path,
+                    fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
+                    fl.person_id,
+                    p.name as person_name
+                FROM face_rectangles fr
+                LEFT JOIN face_labels fl ON fl.face_rectangle_id = fr.id
+                LEFT JOIN persons p ON fl.person_id = p.id
+                WHERE fr.file_path = ? 
+                  AND ABS(fr.bbox_x - ?) <= 10
+                  AND ABS(fr.bbox_y - ?) <= 10
+                  AND ABS(fr.bbox_w - ?) <= 10
+                  AND ABS(fr.bbox_h - ?) <= 10
+                  AND COALESCE(fr.ignore_flag, 0) = 0
+                ORDER BY 
+                  -- Сначала берем лица с назначенной персоной
+                  CASE WHEN fl.person_id IS NOT NULL THEN 0 ELSE 1 END,
+                  -- Затем по точности совпадения координат
+                  (ABS(fr.bbox_x - ?) + ABS(fr.bbox_y - ?) + ABS(fr.bbox_w - ?) + ABS(fr.bbox_h - ?)) ASC,
+                  -- И наконец по ID для стабильности
+                  fr.id ASC
+                LIMIT 1
+                """,
+                (file_path, x, y, w, h, x, y, w, h),
+            )
+            face_row = cur.fetchone()
+            
+            # Если не нашли точное совпадение, пробуем найти любую персону на этом файле
+            # face_row может быть Row объектом из SQLite, который поддерживает доступ через []
+            if not face_row or "person_id" not in face_row.keys() or not face_row["person_id"]:
+                cur.execute(
+                    """
+                    SELECT 
+                        fl.person_id,
+                        p.name as person_name
+                    FROM face_labels fl
+                    JOIN persons p ON fl.person_id = p.id
+                    JOIN face_rectangles fr ON fl.face_rectangle_id = fr.id
+                    WHERE fr.file_path = ?
+                      AND COALESCE(fr.ignore_flag, 0) = 0
+                    LIMIT 1
+                    """,
+                    (file_path,),
+                )
+                fallback_row = cur.fetchone()
+                if fallback_row:
+                    # Используем персону из fallback, но без face_id
+                    face_row = {
+                        "face_id": None,
+                        "file_path": file_path,
+                        "bbox_x": x,
+                        "bbox_y": y,
+                        "bbox_w": w,
+                        "bbox_h": h,
+                        "person_id": fallback_row["person_id"],
+                        "person_name": fallback_row["person_name"],
+                    }
+            
+            # Получаем preview метаданные для файла
+            mime_type, media_type = _guess_mime_media_for_path(file_path)
+            # Если не определили тип, пробуем по расширению файла
+            if not mime_type and file_path:
+                import mimetypes
+                # Для disk: путей используем basename
+                if file_path.startswith("disk:"):
+                    basename = _basename_from_disk_path(file_path)
+                    guessed = mimetypes.guess_type(basename)[0]
+                else:
+                    ext = file_path.lower()
+                    if "." in ext:
+                        ext = ext.rsplit(".", 1)[-1]
+                        guessed = mimetypes.guess_type(f"dummy.{ext}")[0]
+                    else:
+                        guessed = None
+                if guessed:
+                    mime_type = guessed
+                    if guessed.startswith("image/"):
+                        media_type = "image"
+                    elif guessed.startswith("video/"):
+                        media_type = "video"
+            eff_pipeline_run_id = _latest_pipeline_run_id()
+            meta = _faces_preview_meta(
+                path=file_path,
+                mime_type=mime_type,
+                media_type=media_type,
+                pipeline_run_id=eff_pipeline_run_id,
+            )
+            
+            face_data = {
+                "file_path": file_path,
+                "path_short": _short_path_for_ui(file_path) if file_path.startswith("disk:") else file_path,
+                "bbox": {"x": x, "y": y, "w": w, "h": h},
+                "face_id": face_row["face_id"] if face_row and "face_id" in face_row.keys() else None,
+                "preview_kind": meta.get("preview_kind", "none"),
+                "preview_url": meta.get("preview_url"),
+                "mime_type": mime_type,
+            }
+            
+            # Проверяем наличие person_id в face_row (может быть Row объект или dict)
+            person_id_in_row = face_row["person_id"] if face_row and "person_id" in face_row.keys() else None
+            if face_row and person_id_in_row:
+                person_id = face_row["person_id"]
+                person_name = face_row["person_name"] if "person_name" in face_row.keys() else f"Person {person_id}"
+                
+                if person_id not in persons_dict:
+                    persons_dict[person_id] = {
+                        "person_id": person_id,
+                        "person_name": person_name,
+                        "faces": [],
+                    }
+                
+                # Дедупликация: проверяем, нет ли уже лица с таким же file_path и координатами (с погрешностью)
+                # для этой персоны. Также проверяем face_id, если он есть (более надежная проверка).
+                is_duplicate = False
+                # face_row может быть dict или Row объектом из SQLite
+                current_face_id = face_row["face_id"] if face_row and "face_id" in face_row.keys() else None
+                
+                for existing_face in persons_dict[person_id]["faces"]:
+                    if existing_face["file_path"] == file_path:
+                        # Если есть face_id, проверяем по нему (более надежно)
+                        existing_face_id = existing_face.get("face_id")
+                        if current_face_id and existing_face_id and current_face_id == existing_face_id:
+                            is_duplicate = True
+                            break
+                        # Иначе проверяем по координатам (с погрешностью)
+                        existing_bbox = existing_face["bbox"]
+                        if (abs(existing_bbox.get("x", 0) - x) <= 10 and
+                            abs(existing_bbox.get("y", 0) - y) <= 10 and
+                            abs(existing_bbox.get("w", 0) - w) <= 10 and
+                            abs(existing_bbox.get("h", 0) - h) <= 10):
+                            is_duplicate = True
+                            break
+                
+                if not is_duplicate:
+                    persons_dict[person_id]["faces"].append(face_data)
+            else:
+                # Дедупликация для unassigned_faces тоже
+                is_duplicate = False
+                for existing_face in unassigned_faces:
+                    if existing_face["file_path"] == file_path:
+                        existing_bbox = existing_face["bbox"]
+                        if (abs(existing_bbox.get("x", 0) - x) <= 10 and
+                            abs(existing_bbox.get("y", 0) - y) <= 10 and
+                            abs(existing_bbox.get("w", 0) - w) <= 10 and
+                            abs(existing_bbox.get("h", 0) - h) <= 10):
+                            is_duplicate = True
+                            break
+                
+                if not is_duplicate:
+                    unassigned_faces.append(face_data)
+    
+    # Преобразуем в список и сортируем:
+    # 1. Обычные персоны (по имени)
+    # 2. "Посторонние" (если есть)
+    # 3. "Не назначено" (если есть)
+    IGNORED_PERSON_NAME = "Посторонние"
+    regular_persons = []
+    ignored_person = None
+    for p in persons_dict.values():
+        if p["person_name"] == IGNORED_PERSON_NAME:
+            ignored_person = p
+        else:
+            regular_persons.append(p)
+    
+    persons_list = sorted(regular_persons, key=lambda p: p["person_name"])
+    
+    # Добавляем "Не назначено" перед "Посторонние"
+    if unassigned_faces:
+        persons_list.append({
+            "person_id": None,
+            "person_name": "Не назначено",
+            "faces": unassigned_faces,
+        })
+    
+    # Добавляем "Посторонние" в самый конец
+    if ignored_person:
+        persons_list.append(ignored_person)
+    
+    return {
+        "ok": True,
+        "persons": persons_list,
+        "total_persons": len(persons_list),
+        "total_faces": sum(len(p["faces"]) for p in persons_list),
     }
 
 

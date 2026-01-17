@@ -116,8 +116,9 @@ class face_runs <<table>> {
 
 class face_rectangles <<table>> {
   +id: INTEGER <<PK>>
-  run_id: INTEGER <<FK>>
-  file_path: TEXT               ' disk:/...
+  run_id: INTEGER <<FK>>         ' NULL для архива (archive_scope='archive')
+  archive_scope: TEXT             ' NULL|'' для прогонов, 'archive' для архива
+  file_path: TEXT                 ' disk:/...
   face_index: INTEGER
   bbox_x: INTEGER
   bbox_y: INTEGER
@@ -126,7 +127,7 @@ class face_rectangles <<table>> {
   confidence: REAL
   presence_score: REAL
   thumb_jpeg: BLOB
-  manual_person: TEXT           ' временно (до persons/person_id)
+  manual_person: TEXT             ' временно (до persons/person_id)
   ignore_flag: INTEGER
   is_manual: INTEGER
   manual_created_at: TEXT
@@ -136,9 +137,54 @@ class face_rectangles <<table>> {
 face_runs "1" -- "*" face_rectangles : прямоугольники лиц
 pipeline_runs "0..1" -- "0..1" face_runs : шаг 2 (лица)
 
+class persons <<table>> {
+  +id: INTEGER <<PK>>
+  name: TEXT <<UNIQUE>>
+  mode: TEXT                    ' active|deferred|never
+  is_me: INTEGER
+  kinship: TEXT
+  avatar_face_id: INTEGER <<FK>>
+  created_at: TEXT
+  updated_at: TEXT
+}
+
+class face_clusters <<table>> {
+  +id: INTEGER <<PK>>
+  run_id: INTEGER <<FK>>         ' NULL для архива (archive_scope='archive')
+  archive_scope: TEXT             ' NULL|'' для прогонов, 'archive' для архива
+  method: TEXT                    ' DBSCAN|HDBSCAN|...
+  params_json: TEXT
+  created_at: TEXT
+}
+
+class face_cluster_members <<table>> {
+  cluster_id: INTEGER <<FK,PK>>
+  face_rectangle_id: INTEGER <<FK,PK>>
+}
+
+class face_labels <<table>> {
+  +id: INTEGER <<PK>>
+  face_rectangle_id: INTEGER <<FK>>
+  person_id: INTEGER <<FK>>
+  cluster_id: INTEGER <<FK>>
+  source: TEXT                  ' manual|cluster|ai
+  confidence: REAL
+  created_at: TEXT
+}
+
+face_rectangles "0..1" -- "0..1" persons : avatar (avatar_face_id)
+face_rectangles "1" -- "*" face_cluster_members : член кластера
+face_clusters "1" -- "*" face_cluster_members : кластер
+face_rectangles "1" -- "*" face_labels : метки лица
+persons "1" -- "*" face_labels : назначенная персона
+face_clusters "0..1" -- "*" face_labels : источник (если source=cluster)
+face_runs "1" -- "*" face_clusters : прогон кластеризации
+
 note right of face_rectangles
   presence_score (photo) =
   area(face_bbox) / sum(area(all_face_bbox))
+  
+  embedding: BLOB (JSON float32[])
 end note
 
 @enduml

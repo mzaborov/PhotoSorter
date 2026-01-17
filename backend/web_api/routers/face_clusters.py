@@ -59,33 +59,81 @@ async def page_person_detail(request: Request, person_id: int) -> Any:
     return templates.TemplateResponse("person_detail.html", {"request": request, "person_id": person_id})
 
 
+@router.get("/persons/{person_id}/clusters", response_class=HTMLResponse)
+async def page_person_clusters(request: Request, person_id: int) -> Any:
+    """Страница для просмотра кластеров конкретной персоны."""
+    return templates.TemplateResponse("person_clusters.html", {"request": request, "person_id": person_id})
+
+
 @router.get("/api/face-clusters/list")
-async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: str | None = None) -> dict[str, Any]:
+async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: str | None = None, person_id: int | None = None, unassigned_only: bool = False, page: int = 1, page_size: int = 50) -> dict[str, Any]:
     """
     Получает список кластеров лиц, сгруппированных по персоне.
     
     Args:
         run_id: опционально, фильтр по run_id (для прогонов)
         archive_scope: опционально, фильтр по archive_scope (для архива, обычно 'archive')
+        person_id: опционально, фильтр по person_id (для кластеров конкретной персоны)
+        unassigned_only: если True, возвращает только неназначенные кластеры (person_id IS NULL)
+        page: номер страницы (начинается с 1, по умолчанию 1)
+        page_size: размер страницы (по умолчанию 50)
     """
     conn = get_connection()
     cur = conn.cursor()
     
     # Формируем WHERE условие в зависимости от режима
-    if archive_scope == 'archive':
-        # Для архива фильтруем по archive_scope
-        where_clause = "fc.archive_scope = 'archive'"
-        params = (IGNORED_PERSON_NAME,)
-    elif run_id is not None:
-        # Для прогонов фильтруем по run_id
-        where_clause = "fc.run_id = ?"
-        params = (run_id, IGNORED_PERSON_NAME)
-    else:
-        # Без фильтров - показываем все кластеры (для обратной совместимости)
-        where_clause = "1=1"
-        params = (IGNORED_PERSON_NAME,)
+    where_parts = []
+    where_params = []
     
-    # Единый SQL-запрос для всех режимов
+    if archive_scope == 'archive':
+        where_parts.append("fc.archive_scope = 'archive'")
+    elif run_id is not None:
+        where_parts.append("fc.run_id = ?")
+        where_params.append(run_id)
+    
+    # Фильтр по person_id (для кластеров конкретной персоны)
+    if person_id is not None:
+        where_parts.append("(SELECT p2.id FROM face_labels fl2 JOIN persons p2 ON fl2.person_id = p2.id WHERE fl2.cluster_id = fc.id LIMIT 1) = ?")
+        where_params.append(person_id)
+    elif unassigned_only:
+        # Только неназначенные кластеры (person_id IS NULL)
+        where_parts.append("(SELECT p2.id FROM face_labels fl2 JOIN persons p2 ON fl2.person_id = p2.id WHERE fl2.cluster_id = fc.id LIMIT 1) IS NULL")
+    
+    # Формируем финальное WHERE условие
+    if where_parts:
+        where_clause = " AND ".join(where_parts)
+    else:
+        where_clause = "1=1"
+    
+    # Параметры для ORDER BY (IGNORED_PERSON_NAME)
+    params = tuple(where_params) + (IGNORED_PERSON_NAME,)
+    
+    # Подсчет общего количества кластеров для пагинации
+    # Для COUNT нужны только параметры WHERE (без IGNORED_PERSON_NAME, который используется только в ORDER BY)
+    count_params = tuple(where_params)
+    
+    cur_count = conn.cursor()
+    cur_count.execute(
+        f"""
+        SELECT COUNT(DISTINCT fc.id) as total
+        FROM face_clusters fc
+        WHERE {where_clause}
+        AND (SELECT COUNT(DISTINCT fcm2.face_rectangle_id)
+             FROM face_cluster_members fcm2
+             JOIN face_rectangles fr2 ON fcm2.face_rectangle_id = fr2.id
+             WHERE fcm2.cluster_id = fc.id AND COALESCE(fr2.ignore_flag, 0) = 0) > 0
+        """,
+        count_params,
+    )
+    total_row = cur_count.fetchone()
+    total_count = total_row["total"] if total_row else 0
+    
+    # Пагинация
+    page = max(1, page)
+    page_size = max(1, min(500, page_size))  # Ограничиваем размер страницы до 500
+    offset = (page - 1) * page_size
+    
+    # Единый SQL-запрос для всех режимов с пагинацией
     cur.execute(
         f"""
         SELECT 
@@ -123,8 +171,9 @@ async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: st
             person_name ASC, 
             faces_count DESC, 
             fc.created_at DESC
+        LIMIT ? OFFSET ?
         """,
-        params,
+        params + (page_size, offset),
     )
     
     clusters = []
@@ -164,7 +213,7 @@ async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: st
             "preview_face_id": preview_face_id,  # ID самого крупного лица для preview
         })
     
-    return {"clusters": clusters}
+    return {"clusters": clusters, "total": total_count, "page": page, "page_size": page_size}
 
 
 @router.get("/face-clusters/{cluster_id}", response_class=HTMLResponse)
@@ -1279,6 +1328,100 @@ async def api_save_all_persons_to_gold() -> dict[str, Any]:
     return {
         "status": "ok",
         "persons_count": len(persons),
+        "faces_count": total_faces,
+        "files_updated": updated_count,
+    }
+
+
+@router.post("/api/persons/{person_id}/save-to-gold")
+async def api_save_person_to_gold(*, person_id: int) -> dict[str, Any]:
+    """
+    Сохраняет все лица конкретной персоны в gold файл.
+    Объединяет rects для одного файла от разных кластеров этой персоны.
+    """
+    from backend.logic.gold.store import gold_faces_manual_rects_path, gold_read_ndjson_by_path, gold_write_ndjson_by_path
+    
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    # Проверяем, что персона существует
+    cur.execute("SELECT id, name FROM persons WHERE id = ?", (person_id,))
+    person = cur.fetchone()
+    if not person:
+        raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
+    
+    # Получаем все лица персоны через face_labels
+    cur.execute(
+        """
+        SELECT 
+            fr.id, fr.run_id, fr.file_path, fr.face_index,
+            fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
+        FROM face_labels fl
+        JOIN face_rectangles fr ON fl.face_rectangle_id = fr.id
+        WHERE fl.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+        """,
+        (person_id,),
+    )
+    
+    faces = cur.fetchall()
+    
+    # Собираем все лица по файлам
+    all_faces_by_path: dict[str, dict[str, Any]] = {}  # path -> {run_id, rects: []}
+    
+    for face in faces:
+        path = face["file_path"]
+        if path not in all_faces_by_path:
+            all_faces_by_path[path] = {
+                "run_id": face["run_id"],
+                "rects": [],
+            }
+        
+        # Добавляем rect (объединяем, не перезаписываем)
+        rect = {
+            "x": face["bbox_x"],
+            "y": face["bbox_y"],
+            "w": face["bbox_w"],
+            "h": face["bbox_h"],
+        }
+        # Проверяем, нет ли уже такого rect (избегаем дублей)
+        rects = all_faces_by_path[path]["rects"]
+        if rect not in rects:
+            rects.append(rect)
+    
+    # Читаем существующие manual rects
+    gold_path = gold_faces_manual_rects_path()
+    existing_dict = gold_read_ndjson_by_path(gold_path)
+    
+    # Перезаписываем записи для всех файлов с лицами этой персоны
+    updated_count = 0
+    total_faces = 0
+    for file_path, data in all_faces_by_path.items():
+        run_id = data["run_id"]
+        rects = data["rects"]
+        
+        if not rects:
+            continue
+        
+        # Формируем запись для gold (полностью перезаписываем для этого файла)
+        entry_data = {
+            "run_id": run_id,
+            "rects": rects,  # Все rects этой персоны для этого файла
+        }
+        
+        existing_dict[file_path] = entry_data
+        updated_count += 1
+        total_faces += len(rects)
+    
+    # Записываем обратно
+    try:
+        gold_write_ndjson_by_path(gold_path, existing_dict)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to write gold file: {str(e)}")
+    
+    return {
+        "status": "ok",
+        "person_id": person_id,
+        "person_name": person["name"],
         "faces_count": total_faces,
         "files_updated": updated_count,
     }

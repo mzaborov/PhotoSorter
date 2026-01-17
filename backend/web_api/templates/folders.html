@@ -100,8 +100,8 @@
             Запустить / Продолжить
           </button>
           <button class="btn" id="reconcileArchiveStart" type="button"
-            title="Синхронизировать БД с Я.Диском (актуализировать список файлов после ручных изменений на диске)">
-            Синхронизировать БД с Я.Диском
+            title="Синхронизировать БД с Я.Диском и досчитать лица (актуализация списка файлов + append недостающих лиц без дублирования)">
+            Синхронизировать и досчитать лица
           </button>
         </div>
       </div>
@@ -264,8 +264,11 @@
           const pct = denom > 0 ? Math.round((p / denom) * 100) : 0;
 
           setReconcileBar(pct);
+          const statusText = reconcileArchiveRunning 
+            ? "идёт (после завершения автоматически запустится досчёт лиц)"
+            : st;
           setReconcileText(
-            `Сверка архива: ${reconcileArchiveRunning ? "идёт" : st} · прогресс=${pct}% (${p}/${denom || "…"}) · ошибок=${er}`
+            `Синхронизация и досчёт лиц: ${statusText} · прогресс=${pct}% (${p}/${denom || "…"}) · ошибок=${er}`
           );
         } catch (e) {
           setReconcileText("Сверка архива: ошибка статуса: " + String(e));

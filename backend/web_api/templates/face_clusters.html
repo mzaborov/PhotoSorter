@@ -1,0 +1,1092 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>PhotoSorter — Кластеры лиц</title>
+    <style>
+      :root { color-scheme: light; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      a { color: #0b57d0; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+      .muted { color: #6b7280; }
+      .wrap { max-width: 1400px; }
+      .header { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
+      .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+      .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#f3f4f6; color:#374151; font-size:12px; }
+      .btn { appearance:none; border:1px solid #d1d5db; background:#fff; padding:8px 10px; border-radius:10px; cursor:pointer; font-weight:700; }
+      .btn:hover { background:#f9fafb; }
+      .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+      .btn.primary { background:#111827; color:#fff; border-color:#111827; }
+      .btn.primary:hover { background:#374151; }
+      .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top: 12px; }
+      .grid { display:flex; gap:10px; flex-wrap:wrap; margin-top: 14px; }
+      .person-group { margin-bottom: 24px; }
+      .person-group-header { display:flex; align-items:center; gap:12px; margin-bottom:12px; padding:12px; background:#f9fafb; border-radius:12px; }
+      .person-group.ignored .person-group-header { background:#f3f4f6; opacity: 0.7; }
+      .person-group.ignored .person-name { color:#6b7280; }
+      .person-group.ignored .card { opacity: 0.8; border-color: #e5e7eb; }
+      .person-avatar { width: 48px; height: 48px; border-radius:50%; object-fit:cover; border:2px solid #e5e7eb; }
+      .person-avatar-placeholder { width: 48px; height: 48px; border-radius:50%; background:#e5e7eb; display:flex; align-items:center; justify-content:center; font-size:20px; color:#6b7280; }
+      .person-name { font-size:18px; font-weight:700; }
+      a.person-name { text-decoration:none; color:inherit; display:inline-block; }
+      a.person-name:hover { text-decoration:underline !important; cursor:pointer; color:#0b57d0 !important; }
+      .person-clusters-count { color:#6b7280; font-size:14px; }
+      .card { width: 300px; border:1px solid #e5e7eb; border-radius:12px; overflow:hidden; background:#fff; }
+      .card-header { padding: 10px 12px; background:#f9fafb; border-bottom: 1px solid #e5e7eb; }
+      .card-body { padding: 10px 12px; }
+      .thumb-grid { display:flex; gap:4px; flex-wrap:wrap; margin-top:8px; }
+      .thumb { width: 60px; height: 60px; background:#fff; display:flex; align-items:center; justify-content:center; border:1px solid #e5e7eb; border-radius:6px; overflow:hidden; cursor: pointer; }
+      .thumb img { width: 100%; height: 100%; object-fit: cover; }
+      .thumb .noimg { color:#6b7280; font-size:10px; text-align:center; padding:4px; }
+      .kv { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; font-size:12px; color:#374151; }
+      .actions { display:flex; gap:8px; margin-top: 10px; flex-wrap: wrap; }
+      .select { border:1px solid #d1d5db; border-radius:10px; padding:8px 10px; font-size:14px; }
+      .input { border:1px solid #d1d5db; border-radius:10px; padding:8px 10px; font-size:14px; }
+      .modal { position: fixed; inset: 0; background: rgba(17,24,39,0.82); display: none; align-items: center; justify-content: center; padding: 18px; z-index: 9999; }
+      .modal.open { display: flex; }
+      .modal-panel { background: #fff; border-radius: 14px; max-width: 94vw; max-height: 94vh; width: min(800px, 94vw); overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,0.35); }
+      .modal-header { padding: 12px 16px; border-bottom: 1px solid #e5e7eb; display:flex; justify-content:space-between; align-items:center; }
+      .modal-body { padding: 16px; max-height: calc(94vh - 120px); overflow-y: auto; }
+      .modal-footer { padding: 12px 16px; border-top: 1px solid #e5e7eb; display:flex; gap:10px; justify-content:flex-end; }
+      .loading { opacity: 0.6; pointer-events: none; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="header">
+        <div>
+          <h2 style="margin:0;">Неназначенные кластеры лиц</h2>
+          <div class="muted" style="margin-top:6px;">Кластеры, которые еще не назначены персоне. Назначьте их из справочника персон.</div>
+        </div>
+        <div class="muted">
+          <a href="/persons">К списку персон</a> · <a href="/">← на главную</a>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <select class="select" id="selectRunId">
+          <option value="">Все прогоны</option>
+        </select>
+        <button class="btn" id="btnReload" type="button">Обновить</button>
+        <button class="btn primary" id="btnCreatePerson" type="button">Создать персону</button>
+        <button class="btn" id="btnClusterize" type="button">Запустить кластеризацию</button>
+        <span class="muted" id="toast"></span>
+      </div>
+
+      <div class="grid" id="clustersGrid"></div>
+    </div>
+
+    <!-- Modal для создания персоны -->
+    <div class="modal" id="modalCreatePerson">
+      <div class="modal-panel">
+        <div class="modal-header">
+          <h3 style="margin:0;">Создать персону</h3>
+          <button class="btn" type="button" onclick="closeModal('modalCreatePerson')">✕</button>
+        </div>
+        <div class="modal-body">
+          <div style="margin-bottom:12px;">
+            <label style="display:block; margin-bottom:4px; font-weight:700;">Имя:</label>
+            <input type="text" class="input" id="inputPersonName" style="width:100%;" placeholder="Например: Агата" />
+          </div>
+          <div style="margin-bottom:12px;">
+            <label style="display:block; margin-bottom:4px; font-weight:700;">Режим:</label>
+            <select class="select" id="selectPersonMode" style="width:100%;">
+              <option value="active">active</option>
+              <option value="deferred">deferred</option>
+              <option value="never">never</option>
+            </select>
+          </div>
+          <div style="margin-bottom:12px;">
+            <label style="display:block; margin-bottom:4px; font-weight:700;">Родство:</label>
+            <input type="text" class="input" id="inputPersonKinship" style="width:100%;" placeholder="Например: дочь" />
+          </div>
+          <div>
+            <label style="display:flex; align-items:center; gap:8px;">
+              <input type="checkbox" id="checkboxIsMe" />
+              <span>Это я</span>
+            </label>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" type="button" onclick="closeModal('modalCreatePerson')">Отмена</button>
+          <button class="btn primary" type="button" onclick="createPerson()">Создать</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal для назначения кластера персоне -->
+    <div class="modal" id="modalAssignPerson">
+      <div class="modal-panel">
+        <div class="modal-header">
+          <h3 style="margin:0;">Назначить кластер персоне</h3>
+          <button class="btn" type="button" onclick="closeModal('modalAssignPerson')">✕</button>
+        </div>
+        <div class="modal-body">
+          <div>
+            <label style="display:block; margin-bottom:4px; font-weight:700;">Персона:</label>
+            <select class="select" id="selectAssignPerson" style="width:100%;">
+              <option value="">Выберите персону...</option>
+            </select>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" type="button" onclick="closeModal('modalAssignPerson')">Отмена</button>
+          <button class="btn primary" type="button" onclick="assignPerson()">Назначить</button>
+        </div>
+      </div>
+    </div>
+
+
+    <script>
+      let currentClusterId = null;
+      let persons = [];
+      let clusters = [];
+      let runs = [];
+
+      function showToast(msg, duration = 3000) {
+        const el = document.getElementById("toast");
+        el.textContent = msg;
+        setTimeout(() => { el.textContent = ""; }, duration);
+      }
+
+      function closeModal(modalId) {
+        document.getElementById(modalId).classList.remove("open");
+      }
+
+      function openModal(modalId) {
+        document.getElementById(modalId).classList.add("open");
+      }
+
+      async function loadRuns() {
+        try {
+          const resp = await fetch("/api/face-runs/list");
+          if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+          }
+          const data = await resp.json();
+          runs = data.runs || [];
+          
+          const select = document.getElementById("selectRunId");
+          if (select) {
+            select.innerHTML = '<option value="">Все прогоны</option>';
+            for (const run of runs) {
+              const opt = document.createElement("option");
+              opt.value = run.id;
+              opt.textContent = `Run ${run.id}: ${run.root_path} (${run.faces_found} лиц)`;
+              select.appendChild(opt);
+            }
+          }
+        } catch (e) {
+          console.error('[loadRuns] Ошибка:', e);
+          showToast(`Ошибка загрузки прогонов: ${e}`);
+        }
+      }
+
+      async function loadPersons() {
+        try {
+          const resp = await fetch("/api/persons/list");
+          if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+          }
+          const data = await resp.json();
+          persons = data.persons || [];
+          
+          console.log(`[loadPersons] Загружено персон: ${persons.length}`);
+          
+          const select = document.getElementById("selectAssignPerson");
+          if (select) {
+            select.innerHTML = '<option value="">Выберите персону...</option>';
+            for (const person of persons) {
+              const opt = document.createElement("option");
+              opt.value = person.id;
+              opt.textContent = person.name + (person.is_me ? " (я)" : "");
+              select.appendChild(opt);
+            }
+          }
+        } catch (e) {
+          console.error('[loadPersons] Ошибка:', e);
+          showToast(`Ошибка загрузки персон: ${e}`);
+        }
+      }
+
+      async function loadClusters() {
+        const grid = document.getElementById("clustersGrid");
+        if (!grid) return;
+        
+        grid.innerHTML = '<div class="muted" style="padding: 24px; text-align: center;">Загрузка...</div>';
+        
+        // Загружаем персон для выпадашки назначения
+        if (!persons || persons.length === 0) {
+          await loadPersons();
+        }
+        
+        const runId = document.getElementById("selectRunId").value;
+        const params = ['unassigned_only=true', 'page_size=10000']; // Загружаем все кластеры сразу
+        if (runId) params.push(`run_id=${runId}`);
+        const url = `/api/face-clusters/list?${params.join('&')}`;
+        
+        try {
+          const resp = await fetch(url);
+          if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+          }
+          const data = await resp.json();
+          clusters = data.clusters || [];
+          
+          console.log(`[loadClusters] Загружено кластеров: ${clusters.length}`);
+          
+          // Создаем группу "Не назначено"
+          grid.innerHTML = "";
+          const unassignedDiv = document.createElement("div");
+          unassignedDiv.className = "person-group";
+          unassignedDiv.id = "person-group-unassigned";
+          unassignedDiv.innerHTML = `
+            <div class="person-group-header">
+              <div class="person-avatar-placeholder">?</div>
+              <div>
+                <div class="person-name">Не назначено</div>
+                <div class="person-clusters-count">${clusters.length} кластеров</div>
+              </div>
+            </div>
+            <div class="grid" id="unassigned-clusters"></div>
+          `;
+          grid.appendChild(unassignedDiv);
+          
+          // Добавляем кластеры
+          if (clusters.length > 0) {
+            await appendUnassignedClusters(clusters);
+          } else {
+            const unassignedGrid = document.getElementById("unassigned-clusters");
+            if (unassignedGrid) {
+              unassignedGrid.innerHTML = '<div class="muted" style="padding: 24px; text-align: center;">Неназначенные кластеры не найдены.</div>';
+            }
+          }
+        } catch (e) {
+          showToast(`Ошибка загрузки кластеров: ${e}`);
+          grid.innerHTML = '<div class="muted" style="padding: 24px; text-align: center; color: #dc2626;">Ошибка загрузки кластеров</div>';
+        }
+      }
+
+      async function getFaceThumbnail(faceId) {
+        if (!faceId) return null;
+        try {
+          const resp = await fetch(`/api/face-rectangles/${faceId}/thumbnail`);
+          if (resp.ok) {
+            const data = await resp.json();
+            return data.thumb_jpeg_base64 ? `data:image/jpeg;base64,${data.thumb_jpeg_base64}` : null;
+          }
+        } catch (e) {
+          console.error('Ошибка загрузки аватара:', e);
+        }
+        return null;
+      }
+
+      // Создаем заголовки групп для всех персон один раз
+      async function renderPersonGroups() {
+        const grid = document.getElementById("clustersGrid");
+        if (!grid) {
+          console.error("clustersGrid не найден!");
+          return;
+        }
+        
+        console.log(`[renderPersonGroups] Создаем группы для ${(persons || []).length} персон, persons массив:`, persons);
+        
+        // Проверяем, что persons загружен (может быть пустой, но массив должен существовать)
+        if (!Array.isArray(persons)) {
+          console.warn(`[renderPersonGroups] persons не является массивом, создаем пустой:`, persons);
+          persons = [];
+        }
+        
+        // Разделяем персон на обычные и "Посторонние"
+        const regularPersons = (persons || []).filter(p => !p.is_ignored);
+        const ignoredPerson = (persons || []).find(p => p.is_ignored);
+        
+        console.log(`[renderPersonGroups] Обычных персон: ${regularPersons.length}, игнорированных: ${ignoredPerson ? 1 : 0}`);
+        
+        // Рендерим обычных персон
+        for (const person of regularPersons) {
+          const groupDiv = document.createElement("div");
+          groupDiv.className = "person-group";
+          groupDiv.id = `person-group-${person.id}`;
+          
+          // Загружаем аватар персоны
+          let avatarHtml = `<div class="person-avatar-placeholder">${person.name.charAt(0).toUpperCase()}</div>`;
+          if (person.avatar_face_id) {
+            try {
+              const avatarUrl = await getFaceThumbnail(person.avatar_face_id);
+              if (avatarUrl) {
+                avatarHtml = `<img src="${avatarUrl}" alt="${person.name}" class="person-avatar" />`;
+              }
+            } catch (e) {
+              console.error(`Ошибка загрузки аватара для персоны ${person.name}:`, e);
+            }
+          }
+          
+          groupDiv.innerHTML = `
+            <div class="person-group-header">
+              ${avatarHtml}
+              <div>
+                <a href="/persons/${person.id}" class="person-name">${person.name}</a>
+                <div class="person-clusters-count">0 кластеров, 0 лиц</div>
+              </div>
+            </div>
+            <div class="grid" id="person-${person.id}-clusters"></div>
+          `;
+          
+          grid.appendChild(groupDiv);
+        }
+        
+        // Рендерим группу "Не назначено" - всегда создаем, даже если персон нет
+        const unassignedDiv = document.createElement("div");
+        unassignedDiv.className = "person-group";
+        unassignedDiv.id = "person-group-unassigned";
+        unassignedDiv.innerHTML = `
+          <div class="person-group-header">
+            <div class="person-avatar-placeholder">?</div>
+            <div>
+              <div class="person-name">Не назначено</div>
+              <div class="person-clusters-count">0 кластеров</div>
+            </div>
+          </div>
+          <div class="grid" id="unassigned-clusters"></div>
+        `;
+        grid.appendChild(unassignedDiv);
+        console.log(`[renderPersonGroups] Группа "Не назначено" создана, id=${unassignedDiv.id}, DOM элемент:`, unassignedDiv);
+        
+        // Рендерим "Посторонние" в самом низу (если есть)
+        if (ignoredPerson) {
+          const ignoredDiv = document.createElement("div");
+          ignoredDiv.className = "person-group ignored";
+          ignoredDiv.id = `person-group-${ignoredPerson.id}`;
+          ignoredDiv.innerHTML = `
+            <div class="person-group-header">
+              <div class="person-avatar-placeholder" style="font-size:24px;">🚫</div>
+              <div>
+                <a href="/persons/${ignoredPerson.id}" class="person-name">${ignoredPerson.name}</a>
+                <div class="person-clusters-count">0 кластеров, 0 лиц</div>
+              </div>
+            </div>
+            <div class="grid" id="person-${ignoredPerson.id}-clusters"></div>
+          `;
+          grid.appendChild(ignoredDiv);
+        }
+      }
+
+      // Добавляем только неназначенные кластеры в группу "Не назначено"
+      async function appendUnassignedClusters(newClusters) {
+        console.log(`[appendUnassignedClusters] Добавляем ${newClusters.length} неназначенных кластеров`);
+        
+        const groupElement = document.getElementById("person-group-unassigned");
+        if (!groupElement) {
+          console.error(`[appendUnassignedClusters] Группа "Не назначено" не найдена!`);
+          return;
+        }
+        
+        const targetGrid = groupElement.querySelector("#unassigned-clusters");
+        if (!targetGrid) {
+          console.error(`[appendUnassignedClusters] #unassigned-clusters не найден!`);
+          return;
+        }
+        
+        for (const cluster of newClusters) {
+          const card = await createClusterCard(cluster, null);
+          targetGrid.appendChild(card);
+        }
+        
+        // Обновляем счетчик
+        updateGroupCount(groupElement);
+      }
+
+      // Добавляем кластеры в соответствующие группы (старая функция, оставлена для совместимости)
+      async function appendClustersToGroups(newClusters) {
+        console.log(`[appendClustersToGroups] Добавляем ${newClusters.length} кластеров, персон загружено: ${persons.length}`);
+        
+        for (const cluster of newClusters) {
+          const personId = cluster.person_id;
+          const person = personId ? persons.find(p => p.id === personId) : null;
+          
+          let targetGrid = null;
+          let groupElement = null;
+          
+          if (personId) {
+            if (person?.is_ignored) {
+              // Группа "Посторонние"
+              groupElement = document.getElementById(`person-group-${personId}`);
+              targetGrid = groupElement?.querySelector(`#person-${personId}-clusters`);
+            } else {
+              // Обычная персона
+              groupElement = document.getElementById(`person-group-${personId}`);
+              targetGrid = groupElement?.querySelector(`#person-${personId}-clusters`);
+            }
+          } else {
+            // Группа "Не назначено"
+            groupElement = document.getElementById("person-group-unassigned");
+            if (groupElement) {
+              targetGrid = groupElement.querySelector("#unassigned-clusters");
+              if (!targetGrid) {
+                console.error(`[appendClustersToGroups] Группа "Не назначено" найдена (id=${groupElement.id}), но #unassigned-clusters не найден!`, groupElement);
+              }
+            } else {
+              console.error(`[appendClustersToGroups] Группа "Не назначено" (id=person-group-unassigned) не найдена в DOM!`);
+              // Проверим, что вообще есть в DOM
+              const grid = document.getElementById("clustersGrid");
+              if (grid) {
+                const allGroups = grid.querySelectorAll('.person-group');
+                console.error(`[appendClustersToGroups] В DOM найдено групп: ${allGroups.length}, IDs:`, Array.from(allGroups).map(g => g.id));
+              } else {
+                console.error(`[appendClustersToGroups] clustersGrid не найден!`);
+              }
+            }
+          }
+          
+          if (!targetGrid) {
+            console.warn(`[appendClustersToGroups] Не найдена targetGrid для кластера ${cluster.id}, personId=${personId}`);
+            // Если группа не найдена, создаем её на лету (на случай, если персона появилась после создания групп)
+            if (personId && person) {
+              // Группа для персоны должна была быть создана в renderPersonGroups
+              console.warn(`[appendClustersToGroups] Персона ${personId} не имеет группы, пропускаем`);
+            } else if (!personId) {
+              // Группа "Не назначено" должна всегда быть - создаем её на лету, если не найдена
+              console.warn(`[appendClustersToGroups] Группа "Не назначено" не найдена, создаем на лету`);
+              const grid = document.getElementById("clustersGrid");
+              if (grid) {
+                const unassignedDiv = document.createElement("div");
+                unassignedDiv.className = "person-group";
+                unassignedDiv.id = "person-group-unassigned";
+                unassignedDiv.innerHTML = `
+                  <div class="person-group-header">
+                    <div class="person-avatar-placeholder">?</div>
+                    <div>
+                      <div class="person-name">Не назначено</div>
+                      <div class="person-clusters-count">0 кластеров</div>
+                    </div>
+                  </div>
+                  <div class="grid" id="unassigned-clusters"></div>
+                `;
+                // Вставляем перед группой "Посторонние" или в конец
+                const ignoredGroup = grid.querySelector('.person-group.ignored');
+                if (ignoredGroup) {
+                  grid.insertBefore(unassignedDiv, ignoredGroup);
+                } else {
+                  grid.appendChild(unassignedDiv);
+                }
+                groupElement = unassignedDiv;
+                targetGrid = unassignedDiv.querySelector("#unassigned-clusters");
+                console.log(`[appendClustersToGroups] Группа "Не назначено" создана на лету`);
+              }
+            }
+            
+            if (!targetGrid) {
+              console.error(`[appendClustersToGroups] Не удалось создать/найти targetGrid для кластера ${cluster.id}, пропускаем`);
+              continue;
+            }
+          }
+          
+          const card = await createClusterCard(cluster, person);
+          targetGrid.appendChild(card);
+          
+          // Обновляем счетчик в заголовке группы
+          updateGroupCount(groupElement);
+        }
+      }
+
+      // Обновляем счетчик кластеров в заголовке группы
+      function updateGroupCount(groupElement) {
+        const grid = groupElement?.querySelector('.grid');
+        const countElement = groupElement?.querySelector('.person-clusters-count');
+        if (!grid || !countElement) return;
+        
+        const count = grid.children.length;
+        const personName = groupElement.querySelector('.person-name')?.textContent?.trim();
+        
+        if (personName === 'Не назначено') {
+          countElement.textContent = `${count} кластер${count === 1 ? '' : count < 5 ? 'а' : 'ов'}`;
+        } else {
+          const totalFaces = Array.from(grid.querySelectorAll('.card')).reduce((sum, card) => {
+            const facesText = card.querySelector('.muted')?.textContent?.match(/(\d+)\s+лиц/)?.[1];
+            return sum + (parseInt(facesText) || 0);
+          }, 0);
+          countElement.textContent = `${count} кластер${count === 1 ? '' : count < 5 ? 'а' : 'ов'}, ${totalFaces} лиц`;
+        }
+      }
+
+      async function renderClusters() {
+        const grid = document.getElementById("clustersGrid");
+        grid.innerHTML = "";
+        
+        if (clusters.length === 0) {
+          grid.innerHTML = '<div class="muted">Кластеры не найдены. Запустите кластеризацию для прогона.</div>';
+          return;
+        }
+        
+        // Группируем кластеры по персоне
+        const clustersByPerson = new Map();
+        const unassignedClusters = [];
+        
+        for (const cluster of clusters) {
+          const personId = cluster.person_id;
+          if (personId) {
+            if (!clustersByPerson.has(personId)) {
+              clustersByPerson.set(personId, []);
+            }
+            clustersByPerson.get(personId).push(cluster);
+          } else {
+            unassignedClusters.push(cluster);
+          }
+        }
+        
+        // Разделяем персон на обычные и "Посторонние"
+        const regularPersons = [];
+        const ignoredPerson = [];
+        
+        for (const [personId, personClusters] of clustersByPerson.entries()) {
+          const person = persons.find(p => p.id === personId);
+          if (!person) continue;
+          
+          if (person.is_ignored) {
+            ignoredPerson.push({ personId, personClusters, person });
+          } else {
+            regularPersons.push({ personId, personClusters, person });
+          }
+        }
+        
+        // Рендерим обычных персон
+        for (const { personId, personClusters, person } of regularPersons) {
+          const groupDiv = document.createElement("div");
+          groupDiv.className = "person-group";
+          
+          const totalFaces = personClusters.reduce((sum, c) => sum + c.faces_count, 0);
+          
+          // Загружаем аватар персоны
+          let avatarHtml = `<div class="person-avatar-placeholder">${person.name.charAt(0).toUpperCase()}</div>`;
+          if (person.avatar_face_id) {
+            try {
+              const avatarUrl = await getFaceThumbnail(person.avatar_face_id);
+              if (avatarUrl) {
+                avatarHtml = `<img src="${avatarUrl}" alt="${person.name}" class="person-avatar" />`;
+              } else {
+                console.warn(`Не удалось загрузить аватар для персоны ${person.name} (avatar_face_id=${person.avatar_face_id})`);
+              }
+            } catch (e) {
+              console.error(`Ошибка загрузки аватара для персоны ${person.name}:`, e);
+            }
+          }
+          // У персоны может не быть avatar_face_id - это нормально
+          
+          groupDiv.innerHTML = `
+            <div class="person-group-header">
+              ${avatarHtml}
+              <div>
+                <a href="/persons/${personId}" class="person-name">${person.name}</a>
+                <div class="person-clusters-count">${personClusters.length} кластер${personClusters.length === 1 ? '' : personClusters.length < 5 ? 'а' : 'ов'}, ${totalFaces} лиц</div>
+              </div>
+            </div>
+            <div class="grid" id="person-${personId}-clusters"></div>
+          `;
+          
+          grid.appendChild(groupDiv);
+          
+          const personGrid = groupDiv.querySelector(`#person-${personId}-clusters`);
+          for (const cluster of personClusters) {
+            const card = await createClusterCard(cluster, person);
+            personGrid.appendChild(card);
+          }
+        }
+        
+        // Рендерим неназначенные кластеры (перед "Посторонние")
+        if (unassignedClusters.length > 0) {
+          const unassignedDiv = document.createElement("div");
+          unassignedDiv.className = "person-group";
+          unassignedDiv.innerHTML = `
+            <div class="person-group-header">
+              <div class="person-avatar-placeholder">?</div>
+              <div>
+                <div class="person-name">Не назначено</div>
+                <div class="person-clusters-count">${unassignedClusters.length} кластер${unassignedClusters.length === 1 ? '' : unassignedClusters.length < 5 ? 'а' : 'ов'}</div>
+              </div>
+            </div>
+            <div class="grid" id="unassigned-clusters"></div>
+          `;
+          grid.appendChild(unassignedDiv);
+          
+          const unassignedGrid = unassignedDiv.querySelector("#unassigned-clusters");
+          for (const cluster of unassignedClusters) {
+            const card = await createClusterCard(cluster, null);
+            unassignedGrid.appendChild(card);
+          }
+        }
+        
+        // Рендерим "Посторонние" в самом низу (после нераспределенных)
+        for (const { personId, personClusters, person } of ignoredPerson) {
+          const groupDiv = document.createElement("div");
+          groupDiv.className = "person-group ignored";
+          
+          const totalFaces = personClusters.reduce((sum, c) => sum + c.faces_count, 0);
+          
+          // Иконка вместо аватара для "Посторонние"
+          const avatarHtml = `<div class="person-avatar-placeholder" style="font-size:24px;">🚫</div>`;
+          
+          groupDiv.innerHTML = `
+            <div class="person-group-header">
+              ${avatarHtml}
+              <div>
+                <a href="/persons/${personId}" class="person-name">${person.name}</a>
+                <div class="person-clusters-count">${personClusters.length} кластер${personClusters.length === 1 ? '' : personClusters.length < 5 ? 'а' : 'ов'}, ${totalFaces} лиц</div>
+              </div>
+            </div>
+            <div class="grid" id="person-${personId}-clusters"></div>
+          `;
+          
+          grid.appendChild(groupDiv);
+          
+          const personGrid = groupDiv.querySelector(`#person-${personId}-clusters`);
+          for (const cluster of personClusters) {
+            const card = await createClusterCard(cluster, person);
+            personGrid.appendChild(card);
+          }
+        }
+        
+        // Обработчики для кнопок "посторонний" добавлены через делегирование событий на #clustersGrid при инициализации
+        
+      }
+      
+      function attachClusterActionHandlers() {
+        // Используем делегирование событий на контейнере #clustersGrid
+        // Обработчик один раз при инициализации, работает для всех динамически созданных кнопок
+        // Не нужно вызывать каждый раз - обработчик уже есть
+      }
+      
+      async function updateSingleClusterInDOM(clusterId, updatedClusters) {
+        // Находим обновленный кластер в новом списке
+        const updatedCluster = updatedClusters.find(c => c.id === clusterId);
+        if (!updatedCluster) {
+          // Если кластер не найден, перерисовываем весь список
+          clusters = updatedClusters;
+          await renderClusters();
+          return;
+        }
+        
+        // Обновляем кластер в массиве
+        const clusterIndex = clusters.findIndex(c => c.id === clusterId);
+        if (clusterIndex !== -1) {
+          clusters[clusterIndex] = updatedCluster;
+        }
+        
+        // Находим карточку кластера в DOM
+        const cardElement = document.querySelector(`[id="assign-select-${clusterId}"]`)?.closest('.card');
+        if (!cardElement) {
+          // Если карточка не найдена, перерисовываем весь список
+          clusters = updatedClusters;
+          await renderClusters();
+          // renderClusters уже вызывает attachClusterActionHandlers
+          return;
+        }
+        
+        // Находим персону для кластера
+        const person = updatedCluster.person_id ? persons.find(p => p.id === updatedCluster.person_id) : null;
+        
+        // Создаем новую карточку
+        const newCard = await createClusterCard(updatedCluster, person);
+        
+        // Определяем, в какую группу нужно переместить карточку
+        const currentGroup = cardElement.closest('.person-group');
+        const targetPersonId = updatedCluster.person_id;
+        
+        // Находим целевую группу
+        let targetGrid = null;
+        if (targetPersonId) {
+          const person = persons.find(p => p.id === targetPersonId);
+          if (person?.is_ignored) {
+            // Ищем группу "Посторонние"
+            const ignoredGroup = document.querySelector('.person-group.ignored');
+            targetGrid = ignoredGroup?.querySelector('.grid');
+          } else {
+            // Ищем группу персоны
+            targetGrid = document.querySelector(`#person-${targetPersonId}-clusters`);
+          }
+        } else {
+          // Ищем группу "Не назначено"
+          targetGrid = document.querySelector('#unassigned-clusters');
+        }
+        
+        // Если целевая группа не найдена, перерисовываем весь список
+        if (!targetGrid) {
+          clusters = updatedClusters;
+          await renderClusters();
+          return;
+        }
+        
+        // Если карточка уже в нужной группе, просто обновляем её
+        const currentGrid = currentGroup?.querySelector('.grid');
+        if (targetGrid === currentGrid) {
+          cardElement.replaceWith(newCard);
+        } else {
+          // Перемещаем карточку в целевую группу
+          cardElement.remove();
+          targetGrid.appendChild(newCard);
+          
+          // Обновляем счетчики в группах
+          updateGroupCounts();
+        }
+        
+        // Обработчики для кнопок "посторонний" работают через делегирование событий, переподключение не нужно
+      }
+      
+      function updateGroupCounts() {
+        // Обновляем счетчики в заголовках групп
+        document.querySelectorAll('.person-group').forEach(group => {
+          const grid = group.querySelector('.grid');
+          const countElement = group.querySelector('.person-clusters-count');
+          if (grid && countElement) {
+            const count = grid.children.length;
+            const personName = group.querySelector('.person-name')?.textContent;
+            if (personName === 'Не назначено') {
+              countElement.textContent = `${count} кластер${count === 1 ? '' : count < 5 ? 'а' : 'ов'}`;
+            } else {
+              const totalFaces = Array.from(grid.querySelectorAll('.card')).reduce((sum, card) => {
+                const facesText = card.querySelector('.muted')?.textContent?.match(/(\d+)\s+лиц/)?.[1];
+                return sum + (parseInt(facesText) || 0);
+              }, 0);
+              countElement.textContent = `${count} кластер${count === 1 ? '' : count < 5 ? 'а' : 'ов'}, ${totalFaces} лиц`;
+            }
+          }
+        });
+      }
+      
+      async function createClusterCard(cluster, person) {
+        const card = document.createElement("div");
+        card.className = "card";
+        
+        const personName = person ? person.name : (cluster.person_name || "");
+        
+        // Загружаем preview-лицо для кластера
+        let previewHtml = '';
+        if (cluster.preview_face_id) {
+          const previewUrl = await getFaceThumbnail(cluster.preview_face_id);
+          if (previewUrl) {
+            previewHtml = `<img src="${previewUrl}" alt="Preview" style="width:60px; height:60px; object-fit:cover; border-radius:6px; border:1px solid #e5e7eb;" />`;
+          }
+        }
+        
+        // Формируем элементы управления назначением
+        let assignControl = '';
+        const currentPersonId = cluster.person_id;
+        const ignoredPerson = persons.find(p => p.is_ignored);
+        
+        // Кнопка для быстрого назначения на "Посторонние" (только для неназначенных кластеров)
+        let ignoredButton = '';
+        if (!currentPersonId && ignoredPerson) {
+          ignoredButton = `<button class="btn" type="button" data-action="assign-ignored" data-cluster-id="${cluster.id}" data-person-id="${ignoredPerson.id}" style="padding:6px 10px; cursor:pointer; border:1px solid #d1d5db; border-radius:4px; background:white; font-size:18px;" title="Назначить на Посторонние">🚫</button>`;
+        }
+        
+        // Выпадашка для назначения на других персон
+        let optionsHtml = '';
+        if (currentPersonId) {
+          // Если кластер назначен - добавляем опцию "Снять назначение"
+          optionsHtml = '<option value="">Снять назначение</option>';
+        } else {
+          // Если кластер не назначен
+          optionsHtml = '<option value="">Назначить персону...</option>';
+        }
+        
+        // Добавляем всех персон (только обычные, "Посторонние" исключаем из выпадашки)
+        const regularPersons = persons.filter(p => !p.is_ignored);
+        
+        for (const p of regularPersons) {
+          const selected = currentPersonId && p.id === currentPersonId ? ' selected' : '';
+          optionsHtml += `<option value="${p.id}"${selected}>${p.name}${p.is_me ? ' (я)' : ''}</option>`;
+        }
+        
+        const selectHtml = `<select class="btn" style="padding:6px 12px; cursor:pointer; border:1px solid #d1d5db; border-radius:4px; background:white; min-width:180px;" onchange="assignPersonFromDropdown(${cluster.id}, this.value, event)" id="assign-select-${cluster.id}">${optionsHtml}</select>`;
+        
+        // Если кластер назначен - показываем только выпадашку, иначе кнопку + выпадашку
+        assignControl = currentPersonId ? selectHtml : `${ignoredButton}${selectHtml}`;
+        
+        card.innerHTML = `
+          <div class="card-header" style="display:flex; gap:10px; align-items:start;">
+            ${previewHtml ? `<div>${previewHtml}</div>` : ''}
+            <div style="flex:1;">
+              <div style="font-weight:700;">Кластер #${cluster.id}</div>
+              <div class="muted" style="font-size:11px; margin-top:4px;">
+                ${cluster.faces_count} лиц | Run ${cluster.run_id}
+              </div>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="kv">
+              <span class="pill">Метод: ${cluster.method}</span>
+              <span class="pill">Создан: ${new Date(cluster.created_at).toLocaleString('ru-RU')}</span>
+            </div>
+            <div class="actions" style="display:flex; gap:8px; align-items:center;">
+              <a href="/face-clusters/${cluster.id}" class="btn" style="text-decoration:none; display:inline-block;">Просмотр</a>
+              ${assignControl}
+            </div>
+          </div>
+        `;
+        
+        return card;
+      }
+      
+      async function assignPersonFromDropdown(clusterId, personId, event) {
+        if (!clusterId) {
+          return;
+        }
+        
+        // Предотвращаем дефолтное поведение, если передан event
+        if (event) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        
+        // Если personId пустой - это снятие назначения
+        const actualPersonId = personId === '' ? null : personId;
+        
+        console.log(`[Assign] Назначение кластера ${clusterId} персоне ${actualPersonId || '(снятие)'}`);
+        
+        try {
+          const resp = await fetch(`/api/face-clusters/${clusterId}/assign-person`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ person_id: actualPersonId === null ? null : parseInt(actualPersonId) }),
+          });
+          
+          console.log(`[Assign] Ответ сервера: status=${resp.status}, ok=${resp.ok}`);
+          
+          if (resp.ok) {
+            const result = await resp.json();
+            console.log(`[Assign] Результат:`, result);
+            
+            // Обновляем список персон (может появиться новая)
+            await loadPersons();
+            
+            // Если кластер был назначен персоне, удаляем его из списка неназначенных
+            if (actualPersonId !== null) {
+              // Кластер назначен - удаляем карточку из DOM
+              const cardElement = document.querySelector(`[id="assign-select-${clusterId}"]`)?.closest('.card');
+              if (cardElement) {
+                cardElement.remove();
+                // Обновляем счетчик группы "Не назначено"
+                const groupElement = document.getElementById("person-group-unassigned");
+                if (groupElement) {
+                  updateGroupCount(groupElement);
+                }
+                showToast(`Кластер #${clusterId} назначен персоне`);
+              }
+            } else {
+              // Кластер снят с назначения - перезагружаем список
+              await loadClusters();
+            }
+          } else {
+            let errorMsg = "Неизвестная ошибка";
+            try {
+              const err = await resp.json();
+              errorMsg = err.detail || err.message || err.error || JSON.stringify(err);
+              console.error(`[Assign] Ошибка сервера:`, err);
+            } catch (e) {
+              errorMsg = `HTTP ${resp.status}: ${resp.statusText}`;
+              console.error(`[Assign] Ошибка парсинга ответа:`, e);
+            }
+            showToast(`Ошибка: ${errorMsg}`, true);
+            // Сброс выпадашки при ошибке
+            const select = document.getElementById(`assign-select-${clusterId}`);
+            if (select) select.value = '';
+          }
+        } catch (e) {
+          console.error(`[Assign] Исключение:`, e);
+          showToast(`Ошибка: ${e}`, true);
+          const select = document.getElementById(`assign-select-${clusterId}`);
+          if (select) select.value = '';
+        }
+      }
+
+
+      function assignCluster(clusterId) {
+        currentClusterId = clusterId;
+        openModal("modalAssignPerson");
+      }
+
+      async function assignPerson() {
+        const personId = document.getElementById("selectAssignPerson").value;
+        if (!personId || !currentClusterId) return;
+        
+        try {
+          const resp = await fetch(`/api/face-clusters/${currentClusterId}/assign-person`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ person_id: parseInt(personId) }),
+          });
+          
+          if (resp.ok) {
+            showToast("Кластер назначен персоне");
+            closeModal("modalAssignPerson");
+            // Перезагружаем список кластеров и персон
+            await Promise.all([loadPersons(), loadClusters()]);
+          } else {
+            let errorMsg = "Неизвестная ошибка";
+            try {
+              const err = await resp.json();
+              errorMsg = err.detail || err.message || err.error || JSON.stringify(err);
+            } catch (e) {
+              errorMsg = `HTTP ${resp.status}: ${resp.statusText}`;
+            }
+            showToast(`Ошибка: ${errorMsg}`);
+          }
+        } catch (e) {
+          const errorMsg = e instanceof Error ? e.message : String(e);
+          showToast(`Ошибка: ${errorMsg}`);
+        }
+      }
+
+      async function createPerson() {
+        const name = document.getElementById("inputPersonName").value.trim();
+        if (!name) {
+          showToast("Введите имя персоны");
+          return;
+        }
+        
+        const mode = document.getElementById("selectPersonMode").value;
+        const kinship = document.getElementById("inputPersonKinship").value.trim() || null;
+        const isMe = document.getElementById("checkboxIsMe").checked ? 1 : 0;
+        
+        try {
+          const resp = await fetch("/api/persons/create", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name, mode, is_me: isMe, kinship }),
+          });
+          
+          if (resp.ok) {
+            showToast("Персона создана");
+            closeModal("modalCreatePerson");
+            document.getElementById("inputPersonName").value = "";
+            document.getElementById("inputPersonKinship").value = "";
+            document.getElementById("checkboxIsMe").checked = false;
+            loadPersons();
+          } else {
+            let errorMsg = "Неизвестная ошибка";
+            try {
+              const err = await resp.json();
+              errorMsg = err.detail || err.message || err.error || JSON.stringify(err);
+            } catch (e) {
+              errorMsg = `HTTP ${resp.status}: ${resp.statusText}`;
+            }
+            showToast(`Ошибка: ${errorMsg}`);
+          }
+        } catch (e) {
+          const errorMsg = e instanceof Error ? e.message : String(e);
+          showToast(`Ошибка: ${errorMsg}`);
+        }
+      }
+
+      async function clusterize() {
+        const runId = document.getElementById("selectRunId").value;
+        if (!runId) {
+          showToast("Выберите прогон для кластеризации");
+          return;
+        }
+        
+        if (!confirm(`Запустить кластеризацию для run_id=${runId}?`)) return;
+        
+        try {
+          const resp = await fetch("/api/face-clusters/clusterize", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ run_id: parseInt(runId), eps: 0.4, min_samples: 2 }),
+          });
+          
+          if (resp.ok) {
+            const result = await resp.json();
+            showToast(`Кластеризация завершена: ${result.clusters_count} кластеров, ${result.noise_count} шум`);
+            loadClusters();
+          } else {
+            let errorMsg = "Неизвестная ошибка";
+            try {
+              const err = await resp.json();
+              errorMsg = err.detail || err.message || err.error || JSON.stringify(err);
+            } catch (e) {
+              errorMsg = `HTTP ${resp.status}: ${resp.statusText}`;
+            }
+            showToast(`Ошибка: ${errorMsg}`);
+          }
+        } catch (e) {
+          const errorMsg = e instanceof Error ? e.message : String(e);
+          showToast(`Ошибка: ${errorMsg}`);
+        }
+      }
+
+      async function saveAllToGold() {
+        const btn = document.getElementById("btnSaveAllToGold");
+        btn.disabled = true;
+        btn.textContent = "Сохранение...";
+        try {
+          const response = await fetch("/api/persons/save-all-to-gold", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+          });
+          const data = await response.json();
+          if (!response.ok) {
+            throw new Error(data.detail || data.error || "Ошибка сохранения");
+          }
+          showToast(`Сохранено: ${data.persons_count} персон, ${data.faces_count} лиц, ${data.files_updated} файлов`, false);
+        } catch (e) {
+          showToast(`Ошибка: ${e.message}`, true);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "Сохранить все назначенные в gold";
+        }
+      }
+
+      // Делегирование событий для кнопок "посторонний" - один раз при инициализации
+      // Добавляем ДО загрузки данных, чтобы работало сразу для всех карточек
+      const clustersGrid = document.getElementById("clustersGrid");
+      if (clustersGrid) {
+        clustersGrid.addEventListener('click', async (e) => {
+          const btn = e.target.closest('button[data-action="assign-ignored"]');
+          if (!btn) return;
+          
+          // Предотвращаем все виды дефолтного поведения и всплытия
+          e.preventDefault();
+          e.stopPropagation();
+          e.stopImmediatePropagation();
+          
+          const clusterId = parseInt(btn.getAttribute('data-cluster-id'));
+          const personId = btn.getAttribute('data-person-id');
+          
+          if (clusterId && personId) {
+            await assignPersonFromDropdown(clusterId, personId, e);
+          }
+          
+          return false;
+        }, { capture: false, passive: false });
+      }
+      
+      // Инициализация
+      document.getElementById("btnReload").onclick = () => { loadClusters(); loadPersons(); };
+      document.getElementById("btnCreatePerson").onclick = () => openModal("modalCreatePerson");
+      document.getElementById("btnClusterize").onclick = clusterize;
+      document.getElementById("selectRunId").onchange = () => loadClusters();
+      
+      // Инициализация - загружаем данные
+      async function init() {
+        try {
+          await loadRuns();
+          await loadPersons();
+          await loadClusters();
+        } catch (e) {
+          console.error('[init] Ошибка инициализации:', e);
+          showToast(`Ошибка инициализации: ${e}`, 10000);
+        }
+      }
+      
+      // Запускаем инициализацию после полной загрузки DOM
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+      } else {
+        init();
+      }
+    </script>
+  </body>
+</html>

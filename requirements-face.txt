@@ -10,4 +10,10 @@ pillow==12.1.0
 yadisk==3.4.0
 python-dotenv==1.2.1
 requests==2.32.5
+# Face recognition через ONNX модели (чистый Python, без компиляции C++)
+# ONNX модель ArcFace скачивается отдельно (см. docs/FACE_RECOGNITION.md)
+# onnxruntime уже установлен (используется для YOLO)
+#
+# Опционально: insightface только для скачивания модели (не обязательно)
+# insightface>=0.2.1  # Только для скачивания модели, не используется в runtime
 

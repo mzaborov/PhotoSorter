@@ -39,8 +39,8 @@ def main() -> int:
                 ds.delete_run_manual_labels(pipeline_run_id=int(args.pipeline_run_id), path=p)
             else:
                 # legacy fallback
-                ds.set_faces_manual_label(path=p, label=None)
-                ds.set_people_no_face_manual(path=p, is_people_no_face=False, person=None)
+            ds.set_faces_manual_label(path=p, label=None)
+            ds.set_people_no_face_manual(path=p, is_people_no_face=False, person=None)
             updated += 1
     finally:
         ds.close()
