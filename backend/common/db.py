@@ -554,12 +554,13 @@ class FaceStore:
         """)
 
         # Метки лиц (назначение персоны лицу)
+        # ВАЖНО: cluster_id удалён из face_labels (рефакторинг для устранения избыточности)
+        # Кластер определяется через JOIN с face_cluster_members
         cur.execute("""
             CREATE TABLE IF NOT EXISTS face_labels (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                 face_rectangle_id   INTEGER NOT NULL,
                 person_id           INTEGER NOT NULL,
-                cluster_id          INTEGER,                   -- optional: если source=cluster
                 source              TEXT NOT NULL,             -- 'manual'|'cluster'|'ai'
                 confidence          REAL,
                 created_at          TEXT NOT NULL
@@ -583,7 +584,9 @@ class FaceStore:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_cluster_members_face ON face_cluster_members(face_rectangle_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_labels_face ON face_labels(face_rectangle_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_labels_person ON face_labels(person_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_labels_cluster ON face_labels(cluster_id);")
+        # ВАЖНО: idx_face_labels_cluster удалён, т.к. cluster_id больше не хранится в face_labels
+        # UNIQUE индекс для предотвращения дубликатов: одно лицо может быть назначено персоне только один раз
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_face_labels_unique ON face_labels(face_rectangle_id, person_id);")
 
         self.conn.commit()
 

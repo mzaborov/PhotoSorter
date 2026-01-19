@@ -5,6 +5,9 @@ API для работы с кластерами лиц и справочнико
 from typing import Any
 from pathlib import Path
 import urllib.parse
+import subprocess
+import json
+import os
 from fastapi import APIRouter, HTTPException, Request, Body
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
@@ -17,6 +20,12 @@ from backend.logic.face_recognition import (
     cluster_face_embeddings,
     remove_face_from_cluster,
     find_closest_cluster_for_face,
+    find_closest_cluster_with_person_for_face,
+    find_closest_cluster_with_person_for_face_by_min_distance,
+    find_similar_single_face_clusters,
+    find_small_clusters_to_merge_in_person,
+    find_optimal_clusters_to_merge_in_person,
+    merge_clusters,
 )
 
 # Локальные копии функций для работы с YaDisk (чтобы избежать циклического импорта)
@@ -32,6 +41,15 @@ def _normalize_yadisk_path(path: str) -> str:
 def _yd_call_retry(fn):
     """Простая обёртка для вызова YaDisk API (без retry для упрощения)"""
     return fn()
+
+def _repo_root() -> Path:
+    """Возвращает корень репозитория."""
+    return APP_DIR.parent.parent
+
+def _venv_face_python() -> Path:
+    """Возвращает путь к Python из .venv-face."""
+    rr = _repo_root()
+    return rr / ".venv-face" / "Scripts" / "python.exe"
 
 router = APIRouter()
 APP_DIR = Path(__file__).resolve().parents[1]
@@ -93,11 +111,11 @@ async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: st
     
     # Фильтр по person_id (для кластеров конкретной персоны)
     if person_id is not None:
-        where_parts.append("(SELECT p2.id FROM face_labels fl2 JOIN persons p2 ON fl2.person_id = p2.id WHERE fl2.cluster_id = fc.id LIMIT 1) = ?")
+        where_parts.append("(SELECT p2.id FROM face_labels fl2 JOIN persons p2 ON fl2.person_id = p2.id JOIN face_cluster_members fcm_fl2 ON fl2.face_rectangle_id = fcm_fl2.face_rectangle_id WHERE fcm_fl2.cluster_id = fc.id LIMIT 1) = ?")
         where_params.append(person_id)
     elif unassigned_only:
         # Только неназначенные кластеры (person_id IS NULL)
-        where_parts.append("(SELECT p2.id FROM face_labels fl2 JOIN persons p2 ON fl2.person_id = p2.id WHERE fl2.cluster_id = fc.id LIMIT 1) IS NULL")
+        where_parts.append("(SELECT p2.id FROM face_labels fl2 JOIN persons p2 ON fl2.person_id = p2.id JOIN face_cluster_members fcm_fl2 ON fl2.face_rectangle_id = fcm_fl2.face_rectangle_id WHERE fcm_fl2.cluster_id = fc.id LIMIT 1) IS NULL")
     
     # Формируем финальное WHERE условие
     if where_parts:
@@ -144,21 +162,25 @@ async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: st
              WHERE fcm2.cluster_id = fc.id AND COALESCE(fr2.ignore_flag, 0) = 0) as faces_count,
             (SELECT GROUP_CONCAT(DISTINCT fl2.person_id)
              FROM face_labels fl2
-             WHERE fl2.cluster_id = fc.id) as person_ids,
+             JOIN face_cluster_members fcm_fl2 ON fl2.face_rectangle_id = fcm_fl2.face_rectangle_id
+             WHERE fcm_fl2.cluster_id = fc.id) as person_ids,
             (SELECT p2.id
              FROM face_labels fl2
              JOIN persons p2 ON fl2.person_id = p2.id
-             WHERE fl2.cluster_id = fc.id
+             JOIN face_cluster_members fcm_fl2 ON fl2.face_rectangle_id = fcm_fl2.face_rectangle_id
+             WHERE fcm_fl2.cluster_id = fc.id
              LIMIT 1) as person_id,
             (SELECT p2.name
              FROM face_labels fl2
              JOIN persons p2 ON fl2.person_id = p2.id
-             WHERE fl2.cluster_id = fc.id
+             JOIN face_cluster_members fcm_fl2 ON fl2.face_rectangle_id = fcm_fl2.face_rectangle_id
+             WHERE fcm_fl2.cluster_id = fc.id
              LIMIT 1) as person_name,
             (SELECT p2.avatar_face_id
              FROM face_labels fl2
              JOIN persons p2 ON fl2.person_id = p2.id
-             WHERE fl2.cluster_id = fc.id
+             JOIN face_cluster_members fcm_fl2 ON fl2.face_rectangle_id = fcm_fl2.face_rectangle_id
+             WHERE fcm_fl2.cluster_id = fc.id
              LIMIT 1) as avatar_face_id
         FROM face_clusters fc
         WHERE {where_clause}
@@ -167,7 +189,7 @@ async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: st
              JOIN face_rectangles fr2 ON fcm2.face_rectangle_id = fr2.id
              WHERE fcm2.cluster_id = fc.id AND COALESCE(fr2.ignore_flag, 0) = 0) > 0
         ORDER BY 
-            CASE WHEN (SELECT p2.name FROM face_labels fl2 JOIN persons p2 ON fl2.person_id = p2.id WHERE fl2.cluster_id = fc.id LIMIT 1) = ? THEN 1 ELSE 0 END,
+            CASE WHEN (SELECT p2.name FROM face_labels fl2 JOIN persons p2 ON fl2.person_id = p2.id JOIN face_cluster_members fcm_fl2 ON fl2.face_rectangle_id = fcm_fl2.face_rectangle_id WHERE fcm_fl2.cluster_id = fc.id LIMIT 1) = ? THEN 1 ELSE 0 END,
             person_name ASC, 
             faces_count DESC, 
             fc.created_at DESC
@@ -214,6 +236,481 @@ async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: st
         })
     
     return {"clusters": clusters, "total": total_count, "page": page, "page_size": page_size}
+
+
+@router.get("/api/face-clusters/suggestions-for-single")
+async def api_face_clusters_suggestions_for_single(*, max_distance: float = 0.45, run_id: int | None = None, archive_scope: str | None = None) -> dict[str, Any]:
+    """
+    Находит предложения для кластеров с 1 лицом без персоны.
+    
+    Для каждого такого кластера находит ближайший кластер с персоной (исключая "Посторонние").
+    
+    Args:
+        max_distance: максимальное косинусное расстояние для предложения (по умолчанию 0.35)
+        run_id: опционально, фильтр по run_id
+        archive_scope: опционально, фильтр по archive_scope (например, 'archive')
+    
+    Returns:
+        dict с предложениями: {
+            'suggestions': [
+                {
+                    'cluster_id': int,
+                    'face_id': int,
+                    'suggested_cluster_id': int,
+                    'suggested_person_id': int,
+                    'suggested_person_name': str,
+                    'distance': float
+                },
+                ...
+            ],
+            'total': int
+        }
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    # Формируем WHERE условие для кластеров с 1 лицом без персоны
+    where_parts = []
+    where_params = []
+    
+    if archive_scope == 'archive':
+        where_parts.append("fc.archive_scope = 'archive'")
+    elif run_id is not None:
+        where_parts.append("fc.run_id = ?")
+        where_params.append(run_id)
+    
+    # Дополнительное условие для фильтра кластеров с 1 лицом и без персоны
+    where_clause = " AND ".join(where_parts) if where_parts else "1=1"
+    
+    # Находим все кластеры с 1 лицом без персоны
+    cur.execute(
+        f"""
+        SELECT 
+            fc.id as cluster_id,
+            fcm.face_rectangle_id as face_id
+        FROM face_clusters fc
+        JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
+        JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
+        WHERE {where_clause}
+          AND COALESCE(fr.ignore_flag, 0) = 0
+          AND fr.embedding IS NOT NULL
+          AND (SELECT COUNT(DISTINCT fcm2.face_rectangle_id)
+               FROM face_cluster_members fcm2
+               JOIN face_rectangles fr2 ON fcm2.face_rectangle_id = fr2.id
+               WHERE fcm2.cluster_id = fc.id AND COALESCE(fr2.ignore_flag, 0) = 0) = 1
+          AND (SELECT p2.id 
+               FROM face_labels fl2 
+               JOIN persons p2 ON fl2.person_id = p2.id 
+               JOIN face_cluster_members fcm_fl2 ON fl2.face_rectangle_id = fcm_fl2.face_rectangle_id
+               WHERE fcm_fl2.cluster_id = fc.id 
+               LIMIT 1) IS NULL
+        """,
+        tuple(where_params),
+    )
+    
+    single_face_clusters = cur.fetchall()
+    
+    suggestions = []
+    
+    # Для каждого кластера с 1 лицом ищем ближайший кластер с персоной
+    for row in single_face_clusters:
+        cluster_id = row["cluster_id"]
+        face_id = row["face_id"]
+        
+        # Ищем ближайший кластер с персоной (исключая "Посторонние")
+        # Используем версию с минимальным расстоянием (лучше для детей)
+        suggestion = find_closest_cluster_with_person_for_face_by_min_distance(
+            face_rectangle_id=face_id,
+            exclude_cluster_id=cluster_id,
+            max_distance=max_distance,
+            ignored_person_name=IGNORED_PERSON_NAME,
+        )
+        
+        if suggestion:
+            suggestions.append({
+                "cluster_id": cluster_id,
+                "face_id": face_id,
+                "suggested_cluster_id": suggestion["cluster_id"],
+                "suggested_person_id": suggestion["person_id"],
+                "suggested_person_name": suggestion["person_name"],
+                "distance": suggestion["distance"],
+            })
+    
+    # Сортируем по расстоянию (от меньшего к большему)
+    suggestions.sort(key=lambda x: x["distance"])
+    
+    return {
+        "suggestions": suggestions,
+        "total": len(suggestions),
+    }
+
+
+@router.get("/api/face-clusters/similar-single-clusters")
+async def api_face_clusters_similar_single(*, max_distance: float = 0.6, run_id: int | None = None, archive_scope: str | None = None) -> dict[str, Any]:
+    """
+    Находит пары похожих одиночных кластеров (без персоны) для объединения.
+    
+    Args:
+        max_distance: максимальное косинусное расстояние для попадания в пару (по умолчанию 0.45)
+        run_id: опционально, фильтр по run_id
+        archive_scope: опционально, фильтр по archive_scope (например, 'archive')
+    
+    Returns:
+        dict с парами похожих кластеров:
+        {
+            'pairs': [
+                {
+                    'cluster1_id': int,
+                    'cluster1_face_id': int,
+                    'cluster2_id': int,
+                    'cluster2_face_id': int,
+                    'distance': float
+                },
+                ...
+            ],
+            'total': int
+        }
+    """
+    pairs = find_similar_single_face_clusters(
+        max_distance=max_distance,
+        run_id=run_id,
+        archive_scope=archive_scope,
+    )
+    
+    return {
+        "pairs": pairs,
+        "total": len(pairs),
+    }
+
+
+@router.get("/api/face-clusters/suggest-merge-small-clusters")
+async def api_face_clusters_suggest_merge_small(
+    *, max_size: int = 2, max_distance: float = 0.3, person_id: int | None = None,
+    run_id: int | None = None, archive_scope: str | None = None
+) -> dict[str, Any]:
+    """
+    Находит маленькие кластеры (1-2 фото) внутри персоны для возможного объединения.
+    
+    Для каждой персоны находит все маленькие кластеры и предлагает объединение,
+    если минимальное расстояние между кластерами не превышает порог.
+    
+    Args:
+        max_size: максимальный размер кластера для рассмотрения (по умолчанию 2)
+        max_distance: максимальное косинусное расстояние для предложения объединения (по умолчанию 0.3)
+        person_id: опционально, фильтр по person_id (только для одной персоны)
+        run_id: опционально, фильтр по run_id
+        archive_scope: опционально, фильтр по archive_scope (например, 'archive')
+    
+    Returns:
+        dict с предложениями для объединения:
+        {
+            'suggestions': [
+                {
+                    'person_id': int,
+                    'person_name': str,
+                    'source_cluster_id': int,
+                    'source_cluster_size': int,
+                    'target_cluster_id': int,
+                    'target_cluster_size': int,
+                    'distance': float
+                },
+                ...
+            ],
+            'total': int
+        }
+    """
+    suggestions = find_small_clusters_to_merge_in_person(
+        max_size=max_size,
+        max_distance=max_distance,
+        person_id=person_id,
+        run_id=run_id,
+        archive_scope=archive_scope,
+    )
+    
+    return {
+        "suggestions": suggestions,
+        "total": len(suggestions),
+    }
+
+
+@router.get("/api/face-clusters/suggest-optimal-merge")
+async def api_face_clusters_suggest_optimal_merge(
+    *, max_source_size: int = 4, max_distance: float = 0.3, person_id: int | None = None,
+    run_id: int | None = None, archive_scope: str | None = None
+) -> dict[str, Any]:
+    """
+    Находит оптимальные объединения кластеров для минимизации их количества.
+    
+    Для каждого маленького кластера находит ближайший кластер любого размера и предлагает
+    объединение, если расстояние не превышает порог. Несколько маленьких кластеров могут
+    объединяться в один большой.
+    
+    Args:
+        max_source_size: максимальный размер кластера-источника (по умолчанию 4)
+        max_distance: максимальное косинусное расстояние для предложения объединения (по умолчанию 0.3)
+        person_id: опционально, фильтр по person_id (только для одной персоны)
+        run_id: опционально, фильтр по run_id
+        archive_scope: опционально, фильтр по archive_scope (например, 'archive')
+    
+    Returns:
+        dict с предложениями для объединения:
+        {
+            'suggestions': [
+                {
+                    'person_id': int,
+                    'person_name': str,
+                    'source_cluster_id': int,
+                    'source_cluster_size': int,
+                    'target_cluster_id': int,
+                    'target_cluster_size': int,
+                    'distance': float
+                },
+                ...
+            ],
+            'total': int
+        }
+    """
+    import logging
+    from backend.logic.face_recognition import ML_AVAILABLE
+    
+    logger = logging.getLogger(__name__)
+    logger.info(f"[api_face_clusters_suggest_optimal_merge] person_id={person_id}, max_source_size={max_source_size}, max_distance={max_distance}, ML_AVAILABLE={ML_AVAILABLE}")
+    
+    try:
+        suggestions = find_optimal_clusters_to_merge_in_person(
+            max_source_size=max_source_size,
+            max_distance=max_distance,
+            person_id=person_id,
+            run_id=run_id,
+            archive_scope=archive_scope,
+        )
+        
+        logger.info(f"[api_face_clusters_suggest_optimal_merge] Найдено предложений: {len(suggestions)}")
+        if len(suggestions) == 0:
+            logger.warning(f"[api_face_clusters_suggest_optimal_merge] Функция вернула пустой список для person_id={person_id}")
+    except Exception as e:
+        logger.error(f"[api_face_clusters_suggest_optimal_merge] Ошибка: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to find suggestions: {str(e)}")
+    
+    return {
+        "suggestions": suggestions,
+        "total": len(suggestions),
+    }
+
+
+@router.post("/api/face-clusters/merge")
+async def api_face_clusters_merge(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Объединяет два кластера: перемещает все лица из source_cluster в target_cluster.
+    
+    Args:
+        source_cluster_id: ID кластера-источника
+        target_cluster_id: ID целевого кластера
+    """
+    source_cluster_id = payload.get("source_cluster_id")
+    target_cluster_id = payload.get("target_cluster_id")
+    
+    if source_cluster_id is None or target_cluster_id is None:
+        raise HTTPException(status_code=400, detail="source_cluster_id and target_cluster_id are required")
+    
+    try:
+        merge_clusters(
+            source_cluster_id=int(source_cluster_id),
+            target_cluster_id=int(target_cluster_id),
+        )
+        
+        return {
+            "status": "ok",
+            "source_cluster_id": source_cluster_id,
+            "target_cluster_id": target_cluster_id,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to merge clusters: {str(e)}")
+
+
+@router.post("/api/persons/{person_id}/find-pending-merges")
+async def api_persons_find_pending_merges(
+    person_id: int,
+    max_source_size: int = 4,
+    max_distance: float = 0.3,
+) -> dict[str, Any]:
+    """
+    Запускает скрипт для поиска кандидатов на объединение кластеров и сохраняет их в JSON.
+    
+    Args:
+        person_id: ID персоны
+        max_source_size: Максимальный размер маленького кластера (по умолчанию: 4)
+        max_distance: Максимальное расстояние между кластерами (по умолчанию: 0.3)
+    """
+    py = _venv_face_python()
+    if not py.exists():
+        raise HTTPException(status_code=500, detail=f"Missing .venv-face python: {py}")
+    
+    script_path = _repo_root() / "backend" / "scripts" / "tools" / "find_pending_merges.py"
+    if not script_path.exists():
+        raise HTTPException(status_code=500, detail=f"Missing script: {script_path}")
+    
+    # Директория для сохранения JSON
+    data_dir = _repo_root() / "backend" / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Запускаем скрипт через subprocess
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(_repo_root() / "backend")
+    
+    try:
+        result = subprocess.run(
+            [
+                str(py),
+                str(script_path.relative_to(_repo_root())),
+                "--person-id", str(person_id),
+                "--max-source-size", str(max_source_size),
+                "--max-distance", str(max_distance),
+                "--output-dir", str(data_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5 минут максимум
+            cwd=str(_repo_root()),
+            env=env,
+        )
+        
+        if result.returncode != 0:
+            error_detail = result.stderr[:2000] if result.stderr else "Unknown error"
+            raise HTTPException(
+                status_code=500,
+                detail=f"Script failed: {error_detail}",
+            )
+        
+        # Читаем результат из JSON файла
+        output_file = data_dir / f"pending_merges_person_{person_id}.json"
+        if not output_file.exists():
+            raise HTTPException(status_code=500, detail=f"Output file not found: {output_file}")
+        
+        with open(output_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        return {
+            "status": "ok",
+            "person_id": person_id,
+            "total": data.get("total", 0),
+            "suggestions": data.get("suggestions", []),
+        }
+        
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Script timeout")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+@router.get("/api/persons/{person_id}/pending-merges")
+async def api_persons_pending_merges(person_id: int) -> dict[str, Any]:
+    """
+    Получает список кандидатов на объединение из JSON файла.
+    
+    Args:
+        person_id: ID персоны
+    """
+    data_dir = _repo_root() / "backend" / "data"
+    output_file = data_dir / f"pending_merges_person_{person_id}.json"
+    
+    if not output_file.exists():
+        return {
+            "status": "not_found",
+            "person_id": person_id,
+            "total": 0,
+            "suggestions": [],
+        }
+    
+    try:
+        with open(output_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        return {
+            "status": "ok",
+            "person_id": person_id,
+            "total": data.get("total", 0),
+            "suggestions": data.get("suggestions", []),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading JSON: {str(e)}")
+
+
+@router.post("/api/persons/{person_id}/apply-all-pending-merges")
+async def api_persons_apply_all_pending_merges(person_id: int) -> dict[str, Any]:
+    """
+    Объединяет все найденные кандидаты на объединение кластеров.
+    
+    Args:
+        person_id: ID персоны
+    """
+    # Читаем кандидатов из JSON
+    data_dir = _repo_root() / "backend" / "data"
+    output_file = data_dir / f"pending_merges_person_{person_id}.json"
+    
+    if not output_file.exists():
+        raise HTTPException(status_code=404, detail=f"No pending merges found for person {person_id}")
+    
+    try:
+        with open(output_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        suggestions = data.get("suggestions", [])
+        if not suggestions:
+            return {
+                "status": "ok",
+                "person_id": person_id,
+                "merged_count": 0,
+                "message": "No suggestions to merge",
+            }
+        
+        # Объединяем все кандидаты
+        merged_count = 0
+        errors = []
+        
+        for suggestion in suggestions:
+            source_cluster_id = suggestion.get("source_cluster_id")
+            target_cluster_id = suggestion.get("target_cluster_id")
+            
+            if source_cluster_id is None or target_cluster_id is None:
+                continue
+            
+            try:
+                merge_clusters(
+                    source_cluster_id=int(source_cluster_id),
+                    target_cluster_id=int(target_cluster_id),
+                )
+                merged_count += 1
+            except Exception as e:
+                errors.append({
+                    "source_cluster_id": source_cluster_id,
+                    "target_cluster_id": target_cluster_id,
+                    "error": str(e),
+                })
+        
+        # Удаляем JSON файл после успешного объединения
+        if merged_count > 0:
+            try:
+                output_file.unlink()
+            except Exception:
+                pass  # Игнорируем ошибки удаления
+        
+        return {
+            "status": "ok",
+            "person_id": person_id,
+            "merged_count": merged_count,
+            "total": len(suggestions),
+            "errors": errors,
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
 @router.get("/face-clusters/{cluster_id}", response_class=HTMLResponse)
@@ -339,10 +836,11 @@ async def api_persons_stats() -> dict[str, Any]:
             p.id,
             p.name,
             p.avatar_face_id,
-            COUNT(DISTINCT fl.cluster_id) as clusters_count,
+            COUNT(DISTINCT fcm.cluster_id) as clusters_count,
             COUNT(DISTINCT fl.face_rectangle_id) as faces_count
         FROM persons p
         LEFT JOIN face_labels fl ON fl.person_id = p.id
+        LEFT JOIN face_cluster_members fcm ON fl.face_rectangle_id = fcm.face_rectangle_id
         LEFT JOIN face_rectangles fr ON fl.face_rectangle_id = fr.id
         WHERE COALESCE(fr.ignore_flag, 0) = 0
         GROUP BY p.id, p.name, p.avatar_face_id
@@ -409,9 +907,10 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Person not found")
     
     # Получаем все лица персоны через face_labels
+    # Используем DISTINCT, чтобы исключить дубликаты, если в face_labels есть несколько записей для одного face_rectangle_id
     cur.execute(
         """
-        SELECT 
+        SELECT DISTINCT
             fr.id as face_id,
             fr.run_id,
             fr.file_path,
@@ -698,7 +1197,7 @@ async def api_person_face_reassign(*, person_id: int, face_id: int, payload: dic
     # Проверяем, что лицо принадлежит текущей персоне
     cur.execute(
         """
-        SELECT fl.id, fl.cluster_id
+        SELECT fl.id
         FROM face_labels fl
         WHERE fl.person_id = ? AND fl.face_rectangle_id = ?
         """,
@@ -708,7 +1207,19 @@ async def api_person_face_reassign(*, person_id: int, face_id: int, payload: dic
     if not label_row:
         raise HTTPException(status_code=400, detail="Face does not belong to this person")
     
-    cluster_id = label_row["cluster_id"]
+    # Получаем cluster_id через face_cluster_members (если нужно для логирования)
+    # Но НЕ сохраняем его в face_labels
+    cur.execute(
+        """
+        SELECT cluster_id
+        FROM face_cluster_members
+        WHERE face_rectangle_id = ?
+        LIMIT 1
+        """,
+        (face_id,),
+    )
+    cluster_row = cur.fetchone()
+    cluster_id = cluster_row["cluster_id"] if cluster_row else None
     
     # Удаляем из текущей персоны
     cur.execute(
@@ -724,12 +1235,14 @@ async def api_person_face_reassign(*, person_id: int, face_id: int, payload: dic
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
         
+        # ВАЖНО: cluster_id больше не храним в face_labels
+        # Используем INSERT OR REPLACE для предотвращения дубликатов (UNIQUE индекс на face_rectangle_id, person_id)
         cur.execute(
             """
-            INSERT INTO face_labels (face_rectangle_id, person_id, cluster_id, source, confidence, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO face_labels (face_rectangle_id, person_id, source, confidence, created_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (face_id, target_person_id, cluster_id, "manual", 1.0, now),
+            (face_id, target_person_id, "manual", 1.0, now),
         )
     
     conn.commit()
@@ -746,7 +1259,7 @@ async def api_person_face_clear(*, person_id: int, face_id: int) -> dict[str, An
     # Проверяем, что лицо принадлежит персоне
     cur.execute(
         """
-        SELECT fl.id, fl.cluster_id
+        SELECT fl.id
         FROM face_labels fl
         WHERE fl.person_id = ? AND fl.face_rectangle_id = ?
         """,
@@ -1588,15 +2101,17 @@ async def api_assign_person_to_face(*, face_rectangle_id: int, payload: dict[str
     )
     
     # Создаем новое назначение
+    # ВАЖНО: cluster_id больше не храним в face_labels, кластер определяется через face_cluster_members
+    # Используем INSERT OR REPLACE для предотвращения дубликатов (UNIQUE индекс на face_rectangle_id, person_id)
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
     
     cur.execute(
         """
-        INSERT INTO face_labels (face_rectangle_id, person_id, cluster_id, source, confidence, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO face_labels (face_rectangle_id, person_id, source, confidence, created_at)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (face_rectangle_id, person_id, cluster_id, "manual", 1.0, now),
+        (face_rectangle_id, person_id, "manual", 1.0, now),
     )
     
     conn.commit()

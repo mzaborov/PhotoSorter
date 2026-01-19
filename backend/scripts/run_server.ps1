@@ -4,15 +4,29 @@ $ErrorActionPreference = "Stop"
 # Запуск Web UI (FastAPI) в режиме разработки.
 # Важно: этот скрипт можно запускать в отдельном "окне сервера" и держать запущенным.
 
-$python = "C:\Users\mzaborov\AppData\Local\Python\pythoncore-3.14-64\python.exe"
-if (-not (Test-Path $python)) {
-  Write-Error "Python не найден по пути: $python"
+# repo root = .../backend/scripts -> ../..
+$repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+
+# Пробуем использовать Python из .venv-face (где установлены numpy/sklearn)
+$venvPython = Join-Path $repo ".venv-face\Scripts\python.exe"
+if (Test-Path $venvPython) {
+  $python = $venvPython
+  Write-Host "Using Python from .venv-face: $python"
+} else {
+  # Fallback: системный Python (может не иметь numpy/sklearn)
+  $python = "C:\Users\mzaborov\AppData\Local\Python\pythoncore-3.14-64\python.exe"
+  if (-not (Test-Path $python)) {
+    Write-Error "Python не найден по пути: $python"
+  } else {
+    Write-Warning "Using system Python, numpy/sklearn may not be available!"
+  }
 }
 
 # repo root = .../backend/scripts -> ../..
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 
 # ВАЖНО: web_api/common/logic лежат внутри backend/, поэтому добавляем backend/ в sys.path.
+# repo root уже вычислен выше
 $backendDir = (Resolve-Path (Join-Path $repo "backend")).Path
 $env:PYTHONPATH = $backendDir
 

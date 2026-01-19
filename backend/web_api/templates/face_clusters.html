@@ -73,6 +73,8 @@
         <button class="btn" id="btnReload" type="button">Обновить</button>
         <button class="btn primary" id="btnCreatePerson" type="button">Создать персону</button>
         <button class="btn" id="btnClusterize" type="button">Запустить кластеризацию</button>
+        <button class="btn" id="btnFindSuggestions" type="button">Найти предложения для кластеров с 1 лицом</button>
+        <button class="btn" id="btnFindSimilarClusters" type="button">Найти похожие одиночные кластеры</button>
         <span class="muted" id="toast"></span>
       </div>
 
@@ -135,6 +137,42 @@
         <div class="modal-footer">
           <button class="btn" type="button" onclick="closeModal('modalAssignPerson')">Отмена</button>
           <button class="btn primary" type="button" onclick="assignPerson()">Назначить</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal для похожих одиночных кластеров -->
+    <div class="modal" id="modalSimilarClusters">
+      <div class="modal-panel" style="max-width: 90vw; width: min(1200px, 90vw);">
+        <div class="modal-header">
+          <h3 style="margin:0;">Похожие одиночные кластеры</h3>
+          <button class="btn" type="button" onclick="closeModal('modalSimilarClusters')">✕</button>
+        </div>
+        <div class="modal-body">
+          <div id="similarClustersContent">
+            <div class="muted" style="text-align: center; padding: 24px;">Загрузка похожих кластеров...</div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" type="button" onclick="closeModal('modalSimilarClusters')">Закрыть</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal для предложений кластеров с 1 лицом -->
+    <div class="modal" id="modalSuggestions">
+      <div class="modal-panel" style="max-width: 90vw; width: min(1200px, 90vw);">
+        <div class="modal-header">
+          <h3 style="margin:0;">Предложения для кластеров с 1 лицом</h3>
+          <button class="btn" type="button" onclick="closeModal('modalSuggestions')">✕</button>
+        </div>
+        <div class="modal-body">
+          <div id="suggestionsContent">
+            <div class="muted" style="text-align: center; padding: 24px;">Загрузка предложений...</div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" type="button" onclick="closeModal('modalSuggestions')">Закрыть</button>
         </div>
       </div>
     </div>
@@ -1063,10 +1101,281 @@
         }, { capture: false, passive: false });
       }
       
+      async function findSuggestions() {
+        const btn = document.getElementById("btnFindSuggestions");
+        btn.disabled = true;
+        btn.textContent = "Поиск предложений...";
+        
+        try {
+          const runId = document.getElementById("selectRunId").value;
+          const params = ['max_distance=0.45'];
+          if (runId) {
+            params.push(`run_id=${runId}`);
+          } else {
+            params.push('archive_scope=archive');
+          }
+          
+          const url = `/api/face-clusters/suggestions-for-single?${params.join('&')}`;
+          const resp = await fetch(url);
+          
+          if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+          }
+          
+          const data = await resp.json();
+          const suggestions = data.suggestions || [];
+          
+          console.log(`[findSuggestions] Найдено предложений: ${suggestions.length}`);
+          
+          if (suggestions.length === 0) {
+            showToast("Предложения не найдены. Все кластеры с 1 лицом уже имеют персону или не найдено похожих кластеров.");
+            openModal("modalSuggestions");
+            displaySuggestions([]);
+          } else {
+            openModal("modalSuggestions");
+            await displaySuggestions(suggestions);
+          }
+        } catch (e) {
+          console.error('[findSuggestions] Ошибка:', e);
+          showToast(`Ошибка поиска предложений: ${e}`, 10000);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "Найти предложения для кластеров с 1 лицом";
+        }
+      }
+      
+      async function displaySuggestions(suggestions) {
+        const content = document.getElementById("suggestionsContent");
+        
+        if (suggestions.length === 0) {
+          content.innerHTML = '<div class="muted" style="text-align: center; padding: 24px;">Предложения не найдены.</div>';
+          return;
+        }
+        
+        let html = `<div style="margin-bottom: 16px; font-size: 14px; color: #6b7280;">Найдено предложений: ${suggestions.length}</div>`;
+        html += '<div style="display: flex; flex-direction: column; gap: 12px;">';
+        
+        for (const suggestion of suggestions) {
+          // Загружаем thumbnail лица
+          const thumbUrl = await getFaceThumbnail(suggestion.face_id);
+          const thumbHtml = thumbUrl 
+            ? `<img src="${thumbUrl}" alt="Face" style="width: 80px; height: 80px; object-fit: cover; border-radius: 8px; border: 1px solid #e5e7eb;" />`
+            : '<div style="width: 80px; height: 80px; background: #f3f4f6; border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #9ca3af;">Нет фото</div>';
+          
+          const distancePercent = (suggestion.distance * 100).toFixed(1);
+          const distanceColor = suggestion.distance < 0.25 ? '#10b981' : suggestion.distance < 0.30 ? '#f59e0b' : '#ef4444';
+          
+          html += `
+            <div data-cluster-id="${suggestion.cluster_id}" style="display: flex; gap: 12px; padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; align-items: center;">
+              ${thumbHtml}
+              <div style="flex: 1;">
+                <div style="font-weight: 700; margin-bottom: 4px;">Кластер #${suggestion.cluster_id}</div>
+                <div style="font-size: 13px; color: #6b7280; margin-bottom: 8px;">
+                  Предложена персона: <strong>${suggestion.suggested_person_name}</strong>
+                </div>
+                <div style="font-size: 12px; color: ${distanceColor};">
+                  Расстояние: ${distancePercent}% (кластер #${suggestion.suggested_cluster_id})
+                </div>
+              </div>
+              <div style="display: flex; gap: 8px;">
+                <button class="btn" type="button" onclick="rejectSuggestion(${suggestion.cluster_id})" style="padding: 6px 12px; background: #f3f4f6; border: 1px solid #d1d5db;">Отклонить</button>
+                <button class="btn primary" type="button" onclick="acceptSuggestion(${suggestion.cluster_id}, ${suggestion.suggested_person_id})" style="padding: 6px 12px;">Принять</button>
+              </div>
+            </div>
+          `;
+        }
+        
+        html += '</div>';
+        content.innerHTML = html;
+      }
+      
+      async function acceptSuggestion(clusterId, personId) {
+        try {
+          const resp = await fetch(`/api/face-clusters/${clusterId}/assign-person`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ person_id: personId }),
+          });
+          
+          if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+          }
+          
+          showToast(`Кластер #${clusterId} назначен персоне`);
+          
+          // Удаляем принятое предложение из списка
+          const content = document.getElementById("suggestionsContent");
+          const suggestionEl = content.querySelector(`[data-cluster-id="${clusterId}"]`);
+          if (suggestionEl) {
+            suggestionEl.remove();
+          }
+          
+          // Перезагружаем кластеры, чтобы убрать кластер из неназначенных
+          await loadClusters();
+        } catch (e) {
+          console.error('[acceptSuggestion] Ошибка:', e);
+          showToast(`Ошибка: ${e}`, 10000);
+        }
+      }
+      
+      function rejectSuggestion(clusterId) {
+        // Удаляем предложение из списка (просто скрываем его)
+        const content = document.getElementById("suggestionsContent");
+        const suggestionEl = content.querySelector(`[data-cluster-id="${clusterId}"]`) || 
+                            Array.from(content.querySelectorAll('.card, div[style*="border"]')).find(el => 
+                              el.textContent.includes(`Кластер #${clusterId}`)
+                            );
+        if (suggestionEl) {
+          suggestionEl.style.display = 'none';
+        }
+        showToast(`Предложение для кластера #${clusterId} отклонено`, 3000);
+      }
+      
+      // Инициализация
+      async function findSimilarClusters() {
+        const btn = document.getElementById("btnFindSimilarClusters");
+        btn.disabled = true;
+        btn.textContent = "Поиск похожих кластеров...";
+        
+        try {
+          const runId = document.getElementById("selectRunId").value;
+          const params = ['max_distance=0.6'];
+          if (runId) {
+            params.push(`run_id=${runId}`);
+          } else {
+            params.push('archive_scope=archive');
+          }
+          
+          const url = `/api/face-clusters/similar-single-clusters?${params.join('&')}`;
+          const resp = await fetch(url);
+          
+          if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+          }
+          
+          const data = await resp.json();
+          const pairs = data.pairs || [];
+          
+          console.log(`[findSimilarClusters] Найдено пар: ${pairs.length}`);
+          
+          if (pairs.length === 0) {
+            showToast("Похожие одиночные кластеры не найдены.");
+            openModal("modalSimilarClusters");
+            displaySimilarClusters([]);
+          } else {
+            openModal("modalSimilarClusters");
+            await displaySimilarClusters(pairs);
+          }
+        } catch (e) {
+          console.error('[findSimilarClusters] Ошибка:', e);
+          showToast(`Ошибка поиска похожих кластеров: ${e}`, 10000);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "Найти похожие одиночные кластеры";
+        }
+      }
+      
+      async function displaySimilarClusters(pairs) {
+        const content = document.getElementById("similarClustersContent");
+        
+        if (pairs.length === 0) {
+          content.innerHTML = '<div class="muted" style="text-align: center; padding: 24px;">Похожие кластеры не найдены.</div>';
+          return;
+        }
+        
+        let html = `<div style="margin-bottom: 16px; font-size: 14px; color: #6b7280;">Найдено пар похожих кластеров: ${pairs.length}</div>`;
+        html += '<div style="display: flex; flex-direction: column; gap: 12px;">';
+        
+        for (const pair of pairs) {
+          // Загружаем thumbnails обоих лиц
+          const thumb1Url = await getFaceThumbnail(pair.cluster1_face_id);
+          const thumb2Url = await getFaceThumbnail(pair.cluster2_face_id);
+          
+          const thumb1Html = thumb1Url 
+            ? `<img src="${thumb1Url}" alt="Face" style="width: 80px; height: 80px; object-fit: cover; border-radius: 8px; border: 1px solid #e5e7eb;" />`
+            : '<div style="width: 80px; height: 80px; background: #f3f4f6; border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #9ca3af;">Нет фото</div>';
+          
+          const thumb2Html = thumb2Url 
+            ? `<img src="${thumb2Url}" alt="Face" style="width: 80px; height: 80px; object-fit: cover; border-radius: 8px; border: 1px solid #e5e7eb;" />`
+            : '<div style="width: 80px; height: 80px; background: #f3f4f6; border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #9ca3af;">Нет фото</div>';
+          
+          const distancePercent = (pair.distance * 100).toFixed(1);
+          const distanceColor = pair.distance < 0.25 ? '#10b981' : pair.distance < 0.30 ? '#f59e0b' : '#ef4444';
+          
+          html += `
+            <div data-pair-id="${pair.cluster1_id}-${pair.cluster2_id}" style="display: flex; gap: 12px; padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; align-items: center;">
+              <div style="display: flex; gap: 8px; align-items: center;">
+                ${thumb1Html}
+                <div style="font-weight: 700; color: #374151;">#${pair.cluster1_id}</div>
+              </div>
+              <div style="flex: 1; text-align: center; color: ${distanceColor}; font-size: 14px;">
+                ↔ Расстояние: ${distancePercent}%
+              </div>
+              <div style="display: flex; gap: 8px; align-items: center;">
+                <div style="font-weight: 700; color: #374151;">#${pair.cluster2_id}</div>
+                ${thumb2Html}
+              </div>
+              <div style="display: flex; gap: 8px;">
+                <button class="btn" type="button" onclick="rejectMerge(${pair.cluster1_id}, ${pair.cluster2_id})" style="padding: 6px 12px; background: #f3f4f6; border: 1px solid #d1d5db;">Отклонить</button>
+                <button class="btn primary" type="button" onclick="acceptMerge(${pair.cluster1_id}, ${pair.cluster2_id})" style="padding: 6px 12px;">Объединить</button>
+              </div>
+            </div>
+          `;
+        }
+        
+        html += '</div>';
+        content.innerHTML = html;
+      }
+      
+      async function acceptMerge(cluster1Id, cluster2Id) {
+        try {
+          // Объединяем: cluster1 -> cluster2 (cluster2 остается, cluster1 исчезает)
+          const resp = await fetch(`/api/face-clusters/merge`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ 
+              source_cluster_id: cluster1Id, 
+              target_cluster_id: cluster2Id 
+            }),
+          });
+          
+          if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+          }
+          
+          showToast(`Кластеры #${cluster1Id} и #${cluster2Id} объединены`);
+          
+          // Удаляем объединенную пару из списка
+          const content = document.getElementById("similarClustersContent");
+          const pairEl = content.querySelector(`[data-pair-id="${cluster1Id}-${cluster2Id}"]`);
+          if (pairEl) {
+            pairEl.remove();
+          }
+          
+          // Перезагружаем кластеры, чтобы убрать объединенный кластер из списка
+          await loadClusters();
+        } catch (e) {
+          console.error('[acceptMerge] Ошибка:', e);
+          showToast(`Ошибка: ${e}`, 10000);
+        }
+      }
+      
+      function rejectMerge(cluster1Id, cluster2Id) {
+        // Удаляем пару из списка (просто скрываем её)
+        const content = document.getElementById("similarClustersContent");
+        const pairEl = content.querySelector(`[data-pair-id="${cluster1Id}-${cluster2Id}"]`);
+        if (pairEl) {
+          pairEl.style.display = 'none';
+        }
+        showToast(`Предложение объединения кластеров #${cluster1Id} и #${cluster2Id} отклонено`, 3000);
+      }
+      
       // Инициализация
       document.getElementById("btnReload").onclick = () => { loadClusters(); loadPersons(); };
       document.getElementById("btnCreatePerson").onclick = () => openModal("modalCreatePerson");
       document.getElementById("btnClusterize").onclick = clusterize;
+      document.getElementById("btnFindSuggestions").onclick = findSuggestions;
+      document.getElementById("btnFindSimilarClusters").onclick = findSimilarClusters;
       document.getElementById("selectRunId").onchange = () => loadClusters();
       
       // Инициализация - загружаем данные

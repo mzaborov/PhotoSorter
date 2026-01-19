@@ -36,6 +36,14 @@
       .actions { display:flex; gap:8px; margin-top: 10px; flex-wrap: wrap; }
       .select { border:1px solid #d1d5db; border-radius:10px; padding:8px 10px; font-size:14px; }
       .loading { opacity: 0.6; pointer-events: none; }
+      .modal { position: fixed; inset: 0; background: rgba(17,24,39,0.82); display: none; align-items: center; justify-content: center; padding: 18px; z-index: 9999; }
+      .modal.open { display: flex; }
+      .modal-panel { background: #fff; border-radius: 14px; max-width: 94vw; max-height: 94vh; width: min(800px, 94vw); overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,0.35); }
+      .modal-header { padding: 12px 16px; border-bottom: 1px solid #e5e7eb; display:flex; justify-content:space-between; align-items:center; }
+      .modal-body { padding: 16px; max-height: calc(94vh - 120px); overflow-y: auto; }
+      .modal-footer { padding: 12px 16px; border-top: 1px solid #e5e7eb; display:flex; gap:10px; justify-content:flex-end; }
+      .merge-indicator { display: inline-block; padding: 2px 6px; border-radius: 4px; background: #fef3c7; color: #92400e; font-size: 11px; font-weight: 600; margin-left: 6px; }
+      .merge-indicator.has-suggestion { background: #dbeafe; color: #1e40af; }
     </style>
   </head>
   <body>
@@ -52,10 +60,40 @@
 
       <div class="toolbar">
         <button class="btn" id="btnReload" type="button">Обновить</button>
+        <button class="btn" id="btnFindPendingMerges" type="button">Найти кандидатов на объединение</button>
         <span class="muted" id="toast"></span>
       </div>
 
+      <!-- Блок с кандидатами на объединение -->
+      <div id="pendingMergesBlock" style="display: none; margin-top: 24px; padding: 16px; border: 1px solid #e5e7eb; border-radius: 12px; background: #f9fafb;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+          <h3 style="margin: 0; font-size: 16px;">Кандидаты на объединение</h3>
+          <button class="btn primary" id="btnApplyAllMerges" type="button">Объединить все</button>
+        </div>
+        <div id="pendingMergesList" style="display: flex; flex-direction: column; gap: 8px;">
+          <!-- Список кандидатов будет здесь -->
+        </div>
+      </div>
+
       <div class="grid" id="clustersGrid"></div>
+    </div>
+
+    <!-- Modal для предложений объединения маленьких кластеров -->
+    <div class="modal" id="modalMergeSuggestions">
+      <div class="modal-panel" style="max-width: 90vw; width: min(1200px, 90vw);">
+        <div class="modal-header">
+          <h3 style="margin:0;">Предложения по объединению маленьких кластеров</h3>
+          <button class="btn" type="button" onclick="closeModal('modalMergeSuggestions')">✕</button>
+        </div>
+        <div class="modal-body">
+          <div id="mergeSuggestionsContent">
+            <div class="muted" style="text-align: center; padding: 24px;">Загрузка предложений...</div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" type="button" onclick="closeModal('modalMergeSuggestions')">Закрыть</button>
+        </div>
+      </div>
     </div>
 
     <script>
@@ -64,6 +102,7 @@
       const personId = urlMatch ? parseInt(urlMatch[1]) : null;
       let person = null;
       let clusters = [];
+      let mergeSuggestions = [];
       
       // Пагинация для кластеров
       let clusterPage = 1;
@@ -77,6 +116,14 @@
         const el = document.getElementById("toast");
         el.textContent = msg;
         setTimeout(() => { el.textContent = ""; }, duration);
+      }
+
+      function closeModal(modalId) {
+        document.getElementById(modalId).classList.remove("open");
+      }
+
+      function openModal(modalId) {
+        document.getElementById(modalId).classList.add("open");
       }
 
       function updateSentinel() {
@@ -217,6 +264,21 @@
           }
         }
         
+        // Проверяем, есть ли предложения по объединению для этого кластера
+        let mergeIndicator = '';
+        const suggestionAsSource = mergeSuggestions.find(s => s.source_cluster_id === cluster.id);
+        const suggestionAsTarget = mergeSuggestions.find(s => s.target_cluster_id === cluster.id);
+        
+        if (suggestionAsSource || suggestionAsTarget) {
+          const suggestion = suggestionAsSource || suggestionAsTarget;
+          const isSource = !!suggestionAsSource;
+          const otherClusterId = isSource ? suggestion.target_cluster_id : suggestion.source_cluster_id;
+          const distancePercent = (suggestion.distance * 100).toFixed(1);
+          mergeIndicator = `<span class="merge-indicator has-suggestion" title="Есть предложение объединить с кластером #${otherClusterId} (расстояние: ${distancePercent}%)">🔗 Маленький</span>`;
+        } else if (cluster.faces_count <= 2) {
+          mergeIndicator = `<span class="merge-indicator" title="Маленький кластер (${cluster.faces_count} фото)">Маленький</span>`;
+        }
+        
         // Выпадашка для снятия назначения или переназначения
         let optionsHtml = '<option value="">Снять назначение</option>';
         
@@ -224,7 +286,10 @@
           <div class="card-header" style="display:flex; gap:10px; align-items:start;">
             ${previewHtml ? `<div>${previewHtml}</div>` : ''}
             <div style="flex:1;">
-              <div style="font-weight:700;">Кластер #${cluster.id}</div>
+              <div style="font-weight:700;">
+                Кластер #${cluster.id}
+                ${mergeIndicator}
+              </div>
               <div class="muted" style="font-size:11px; margin-top:4px;">
                 ${cluster.faces_count} лиц | Run ${cluster.run_id}
               </div>
@@ -235,8 +300,9 @@
               <span class="pill">Метод: ${cluster.method}</span>
               <span class="pill">Создан: ${new Date(cluster.created_at).toLocaleString('ru-RU')}</span>
             </div>
-            <div class="actions" style="display:flex; gap:8px; align-items:center;">
+            <div class="actions" style="display:flex; gap:8px; align-items:center; flex-wrap: wrap;">
               <a href="/face-clusters/${cluster.id}" class="btn" style="text-decoration:none; display:inline-block;">Просмотр</a>
+              ${suggestionAsSource ? `<button class="btn primary" type="button" onclick="acceptMergeSuggestion(${suggestion.source_cluster_id}, ${suggestion.target_cluster_id})" style="padding:6px 12px;">Объединить с #${suggestion.target_cluster_id}</button>` : ''}
               <select class="btn" style="padding:6px 12px; cursor:pointer; border:1px solid #d1d5db; border-radius:4px; background:white; min-width:180px;" onchange="assignPersonFromDropdown(${cluster.id}, this.value, event)" id="assign-select-${cluster.id}">
                 ${optionsHtml}
               </select>
@@ -296,8 +362,338 @@
         }
       }
 
+      async function findPendingMerges() {
+        const btn = document.getElementById("btnFindPendingMerges");
+        btn.disabled = true;
+        btn.textContent = "Поиск кандидатов...";
+        
+        try {
+          // Запускаем скрипт для поиска кандидатов
+          const url = `/api/persons/${personId}/find-pending-merges?max_source_size=4&max_distance=0.3`;
+          const resp = await fetch(url, { method: "POST" });
+          
+          if (!resp.ok) {
+            const errorData = await resp.json().catch(() => ({}));
+            throw new Error(errorData.detail || `HTTP ${resp.status}: ${resp.statusText}`);
+          }
+          
+          const data = await resp.json();
+          console.log(`[findPendingMerges] Ответ API:`, data);
+          mergeSuggestions = data.suggestions || [];
+          
+          console.log(`[findPendingMerges] Найдено предложений: ${mergeSuggestions.length}`);
+          if (mergeSuggestions.length > 0) {
+            console.log(`[findPendingMerges] Первые 3 предложения:`, mergeSuggestions.slice(0, 3));
+            showToast(`Найдено ${mergeSuggestions.length} кандидатов на объединение`);
+            await displayPendingMerges(mergeSuggestions);
+          } else {
+            showToast("Кандидаты на объединение не найдены.");
+            document.getElementById("pendingMergesBlock").style.display = "none";
+          }
+        } catch (e) {
+          console.error('[findPendingMerges] Ошибка:', e);
+          showToast(`Ошибка поиска кандидатов: ${e}`, 10000);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "Найти кандидатов на объединение";
+        }
+      }
+
+      async function loadPendingMerges() {
+        try {
+          const url = `/api/persons/${personId}/pending-merges`;
+          const resp = await fetch(url);
+          
+          if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+          }
+          
+          const data = await resp.json();
+          mergeSuggestions = data.suggestions || [];
+          
+          if (mergeSuggestions.length > 0) {
+            await displayPendingMerges(mergeSuggestions);
+          } else {
+            document.getElementById("pendingMergesBlock").style.display = "none";
+          }
+        } catch (e) {
+          console.error('[loadPendingMerges] Ошибка:', e);
+        }
+      }
+
+      async function displayPendingMerges(suggestions) {
+        const block = document.getElementById("pendingMergesBlock");
+        const list = document.getElementById("pendingMergesList");
+        
+        if (suggestions.length === 0) {
+          block.style.display = "none";
+          return;
+        }
+        
+        block.style.display = "block";
+        
+        let html = `<div class="muted" style="margin-bottom: 8px; font-size: 13px;">Найдено кандидатов: ${suggestions.length}</div>`;
+        
+        // Загружаем preview для каждого кандидата
+        for (const suggestion of suggestions.slice(0, 10)) { // Показываем первые 10
+          const distancePercent = (suggestion.distance * 100).toFixed(1);
+          
+          // Ищем кластеры в уже загруженных данных
+          const sourceCluster = allLoadedClusters.find(c => c.id === suggestion.source_cluster_id);
+          const targetCluster = allLoadedClusters.find(c => c.id === suggestion.target_cluster_id);
+          
+          // Загружаем preview для source кластера
+          let sourcePreview = null;
+          if (sourceCluster?.preview_face_id) {
+            sourcePreview = await getFaceThumbnail(sourceCluster.preview_face_id);
+          } else if (suggestion.source_cluster_id) {
+            // Если кластер не найден в загруженных, пробуем получить через API
+            try {
+              const resp = await fetch(`/api/face-clusters/${suggestion.source_cluster_id}?limit=1`);
+              if (resp.ok) {
+                const clusterData = await resp.json();
+                if (clusterData.faces && clusterData.faces.length > 0 && clusterData.faces[0].thumb_jpeg_base64) {
+                  sourcePreview = `data:image/jpeg;base64,${clusterData.faces[0].thumb_jpeg_base64}`;
+                }
+              }
+            } catch (e) {
+              console.warn(`Не удалось загрузить preview для кластера ${suggestion.source_cluster_id}:`, e);
+            }
+          }
+          
+          // Загружаем preview для target кластера
+          let targetPreview = null;
+          if (targetCluster?.preview_face_id) {
+            targetPreview = await getFaceThumbnail(targetCluster.preview_face_id);
+          } else if (suggestion.target_cluster_id) {
+            // Если кластер не найден в загруженных, пробуем получить через API
+            try {
+              const resp = await fetch(`/api/face-clusters/${suggestion.target_cluster_id}?limit=1`);
+              if (resp.ok) {
+                const clusterData = await resp.json();
+                if (clusterData.faces && clusterData.faces.length > 0 && clusterData.faces[0].thumb_jpeg_base64) {
+                  targetPreview = `data:image/jpeg;base64,${clusterData.faces[0].thumb_jpeg_base64}`;
+                }
+              }
+            } catch (e) {
+              console.warn(`Не удалось загрузить preview для кластера ${suggestion.target_cluster_id}:`, e);
+            }
+          }
+          
+          const sourceThumb = sourcePreview 
+            ? `<img src="${sourcePreview}" alt="Cluster ${suggestion.source_cluster_id}" style="width: 60px; height: 60px; object-fit: cover; border-radius: 6px; border: 1px solid #e5e7eb;" />`
+            : '<div style="width: 60px; height: 60px; background: #f3f4f6; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #9ca3af; font-size: 10px;">Нет</div>';
+          
+          const targetThumb = targetPreview 
+            ? `<img src="${targetPreview}" alt="Cluster ${suggestion.target_cluster_id}" style="width: 60px; height: 60px; object-fit: cover; border-radius: 6px; border: 1px solid #e5e7eb;" />`
+            : '<div style="width: 60px; height: 60px; background: #f3f4f6; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #9ca3af; font-size: 10px;">Нет</div>';
+          
+          html += `
+            <div style="padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; display: flex; gap: 12px; align-items: center; font-size: 13px;">
+              <div style="display: flex; flex-direction: column; gap: 4px; align-items: center;">
+                ${sourceThumb}
+                <div style="font-size: 11px; color: #6b7280;">#${suggestion.source_cluster_id}</div>
+                <div style="font-size: 10px; color: #9ca3af;">${suggestion.source_cluster_size} фото</div>
+              </div>
+              <div style="flex: 1; text-align: center;">
+                <div style="font-size: 14px; font-weight: 600; margin-bottom: 4px;">
+                  → Расстояние: <strong>${distancePercent}%</strong>
+                </div>
+              </div>
+              <div style="display: flex; flex-direction: column; gap: 4px; align-items: center;">
+                ${targetThumb}
+                <div style="font-size: 11px; color: #6b7280;">#${suggestion.target_cluster_id}</div>
+                <div style="font-size: 10px; color: #9ca3af;">${suggestion.target_cluster_size} фото</div>
+              </div>
+            </div>
+          `;
+        }
+        
+        if (suggestions.length > 10) {
+          html += `<div class="muted" style="margin-top: 8px; font-size: 12px;">...и еще ${suggestions.length - 10} кандидатов</div>`;
+        }
+        
+        list.innerHTML = html;
+      }
+
+      async function applyAllPendingMerges() {
+        const btn = document.getElementById("btnApplyAllMerges");
+        if (!confirm(`Вы уверены, что хотите объединить все ${mergeSuggestions.length} кандидатов?`)) {
+          return;
+        }
+        
+        btn.disabled = true;
+        btn.textContent = "Объединение...";
+        
+        try {
+          const url = `/api/persons/${personId}/apply-all-pending-merges`;
+          const resp = await fetch(url, { method: "POST" });
+          
+          if (!resp.ok) {
+            const errorData = await resp.json().catch(() => ({}));
+            throw new Error(errorData.detail || `HTTP ${resp.status}: ${resp.statusText}`);
+          }
+          
+          const data = await resp.json();
+          const mergedCount = data.merged_count || 0;
+          
+          showToast(`Успешно объединено ${mergedCount} кандидатов`);
+          document.getElementById("pendingMergesBlock").style.display = "none";
+          mergeSuggestions = [];
+          
+          // Перезагружаем кластеры
+          await loadClusters(true);
+        } catch (e) {
+          console.error('[applyAllPendingMerges] Ошибка:', e);
+          showToast(`Ошибка объединения: ${e}`, 10000);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "Объединить все";
+        }
+      }
+
+      async function reloadClusterCards() {
+        // Пересоздаем карточки с учетом предложений
+        const grid = document.getElementById("clustersGrid");
+        if (!grid) return;
+        
+        const cards = Array.from(grid.querySelectorAll('.card'));
+        for (const card of cards) {
+          const selectEl = card.querySelector('[id^="assign-select-"]');
+          if (!selectEl) continue;
+          
+          const clusterIdMatch = selectEl.id.match(/assign-select-(\d+)/);
+          if (!clusterIdMatch) continue;
+          
+          const clusterId = parseInt(clusterIdMatch[1]);
+          const cluster = clusters.find(c => c.id === clusterId);
+          if (!cluster) continue;
+          
+          const newCard = await createClusterCard(cluster);
+          card.replaceWith(newCard);
+        }
+      }
+
+      async function displayMergeSuggestions(suggestions) {
+        const content = document.getElementById("mergeSuggestionsContent");
+        
+        if (suggestions.length === 0) {
+          content.innerHTML = '<div class="muted" style="text-align: center; padding: 24px;">Предложения по объединению не найдены.</div>';
+          return;
+        }
+        
+        let html = `<div style="margin-bottom: 16px; font-size: 14px; color: #6b7280;">Найдено предложений: ${suggestions.length}</div>`;
+        html += '<div style="display: flex; flex-direction: column; gap: 12px;">';
+        
+        for (const suggestion of suggestions) {
+          // Загружаем preview для обоих кластеров
+          const sourceCluster = clusters.find(c => c.id === suggestion.source_cluster_id);
+          const targetCluster = clusters.find(c => c.id === suggestion.target_cluster_id);
+          
+          const sourcePreview = sourceCluster?.preview_face_id ? await getFaceThumbnail(sourceCluster.preview_face_id) : null;
+          const targetPreview = targetCluster?.preview_face_id ? await getFaceThumbnail(targetCluster.preview_face_id) : null;
+          
+          const sourceThumb = sourcePreview 
+            ? `<img src="${sourcePreview}" alt="Cluster ${suggestion.source_cluster_id}" style="width: 60px; height: 60px; object-fit: cover; border-radius: 6px; border: 1px solid #e5e7eb;" />`
+            : '<div style="width: 60px; height: 60px; background: #f3f4f6; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #9ca3af; font-size: 10px;">Нет</div>';
+          
+          const targetThumb = targetPreview 
+            ? `<img src="${targetPreview}" alt="Cluster ${suggestion.target_cluster_id}" style="width: 60px; height: 60px; object-fit: cover; border-radius: 6px; border: 1px solid #e5e7eb;" />`
+            : '<div style="width: 60px; height: 60px; background: #f3f4f6; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #9ca3af; font-size: 10px;">Нет</div>';
+          
+          const distancePercent = (suggestion.distance * 100).toFixed(1);
+          const distanceColor = suggestion.distance < 0.25 ? '#10b981' : suggestion.distance < 0.30 ? '#f59e0b' : '#ef4444';
+          
+          html += `
+            <div data-suggestion-id="${suggestion.source_cluster_id}-${suggestion.target_cluster_id}" style="display: flex; gap: 12px; padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; align-items: center;">
+              <div style="display: flex; flex-direction: column; gap: 4px; align-items: center;">
+                ${sourceThumb}
+                <div style="font-size: 11px; color: #6b7280;">#${suggestion.source_cluster_id}</div>
+                <div style="font-size: 10px; color: #9ca3af;">${suggestion.source_cluster_size} фото</div>
+              </div>
+              <div style="flex: 1; text-align: center;">
+                <div style="color: ${distanceColor}; font-size: 14px; font-weight: 600; margin-bottom: 4px;">
+                  Расстояние: ${distancePercent}%
+                </div>
+                <div style="font-size: 12px; color: #6b7280;">${suggestion.person_name}</div>
+              </div>
+              <div style="display: flex; flex-direction: column; gap: 4px; align-items: center;">
+                ${targetThumb}
+                <div style="font-size: 11px; color: #6b7280;">#${suggestion.target_cluster_id}</div>
+                <div style="font-size: 10px; color: #9ca3af;">${suggestion.target_cluster_size} фото</div>
+              </div>
+              <div style="display: flex; gap: 8px;">
+                <button class="btn" type="button" onclick="rejectMergeSuggestion(${suggestion.source_cluster_id}, ${suggestion.target_cluster_id})" style="padding: 6px 12px; background: #f3f4f6; border: 1px solid #d1d5db;">Отклонить</button>
+                <button class="btn primary" type="button" onclick="acceptMergeSuggestion(${suggestion.source_cluster_id}, ${suggestion.target_cluster_id})" style="padding: 6px 12px;">Объединить</button>
+              </div>
+            </div>
+          `;
+        }
+        
+        html += '</div>';
+        content.innerHTML = html;
+      }
+
+      async function acceptMergeSuggestion(sourceClusterId, targetClusterId) {
+        try {
+          const resp = await fetch(`/api/face-clusters/merge`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ 
+              source_cluster_id: sourceClusterId, 
+              target_cluster_id: targetClusterId 
+            }),
+          });
+          
+          if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+          }
+          
+          showToast(`Кластеры #${sourceClusterId} и #${targetClusterId} объединены`);
+          
+          // Удаляем предложение из списка
+          mergeSuggestions = mergeSuggestions.filter(s => 
+            !(s.source_cluster_id === sourceClusterId && s.target_cluster_id === targetClusterId)
+          );
+          
+          // Удаляем объединенную пару из модального окна
+          const content = document.getElementById("mergeSuggestionsContent");
+          const suggestionEl = content.querySelector(`[data-suggestion-id="${sourceClusterId}-${targetClusterId}"]`);
+          if (suggestionEl) {
+            suggestionEl.remove();
+          }
+          
+          // Перезагружаем кластеры
+          await loadClusters(true);
+        } catch (e) {
+          console.error('[acceptMergeSuggestion] Ошибка:', e);
+          showToast(`Ошибка: ${e}`, 10000);
+        }
+      }
+
+      function rejectMergeSuggestion(sourceClusterId, targetClusterId) {
+        // Удаляем предложение из списка
+        mergeSuggestions = mergeSuggestions.filter(s => 
+          !(s.source_cluster_id === sourceClusterId && s.target_cluster_id === targetClusterId)
+        );
+        
+        // Удаляем предложение из модального окна
+        const content = document.getElementById("mergeSuggestionsContent");
+        const suggestionEl = content.querySelector(`[data-suggestion-id="${sourceClusterId}-${targetClusterId}"]`);
+        if (suggestionEl) {
+          suggestionEl.style.display = 'none';
+        }
+        
+        // Обновляем карточки кластеров
+        reloadClusterCards();
+        
+        showToast(`Предложение объединения кластеров #${sourceClusterId} и #${targetClusterId} отклонено`, 3000);
+      }
+
       // Инициализация
       document.getElementById("btnReload").onclick = () => loadClusters(true);
+      document.getElementById("btnFindPendingMerges").onclick = findPendingMerges;
+      document.getElementById("btnApplyAllMerges").onclick = applyAllPendingMerges;
       
       // Sentinel для бесконечного скролла
       const sentinel = document.createElement("div");
@@ -323,6 +719,7 @@
         try {
           await loadPerson();
           await loadClusters(true);
+          await loadPendingMerges(); // Загружаем сохраненные кандидаты при загрузке страницы
         } catch (e) {
           console.error('[init] Ошибка инициализации:', e);
           showToast(`Ошибка инициализации: ${e}`, 10000);

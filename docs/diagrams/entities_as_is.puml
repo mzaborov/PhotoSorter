@@ -90,15 +90,106 @@ class files <<table>> {
   faces_manual_at: TEXT
   faces_auto_quarantine: INTEGER
   faces_quarantine_reason: TEXT
+  faces_auto_group: TEXT
   animals_auto: INTEGER
   animals_kind: TEXT
+  animals_manual: INTEGER
+  animals_manual_kind: TEXT
+  animals_manual_at: TEXT
   people_no_face_manual: INTEGER
   people_no_face_person: TEXT
+  taken_at: TEXT
+  gps_lat: REAL
+  gps_lon: REAL
+  place_country: TEXT
+  place_city: TEXT
+  place_source: TEXT
+  place_at: TEXT
+  image_width: INTEGER
+  image_height: INTEGER
+}
+
+class geocode_cache <<table>> {
+  +key: TEXT <<PK>>             ' "55.7558,37.6173" (rounded)
+  lat: REAL
+  lon: REAL
+  country: TEXT
+  city: TEXT
+  source: TEXT                   ' yandex
+  updated_at: TEXT
+  raw_json: TEXT
+}
+
+class pipeline_run_metrics <<table>> {
+  +pipeline_run_id: INTEGER <<PK>>
+  computed_at: TEXT
+  face_run_id: INTEGER
+  step0_checked: INTEGER
+  step0_non_media: INTEGER
+  step0_broken_media: INTEGER
+  step2_total: INTEGER
+  step2_processed: INTEGER
+  cats_total: INTEGER
+  cats_mism: INTEGER
+  faces_total: INTEGER
+  faces_mism: INTEGER
+  no_faces_total: INTEGER
+  no_faces_mism: INTEGER
+}
+
+class preclean_state <<table>> {
+  +pipeline_run_id: INTEGER <<PK>>
+  root_path: TEXT
+  dry_run: INTEGER
+  checked: INTEGER
+  non_media: INTEGER
+  broken_media: INTEGER
+  last_path: TEXT
+  updated_at: TEXT
+}
+
+class preclean_moves <<table>> {
+  +id: INTEGER <<PK>>
+  pipeline_run_id: INTEGER
+  kind: TEXT                    ' non_media|broken_media
+  src_path: TEXT
+  dst_path: TEXT
+  is_applied: INTEGER
+  created_at: TEXT
+}
+
+class files_manual_labels <<table>> {
+  +pipeline_run_id: INTEGER <<PK>>
+  +path: TEXT <<PK>>
+  faces_manual_label: TEXT
+  faces_manual_at: TEXT
+  people_no_face_manual: INTEGER
+  people_no_face_person: TEXT
+  animals_manual: INTEGER
+  animals_manual_kind: TEXT
+  animals_manual_at: TEXT
+  quarantine_manual: INTEGER
+  quarantine_manual_at: TEXT
+}
+
+class video_manual_frames <<table>> {
+  +pipeline_run_id: INTEGER <<PK>>
+  +path: TEXT <<PK>>
+  +frame_idx: INTEGER <<PK>>    ' 1..3
+  t_sec: REAL
+  rects_json: TEXT
+  updated_at: TEXT
 }
 
 folders "0..1" -- "*" files : файлы в папке (parent_path, логически)
 dedup_runs "1" -- "*" files : прогон дедупа
 pipeline_runs "0..1" -- "0..1" dedup_runs : шаг 1 (дедуп)
+pipeline_runs "1" -- "0..1" pipeline_run_metrics : метрики прогона
+pipeline_runs "1" -- "0..1" preclean_state : состояние предочистки
+pipeline_runs "1" -- "*" preclean_moves : перемещения предочистки
+pipeline_runs "1" -- "*" files_manual_labels : ручные метки файлов
+pipeline_runs "1" -- "*" video_manual_frames : ручные кадры видео
+files "*" -- "0..1" geocode_cache : геокодирование (gps_lat, gps_lon, логически)
 
 class face_runs <<table>> {
   +id: INTEGER <<PK>>
@@ -127,6 +218,7 @@ class face_rectangles <<table>> {
   confidence: REAL
   presence_score: REAL
   thumb_jpeg: BLOB
+  embedding: BLOB                 ' JSON float32[] (вектор лица)
   manual_person: TEXT             ' временно (до persons/person_id)
   ignore_flag: INTEGER
   is_manual: INTEGER
@@ -166,7 +258,6 @@ class face_labels <<table>> {
   +id: INTEGER <<PK>>
   face_rectangle_id: INTEGER <<FK>>
   person_id: INTEGER <<FK>>
-  cluster_id: INTEGER <<FK>>
   source: TEXT                  ' manual|cluster|ai
   confidence: REAL
   created_at: TEXT
@@ -177,17 +268,36 @@ face_rectangles "1" -- "*" face_cluster_members : член кластера
 face_clusters "1" -- "*" face_cluster_members : кластер
 face_rectangles "1" -- "*" face_labels : метки лица
 persons "1" -- "*" face_labels : назначенная персона
-face_clusters "0..1" -- "*" face_labels : источник (если source=cluster)
 face_runs "1" -- "*" face_clusters : прогон кластеризации
+
+note right of face_labels
+  ВАЖНО: cluster_id удалён из face_labels
+  (рефакторинг для устранения избыточности)
+  
+  Кластер определяется через JOIN:
+  face_labels → face_cluster_members → face_clusters
+  
+  face_cluster_members — единственный источник истины
+  о том, в каком кластере находится лицо
+end note
+
+note right of face_cluster_members
+  Единственный источник истины:
+  какое лицо в каком кластере
+  
+  PRIMARY KEY (cluster_id, face_rectangle_id)
+  Одно лицо → один кластер
+  
+  Если лицо не в кластере (noise) —
+  записи нет
+end note
 
 note right of face_rectangles
   presence_score (photo) =
   area(face_bbox) / sum(area(all_face_bbox))
   
   embedding: BLOB (JSON float32[])
+  для распознавания лиц
 end note
 
 @enduml
-
-
-

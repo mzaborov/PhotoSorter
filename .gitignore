@@ -224,6 +224,11 @@ models/
 # debug-логи и debug данные (локальные артефакты)
 scripts/debug/_logs/
 backend/data/
+backend/scripts/debug/
+# отладочные JSON файлы в корне (анализ, снимки, pending merges)
+person_*_analysis.json
+person_*_snapshot.json
+pending_merges_*.json
 
 # debug скрипты (локальные инструменты отладки)
 backend/scripts/debug/

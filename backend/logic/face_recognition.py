@@ -373,10 +373,15 @@ def assign_cluster_to_person(*, cluster_id: int, person_id: int | None) -> None:
     cur = conn.cursor()
     
     # УДАЛЯЕМ все старые назначения для этого кластера
+    # Получаем все лица из кластера и удаляем их face_labels
     cur.execute(
         """
         DELETE FROM face_labels
-        WHERE cluster_id = ?
+        WHERE face_rectangle_id IN (
+            SELECT face_rectangle_id
+            FROM face_cluster_members
+            WHERE cluster_id = ?
+        )
         """,
         (cluster_id,),
     )
@@ -407,12 +412,14 @@ def assign_cluster_to_person(*, cluster_id: int, person_id: int | None) -> None:
     
     for face_id in face_ids:
         # Создаём новую метку (старые уже удалены)
+        # ВАЖНО: cluster_id больше не храним в face_labels, кластер определяется через face_cluster_members
+        # Используем INSERT OR REPLACE для предотвращения дубликатов (UNIQUE индекс на face_rectangle_id, person_id)
         cur.execute(
             """
-            INSERT INTO face_labels (face_rectangle_id, person_id, cluster_id, source, confidence, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO face_labels (face_rectangle_id, person_id, source, confidence, created_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (face_id, person_id, cluster_id, "cluster", 0.8, now),
+            (face_id, person_id, "cluster", 0.8, now),
         )
     
     conn.commit()
@@ -501,7 +508,8 @@ def get_cluster_info(*, cluster_id: int, limit: int | None = None) -> dict[str, 
         SELECT DISTINCT fl.person_id, p.name
         FROM face_labels fl
         JOIN persons p ON fl.person_id = p.id
-        WHERE fl.cluster_id = ?
+        JOIN face_cluster_members fcm ON fl.face_rectangle_id = fcm.face_rectangle_id
+        WHERE fcm.cluster_id = ?
         """,
         (cluster_id,),
     )
@@ -644,6 +652,292 @@ def find_closest_cluster_for_face(*, face_rectangle_id: int, exclude_cluster_id:
     return best_cluster_id
 
 
+def find_closest_cluster_with_person_for_face(
+    *, face_rectangle_id: int, exclude_cluster_id: int | None = None, max_distance: float = 0.3, ignored_person_name: str = "Посторонние"
+) -> dict[str, Any] | None:
+    """
+    Находит ближайший кластер с персоной (исключая "Посторонние") для лица по embedding.
+    
+    Args:
+        face_rectangle_id: ID лица
+        exclude_cluster_id: ID кластера, который нужно исключить из поиска
+        max_distance: максимальное косинусное расстояние для попадания в кластер
+        ignored_person_name: имя персоны, которую нужно исключить (по умолчанию "Посторонние")
+    
+    Returns:
+        dict с информацией о ближайшем кластере:
+        {
+            'cluster_id': int,
+            'person_id': int,
+            'person_name': str,
+            'distance': float
+        }
+        или None, если не найден подходящий
+    """
+    if not ML_AVAILABLE:
+        return None
+    
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    # Получаем embedding лица
+    cur.execute(
+        """
+        SELECT embedding
+        FROM face_rectangles
+        WHERE id = ? AND embedding IS NOT NULL
+        """,
+        (face_rectangle_id,),
+    )
+    
+    face_row = cur.fetchone()
+    if not face_row or not face_row["embedding"]:
+        return None
+    
+    try:
+        emb_json = face_row["embedding"]
+        emb_list = json.loads(emb_json.decode("utf-8"))
+        face_emb = np.array(emb_list, dtype=np.float32)
+        
+        # Нормализуем
+        norm = np.linalg.norm(face_emb)
+        if norm == 0:
+            return None
+        face_emb_normalized = face_emb / norm
+    except Exception:
+        return None
+    
+    # Получаем все кластеры с персоной (исключая "Посторонние") с их средними embeddings
+    exclude_clause = ""
+    exclude_params = [ignored_person_name]
+    if exclude_cluster_id is not None:
+        exclude_clause = "AND fc.id != ?"
+        exclude_params.append(exclude_cluster_id)
+    
+    cur.execute(
+        f"""
+        SELECT 
+            fc.id as cluster_id,
+            fl.person_id,
+            p.name as person_name,
+            fr.embedding
+        FROM face_clusters fc
+        JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
+        JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
+        JOIN face_labels fl ON fcm.face_rectangle_id = fl.face_rectangle_id
+        JOIN persons p ON fl.person_id = p.id
+        WHERE fr.embedding IS NOT NULL
+          AND COALESCE(fr.ignore_flag, 0) = 0
+          AND p.name != ?
+          {exclude_clause}
+        GROUP BY fc.id, fl.person_id, p.name
+        """,
+        tuple(exclude_params),
+    )
+    
+    clusters_embeddings: dict[int, dict[str, Any]] = {}
+    
+    for row in cur.fetchall():
+        cluster_id = row["cluster_id"]
+        emb_json = row["embedding"]
+        
+        # Сохраняем информацию о персоне для кластера
+        if cluster_id not in clusters_embeddings:
+            clusters_embeddings[cluster_id] = {
+                "person_id": row["person_id"],
+                "person_name": row["person_name"],
+                "embeddings": [],
+            }
+        
+        try:
+            emb_list = json.loads(emb_json.decode("utf-8"))
+            emb_array = np.array(emb_list, dtype=np.float32)
+            norm = np.linalg.norm(emb_array)
+            if norm > 0:
+                emb_normalized = emb_array / norm
+                clusters_embeddings[cluster_id]["embeddings"].append(emb_normalized)
+        except Exception:
+            continue
+    
+    if not clusters_embeddings:
+        return None
+    
+    # Вычисляем средний embedding для каждого кластера и находим ближайший
+    best_result = None
+    best_distance = float('inf')
+    
+    for cluster_id, cluster_data in clusters_embeddings.items():
+        embs = cluster_data["embeddings"]
+        if not embs:
+            continue
+        
+        # Средний embedding кластера
+        cluster_center = np.mean(embs, axis=0)
+        cluster_center_norm = np.linalg.norm(cluster_center)
+        if cluster_center_norm > 0:
+            cluster_center = cluster_center / cluster_center_norm
+        
+        # Косинусное расстояние
+        distance = 1.0 - np.dot(face_emb_normalized, cluster_center)
+        
+        if distance < best_distance and distance <= max_distance:
+            best_distance = distance
+            best_result = {
+                "cluster_id": cluster_id,
+                "person_id": cluster_data["person_id"],
+                "person_name": cluster_data["person_name"],
+                "distance": float(distance),
+            }
+    
+    return best_result
+
+
+def find_closest_cluster_with_person_for_face_by_min_distance(
+    *, face_rectangle_id: int, exclude_cluster_id: int | None = None, max_distance: float = 0.3, ignored_person_name: str = "Посторонние"
+) -> dict[str, Any] | None:
+    """
+    Находит ближайший кластер с персоной (исключая "Посторонние") для лица по embedding.
+    Использует минимальное расстояние до любого лица в кластере (не среднее).
+    
+    Это лучше работает для детей, где лица могут сильно отличаться в разных фотографиях.
+    Используется специально для поиска предложений для одиночных кластеров.
+    
+    Args:
+        face_rectangle_id: ID лица
+        exclude_cluster_id: ID кластера, который нужно исключить из поиска
+        max_distance: максимальное косинусное расстояние для попадания в кластер
+        ignored_person_name: имя персоны, которую нужно исключить (по умолчанию "Посторонние")
+    
+    Returns:
+        dict с информацией о ближайшем кластере:
+        {
+            'cluster_id': int,
+            'person_id': int,
+            'person_name': str,
+            'distance': float
+        }
+        или None, если не найден подходящий
+    """
+    if not ML_AVAILABLE:
+        return None
+    
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    # Получаем embedding лица
+    cur.execute(
+        """
+        SELECT embedding
+        FROM face_rectangles
+        WHERE id = ? AND embedding IS NOT NULL
+        """,
+        (face_rectangle_id,),
+    )
+    
+    face_row = cur.fetchone()
+    if not face_row or not face_row["embedding"]:
+        return None
+    
+    try:
+        emb_json = face_row["embedding"]
+        emb_list = json.loads(emb_json.decode("utf-8"))
+        face_emb = np.array(emb_list, dtype=np.float32)
+        
+        # Нормализуем
+        norm = np.linalg.norm(face_emb)
+        if norm == 0:
+            return None
+        face_emb_normalized = face_emb / norm
+    except Exception:
+        return None
+    
+    # Получаем все кластеры с персоной (исключая "Посторонние") с их embeddings
+    exclude_clause = ""
+    exclude_params = [ignored_person_name]
+    if exclude_cluster_id is not None:
+        exclude_clause = "AND fc.id != ?"
+        exclude_params.append(exclude_cluster_id)
+    
+    cur.execute(
+        f"""
+        SELECT 
+            fc.id as cluster_id,
+            fl.person_id,
+            p.name as person_name,
+            fr.embedding
+        FROM face_clusters fc
+        JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
+        JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
+        JOIN face_labels fl ON fcm.face_rectangle_id = fl.face_rectangle_id
+        JOIN persons p ON fl.person_id = p.id
+        WHERE fr.embedding IS NOT NULL
+          AND COALESCE(fr.ignore_flag, 0) = 0
+          AND p.name != ?
+          {exclude_clause}
+        GROUP BY fc.id, fl.person_id, p.name
+        """,
+        tuple(exclude_params),
+    )
+    
+    clusters_embeddings: dict[int, dict[str, Any]] = {}
+    
+    for row in cur.fetchall():
+        cluster_id = row["cluster_id"]
+        emb_json = row["embedding"]
+        
+        # Сохраняем информацию о персоне для кластера
+        if cluster_id not in clusters_embeddings:
+            clusters_embeddings[cluster_id] = {
+                "person_id": row["person_id"],
+                "person_name": row["person_name"],
+                "embeddings": [],
+            }
+        
+        try:
+            emb_list = json.loads(emb_json.decode("utf-8"))
+            emb_array = np.array(emb_list, dtype=np.float32)
+            norm = np.linalg.norm(emb_array)
+            if norm > 0:
+                emb_normalized = emb_array / norm
+                clusters_embeddings[cluster_id]["embeddings"].append(emb_normalized)
+        except Exception:
+            continue
+    
+    if not clusters_embeddings:
+        return None
+    
+    # Вычисляем минимальное расстояние до любого лица в кластере (не среднее!)
+    # Это лучше работает для детей, где лица могут сильно отличаться в разных фотографиях
+    best_result = None
+    best_distance = float('inf')
+    
+    for cluster_id, cluster_data in clusters_embeddings.items():
+        embs = cluster_data["embeddings"]
+        if not embs:
+            continue
+        
+        # Для каждого лица в кластере вычисляем расстояние
+        # Берем минимальное расстояние (ближайшее лицо)
+        min_cluster_distance = float('inf')
+        for emb_normalized in embs:
+            # Косинусное расстояние
+            distance = 1.0 - np.dot(face_emb_normalized, emb_normalized)
+            if distance < min_cluster_distance:
+                min_cluster_distance = distance
+        
+        # Используем минимальное расстояние из кластера
+        if min_cluster_distance < best_distance and min_cluster_distance <= max_distance:
+            best_distance = min_cluster_distance
+            best_result = {
+                "cluster_id": cluster_id,
+                "person_id": cluster_data["person_id"],
+                "person_name": cluster_data["person_name"],
+                "distance": float(min_cluster_distance),
+            }
+    
+    return best_result
+
+
 def remove_face_from_cluster(*, cluster_id: int, face_rectangle_id: int) -> None:
     """
     Исключает лицо из кластера (удаляет из face_cluster_members).
@@ -678,5 +972,866 @@ def remove_face_from_cluster(*, cluster_id: int, face_rectangle_id: int) -> None
     
     # Если у кластера больше нет лиц, можно удалить и сам кластер (опционально)
     # Пока оставляем кластер, даже если он пустой
+    
+    conn.commit()
+
+
+def find_similar_single_face_clusters(
+    *, max_distance: float = 0.6, run_id: int | None = None, archive_scope: str | None = None
+) -> list[dict[str, Any]]:
+    """
+    Находит пары похожих одиночных кластеров (без персоны).
+    
+    Для каждого одиночного кластера ищет другой одиночный кластер с похожим лицом.
+    Используется для предложения объединения кластеров.
+    
+    Args:
+        max_distance: максимальное косинусное расстояние для попадания в пару
+        run_id: опционально, фильтр по run_id
+        archive_scope: опционально, фильтр по archive_scope (например, 'archive')
+    
+    Returns:
+        list[dict] с парами похожих кластеров:
+        [
+            {
+                'cluster1_id': int,
+                'cluster1_face_id': int,
+                'cluster2_id': int,
+                'cluster2_face_id': int,
+                'distance': float
+            },
+            ...
+        ]
+    """
+    if not ML_AVAILABLE:
+        return []
+    
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    # Формируем WHERE условие
+    where_parts = []
+    where_params = []
+    
+    if archive_scope == 'archive':
+        where_parts.append("fc.archive_scope = 'archive'")
+    elif run_id is not None:
+        where_parts.append("fc.run_id = ?")
+        where_params.append(run_id)
+    
+    where_clause = " AND ".join(where_parts) if where_parts else "1=1"
+    
+    # Находим все одиночные кластеры без персоны
+    cur.execute(
+        f"""
+        SELECT 
+            fc.id as cluster_id,
+            fcm.face_rectangle_id as face_id,
+            fr.embedding
+        FROM face_clusters fc
+        JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
+        JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
+        WHERE {where_clause}
+          AND COALESCE(fr.ignore_flag, 0) = 0
+          AND fr.embedding IS NOT NULL
+          AND (SELECT COUNT(DISTINCT fcm2.face_rectangle_id)
+               FROM face_cluster_members fcm2
+               JOIN face_rectangles fr2 ON fcm2.face_rectangle_id = fr2.id
+               WHERE fcm2.cluster_id = fc.id AND COALESCE(fr2.ignore_flag, 0) = 0) = 1
+          AND (SELECT p2.id 
+               FROM face_labels fl2 
+               JOIN persons p2 ON fl2.person_id = p2.id 
+               JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id
+WHERE fcm2.cluster_id = fc.id 
+               LIMIT 1) IS NULL
+        ORDER BY fc.id
+        """,
+        tuple(where_params),
+    )
+    
+    single_clusters = cur.fetchall()
+    
+    if len(single_clusters) < 2:
+        return []  # Нужно минимум 2 кластера для сравнения
+    
+    # Загружаем embeddings
+    cluster_embeddings: dict[int, dict[str, Any]] = {}
+    
+    for row in single_clusters:
+        cluster_id = row["cluster_id"]
+        face_id = row["face_id"]
+        emb_json = row["embedding"]
+        
+        try:
+            emb_list = json.loads(emb_json.decode("utf-8"))
+            emb_array = np.array(emb_list, dtype=np.float32)
+            norm = np.linalg.norm(emb_array)
+            if norm > 0:
+                emb_normalized = emb_array / norm
+                cluster_embeddings[cluster_id] = {
+                    "face_id": face_id,
+                    "embedding": emb_normalized,
+                }
+        except Exception:
+            continue
+    
+    if len(cluster_embeddings) < 2:
+        return []
+    
+    # Находим пары похожих кластеров
+    similar_pairs = []
+    cluster_ids = list(cluster_embeddings.keys())
+    
+    # Сравниваем каждый кластер с каждым (но избегаем дублирования пар)
+    for i in range(len(cluster_ids)):
+        cluster1_id = cluster_ids[i]
+        emb1 = cluster_embeddings[cluster1_id]["embedding"]
+        face1_id = cluster_embeddings[cluster1_id]["face_id"]
+        
+        for j in range(i + 1, len(cluster_ids)):
+            cluster2_id = cluster_ids[j]
+            emb2 = cluster_embeddings[cluster2_id]["embedding"]
+            face2_id = cluster_embeddings[cluster2_id]["face_id"]
+            
+            # Косинусное расстояние
+            distance = 1.0 - np.dot(emb1, emb2)
+            
+            if distance <= max_distance:
+                similar_pairs.append({
+                    "cluster1_id": cluster1_id,
+                    "cluster1_face_id": face1_id,
+                    "cluster2_id": cluster2_id,
+                    "cluster2_face_id": face2_id,
+                    "distance": float(distance),
+                })
+    
+    # Сортируем по расстоянию (от меньшего к большему)
+    similar_pairs.sort(key=lambda x: x["distance"])
+    
+    return similar_pairs
+
+
+def find_small_clusters_to_merge_in_person(
+    *, max_size: int = 2, max_distance: float = 0.3, person_id: int | None = None, 
+    run_id: int | None = None, archive_scope: str | None = None
+) -> list[dict[str, Any]]:
+    """
+    Находит маленькие кластеры (1-2 фото) внутри персоны для возможного объединения.
+    
+    Для каждой персоны находит все маленькие кластеры и предлагает объединение,
+    если минимальное расстояние между кластерами не превышает порог.
+    
+    Args:
+        max_size: максимальный размер кластера для рассмотрения (по умолчанию 2)
+        max_distance: максимальное косинусное расстояние для предложения объединения (по умолчанию 0.3)
+        person_id: опционально, фильтр по person_id (только для одной персоны)
+        run_id: опционально, фильтр по run_id
+        archive_scope: опционально, фильтр по archive_scope (например, 'archive')
+    
+    Returns:
+        list[dict] с предложениями для объединения:
+        [
+            {
+                'person_id': int,
+                'person_name': str,
+                'source_cluster_id': int,
+                'source_cluster_size': int,
+                'target_cluster_id': int,
+                'target_cluster_size': int,
+                'distance': float  # минимальное расстояние между кластерами
+            },
+            ...
+        ]
+    """
+    if not ML_AVAILABLE:
+        return []
+    
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    # Формируем WHERE условие
+    where_parts = []
+    where_params = []
+    
+    if archive_scope == 'archive':
+        where_parts.append("fc.archive_scope = 'archive'")
+    elif run_id is not None:
+        where_parts.append("fc.run_id = ?")
+        where_params.append(run_id)
+    
+    where_clause = " AND ".join(where_parts) if where_parts else "1=1"
+    
+    # Фильтр по person_id используем через подзапрос
+    person_id_condition = ""
+    if person_id is not None:
+        person_id_condition = "AND (SELECT fl2.person_id FROM face_labels fl2 JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id WHERE fcm2.cluster_id = fc.id LIMIT 1) = ?"
+        where_params.append(person_id)
+    
+    # Отладочное логирование
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.debug(f"[find_small_clusters_to_merge_in_person] person_id={person_id}, max_size={max_size}, max_distance={max_distance}")
+    logger.debug(f"[find_small_clusters_to_merge_in_person] WHERE clause: {where_clause}, person_id_condition: {person_id_condition}, params: {where_params}")
+    
+    # Находим все маленькие кластеры с персоной
+    # Используем подзапрос для получения person_id, чтобы избежать дубликатов от JOIN с face_labels
+    sql_query = f"""
+        SELECT 
+            (SELECT fl2.person_id 
+             FROM face_labels fl2 
+             JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id
+WHERE fcm2.cluster_id = fc.id 
+             LIMIT 1) as person_id,
+            (SELECT p2.name 
+             FROM face_labels fl2 
+             JOIN persons p2 ON fl2.person_id = p2.id 
+             JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id
+WHERE fcm2.cluster_id = fc.id 
+             LIMIT 1) as person_name,
+            fc.id as cluster_id,
+            COUNT(DISTINCT fcm.face_rectangle_id) as cluster_size
+        FROM face_clusters fc
+        JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
+        JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
+        WHERE {where_clause}
+          AND COALESCE(fr.ignore_flag, 0) = 0
+          AND fr.embedding IS NOT NULL
+          AND (SELECT fl2.person_id 
+               FROM face_labels fl2 
+               JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id
+WHERE fcm2.cluster_id = fc.id 
+               LIMIT 1) IS NOT NULL
+          {person_id_condition}
+        GROUP BY fc.id
+        HAVING cluster_size <= ?
+        ORDER BY person_id, fc.id
+    """
+    
+    logger.debug(f"[find_small_clusters_to_merge_in_person] SQL query: {sql_query}")
+    logger.debug(f"[find_small_clusters_to_merge_in_person] SQL params: {tuple(where_params) + (max_size,)}")
+    
+    cur.execute(sql_query, tuple(where_params) + (max_size,))
+    
+    small_clusters_by_person: dict[int, list[dict[str, Any]]] = {}
+    rows = cur.fetchall()
+    logger.debug(f"[find_small_clusters_to_merge_in_person] Найдено маленьких кластеров: {len(rows)}")
+    
+    for row in rows:
+        person_id_val = row["person_id"]
+        logger.debug(f"[find_small_clusters_to_merge_in_person] Персона {person_id_val} ({row['person_name']}): кластер {row['cluster_id']}, размер {row['cluster_size']}")
+        if person_id_val not in small_clusters_by_person:
+            small_clusters_by_person[person_id_val] = {
+                "person_name": row["person_name"],
+                "clusters": [],
+            }
+        
+        small_clusters_by_person[person_id_val]["clusters"].append({
+            "cluster_id": row["cluster_id"],
+            "size": row["cluster_size"],
+        })
+    
+    logger.debug(f"[find_small_clusters_to_merge_in_person] Групп персон с маленькими кластерами: {len(small_clusters_by_person)}")
+    
+    if not small_clusters_by_person:
+        return []
+    
+    # Для каждой персоны загружаем embeddings кластеров и находим похожие пары
+    suggestions = []
+    
+    for person_id_val, person_data in small_clusters_by_person.items():
+        person_name = person_data["person_name"]
+        clusters = person_data["clusters"]
+        
+        # Если у персоны меньше 2 маленьких кластеров, пропускаем
+        logger.debug(f"[find_small_clusters_to_merge_in_person] Персона {person_id_val} ({person_name}): {len(clusters)} маленьких кластеров")
+        if len(clusters) < 2:
+            logger.debug(f"[find_small_clusters_to_merge_in_person] Пропускаем персону {person_id_val}: меньше 2 кластеров")
+            continue
+        
+        # Загружаем embeddings для всех кластеров этой персоны
+        cluster_ids = [c["cluster_id"] for c in clusters]
+        placeholders = ",".join("?" * len(cluster_ids))
+        
+        cur.execute(
+            f"""
+            SELECT 
+                fc.id as cluster_id,
+                fr.id as face_id,
+                fr.embedding
+            FROM face_clusters fc
+            JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
+            JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
+            WHERE fc.id IN ({placeholders})
+              AND COALESCE(fr.ignore_flag, 0) = 0
+              AND fr.embedding IS NOT NULL
+            ORDER BY fc.id, fr.id
+            """,
+            tuple(cluster_ids),
+        )
+        
+        # Группируем embeddings по кластерам
+        cluster_embeddings: dict[int, list[np.ndarray]] = {}
+        cluster_sizes: dict[int, int] = {}
+        
+        for row in cur.fetchall():
+            cluster_id = row["cluster_id"]
+            emb_json = row["embedding"]
+            
+            if cluster_id not in cluster_embeddings:
+                cluster_embeddings[cluster_id] = []
+                cluster_sizes[cluster_id] = 0
+            
+            try:
+                emb_list = json.loads(emb_json.decode("utf-8"))
+                emb_array = np.array(emb_list, dtype=np.float32)
+                norm = np.linalg.norm(emb_array)
+                if norm > 0:
+                    emb_normalized = emb_array / norm
+                    cluster_embeddings[cluster_id].append(emb_normalized)
+                    cluster_sizes[cluster_id] += 1
+            except Exception:
+                continue
+        
+        # Находим пары похожих кластеров
+        # Используем минимальное расстояние между любыми лицами из разных кластеров
+        cluster_ids_list = list(cluster_embeddings.keys())
+        
+        for i in range(len(cluster_ids_list)):
+            cluster1_id = cluster_ids_list[i]
+            embs1 = cluster_embeddings[cluster1_id]
+            size1 = cluster_sizes[cluster1_id]
+            
+            if not embs1:
+                continue
+            
+            for j in range(i + 1, len(cluster_ids_list)):
+                cluster2_id = cluster_ids_list[j]
+                embs2 = cluster_embeddings[cluster2_id]
+                size2 = cluster_sizes[cluster2_id]
+                
+                if not embs2:
+                    continue
+                
+                # Вычисляем минимальное расстояние между любыми лицами из двух кластеров
+                min_distance = float('inf')
+                for emb1 in embs1:
+                    for emb2 in embs2:
+                        distance = 1.0 - np.dot(emb1, emb2)
+                        if distance < min_distance:
+                            min_distance = distance
+                
+                # Если минимальное расстояние не превышает порог, предлагаем объединение
+                logger.debug(f"[find_small_clusters_to_merge_in_person] Кластеры {cluster1_id} и {cluster2_id}: расстояние {min_distance:.4f}, порог {max_distance}")
+                if min_distance <= max_distance:
+                    # Выбираем больший кластер как target (целевой)
+                    if size2 > size1:
+                        source_cluster_id = cluster1_id
+                        target_cluster_id = cluster2_id
+                        source_size = size1
+                        target_size = size2
+                    else:
+                        source_cluster_id = cluster2_id
+                        target_cluster_id = cluster1_id
+                        source_size = size2
+                        target_size = size1
+                    
+                    suggestions.append({
+                        "person_id": person_id_val,
+                        "person_name": person_name,
+                        "source_cluster_id": source_cluster_id,
+                        "source_cluster_size": source_size,
+                        "target_cluster_id": target_cluster_id,
+                        "target_cluster_size": target_size,
+                        "distance": float(min_distance),
+                    })
+    
+    # Сортируем по расстоянию (от меньшего к большему), затем по person_id
+    suggestions.sort(key=lambda x: (x["distance"], x["person_id"]))
+    
+    return suggestions
+
+
+def find_optimal_clusters_to_merge_in_person(
+    *, max_source_size: int = 2, max_distance: float = 0.3, person_id: int | None = None,
+    run_id: int | None = None, archive_scope: str | None = None
+) -> list[dict[str, Any]]:
+    """
+    Находит оптимальные объединения кластеров в персоне для минимизации их количества.
+    
+    Для каждого маленького кластера находит ближайший кластер любого размера и предлагает
+    объединение, если расстояние не превышает порог. Несколько маленьких кластеров могут
+    объединяться в один большой.
+    
+    Args:
+        max_source_size: максимальный размер кластера-источника для рассмотрения (по умолчанию 2)
+        max_distance: максимальное косинусное расстояние для предложения объединения (по умолчанию 0.3)
+        person_id: опционально, фильтр по person_id (только для одной персоны)
+        run_id: опционально, фильтр по run_id
+        archive_scope: опционально, фильтр по archive_scope (например, 'archive')
+    
+    Returns:
+        list[dict] с предложениями для объединения:
+        [
+            {
+                'person_id': int,
+                'person_name': str,
+                'source_cluster_id': int,
+                'source_cluster_size': int,
+                'target_cluster_id': int,
+                'target_cluster_size': int,
+                'distance': float  # минимальное расстояние между кластерами
+            },
+            ...
+        ]
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    logger.info(f"[find_optimal_clusters_to_merge_in_person] ML_AVAILABLE = {ML_AVAILABLE}")
+    
+    if not ML_AVAILABLE:
+        logger.warning("[find_optimal_clusters_to_merge_in_person] ML_AVAILABLE = False, возвращаем пустой список")
+        logger.warning(f"[find_optimal_clusters_to_merge_in_person] numpy доступен: {np is not None}")
+        try:
+            import numpy as np_test
+            logger.warning(f"[find_optimal_clusters_to_merge_in_person] numpy импортируется: {np_test is not None}")
+        except ImportError as e:
+            logger.warning(f"[find_optimal_clusters_to_merge_in_person] numpy НЕ импортируется: {e}")
+        return []
+    
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    # Формируем WHERE условие
+    where_parts = []
+    where_params = []
+    
+    if archive_scope == 'archive':
+        where_parts.append("fc.archive_scope = 'archive'")
+    elif run_id is not None:
+        where_parts.append("fc.run_id = ?")
+        where_params.append(run_id)
+    
+    where_clause = " AND ".join(where_parts) if where_parts else "1=1"
+    
+    # Фильтр по person_id используем через подзапрос
+    # ВАЖНО: person_id НЕ добавляем в where_params, т.к. он передается отдельно в параметрах запросов
+    person_id_condition = ""
+    if person_id is not None:
+        person_id_condition = "AND (SELECT fl2.person_id FROM face_labels fl2 JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id WHERE fcm2.cluster_id = fc.id LIMIT 1) = ?"
+    logger.info(f"[find_optimal_clusters_to_merge_in_person] person_id={person_id}, max_source_size={max_source_size}, max_distance={max_distance}")
+    
+    # Шаг 1: Находим маленькие кластеры (источники)
+    sql_query_sources = f"""
+        SELECT 
+            (SELECT fl2.person_id 
+             FROM face_labels fl2 
+             JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id
+WHERE fcm2.cluster_id = fc.id 
+             LIMIT 1) as person_id,
+            (SELECT p2.name 
+             FROM face_labels fl2 
+             JOIN persons p2 ON fl2.person_id = p2.id 
+             JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id
+WHERE fcm2.cluster_id = fc.id 
+             LIMIT 1) as person_name,
+            fc.id as cluster_id,
+            COUNT(DISTINCT fcm.face_rectangle_id) as cluster_size
+        FROM face_clusters fc
+        JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
+        JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
+        WHERE {where_clause}
+          AND COALESCE(fr.ignore_flag, 0) = 0
+          AND fr.embedding IS NOT NULL
+          AND (SELECT fl2.person_id 
+               FROM face_labels fl2 
+               JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id
+WHERE fcm2.cluster_id = fc.id 
+               LIMIT 1) IS NOT NULL
+          {person_id_condition}
+        GROUP BY fc.id
+        HAVING cluster_size <= ?
+        ORDER BY person_id, fc.id
+    """
+    
+    # Формируем параметры для первого запроса
+    # Порядок: where_params (для where_clause) + person_id (для person_id_condition, если указан) + max_source_size (для HAVING)
+    if person_id is not None:
+        query_params = tuple(where_params) + (person_id, max_source_size)
+    else:
+        query_params = tuple(where_params) + (max_source_size,)
+    
+    logger.info(f"[find_optimal_clusters_to_merge_in_person] SQL params: where_params={where_params}, query_params={query_params}, person_id={person_id}")
+    logger.debug(f"[find_optimal_clusters_to_merge_in_person] SQL query: {sql_query_sources}")
+    
+    cur.execute(sql_query_sources, query_params)
+    small_clusters_rows = cur.fetchall()
+    
+    logger.info(f"[find_optimal_clusters_to_merge_in_person] Найдено маленьких кластеров: {len(small_clusters_rows)}")
+    
+    if len(small_clusters_rows) == 0:
+        logger.warning(f"[find_optimal_clusters_to_merge_in_person] Не найдено маленьких кластеров (<= {max_source_size} фото)")
+        return []
+    
+    # Группируем по персоне
+    small_clusters_by_person: dict[int, list[dict[str, Any]]] = {}
+    for row in small_clusters_rows:
+        person_id_val = row["person_id"]
+        if person_id_val not in small_clusters_by_person:
+            small_clusters_by_person[person_id_val] = {
+                "person_name": row["person_name"],
+                "clusters": [],
+            }
+        small_clusters_by_person[person_id_val]["clusters"].append({
+            "cluster_id": row["cluster_id"],
+            "size": row["cluster_size"],
+        })
+    
+    # Логируем, какие персоны найдены
+    found_person_ids = list(small_clusters_by_person.keys())
+    logger.info(f"[find_optimal_clusters_to_merge_in_person] Найдены персоны в результатах: {found_person_ids}, ожидается person_id={person_id}")
+    
+    # Шаг 2: Для каждой персоны загружаем embeddings всех кластеров (не только маленьких)
+    suggestions = []
+    
+    for person_id_val, person_data in small_clusters_by_person.items():
+        # Если указан person_id, обрабатываем только эту персону
+        if person_id is not None and person_id_val != person_id:
+            continue
+            
+        person_name = person_data["person_name"]
+        source_clusters = person_data["clusters"]
+        
+        if len(source_clusters) == 0:
+            continue
+        
+        # Получаем ВСЕ кластеры персоны (включая большие) для поиска целевых
+        sql_all_clusters = f"""
+            SELECT 
+                fc.id as cluster_id,
+                COUNT(DISTINCT fcm.face_rectangle_id) as cluster_size
+            FROM face_clusters fc
+            JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
+            JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
+            WHERE {where_clause}
+              AND COALESCE(fr.ignore_flag, 0) = 0
+              AND fr.embedding IS NOT NULL
+              AND (SELECT fl2.person_id 
+                   FROM face_labels fl2 
+                   JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id
+WHERE fcm2.cluster_id = fc.id 
+                   LIMIT 1) = ?
+            GROUP BY fc.id
+            ORDER BY fc.id
+        """
+        
+        # Для sql_all_clusters используем только where_params (без person_id) + person_id_val
+        # person_id_val уже учтен через условие в SQL-запросе
+        sql_all_params = tuple(where_params) + (person_id_val,)
+        cur.execute(sql_all_clusters, sql_all_params)
+        all_clusters_rows = cur.fetchall()
+        all_cluster_ids = [row["cluster_id"] for row in all_clusters_rows]
+        all_cluster_sizes = {row["cluster_id"]: row["cluster_size"] for row in all_clusters_rows}
+        
+        logger.info(f"[find_optimal_clusters_to_merge_in_person] Персона {person_id_val} ({person_name}): {len(source_clusters)} источников, {len(all_cluster_ids)} всего кластеров")
+        
+        if len(all_cluster_ids) == 0:
+            continue
+        
+        # Загружаем embeddings для всех кластеров
+        placeholders = ",".join("?" * len(all_cluster_ids))
+        cur.execute(
+            f"""
+            SELECT 
+                fc.id as cluster_id,
+                fr.id as face_id,
+                fr.embedding
+            FROM face_clusters fc
+            JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
+            JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
+            WHERE fc.id IN ({placeholders})
+              AND COALESCE(fr.ignore_flag, 0) = 0
+              AND fr.embedding IS NOT NULL
+            ORDER BY fc.id, fr.id
+            """,
+            tuple(all_cluster_ids),
+        )
+        
+        # Группируем embeddings по кластерам
+        cluster_embeddings: dict[int, list[np.ndarray]] = {}
+        
+        for row in cur.fetchall():
+            cluster_id = row["cluster_id"]
+            emb_json = row["embedding"]
+            
+            if cluster_id not in cluster_embeddings:
+                cluster_embeddings[cluster_id] = []
+            
+            try:
+                emb_list = json.loads(emb_json.decode("utf-8"))
+                emb_array = np.array(emb_list, dtype=np.float32)
+                norm = np.linalg.norm(emb_array)
+                if norm > 0:
+                    emb_normalized = emb_array / norm
+                    cluster_embeddings[cluster_id].append(emb_normalized)
+            except Exception:
+                continue
+        
+        # Шаг 3: Для каждого маленького кластера находим ближайший любой кластер
+        source_cluster_ids = [c["cluster_id"] for c in source_clusters]
+        
+        for source_cluster_info in source_clusters:
+            source_cluster_id = source_cluster_info["cluster_id"]
+            source_size = source_cluster_info["size"]
+            source_embs = cluster_embeddings.get(source_cluster_id, [])
+            
+            if not source_embs:
+                continue
+            
+            # Исключаем сам кластер из поиска
+            candidate_target_ids = [cid for cid in all_cluster_ids if cid != source_cluster_id]
+            
+            best_target_id = None
+            best_distance = float('inf')
+            
+            for target_cluster_id in candidate_target_ids:
+                target_embs = cluster_embeddings.get(target_cluster_id, [])
+                if not target_embs:
+                    continue
+                
+                # Вычисляем минимальное расстояние между любыми лицами из двух кластеров
+                min_distance = float('inf')
+                for emb1 in source_embs:
+                    for emb2 in target_embs:
+                        distance = 1.0 - np.dot(emb1, emb2)
+                        if distance < min_distance:
+                            min_distance = distance
+                
+                if min_distance < best_distance:
+                    best_distance = min_distance
+                    best_target_id = target_cluster_id
+            
+            # Если найдено подходящее объединение
+            if best_target_id is not None:
+                logger.debug(f"[find_optimal_clusters_to_merge_in_person] Кластер {source_cluster_id} -> {best_target_id}, расстояние: {best_distance:.4f}, порог: {max_distance}")
+            if best_target_id is not None and best_distance <= max_distance:
+                target_size = all_cluster_sizes.get(best_target_id, 0)
+                
+                suggestions.append({
+                    "person_id": person_id_val,
+                    "person_name": person_name,
+                    "source_cluster_id": source_cluster_id,
+                    "source_cluster_size": source_size,
+                    "target_cluster_id": best_target_id,
+                    "target_cluster_size": target_size,
+                    "distance": float(best_distance),
+                })
+    
+    # Сортируем по расстоянию (от меньшего к большему), затем по person_id
+    suggestions.sort(key=lambda x: (x["distance"], x["person_id"]))
+    
+    logger.info(f"[find_optimal_clusters_to_merge_in_person] Итого найдено предложений: {len(suggestions)}")
+    
+    return suggestions
+
+
+def merge_clusters(*, source_cluster_id: int, target_cluster_id: int) -> None:
+    """
+    Объединяет два кластера: перемещает все лица из source_cluster в target_cluster.
+    
+    Args:
+        source_cluster_id: ID кластера-источника (будет пустым после объединения)
+        target_cluster_id: ID целевого кластера (куда перемещаются лица)
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    # Проверяем, что оба кластера существуют
+    cur.execute("SELECT id FROM face_clusters WHERE id IN (?, ?)", (source_cluster_id, target_cluster_id))
+    found_clusters = {row["id"] for row in cur.fetchall()}
+    
+    if source_cluster_id not in found_clusters:
+        raise ValueError(f"Source cluster {source_cluster_id} not found")
+    if target_cluster_id not in found_clusters:
+        raise ValueError(f"Target cluster {target_cluster_id} not found")
+    
+    if source_cluster_id == target_cluster_id:
+        raise ValueError("Cannot merge cluster with itself")
+    
+    # Получаем все лица из source_cluster
+    cur.execute(
+        """
+        SELECT face_rectangle_id
+        FROM face_cluster_members
+        WHERE cluster_id = ?
+        """,
+        (source_cluster_id,),
+    )
+    
+    face_ids = [row["face_rectangle_id"] for row in cur.fetchall()]
+    
+    if len(face_ids) == 0:
+        # Источник пустой, нечего перемещать
+        return
+    
+    # Проверяем, нет ли уже этих лиц в target_cluster (избегаем дублирования)
+    cur.execute(
+        """
+        SELECT face_rectangle_id
+        FROM face_cluster_members
+        WHERE cluster_id = ? AND face_rectangle_id IN ({})
+        """.format(",".join("?" * len(face_ids))),
+        [target_cluster_id] + face_ids,
+    )
+    
+    existing_face_ids = {row["face_rectangle_id"] for row in cur.fetchall()}
+    
+    # Перемещаем только те лица, которых еще нет в target_cluster
+    faces_to_move = [fid for fid in face_ids if fid not in existing_face_ids]
+    
+    # ВАЖНО: Получаем все face_labels для source_cluster ДО перемещения лиц
+    # чтобы потом удалить их для всех перемещенных лиц
+    # Кластер определяется через JOIN с face_cluster_members
+    cur.execute(
+        """
+        SELECT fl.face_rectangle_id, fl.person_id
+        FROM face_labels fl
+        JOIN face_cluster_members fcm ON fl.face_rectangle_id = fcm.face_rectangle_id
+        WHERE fcm.cluster_id = ?
+        """,
+        (source_cluster_id,),
+    )
+    source_labels_to_cleanup = cur.fetchall()
+    source_labels_by_face = {(row["face_rectangle_id"], row["person_id"]) for row in source_labels_to_cleanup}
+    
+    # Если все лица уже в target_cluster, просто удаляем из source
+    if len(faces_to_move) == 0:
+        # Удаляем все связи из source_cluster (даже если они дублируются)
+        cur.execute(
+            """
+            DELETE FROM face_cluster_members
+            WHERE cluster_id = ?
+            """,
+            (source_cluster_id,),
+        )
+    else:
+        # Перемещаем лица в target_cluster
+        for face_id in faces_to_move:
+            # Сначала удаляем из source
+            cur.execute(
+                """
+                DELETE FROM face_cluster_members
+                WHERE cluster_id = ? AND face_rectangle_id = ?
+                """,
+                (source_cluster_id, face_id),
+            )
+            
+            # Затем добавляем в target
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO face_cluster_members (cluster_id, face_rectangle_id)
+                VALUES (?, ?)
+                """,
+                (target_cluster_id, face_id),
+            )
+    
+    # ВАЖНО: Удаляем face_labels для source_cluster для ВСЕХ лиц, которые были в source_cluster
+    # независимо от того, были ли они уже в target_cluster или нет
+    # Это предотвращает дубликаты записей face_labels
+    for face_id in face_ids:  # Все лица, которые были в source_cluster
+        # Находим person_id для этого лица из source_labels
+        person_ids_for_face = [pid for fid, pid in source_labels_by_face if fid == face_id]
+        
+        for person_id in person_ids_for_face:
+            # Удаляем face_label для этого лица и персоны
+            # ВАЖНО: cluster_id больше не храним, удаляем только по face_rectangle_id + person_id
+            cur.execute(
+                """
+                DELETE FROM face_labels
+                WHERE face_rectangle_id = ? AND person_id = ?
+                """,
+                (face_id, person_id),
+            )
+            
+            # Проверяем, есть ли уже face_label для этого лица и персоны
+            # (независимо от кластера, т.к. cluster_id больше не храним)
+            cur.execute(
+                """
+                SELECT id FROM face_labels
+                WHERE face_rectangle_id = ? AND person_id = ?
+                """,
+                (face_id, person_id),
+            )
+            
+            existing_label = cur.fetchone()
+            
+            if not existing_label:
+                # Получаем данные из старой записи для создания новой
+                # Ищем по face_rectangle_id + person_id (без cluster_id)
+                cur.execute(
+                    """
+                    SELECT source, confidence, created_at
+                    FROM face_labels
+                    WHERE face_rectangle_id = ? AND person_id = ?
+                    LIMIT 1
+                    """,
+                    (face_id, person_id),
+                )
+                old_label = cur.fetchone()
+                
+                if not old_label:
+                    # Если не нашли старую запись (уже удалили), используем значения по умолчанию
+                    from datetime import datetime, timezone
+                    now = datetime.now(timezone.utc).isoformat()
+                    # ВАЖНО: cluster_id больше не храним в face_labels
+                    # Используем INSERT OR REPLACE для предотвращения дубликатов
+                    cur.execute(
+                        """
+                        INSERT OR REPLACE INTO face_labels (face_rectangle_id, person_id, source, confidence, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (face_id, person_id, "cluster", 0.8, now),
+                    )
+                else:
+                    # Создаем новую запись с данными из старой
+                    # ВАЖНО: cluster_id больше не храним в face_labels
+                    # Используем INSERT OR REPLACE для предотвращения дубликатов
+                    cur.execute(
+                        """
+                        INSERT OR REPLACE INTO face_labels (face_rectangle_id, person_id, source, confidence, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (face_id, person_id, old_label["source"], old_label["confidence"], old_label["created_at"]),
+                    )
+    
+    # Проверяем, что source_cluster стал пустым, и удаляем его
+    cur.execute(
+        """
+        SELECT COUNT(*) as count
+        FROM face_cluster_members
+        WHERE cluster_id = ?
+        """,
+        (source_cluster_id,),
+    )
+    remaining_faces = cur.fetchone()["count"]
+    
+    if remaining_faces == 0:
+        # Удаляем оставшиеся face_labels для source_cluster (если они еще есть)
+        # Основная очистка уже была сделана выше при перемещении лиц
+        # Кластер определяется через JOIN с face_cluster_members
+        cur.execute(
+            """
+            DELETE FROM face_labels
+            WHERE face_rectangle_id IN (
+                SELECT face_rectangle_id
+                FROM face_cluster_members
+                WHERE cluster_id = ?
+            )
+            """,
+            (source_cluster_id,),
+        )
+        
+        # Удаляем сам пустой кластер
+        cur.execute("DELETE FROM face_clusters WHERE id = ?", (source_cluster_id,))
     
     conn.commit()
