@@ -4,8 +4,10 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import subprocess
 import tempfile
+import logging
 import time
 import urllib.parse
 from datetime import datetime, timedelta
@@ -15,6 +17,8 @@ from typing import Any, Optional
 from fastapi import APIRouter, Body, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.templating import Jinja2Templates
+
+logger = logging.getLogger(__name__)
 
 from common.db import DedupStore, FaceStore, PipelineStore, list_folders
 from common.yadisk_client import get_disk
@@ -417,7 +421,7 @@ def _faces_preview_meta(*, path: str, mime_type: str | None, media_type: str | N
 
 def _group_into_trips(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    Группирует файлы в поездки для вкладки "Нет лиц" с сортировкой по месту и дате.
+    Группирует файлы в поездки для вкладки "Нет людей" с сортировкой по месту и дате.
     
     Логика:
     - Страна обязательна для группировки по месту
@@ -449,13 +453,14 @@ def _group_into_trips(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     trips: list[list[dict[str, Any]]] = []
     current_trip: list[dict[str, Any]] | None = None
     
-    # Сортируем по стране, городу (только для России), дате
+    # Сортируем по стране, городу (только для России), дате, пути (для стабильности)
     with_place_sorted = sorted(
         with_place,
         key=lambda x: (
             str(x.get("place_country") or ""),
             str(x.get("place_city") or "") if str(x.get("place_country") or "").lower() == "россия" else "",
             str(x.get("taken_at") or ""),
+            str(x.get("path") or ""),
         ),
     )
     
@@ -541,8 +546,8 @@ def _group_into_trips(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     
     # Поездки с местом
     for trip in trips:
-        # Сортируем файлы внутри поездки по дате
-        trip_sorted = sorted(trip, key=lambda x: str(x.get("taken_at") or ""))
+        # Сортируем файлы внутри поездки по дате, затем по пути (для стабильности)
+        trip_sorted = sorted(trip, key=lambda x: (str(x.get("taken_at") or ""), str(x.get("path") or "")))
         # Берём дату первого файла для сортировки
         first_date_str = trip_sorted[0].get("taken_at", "") if trip_sorted else ""
         first_date = None
@@ -560,10 +565,10 @@ def _group_into_trips(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for _date, trip_sorted in all_trips_with_date:
         result.extend(trip_sorted)
     
-    # Добавляем файлы без места в конец (без группировки, просто отсортированные по дате)
+    # Добавляем файлы без места в конец (без группировки, просто отсортированные по дате, затем по пути)
     without_place_sorted = sorted(
         without_place,
-        key=lambda x: str(x.get("taken_at") or ""),
+        key=lambda x: (str(x.get("taken_at") or ""), str(x.get("path") or "")),
     )
     result.extend(without_place_sorted)
     
@@ -581,14 +586,43 @@ def api_faces_results(
     page: int = 1,
     page_size: int = 60,
 ) -> dict[str, Any]:
+    start_time = time.time()
+    msg = f"[API] api_faces_results: начало, pipeline_run_id={pipeline_run_id}, tab={tab}, subtab={subtab}, page={page}, page_size={page_size}"
+    logger.info(msg)
+    print(msg)  # Дублируем в print для гарантированного вывода
     tab_n = (tab or "").strip().lower()
     if tab_n not in ("faces", "no_faces", "quarantine", "animals", "people_no_face"):
         raise HTTPException(status_code=400, detail="tab must be faces|no_faces|quarantine|animals|people_no_face")
+    # Карантин теперь показывается в "Нет людей" -> "К разбору", но оставляем поддержку для обратной совместимости
+    if tab_n == "quarantine":
+        tab_n = "no_faces"
 
     subtab_n = (subtab or "").strip().lower() or "all"
+    person_id_filter: int | None = None
+    group_path_filter: str | None = None
     if tab_n == "faces":
-        if subtab_n not in ("all", "many_faces"):
-            raise HTTPException(status_code=400, detail="subtab for faces must be all|many_faces")
+        if subtab_n.startswith("person_"):
+            try:
+                person_id_filter = int(subtab_n.replace("person_", ""))
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid person_id in subtab")
+        elif subtab_n not in ("all", "many_faces", "unsorted"):
+            raise HTTPException(status_code=400, detail="subtab for faces must be all|many_faces|unsorted|person_<id>")
+    elif tab_n == "no_faces":
+        if subtab_n.startswith("group_"):
+            # Декодируем путь группы (может содержать "/" и другие спецсимволы)
+            group_path_filter = urllib.parse.unquote(subtab_n.replace("group_", ""))
+            # Убираем лишние пробелы (данные уже нормализованы в БД)
+            group_path_filter = group_path_filter.strip()
+            print(f"[DEBUG] Декодирован group_path_filter: '{group_path_filter}' из subtab_n='{subtab_n}'")
+        elif subtab_n not in ("all", "unsorted", "unsorted_photos", "unsorted_videos"):
+            raise HTTPException(status_code=400, detail="subtab for no_faces must be all|unsorted|unsorted_photos|unsorted_videos|group_<path>")
+        else:
+            # Поддерживаем старый формат "all" и "unsorted" для совместимости
+            if subtab_n in ("all", "unsorted"):
+                subtab_n = "unsorted_photos"  # По умолчанию "Фото к разбору" для "Нет людей"
+            elif subtab_n not in ("unsorted_photos", "unsorted_videos"):
+                subtab_n = "unsorted_photos"
     else:
         subtab_n = "all"
 
@@ -627,37 +661,187 @@ def api_faces_results(
         except Exception:
             root_like = None
 
-    where = ["f.faces_run_id = ?", "f.status != 'deleted'"]
-    params: list[Any] = [face_run_id_i]
+    # Показываем файлы с faces_run_id = ? ИЛИ (видео без faces_run_id в корневой папке)
+    # Это нужно, потому что видео могут быть не обработаны для детекции лиц
+    where = ["f.status != 'deleted'"]
+    params: list[Any] = []
+    
     if root_like:
-        where.append("f.path LIKE ?")
+        # Показываем файлы с faces_run_id = ? ИЛИ видео без faces_run_id в корневой папке
+        where.append("""
+        (
+          f.faces_run_id = ?
+          OR (
+            f.faces_run_id IS NULL 
+            AND (COALESCE(f.media_type, '') = 'video' OR COALESCE(f.mime_type, '') LIKE 'video/%')
+            AND f.path LIKE ?
+          )
+        )
+        """)
+        params.append(face_run_id_i)
         params.append(root_like)
+    else:
+        # Если нет root_like, используем только faces_run_id
+        where.append("f.faces_run_id = ?")
+        params.append(face_run_id_i)
+    
     where_sql = " AND ".join(where)
 
     eff_sql = """
     CASE
-      WHEN COALESCE(m.people_no_face_manual, 0) = 1 THEN 'people_no_face'
+      WHEN COALESCE(m.people_no_face_manual, 0) = 1 THEN 'faces'
       WHEN lower(trim(coalesce(m.faces_manual_label, ''))) = 'faces' THEN 'faces'
       WHEN lower(trim(coalesce(m.faces_manual_label, ''))) = 'no_faces' THEN 'no_faces'
-      WHEN COALESCE(m.quarantine_manual, 0) = 1
-           AND COALESCE(f.faces_count, 0) > 0
-        THEN 'quarantine'
+      WHEN COALESCE(m.quarantine_manual, 0) = 1 THEN 'no_faces'
       WHEN COALESCE(m.animals_manual, 0) = 1 THEN 'animals'
       WHEN COALESCE(f.animals_auto, 0) = 1 THEN 'animals'
       WHEN COALESCE(f.faces_auto_quarantine, 0) = 1
            AND COALESCE(f.faces_count, 0) > 0
            AND lower(trim(coalesce(f.faces_quarantine_reason, ''))) != 'many_small_faces'
-        THEN 'quarantine'
+        THEN 'no_faces'
       ELSE (CASE WHEN COALESCE(f.faces_count, 0) > 0 THEN 'faces' ELSE 'no_faces' END)
     END
     """
 
     sub_where = "1=1"
     sub_params: list[Any] = []
+    person_filter_sql = "1=1"
+    person_filter_params: list[Any] = []
+    group_filter_sql = "1=1"
+    group_filter_params: list[Any] = []
+    media_filter_sql = "1=1"  # Фильтр по типу медиа (фото/видео)
     if tab_n == "faces" and subtab_n == "many_faces":
         sub_where = "COALESCE(faces_count, 0) >= 8"
     elif tab_n == "faces" and subtab_n == "all":
         sub_where = "COALESCE(faces_count, 0) < 8"
+    elif tab_n == "faces" and subtab_n == "unsorted":
+        # "К разбору": файлы без привязки к персонам ИЛИ люди без лиц (people_no_face_manual=1)
+        sub_where = "COALESCE(faces_count, 0) < 8"
+        # person_filter_sql будет исключать файлы с привязкой к персонам, но включать people_no_face_manual=1
+        # Привязка может быть через: face_labels, person_rectangles, file_persons, или через кластеры
+        person_filter_sql = """
+        (
+          -- Файл не привязан ни к одной персоне через лица (прямая привязка)
+          NOT EXISTS (
+              SELECT 1 FROM face_labels fl
+              JOIN face_rectangles fr ON fr.id = fl.face_rectangle_id
+              WHERE fr.file_path = f.path AND fr.run_id = ? AND fl.person_id IS NOT NULL
+          )
+          AND NOT EXISTS (
+              -- Файл не привязан ни к одной персоне через кластеры (оптимизированный вариант)
+              SELECT 1 FROM face_rectangles fr_cluster
+              JOIN face_cluster_members fcm_all ON fcm_all.face_rectangle_id = fr_cluster.id
+              JOIN (
+                  -- Находим кластеры с персонами через подзапрос
+                  SELECT DISTINCT fcm_labeled.cluster_id
+                  FROM face_labels fl_cluster
+                  JOIN face_cluster_members fcm_labeled ON fcm_labeled.face_rectangle_id = fl_cluster.face_rectangle_id
+                  JOIN face_clusters fc ON fc.id = fcm_labeled.cluster_id
+                  WHERE fl_cluster.person_id IS NOT NULL
+                    AND (fc.run_id = ? OR fc.archive_scope = 'archive')
+              ) person_clusters ON person_clusters.cluster_id = fcm_all.cluster_id
+              WHERE fr_cluster.file_path = f.path 
+                AND fr_cluster.run_id = ? 
+                AND COALESCE(fr_cluster.ignore_flag, 0) = 0
+          )
+          AND NOT EXISTS (
+              -- Файл не привязан ни к одной персоне через прямоугольники
+              SELECT 1 FROM person_rectangles pr
+              WHERE pr.file_path = f.path AND pr.pipeline_run_id = ? AND pr.person_id IS NOT NULL
+          )
+          AND NOT EXISTS (
+              -- Файл не привязан ни к одной персоне напрямую
+              SELECT 1 FROM file_persons fp
+              WHERE fp.file_path = f.path AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL
+          )
+        ) OR COALESCE(m.people_no_face_manual, 0) = 1
+        """
+        # Параметры для оптимизированного запроса через кластеры: [face_run_id для подзапроса, face_run_id для fr_cluster]
+        person_filter_params = [face_run_id_i, face_run_id_i, int(pipeline_run_id), int(pipeline_run_id)]
+    elif tab_n == "no_faces" and subtab_n in ("unsorted", "unsorted_photos", "unsorted_videos"):
+        # "К разбору" для "Нет людей": файлы без группы
+        group_filter_sql = """
+        NOT EXISTS (
+            SELECT 1 FROM file_groups fg
+            WHERE fg.file_path = f.path AND fg.pipeline_run_id = ?
+        )
+        """
+        group_filter_params = [int(pipeline_run_id)]
+        
+        # Фильтр по типу медиа для разделения фото и видео
+        if subtab_n == "unsorted_photos":
+            # Только фото: media_type = 'image' или пустой, и mime_type не начинается с 'video/'
+            media_filter_sql = """
+            (COALESCE(f.media_type, '') = 'image' OR COALESCE(f.media_type, '') = '')
+            AND NOT (COALESCE(f.mime_type, '') LIKE 'video/%')
+            """
+        elif subtab_n == "unsorted_videos":
+            # Только видео: media_type = 'video' или mime_type начинается с 'video/'
+            media_filter_sql = """
+            (COALESCE(f.media_type, '') = 'video' OR COALESCE(f.mime_type, '') LIKE 'video/%')
+            """
+        else:
+            # Старый формат "unsorted" - показываем все
+            media_filter_sql = "1=1"
+        
+        print(f"[DEBUG] Фильтр 'К разбору': group_filter_sql установлен, media_filter={subtab_n}, params={group_filter_params}")
+    elif tab_n == "no_faces" and group_path_filter is not None:
+        # Фильтр по конкретной группе
+        # Ищем точно по названию (данные уже нормализованы в БД)
+        group_filter_sql = """
+        EXISTS (
+            SELECT 1 FROM file_groups fg
+            WHERE fg.file_path = f.path AND fg.pipeline_run_id = ? 
+            AND fg.group_path = ?
+        )
+        """
+        group_filter_params = [int(pipeline_run_id), str(group_path_filter)]
+        print(f"[DEBUG] Фильтр по группе '{group_path_filter}': group_filter_sql установлен, params={group_filter_params}")
+    elif tab_n == "faces" and person_id_filter is not None:
+        # Фильтр по персоне: файл должен быть привязан к персоне через любой из 4 способов
+        person_filter_sql = """
+        EXISTS (
+            -- Через лица (прямая привязка)
+            SELECT 1 FROM face_labels fl
+            JOIN face_rectangles fr ON fr.id = fl.face_rectangle_id
+            WHERE fr.file_path = f.path AND fr.run_id = ? AND fl.person_id = ?
+        ) OR EXISTS (
+            -- Через кластеры (оптимизированный вариант с подзапросом)
+            SELECT 1 FROM face_rectangles fr_cluster
+            JOIN face_cluster_members fcm_all ON fcm_all.face_rectangle_id = fr_cluster.id
+            JOIN (
+                -- Находим кластеры с конкретной персоной через подзапрос
+                SELECT DISTINCT fcm_labeled.cluster_id
+                FROM face_labels fl_cluster
+                JOIN face_cluster_members fcm_labeled ON fcm_labeled.face_rectangle_id = fl_cluster.face_rectangle_id
+                JOIN face_clusters fc ON fc.id = fcm_labeled.cluster_id
+                WHERE fl_cluster.person_id = ?
+                  AND (fc.run_id = ? OR fc.archive_scope = 'archive')
+            ) person_clusters ON person_clusters.cluster_id = fcm_all.cluster_id
+            WHERE fr_cluster.file_path = f.path 
+              AND fr_cluster.run_id = ? 
+              AND COALESCE(fr_cluster.ignore_flag, 0) = 0
+        ) OR EXISTS (
+            -- Через прямоугольники без лица
+            SELECT 1 FROM person_rectangles pr
+            WHERE pr.file_path = f.path AND pr.pipeline_run_id = ? AND pr.person_id = ?
+        ) OR EXISTS (
+            -- Прямая привязка
+            SELECT 1 FROM file_persons fp
+            WHERE fp.file_path = f.path AND fp.pipeline_run_id = ? AND fp.person_id = ?
+        )
+        """
+        # Параметры для оптимизированного запроса:
+        # 1. face_run_id_i - для EXISTS (face_labels) - fr.run_id
+        # 2. person_id_filter - для EXISTS (face_labels) - fl.person_id
+        # 3. person_id_filter - для подзапроса кластеров - fl_cluster.person_id
+        # 4. face_run_id_i - для подзапроса кластеров - fc.run_id
+        # 5. face_run_id_i - для основного запроса кластеров - fr_cluster.run_id
+        # 6. int(pipeline_run_id) - для person_rectangles
+        # 7. person_id_filter - для person_rectangles
+        # 8. int(pipeline_run_id) - для file_persons
+        # 9. person_id_filter - для file_persons
+        person_filter_params = [face_run_id_i, person_id_filter, person_id_filter, face_run_id_i, face_run_id_i, int(pipeline_run_id), person_id_filter, int(pipeline_run_id), person_id_filter]
 
     def _norm_dt(s: str | None, *, is_to: bool) -> str | None:
         if not s:
@@ -680,22 +864,52 @@ def api_faces_results(
             params.append(dt_to)
         where_sql = " AND ".join(where)
 
+    # Для вкладки "Нет людей" добавляем сортировку по группам
+    group_join = ""
+    group_select = ""
+    group_order = ""
+    group_count_params = []
+    if tab_n == "no_faces":
+        # Добавляем LEFT JOIN с file_groups для получения group_path
+        group_join = """
+        LEFT JOIN (
+            SELECT DISTINCT file_path, 
+                   MIN(group_path) AS group_path
+            FROM file_groups
+            WHERE pipeline_run_id = ?
+            GROUP BY file_path
+        ) fg ON fg.file_path = f.path
+        """
+        group_select = ", COALESCE(fg.group_path, '') AS group_path"
+        # Сортировка: сначала файлы с группами (по названию группы), потом без групп
+        group_order = """
+          (CASE WHEN COALESCE(fg.group_path, '') = '' THEN 1 ELSE 0 END) ASC,
+          COALESCE(fg.group_path, '') ASC,
+        """
+        group_count_params = [int(pipeline_run_id)]
+
     ds = DedupStore()
     try:
         cur = ds.conn.cursor()
+        count_start = time.time()
         cur.execute(
             f"""
             SELECT COUNT(*) AS cnt
             FROM files f
             LEFT JOIN files_manual_labels m
-              ON m.pipeline_run_id = ? AND m.path = f.path
-            WHERE {where_sql} AND ({eff_sql}) = ? AND ({sub_where})
+              ON m.pipeline_run_id = ? AND m.path = f.path{group_join}
+            WHERE {where_sql} AND ({eff_sql}) = ? AND ({sub_where}) AND ({person_filter_sql}) AND ({group_filter_sql}) AND ({media_filter_sql})
             """,
-            [int(pipeline_run_id)] + params + [tab_n] + sub_params,
+            group_count_params + [int(pipeline_run_id)] + params + [tab_n] + sub_params + person_filter_params + group_filter_params,
         )
         total = int(cur.fetchone()[0] or 0)
+        count_time = time.time() - count_start
+        msg = f"[API] api_faces_results: COUNT запрос занял {count_time:.3f}с, total={total}"
+        logger.info(msg)
+        print(msg)
 
         sort_n = str((sort or "").strip().lower() or "")
+        select_start = time.time()
         cur.execute(
             f"""
             SELECT
@@ -713,12 +927,13 @@ def api_faces_results(
               COALESCE(m.animals_manual, 0) AS animals_manual,
               COALESCE(m.animals_manual_kind, '') AS animals_manual_kind,
               COALESCE(m.people_no_face_manual, 0) AS people_no_face_manual,
-              COALESCE(m.people_no_face_person, '') AS people_no_face_person
+              COALESCE(m.people_no_face_person, '') AS people_no_face_person{group_select}
             FROM files f
             LEFT JOIN files_manual_labels m
-              ON m.pipeline_run_id = ? AND m.path = f.path
-            WHERE {where_sql} AND ({eff_sql}) = ? AND ({sub_where})
+              ON m.pipeline_run_id = ? AND m.path = f.path{group_join}
+            WHERE {where_sql} AND ({eff_sql}) = ? AND ({sub_where}) AND ({person_filter_sql}) AND ({group_filter_sql}) AND ({media_filter_sql})
             ORDER BY
+              {group_order}
               (CASE WHEN ? = 'place_date' AND (COALESCE(f.place_country,'') = '' AND COALESCE(f.place_city,'') = '') THEN 1 ELSE 0 END) ASC,
               (CASE WHEN ? = 'place_date' THEN COALESCE(f.place_country,'') ELSE '' END) ASC,
               (CASE WHEN ? = 'place_date' THEN COALESCE(f.place_city,'') ELSE '' END) ASC,
@@ -727,13 +942,79 @@ def api_faces_results(
               f.path ASC
             LIMIT ? OFFSET ?
             """,
-            [int(pipeline_run_id)]
+            group_count_params
+            + [int(pipeline_run_id)]
             + params
             + [tab_n]
             + sub_params
+            + person_filter_params
+            + group_filter_params
             + [sort_n, sort_n, sort_n, sort_n, sort_n, size_i, offset],
         )
         rows = [dict(r) for r in cur.fetchall()]
+        select_time = time.time() - select_start
+        msg = f"[API] api_faces_results: SELECT запрос занял {select_time:.3f}с, строк: {len(rows)}"
+        logger.info(msg)
+        print(msg)
+        
+        # Отладочный вывод для проверки фильтрации
+        if tab_n == "no_faces":
+            print(f"[DEBUG] Загружено строк: {len(rows)} для tab_n={tab_n}, subtab_n={subtab_n}")
+            if len(rows) == 0 and (subtab_n == "unsorted" or group_path_filter):
+                # Проверяем, почему нет результатов
+                print(f"[DEBUG] Проверяем почему нет результатов для subtab_n={subtab_n}, group_path_filter={group_path_filter}")
+                # Делаем тестовый запрос
+                test_cur = ds.conn.cursor()
+                
+                if group_path_filter:
+                    # Проверяем файлы в группе БЕЗ фильтра по eff_sql
+                    test_cur.execute(f"""
+                        SELECT COUNT(*) as cnt
+                        FROM files f
+                        LEFT JOIN files_manual_labels m ON m.pipeline_run_id = ? AND m.path = f.path
+                        WHERE f.faces_run_id = ? AND f.status != 'deleted'
+                        AND EXISTS (
+                            SELECT 1 FROM file_groups fg
+                            WHERE fg.file_path = f.path AND fg.pipeline_run_id = ? 
+                            AND fg.group_path = ?
+                        )
+                    """, [int(pipeline_run_id), face_run_id_i, int(pipeline_run_id), str(group_path_filter)])
+                    group_count_all = test_cur.fetchone()[0]
+                    print(f"[DEBUG] Файлов в группе '{group_path_filter}' (без фильтра по tab): {group_count_all}")
+                    
+                    # Проверяем файлы в группе С фильтром по eff_sql = 'no_faces'
+                    test_cur.execute(f"""
+                        SELECT COUNT(*) as cnt
+                        FROM files f
+                        LEFT JOIN files_manual_labels m ON m.pipeline_run_id = ? AND m.path = f.path
+                        WHERE f.faces_run_id = ? AND f.status != 'deleted'
+                        AND ({eff_sql}) = 'no_faces'
+                        AND EXISTS (
+                            SELECT 1 FROM file_groups fg
+                            WHERE fg.file_path = f.path AND fg.pipeline_run_id = ? 
+                            AND fg.group_path = ?
+                        )
+                    """, [int(pipeline_run_id), face_run_id_i, int(pipeline_run_id), str(group_path_filter)])
+                    group_count_no_faces = test_cur.fetchone()[0]
+                    print(f"[DEBUG] Файлов в группе '{group_path_filter}' с eff_sql='no_faces': {group_count_no_faces}")
+                    
+                    # Проверяем конкретные файлы в группе
+                    test_cur.execute(f"""
+                        SELECT f.path, ({eff_sql}) as eff_tab, f.faces_count, 
+                               COALESCE(m.faces_manual_label, '') as manual_label
+                        FROM files f
+                        LEFT JOIN files_manual_labels m ON m.pipeline_run_id = ? AND m.path = f.path
+                        WHERE EXISTS (
+                            SELECT 1 FROM file_groups fg
+                            WHERE fg.file_path = f.path AND fg.pipeline_run_id = ? 
+                            AND fg.group_path = ?
+                        )
+                        LIMIT 5
+                    """, [int(pipeline_run_id), int(pipeline_run_id), str(group_path_filter)])
+                    group_files = test_cur.fetchall()
+                    print(f"[DEBUG] Файлы в группе '{group_path_filter}':")
+                    for row in group_files:
+                        print(f"  {row[0]}: eff_tab={row[1]}, faces_count={row[2]}, manual_label={row[3]}")
     finally:
         ds.close()
 
@@ -779,6 +1060,7 @@ def api_faces_results(
                 "animals_manual_kind": (str(r.get("animals_manual_kind") or "") or "") or None,
                 "people_no_face_manual": int(r.get("people_no_face_manual") or 0),
                 "people_no_face_person": (str(r.get("people_no_face_person") or "") or "") or None,
+                "group_path": (str(r.get("group_path") or "") or "") or None if tab_n == "no_faces" else None,  # Группа для сортировки
                 "trip_group": str(r.get("trip_group") or "") or None,  # Группа поездки для группировки на UI
                 "trip_label": str(r.get("trip_label") or "") or None,  # Название поездки для отображения
                 "sorted_past_gold": bool(gold_expected.get(path) is not None and gold_expected.get(path) != tab_n),
@@ -787,6 +1069,11 @@ def api_faces_results(
             }
         )
 
+    elapsed = time.time() - start_time
+    msg = f"[API] api_faces_results: завершено за {elapsed:.3f}с, элементов: {len(items)}, всего: {total}, tab={tab_n}, subtab={subtab_n}"
+    logger.info(msg)
+    print(msg)
+    
     return {
         "ok": True,
         "pipeline_run_id": int(pipeline_run_id),
@@ -835,27 +1122,44 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
         except Exception:
             root_like = None
 
-    where = ["f.faces_run_id = ?", "f.status != 'deleted'"]
-    params: list[Any] = [face_run_id_i]
+    # Показываем файлы с faces_run_id = ? ИЛИ (видео без faces_run_id в корневой папке)
+    # Это нужно, потому что видео могут быть не обработаны для детекции лиц
+    where = ["f.status != 'deleted'"]
+    params: list[Any] = []
+    
     if root_like:
-        where.append("f.path LIKE ?")
+        # Показываем файлы с faces_run_id = ? ИЛИ видео без faces_run_id в корневой папке
+        where.append("""
+        (
+          f.faces_run_id = ?
+          OR (
+            f.faces_run_id IS NULL 
+            AND (COALESCE(f.media_type, '') = 'video' OR COALESCE(f.mime_type, '') LIKE 'video/%')
+            AND f.path LIKE ?
+          )
+        )
+        """)
+        params.append(face_run_id_i)
         params.append(root_like)
+    else:
+        # Если нет root_like, используем только faces_run_id
+        where.append("f.faces_run_id = ?")
+        params.append(face_run_id_i)
+    
     where_sql = " AND ".join(where)
 
     eff_sql = """
     CASE
-      WHEN COALESCE(m.people_no_face_manual, 0) = 1 THEN 'people_no_face'
+      WHEN COALESCE(m.people_no_face_manual, 0) = 1 THEN 'faces'
       WHEN lower(trim(coalesce(m.faces_manual_label, ''))) = 'faces' THEN 'faces'
       WHEN lower(trim(coalesce(m.faces_manual_label, ''))) = 'no_faces' THEN 'no_faces'
-      WHEN COALESCE(m.quarantine_manual, 0) = 1
-           AND COALESCE(f.faces_count, 0) > 0
-        THEN 'quarantine'
+      WHEN COALESCE(m.quarantine_manual, 0) = 1 THEN 'no_faces'
       WHEN COALESCE(m.animals_manual, 0) = 1 THEN 'animals'
       WHEN COALESCE(f.animals_auto, 0) = 1 THEN 'animals'
       WHEN COALESCE(f.faces_auto_quarantine, 0) = 1
            AND COALESCE(f.faces_count, 0) > 0
            AND lower(trim(coalesce(f.faces_quarantine_reason, ''))) != 'many_small_faces'
-        THEN 'quarantine'
+        THEN 'no_faces'
       ELSE (CASE WHEN COALESCE(f.faces_count, 0) > 0 THEN 'faces' ELSE 'no_faces' END)
     END
     """
@@ -899,10 +1203,69 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
             WHERE {where_sql}
               AND ({eff_sql}) = 'faces'
               AND COALESCE(faces_count, 0) < 8
+              AND (
+                -- Файл не привязан ни к одной персоне
+                (
+                  NOT EXISTS (
+                      SELECT 1 FROM face_labels fl
+                      JOIN face_rectangles fr ON fr.id = fl.face_rectangle_id
+                      WHERE fr.file_path = f.path AND fr.run_id = ? AND fl.person_id IS NOT NULL
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM person_rectangles pr
+                      WHERE pr.file_path = f.path AND pr.pipeline_run_id = ? AND pr.person_id IS NOT NULL
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM file_persons fp
+                      WHERE fp.file_path = f.path AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL
+                  )
+                )
+                -- ИЛИ это люди без лиц
+                OR COALESCE(m.people_no_face_manual, 0) = 1
+              )
             """,
-            [int(pipeline_run_id)] + params,
+            [int(pipeline_run_id)] + params + [face_run_id_i, int(pipeline_run_id), int(pipeline_run_id)],
         )
         unsorted_cnt = int(cur.fetchone()[0] or 0)
+        
+        # Счетчик для "Фото к разбору" в "Нет людей" (файлы без группы, только фото)
+        cur.execute(
+            f"""
+            SELECT COUNT(*) AS cnt
+            FROM files f
+            LEFT JOIN files_manual_labels m
+              ON m.pipeline_run_id = ? AND m.path = f.path
+            WHERE {where_sql}
+              AND ({eff_sql}) = 'no_faces'
+              AND NOT EXISTS (
+                  SELECT 1 FROM file_groups fg
+                  WHERE fg.file_path = f.path AND fg.pipeline_run_id = ?
+              )
+              AND (COALESCE(f.media_type, '') = 'image' OR COALESCE(f.media_type, '') = '')
+              AND NOT (COALESCE(f.mime_type, '') LIKE 'video/%')
+            """,
+            [int(pipeline_run_id)] + params + [int(pipeline_run_id)],
+        )
+        no_faces_unsorted_photos_cnt = int(cur.fetchone()[0] or 0)
+        
+        # Счетчик для "Видео к разбору" в "Нет людей" (файлы без группы, только видео)
+        cur.execute(
+            f"""
+            SELECT COUNT(*) AS cnt
+            FROM files f
+            LEFT JOIN files_manual_labels m
+              ON m.pipeline_run_id = ? AND m.path = f.path
+            WHERE {where_sql}
+              AND ({eff_sql}) = 'no_faces'
+              AND NOT EXISTS (
+                  SELECT 1 FROM file_groups fg
+                  WHERE fg.file_path = f.path AND fg.pipeline_run_id = ?
+              )
+              AND (COALESCE(f.media_type, '') = 'video' OR COALESCE(f.mime_type, '') LIKE 'video/%')
+            """,
+            [int(pipeline_run_id)] + params + [int(pipeline_run_id)],
+        )
+        no_faces_unsorted_videos_cnt = int(cur.fetchone()[0] or 0)
     finally:
         ds.close()
 
@@ -915,8 +1278,357 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
         "ok": True,
         "pipeline_run_id": int(pipeline_run_id),
         "counts": counts,
-        "subcounts": {"faces": {"many_faces": many_faces_cnt, "unsorted": unsorted_cnt}},
+        "subcounts": {
+            "faces": {"many_faces": many_faces_cnt, "unsorted": unsorted_cnt},
+            "no_faces": {
+                "unsorted_photos": no_faces_unsorted_photos_cnt,
+                "unsorted_videos": no_faces_unsorted_videos_cnt
+            }
+        },
     }
+
+
+@router.get("/api/faces/persons-with-files")
+def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
+    """
+    Возвращает список персон, у которых есть файлы в данном прогоне.
+    Используется для отображения подзакладок по персонам в закладке "Люди".
+    """
+    start_time = time.time()
+    msg = f"[API] api_faces_persons_with_files: начало, pipeline_run_id={pipeline_run_id}"
+    logger.info(msg)
+    print(msg)
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    face_run_id = pr.get("face_run_id")
+    if not face_run_id:
+        raise HTTPException(status_code=400, detail="face_run_id is not set yet (step 3 not started)")
+    face_run_id_i = int(face_run_id)
+    root_path = str(pr.get("root_path") or "")
+
+    root_like = None
+    if root_path.startswith("disk:"):
+        rp = root_path.rstrip("/")
+        root_like = rp + "/%"
+    else:
+        try:
+            rp_abs = os.path.abspath(root_path)
+            rp_abs = rp_abs.rstrip("\\/") + "\\"
+            root_like = "local:" + rp_abs + "%"
+        except Exception:
+            root_like = None
+
+    fs = FaceStore()
+    try:
+        conn = fs.conn
+        cur = conn.cursor()
+        
+        # Получаем персон с файлами через все 4 способа привязки
+        # 1. Через лица (face_labels) - прямая привязка
+        where_parts = ["fr.run_id = ?"]
+        params = [face_run_id_i]
+        if root_like:
+            where_parts.append("fr.file_path LIKE ?")
+            params.append(root_like)
+        where_sql = " AND ".join(where_parts)
+        
+        # Персоны через лица (прямая привязка)
+        query1_start = time.time()
+        cur.execute(
+            f"""
+            SELECT DISTINCT fl.person_id, p.name AS person_name, COUNT(DISTINCT fr.file_path) AS files_count
+            FROM face_labels fl
+            JOIN face_rectangles fr ON fr.id = fl.face_rectangle_id
+            LEFT JOIN persons p ON p.id = fl.person_id
+            WHERE {where_sql} AND fl.person_id IS NOT NULL
+            GROUP BY fl.person_id, p.name
+            """,
+            params,
+        )
+        persons_from_faces = {r["person_id"]: {"id": r["person_id"], "name": r["person_name"], "files_count": int(r["files_count"] or 0)} for r in cur.fetchall()}
+        query1_time = time.time() - query1_start
+        msg = f"[API] api_faces_persons_with_files: запрос 1 (face_labels) занял {query1_time:.3f}с, персон: {len(persons_from_faces)}"
+        logger.info(msg)
+        print(msg)
+        
+        # 1b. Через кластеры (лицо в файле находится в кластере, где есть другие лица с face_labels для персоны)
+        where_parts_cluster = ["fr_cluster.run_id = ?"]
+        params_cluster = [face_run_id_i]
+        if root_like:
+            where_parts_cluster.append("fr_cluster.file_path LIKE ?")
+            params_cluster.append(root_like)
+        where_sql_cluster = " AND ".join(where_parts_cluster)
+        
+        query2_start = time.time()
+        # Оптимизированный запрос: используем подзапрос для кластеров с персонами
+        # Это должно быть быстрее, чем множественные JOIN'ы
+        cur.execute(
+            f"""
+            SELECT 
+                person_clusters.person_id,
+                p.name AS person_name,
+                COUNT(DISTINCT fr_cluster.file_path) AS files_count
+            FROM (
+                -- Находим все кластеры, где есть лица с привязанными персонами
+                SELECT DISTINCT
+                    fl_cluster.person_id,
+                    fcm_labeled.cluster_id
+                FROM face_labels fl_cluster
+                JOIN face_cluster_members fcm_labeled ON fcm_labeled.face_rectangle_id = fl_cluster.face_rectangle_id
+                JOIN face_clusters fc ON fc.id = fcm_labeled.cluster_id
+                WHERE fl_cluster.person_id IS NOT NULL
+                  AND (fc.run_id = ? OR fc.archive_scope = 'archive')
+            ) person_clusters
+            -- Находим все лица в этих кластерах
+            JOIN face_cluster_members fcm_all ON fcm_all.cluster_id = person_clusters.cluster_id
+            JOIN face_rectangles fr_cluster ON fr_cluster.id = fcm_all.face_rectangle_id
+            LEFT JOIN persons p ON p.id = person_clusters.person_id
+            WHERE {where_sql_cluster}
+              AND COALESCE(fr_cluster.ignore_flag, 0) = 0
+              -- Исключаем лица, которые уже учтены в запросе 1 (прямая привязка)
+              AND NOT EXISTS (
+                  SELECT 1 FROM face_labels fl_direct
+                  WHERE fl_direct.face_rectangle_id = fr_cluster.id
+                    AND fl_direct.person_id = person_clusters.person_id
+              )
+            GROUP BY person_clusters.person_id, p.name
+            """,
+            [face_run_id_i] + params_cluster,
+        )
+        persons_from_clusters = {r["person_id"]: {"id": r["person_id"], "name": r["person_name"], "files_count": int(r["files_count"] or 0)} for r in cur.fetchall()}
+        query2_time = time.time() - query2_start
+        msg = f"[API] api_faces_persons_with_files: запрос 2 (clusters) занял {query2_time:.3f}с, персон: {len(persons_from_clusters)}"
+        logger.info(msg)
+        print(msg)
+        
+        # 2. Через прямоугольники без лица (person_rectangles)
+        where_parts2 = ["pr.pipeline_run_id = ?"]
+        params2 = [int(pipeline_run_id)]
+        if root_like:
+            where_parts2.append("pr.file_path LIKE ?")
+            params2.append(root_like)
+        where_sql2 = " AND ".join(where_parts2)
+        
+        query3_start = time.time()
+        cur.execute(
+            f"""
+            SELECT DISTINCT pr.person_id, p.name AS person_name, COUNT(DISTINCT pr.file_path) AS files_count
+            FROM person_rectangles pr
+            LEFT JOIN persons p ON p.id = pr.person_id
+            WHERE {where_sql2} AND pr.person_id IS NOT NULL
+            GROUP BY pr.person_id, p.name
+            """,
+            params2,
+        )
+        persons_from_rects = {r["person_id"]: {"id": r["person_id"], "name": r["person_name"], "files_count": int(r["files_count"] or 0)} for r in cur.fetchall()}
+        query3_time = time.time() - query3_start
+        msg = f"[API] api_faces_persons_with_files: запрос 3 (person_rectangles) занял {query3_time:.3f}с, персон: {len(persons_from_rects)}"
+        logger.info(msg)
+        print(msg)
+        
+        # 3. Прямые привязки (file_persons)
+        where_parts3 = ["fp.pipeline_run_id = ?"]
+        params3 = [int(pipeline_run_id)]
+        if root_like:
+            where_parts3.append("fp.file_path LIKE ?")
+            params3.append(root_like)
+        where_sql3 = " AND ".join(where_parts3)
+        
+        query4_start = time.time()
+        cur.execute(
+            f"""
+            SELECT DISTINCT fp.person_id, p.name AS person_name, COUNT(DISTINCT fp.file_path) AS files_count
+            FROM file_persons fp
+            LEFT JOIN persons p ON p.id = fp.person_id
+            WHERE {where_sql3} AND fp.person_id IS NOT NULL
+            GROUP BY fp.person_id, p.name
+            """,
+            params3,
+        )
+        persons_from_direct = {r["person_id"]: {"id": r["person_id"], "name": r["person_name"], "files_count": int(r["files_count"] or 0)} for r in cur.fetchall()}
+        query4_time = time.time() - query4_start
+        msg = f"[API] api_faces_persons_with_files: запрос 4 (file_persons) занял {query4_time:.3f}с, персон: {len(persons_from_direct)}"
+        logger.info(msg)
+        print(msg)
+        
+        # Объединяем все персоны и суммируем количество файлов
+        all_persons: dict[int, dict[str, Any]] = {}
+        for pid, pdata in persons_from_faces.items():
+            all_persons[pid] = {"id": pid, "name": pdata["name"], "files_count": pdata["files_count"]}
+        for pid, pdata in persons_from_clusters.items():
+            if pid in all_persons:
+                all_persons[pid]["files_count"] += pdata["files_count"]
+            else:
+                all_persons[pid] = {"id": pid, "name": pdata["name"], "files_count": pdata["files_count"]}
+        for pid, pdata in persons_from_rects.items():
+            if pid in all_persons:
+                all_persons[pid]["files_count"] += pdata["files_count"]
+            else:
+                all_persons[pid] = {"id": pid, "name": pdata["name"], "files_count": pdata["files_count"]}
+        for pid, pdata in persons_from_direct.items():
+            if pid in all_persons:
+                all_persons[pid]["files_count"] += pdata["files_count"]
+            else:
+                all_persons[pid] = {"id": pid, "name": pdata["name"], "files_count": pdata["files_count"]}
+        
+        # Сортируем по имени
+        persons_list = sorted(all_persons.values(), key=lambda x: (x["name"] or "").lower())
+        
+        elapsed = time.time() - start_time
+        msg = f"[API] api_faces_persons_with_files: завершено за {elapsed:.3f}с, персон: {len(persons_list)}"
+        logger.info(msg)
+        print(msg)
+        
+    finally:
+        fs.close()
+    
+    return {
+        "ok": True,
+        "pipeline_run_id": int(pipeline_run_id),
+        "persons": persons_list,
+    }
+
+
+@router.get("/api/faces/groups-with-files")
+def api_faces_groups_with_files(pipeline_run_id: int) -> dict[str, Any]:
+    """
+    Возвращает список групп с количеством файлов для прогона.
+    Используется для отображения подзакладок в закладке "Нет людей".
+    """
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    
+    fs = FaceStore()
+    try:
+        groups = fs.list_file_groups_with_counts(pipeline_run_id=int(pipeline_run_id))
+        # Возвращаем группы как есть, без нормализации "налету"
+    finally:
+        fs.close()
+    
+    return {
+        "ok": True,
+        "pipeline_run_id": int(pipeline_run_id),
+        "groups": groups,
+    }
+
+
+@router.post("/api/faces/assign-group")
+def api_faces_assign_group(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Назначает файл в группу (file_groups).
+    Параметры: pipeline_run_id, path, group_path
+    """
+    pipeline_run_id = payload.get("pipeline_run_id")
+    path = payload.get("path")
+    group_path = payload.get("group_path")
+    
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required")
+    if not isinstance(path, str) or not (path.startswith("local:") or path.startswith("disk:")):
+        raise HTTPException(status_code=400, detail="path must start with local: or disk:")
+    if not isinstance(group_path, str) or not group_path.strip():
+        raise HTTPException(status_code=400, detail="group_path is required")
+    
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    
+    fs = FaceStore()
+    try:
+        # Сохраняем group_path как есть (данные должны быть нормализованы в БД через миграцию)
+        normalized_group_path = str(group_path).strip()
+        
+        # Проверяем, что группа не пустая
+        if not normalized_group_path:
+            raise HTTPException(status_code=400, detail="group_path cannot be empty")
+        
+        print(f"[DEBUG assign-group] Получено: pipeline_run_id={pipeline_run_id} (type: {type(pipeline_run_id)}), path={repr(path)} (type: {type(path)}), group_path={repr(group_path)} (type: {type(group_path)})")
+        print(f"[DEBUG assign-group] Нормализовано: path={repr(str(path))}, group_path={repr(normalized_group_path)}")
+        
+        try:
+            fs.insert_file_group(
+                pipeline_run_id=int(pipeline_run_id),
+                file_path=str(path),
+                group_path=normalized_group_path,
+            )
+            print(f"[DEBUG assign-group] INSERT выполнен успешно")
+        except Exception as e:
+            print(f"[DEBUG assign-group] ОШИБКА при INSERT: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+        
+        # Проверяем, что группа действительно сохранилась
+        groups = fs.list_file_groups(
+            pipeline_run_id=int(pipeline_run_id),
+            file_path=str(path),
+        )
+        print(f"[DEBUG assign-group] После сохранения найдено групп для файла: {len(groups)}")
+        for g in groups:
+            print(f"[DEBUG assign-group]   Группа: {repr(g.get('group_path'))}")
+        
+        saved = any(g.get("group_path") == normalized_group_path for g in groups)
+        if not saved:
+            print(f"[DEBUG assign-group] ОШИБКА: Группа не сохранилась! Искали: {repr(normalized_group_path)}, нашли: {[repr(g.get('group_path')) for g in groups]}")
+            raise HTTPException(status_code=500, detail=f"Failed to save group assignment. Expected: '{normalized_group_path}', found: {[g.get('group_path') for g in groups]}")
+        else:
+            print(f"[DEBUG assign-group] ✅ Группа успешно сохранена и проверена")
+    finally:
+        fs.close()
+    
+    return {"ok": True, "group_path": normalized_group_path}
+
+
+@router.post("/api/faces/remove-group")
+def api_faces_remove_group(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Удаляет файл из группы.
+    Параметры: pipeline_run_id, path, group_path
+    """
+    pipeline_run_id = payload.get("pipeline_run_id")
+    path = payload.get("path")
+    group_path = payload.get("group_path")
+    
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required")
+    if not isinstance(path, str) or not (path.startswith("local:") or path.startswith("disk:")):
+        raise HTTPException(status_code=400, detail="path must start with local: or disk:")
+    if not isinstance(group_path, str):
+        raise HTTPException(status_code=400, detail="group_path is required")
+    
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    
+    fs = FaceStore()
+    try:
+        fs.delete_file_group(
+            pipeline_run_id=int(pipeline_run_id),
+            file_path=str(path),
+            group_path=str(group_path),
+        )
+    finally:
+        fs.close()
+    
+    return {"ok": True}
 
 
 @router.get("/api/faces/rectangles")
@@ -931,12 +1643,268 @@ def api_faces_rectangles(pipeline_run_id: int, path: str) -> dict[str, Any]:
     face_run_id = pr.get("face_run_id")
     if not face_run_id:
         raise HTTPException(status_code=400, detail="face_run_id is not set yet")
+    face_run_id_i = int(face_run_id)
+    
     fs = FaceStore()
     try:
-        rects = fs.list_rectangles(run_id=int(face_run_id), file_path=str(path))
+        rects = fs.list_rectangles(run_id=face_run_id_i, file_path=str(path))
+        
+        # Добавляем информацию о персонах для каждого прямоугольника
+        ds = DedupStore()
+        try:
+            conn = ds.conn
+            cur = conn.cursor()
+            
+            # Получаем информацию о персонах для каждого прямоугольника
+            for rect in rects:
+                rect_id = rect.get("id")
+                if not rect_id:
+                    continue
+                
+                # Ищем персону через face_labels
+                cur.execute("""
+                    SELECT fl.person_id, p.name AS person_name
+                    FROM face_labels fl
+                    LEFT JOIN persons p ON p.id = fl.person_id
+                    WHERE fl.face_rectangle_id = ? AND fl.person_id IS NOT NULL
+                    LIMIT 1
+                """, (rect_id,))
+                person_row = cur.fetchone()
+                if person_row:
+                    rect["person_id"] = person_row["person_id"]
+                    rect["person_name"] = person_row["person_name"]
+                else:
+                    rect["person_id"] = None
+                    rect["person_name"] = None
+        finally:
+            ds.close()
     finally:
         fs.close()
-    return {"ok": True, "pipeline_run_id": int(pipeline_run_id), "run_id": int(face_run_id), "path": path, "rectangles": rects}
+    
+    return {"ok": True, "pipeline_run_id": int(pipeline_run_id), "run_id": face_run_id_i, "path": path, "rectangles": rects}
+
+
+@router.post("/api/faces/assign-face-person")
+def api_faces_assign_face_person(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Назначает персону лицу (face_rectangle_id).
+    
+    Параметры:
+    - pipeline_run_id: int (обязательно)
+    - face_rectangle_id: int (обязательно)
+    - person_id: int (обязательно)
+    """
+    pipeline_run_id = payload.get("pipeline_run_id")
+    face_rectangle_id = payload.get("face_rectangle_id")
+    person_id = payload.get("person_id")
+    
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required and must be int")
+    if not isinstance(face_rectangle_id, int):
+        raise HTTPException(status_code=400, detail="face_rectangle_id is required and must be int")
+    if not isinstance(person_id, int):
+        raise HTTPException(status_code=400, detail="person_id is required and must be int")
+    
+    # Проверяем, что pipeline_run_id существует
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+        if not pr:
+            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    finally:
+        ps.close()
+    
+    # Проверяем, что лицо существует
+    fs = FaceStore()
+    try:
+        conn = fs.conn
+        cur = conn.cursor()
+        cur.execute("SELECT id, file_path FROM face_rectangles WHERE id = ?", (int(face_rectangle_id),))
+        face_row = cur.fetchone()
+        if not face_row:
+            raise HTTPException(status_code=404, detail="face_rectangle_id not found")
+        
+        # Проверяем, что персона существует
+        cur.execute("SELECT id, name FROM persons WHERE id = ?", (int(person_id),))
+        person_row = cur.fetchone()
+        if not person_row:
+            raise HTTPException(status_code=404, detail="person_id not found")
+        
+        # Создаем или обновляем face_labels
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        
+        cur.execute("""
+            INSERT OR REPLACE INTO face_labels (face_rectangle_id, person_id, source, created_at)
+            VALUES (?, ?, 'manual', ?)
+        """, (int(face_rectangle_id), int(person_id), now))
+        conn.commit()
+    finally:
+        fs.close()
+    
+    return {
+        "ok": True,
+        "pipeline_run_id": int(pipeline_run_id),
+        "face_rectangle_id": int(face_rectangle_id),
+        "person_id": int(person_id),
+        "person_name": person_row["name"],
+    }
+
+
+@router.get("/api/faces/file-persons")
+def api_faces_file_persons(pipeline_run_id: int, path: str) -> dict[str, Any]:
+    """
+    Возвращает список персон, привязанных к файлу (через любые способы), с информацией о лицах.
+    """
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    face_run_id = pr.get("face_run_id")
+    if not face_run_id:
+        raise HTTPException(status_code=400, detail="face_run_id is not set yet")
+    face_run_id_i = int(face_run_id)
+    
+    fs = FaceStore()
+    ds = DedupStore()
+    try:
+        # Используем подключение из FaceStore для работы с face_labels и face_rectangles
+        fs_cur = fs.conn.cursor()
+        # Используем подключение из DedupStore для работы с persons, person_rectangles и file_persons
+        ds_cur = ds.conn.cursor()
+        persons_set = {}
+        
+        # 1. Через face_labels (лица) - получаем информацию о лицах (прямая привязка)
+        fs_cur.execute("""
+            SELECT 
+                fl.person_id, 
+                p.name AS person_name,
+                fr.id AS face_rectangle_id,
+                fr.bbox_x AS x,
+                fr.bbox_y AS y,
+                fr.bbox_w AS w,
+                fr.bbox_h AS h
+            FROM face_labels fl
+            JOIN face_rectangles fr ON fr.id = fl.face_rectangle_id
+            LEFT JOIN persons p ON p.id = fl.person_id
+            WHERE fr.file_path = ? AND fr.run_id = ? AND fl.person_id IS NOT NULL
+            ORDER BY fr.id
+        """, (str(path), face_run_id_i))
+        for row in fs_cur.fetchall():
+            pid = row["person_id"]
+            if pid not in persons_set:
+                persons_set[pid] = {
+                    "id": pid, 
+                    "name": row["person_name"],
+                    "faces": []
+                }
+            persons_set[pid]["faces"].append({
+                "id": row["face_rectangle_id"],
+                "x": row["x"],
+                "y": row["y"],
+                "w": row["w"],
+                "h": row["h"]
+            })
+        
+        # 1b. Через кластеры (лицо в файле находится в кластере, где есть другие лица с face_labels для персоны)
+        # Логика из analyze_person_distribution.py:
+        # - Находим кластеры, где есть лица с face_labels для персоны
+        # - Находим ВСЕ лица в этих кластерах (включая новые, без face_labels)
+        # - Если лицо из файла находится в таком кластере, оно считается привязанным к персоне
+        # Важно: показываем персону только если хотя бы одно лицо в файле находится в кластере с этой персоной
+        fs_cur.execute("""
+            SELECT DISTINCT
+                fl_cluster.person_id,
+                p.name AS person_name,
+                fr_file.id AS face_rectangle_id,
+                fr_file.bbox_x AS x,
+                fr_file.bbox_y AS y,
+                fr_file.bbox_w AS w,
+                fr_file.bbox_h AS h
+            FROM persons p
+            JOIN face_labels fl_cluster ON fl_cluster.person_id = p.id
+            -- Находим кластеры, где есть лица с face_labels для этой персоны
+            JOIN face_cluster_members fcm_labeled ON fcm_labeled.face_rectangle_id = fl_cluster.face_rectangle_id
+            JOIN face_clusters fc ON fc.id = fcm_labeled.cluster_id
+            -- Находим ВСЕ лица в этих кластерах (включая лица из нашего файла)
+            JOIN face_cluster_members fcm_all ON fcm_all.cluster_id = fc.id
+            JOIN face_rectangles fr_file ON fr_file.id = fcm_all.face_rectangle_id
+            WHERE fr_file.file_path = ?
+              AND fr_file.run_id = ?
+              AND COALESCE(fr_file.ignore_flag, 0) = 0
+              AND (fc.run_id = ? OR fc.archive_scope = 'archive')
+              -- Исключаем лица, которые уже есть в прямой привязке (face_labels) для этой персоны
+              AND NOT EXISTS (
+                  SELECT 1 FROM face_labels fl_direct
+                  WHERE fl_direct.face_rectangle_id = fr_file.id
+                    AND fl_direct.person_id = fl_cluster.person_id
+              )
+              -- Исключаем случаи, когда лицо из файла само имеет face_label для другой персоны
+              -- (т.е. если лицо уже привязано к другой персоне напрямую, не показываем его через кластеры)
+              AND NOT EXISTS (
+                  SELECT 1 FROM face_labels fl_other
+                  WHERE fl_other.face_rectangle_id = fr_file.id
+                    AND fl_other.person_id IS NOT NULL
+              )
+            ORDER BY fl_cluster.person_id, fr_file.id
+        """, (str(path), face_run_id_i, face_run_id_i))
+        for row in fs_cur.fetchall():
+            pid = row["person_id"]
+            if pid not in persons_set:
+                persons_set[pid] = {
+                    "id": pid, 
+                    "name": row["person_name"],
+                    "faces": []
+                }
+            # Проверяем, что это лицо еще не добавлено (может быть дубликат из-за нескольких кластеров)
+            face_id = row["face_rectangle_id"]
+            if not any(f["id"] == face_id for f in persons_set[pid]["faces"]):
+                persons_set[pid]["faces"].append({
+                    "id": face_id,
+                    "x": row["x"],
+                    "y": row["y"],
+                    "w": row["w"],
+                    "h": row["h"]
+                })
+        
+        # 2. Через person_rectangles
+        ds_cur.execute("""
+            SELECT DISTINCT pr.person_id, p.name AS person_name
+            FROM person_rectangles pr
+            LEFT JOIN persons p ON p.id = pr.person_id
+            WHERE pr.file_path = ? AND pr.pipeline_run_id = ? AND pr.person_id IS NOT NULL
+        """, (str(path), int(pipeline_run_id)))
+        for row in ds_cur.fetchall():
+            pid = row["person_id"]
+            if pid not in persons_set:
+                persons_set[pid] = {"id": pid, "name": row["person_name"], "faces": []}
+        
+        # 3. Через file_persons (прямая привязка)
+        ds_cur.execute("""
+            SELECT DISTINCT fp.person_id, p.name AS person_name
+            FROM file_persons fp
+            LEFT JOIN persons p ON p.id = fp.person_id
+            WHERE fp.file_path = ? AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL
+        """, (str(path), int(pipeline_run_id)))
+        for row in ds_cur.fetchall():
+            pid = row["person_id"]
+            if pid not in persons_set:
+                persons_set[pid] = {"id": pid, "name": row["person_name"], "faces": []}
+        
+        persons_list = list(persons_set.values())
+    finally:
+        fs.close()
+        ds.close()
+    
+    return {
+        "ok": True,
+        "pipeline_run_id": int(pipeline_run_id),
+        "path": path,
+        "persons": persons_list,
+    }
 
 
 @router.post("/api/faces/manual-label")
@@ -1581,6 +2549,8 @@ def api_faces_delete(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
                 effective_tab = "quarantine"
             elif r.get("animals_manual"):
                 effective_tab = "animals"
+            elif r.get("faces_auto_quarantine") and r.get("faces_count", 0) > 0:
+                effective_tab = "quarantine"
             elif r.get("faces_count", 0) > 0:
                 effective_tab = "faces"
 

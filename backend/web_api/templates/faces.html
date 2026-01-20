@@ -89,6 +89,28 @@
       .imgwrap img { max-width: 92vw; max-height: calc(92vh - 130px); width: auto; height: auto; display: block; background: #111827; }
       .imgwrap video { max-width: 92vw; max-height: calc(92vh - 130px); width: auto; height: auto; display: block; background: #111827; }
       .imgwrap canvas { position: absolute; left: 0; top: 0; pointer-events: auto; }
+      .lb-rectangle-label { 
+        position: absolute; 
+        background: rgba(250, 204, 21, 0.95); 
+        color: #111827; 
+        padding: 3px 8px; 
+        font-size: 12px; 
+        font-weight: 700; 
+        border-radius: 4px; 
+        white-space: nowrap; 
+        z-index: 10001; 
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+        border: 1px solid rgba(250, 204, 21, 1);
+        max-width: 200px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        pointer-events: none;
+      }
+      .lb-rectangle-label.manual {
+        background: rgba(59, 130, 246, 0.95);
+        color: #fff;
+        border-color: rgba(59, 130, 246, 1);
+      }
       .lb-bottom { padding: 10px 12px; border-top: 1px solid #e5e7eb; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
       .rectlist { display:flex; gap:8px; flex-wrap:wrap; }
       .rectpill { display:inline-block; padding:2px 8px; border-radius:999px; background:#eef2ff; color:#1f2937; font-size:12px; }
@@ -126,17 +148,25 @@
         </div>
 
         <div class="tabs">
-          <button class="tab active" id="tabFaces" type="button">Есть лица</button>
-          <button class="tab" id="tabQuarantine" type="button">Карантин</button>
+          <button class="tab active" id="tabFaces" type="button">Люди</button>
+          <button class="tab" id="tabQuarantine" type="button" style="display:none;">Карантин</button>
           <button class="tab" id="tabAnimals" type="button">Животные</button>
-          <button class="tab" id="tabPeopleNoFace" type="button">Есть люди (без лиц)</button>
-          <button class="tab" id="tabNoFaces" type="button">Нет лиц</button>
+          <button class="tab" id="tabPeopleNoFace" type="button" style="display:none;">Есть люди (без лиц)</button>
+          <button class="tab" id="tabNoFaces" type="button">Нет людей</button>
         </div>
 
-        <!-- 2-й уровень (постепенно): пока только для "Есть лица" -->
+        <!-- 2-й уровень: подзакладки для "Люди" -->
         <div class="subtabs" id="subtabsFaces" style="display:none;">
-          <button class="subtab active" id="subFacesAll" type="button">Неотсортировано</button>
+          <button class="subtab active" id="subFacesUnsorted" type="button">К разбору</button>
           <button class="subtab" id="subFacesMany" type="button">Много лиц</button>
+          <!-- Динамические подзакладки по персонам будут добавлены через JS -->
+        </div>
+        
+        <!-- 2-й уровень: подзакладки для "Нет людей" -->
+        <div class="subtabs" id="subtabsNoFaces" style="display:none;">
+          <button class="subtab active" id="subNoFacesUnsortedPhotos" type="button">Фото к разбору</button>
+          <button class="subtab" id="subNoFacesUnsortedVideos" type="button">Видео к разбору</button>
+          <!-- Динамические подзакладки по группам будут добавлены через JS -->
         </div>
 
         <div class="toolbar">
@@ -190,11 +220,94 @@
         <div class="lb-bottom">
           <div class="muted">Прямоугольники:</div>
           <div class="rectlist" id="rectList"></div>
+          <div style="margin-top:8px; font-size:11px; color:#6b7280;">
+            Двойной клик по прямоугольнику — назначить персону
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Модальное окно для выбора персоны -->
+    <div class="lb" id="modalPerson" style="display:none;" aria-hidden="true">
+      <div class="lb-panel" role="dialog" aria-modal="true" style="max-width: 500px;">
+        <div class="lb-top">
+          <div style="font-weight:700;">Назначить персону</div>
+          <button class="btn" type="button" onclick="closePersonModal()" style="padding:4px 8px;">✕</button>
+        </div>
+        <div style="padding: 16px;">
+          <div style="margin-bottom:12px; display:flex; align-items:center; gap:8px;">
+            <input type="checkbox" id="checkboxMultiplePersons" style="width:18px; height:18px; cursor:pointer;" />
+            <label for="checkboxMultiplePersons" style="font-weight:700; cursor:pointer;">Персона не одна (выбрать несколько)</label>
+          </div>
+          
+          <!-- Режим одной персоны -->
+          <div id="singlePersonMode" style="margin-top:12px;">
+            <div style="margin-bottom:12px; font-weight:700;">Выберите персону:</div>
+            <select id="selectPerson" style="width:100%; border:1px solid #d1d5db; border-radius:10px; padding:8px 10px; font-size:14px; margin-bottom:16px;">
+              <option value="">Выберите персону...</option>
+            </select>
+            <div style="margin-top:16px; padding-top:16px; border-top:1px solid #e5e7eb;">
+              <div style="margin-bottom:8px; font-weight:700;">Или создайте новую:</div>
+              <input type="text" id="inputNewPersonName" placeholder="Имя персоны" style="width:100%; border:1px solid #d1d5db; border-radius:10px; padding:8px 10px; font-size:14px; margin-bottom:8px;" />
+            </div>
+          </div>
+          
+          <!-- Режим нескольких персон -->
+          <div id="multiplePersonsMode" style="margin-top:12px; display:none;">
+            <div style="margin-bottom:12px; font-weight:700;">Выберите персон (можно несколько):</div>
+            <div id="personsCheckboxList" style="max-height:300px; overflow-y:auto; border:1px solid #d1d5db; border-radius:10px; padding:8px; background:#f9fafb;">
+              <!-- Список персон с чекбоксами будет добавлен через JS -->
+            </div>
+            <div style="margin-top:12px; padding-top:12px; border-top:1px solid #e5e7eb;">
+              <div style="margin-bottom:8px; font-weight:700;">Или создайте новую:</div>
+              <input type="text" id="inputNewPersonNameMultiple" placeholder="Имя персоны" style="width:100%; border:1px solid #d1d5db; border-radius:10px; padding:8px 10px; font-size:14px; margin-bottom:8px;" />
+            </div>
+          </div>
+          
+          <button class="btn" type="button" onclick="assignSelectedPerson()" style="width:100%; margin-top:16px;">Назначить</button>
+        </div>
+        <div class="lb-bottom" style="justify-content:flex-end;">
+          <button class="btn" type="button" onclick="closePersonModal()">Отмена</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Модальное окно для выбора группы -->
+    <div class="lb" id="modalGroup" style="display:none;" aria-hidden="true">
+      <div class="lb-panel" role="dialog" aria-modal="true" style="max-width: 400px;">
+        <div class="lb-top">
+          <div style="font-weight:700;">Назначить группу</div>
+          <button class="btn" type="button" onclick="closeGroupModal()" style="padding:4px 8px;">✕</button>
+        </div>
+        <div style="padding: 16px;">
+          <div style="margin-bottom:12px; font-weight:700;">Выберите группу:</div>
+          <select id="selectGroup" style="width:100%; border:1px solid #d1d5db; border-radius:10px; padding:8px 10px; font-size:14px; margin-bottom:16px;">
+            <option value="">Выберите группу...</option>
+          </select>
+          <div style="margin-top:16px; padding-top:16px; border-top:1px solid #e5e7eb;">
+            <div style="margin-bottom:8px; font-weight:700;">Или создайте новую:</div>
+            <input type="text" id="inputNewGroupPath" placeholder="Например: Поездки\\2025 Италия" style="width:100%; border:1px solid #d1d5db; border-radius:10px; padding:8px 10px; font-size:14px; margin-bottom:8px;" />
+            <button class="btn" type="button" onclick="assignSelectedGroup()" style="width:100%;">Назначить</button>
+          </div>
+        </div>
+        <div class="lb-bottom" style="justify-content:flex-end;">
+          <button class="btn" type="button" onclick="closeGroupModal()">Отмена</button>
         </div>
       </div>
     </div>
 
     <script>
+      // Глобальная обработка ошибок для предотвращения перезагрузки страницы
+      window.addEventListener("error", (event) => {
+        console.error("[global-error]", event.error || event.message, event.filename, event.lineno);
+        event.preventDefault(); // Предотвращаем стандартную обработку ошибки
+        return true; // Сообщаем, что ошибка обработана
+      });
+      window.addEventListener("unhandledrejection", (event) => {
+        console.error("[unhandled-rejection]", event.reason);
+        event.preventDefault(); // Предотвращаем вывод в консоль по умолчанию
+      });
+      
       function qs(sel, el=document) { return el.querySelector(sel); }
       function qsa(sel, el=document) { return Array.from(el.querySelectorAll(sel)); }
       function escapeHtml(s) {
@@ -228,7 +341,7 @@
 
       let pipelineRunId = null;
       let tab = "faces";
-      let subtab = "all"; // 2-й уровень (используем пока только для tab=faces)
+      let subtab = "unsorted"; // 2-й уровень: "unsorted" (К разбору), "unsorted_photos" (Фото к разбору), "unsorted_videos" (Видео к разбору), "many_faces" (Много лиц), "person_<id>" (по персонам), "group_<path>" (по группам)
       let page = 1;
       const pageSize = 60;
       let loading = false;
@@ -284,11 +397,26 @@
       }, { root: null, threshold: 0.1 });
 
       function observeNewCards() {
-        _cards().forEach(el => {
-          if (el.getAttribute("data-observed") === "1") return;
+        // Ограничиваем количество одновременно наблюдаемых элементов для производительности
+        const maxObserved = 150; // максимум 150 элементов в IntersectionObserver (уменьшено)
+        const cards = _cards();
+        const unobserved = cards.filter(el => el.getAttribute("data-observed") !== "1");
+        // Берем только последние элементы (те, что видимы или недавно добавлены)
+        const toObserve = unobserved.slice(-maxObserved);
+        toObserve.forEach(el => {
           el.setAttribute("data-observed", "1");
-          try { cardIo.observe(el); } catch (e) {}
+          try { cardIo.observe(el); } catch (e) {
+            console.warn("[observeNewCards] Ошибка наблюдения за элементом:", e);
+          }
         });
+        // Если элементов слишком много, прекращаем наблюдение за старыми
+        if (cards.length > maxObserved) {
+          const oldCards = cards.slice(0, cards.length - maxObserved);
+          oldCards.forEach(el => {
+            try { cardIo.unobserve(el); } catch (e) {}
+            el.removeAttribute("data-observed");
+          });
+        }
       }
 
       function removeCardByPath(path) {
@@ -307,17 +435,33 @@
 
       // init tab/subtab from query (до первого load)
       tab = (getParam("tab") || tab || "faces").toString().trim().toLowerCase() || "faces";
-      if (!["faces","quarantine","animals","people_no_face","no_faces"].includes(tab)) tab = "faces";
-      subtab = (getParam("subtab") || subtab || "all").toString().trim().toLowerCase() || "all";
-      if (!["all","many_faces"].includes(subtab)) subtab = "all";
-      if (tab !== "faces") subtab = "all";
+      // Карантин теперь показывается в "Нет людей"
+      if (tab === "quarantine") tab = "no_faces";
+      if (!["faces","animals","people_no_face","no_faces"].includes(tab)) tab = "faces";
+      subtab = (getParam("subtab") || subtab || "unsorted").toString().trim().toLowerCase() || "unsorted";
+      // Поддерживаем старый формат "all" для совместимости
+      if (subtab === "all") subtab = "unsorted";
+      if (tab === "no_faces" && (subtab === "unsorted" || subtab === "all")) {
+        subtab = "unsorted_photos"; // По умолчанию "Фото к разбору" для "Нет людей"
+      }
+      if (tab === "faces") {
+        if (!["unsorted","many_faces"].includes(subtab) && !subtab.startsWith("person_")) {
+          subtab = "unsorted";
+        }
+      } else if (tab === "no_faces") {
+        if (!["unsorted_photos", "unsorted_videos"].includes(subtab) && !subtab.startsWith("group_")) {
+          subtab = "unsorted_photos";
+        }
+      } else {
+        subtab = "unsorted";
+      }
 
       // no_faces filters removed - сортировка по place_date работает автоматически
 
       function updateUrlParams() {
         const u = new URL(window.location.href);
         u.searchParams.set("tab", tab);
-        if (tab === "faces" && subtab && subtab !== "all") {
+        if ((tab === "faces" || tab === "no_faces") && subtab && subtab !== "unsorted") {
           u.searchParams.set("subtab", subtab);
         } else {
           u.searchParams.delete("subtab");
@@ -331,15 +475,1171 @@
       }
 
       function updateSubtabsVisibility() {
+        // Подзакладки для "Люди"
+        const rowFaces = qs("#subtabsFaces");
+        if (rowFaces) {
+          rowFaces.style.display = (tab === "faces") ? "flex" : "none";
+          const bUnsorted = qs("#subFacesUnsorted");
+          const bMany = qs("#subFacesMany");
+          if (bUnsorted) bUnsorted.classList.toggle("active", tab === "faces" && (subtab === "unsorted" || subtab === "all"));
+          if (bMany) bMany.classList.toggle("active", tab === "faces" && subtab === "many_faces");
+          
+          // Обновляем активность подзакладок персон
+          const personSubtabs = rowFaces.querySelectorAll('[data-person-id]');
+          personSubtabs.forEach(btn => {
+            const pid = btn.getAttribute('data-person-id');
+            const isActive = tab === "faces" && subtab === `person_${pid}`;
+            btn.classList.toggle("active", isActive);
+          });
+        }
+        
+        // Подзакладки для "Нет людей"
+        const rowNoFaces = qs("#subtabsNoFaces");
+        if (rowNoFaces) {
+          rowNoFaces.style.display = (tab === "no_faces") ? "flex" : "none";
+          const bUnsortedNoFacesPhotos = qs("#subNoFacesUnsortedPhotos");
+          if (bUnsortedNoFacesPhotos) bUnsortedNoFacesPhotos.classList.toggle("active", tab === "no_faces" && subtab === "unsorted_photos");
+          const bUnsortedNoFacesVideos = qs("#subNoFacesUnsortedVideos");
+          if (bUnsortedNoFacesVideos) bUnsortedNoFacesVideos.classList.toggle("active", tab === "no_faces" && subtab === "unsorted_videos");
+          
+          // Обновляем активность подзакладок групп
+          const groupSubtabs = rowNoFaces.querySelectorAll('[data-group-path]');
+          groupSubtabs.forEach(btn => {
+            const gpath = btn.getAttribute('data-group-path');
+            const isActive = tab === "no_faces" && subtab === `group_${encodeURIComponent(gpath)}`;
+            btn.classList.toggle("active", isActive);
+          });
+        }
+      }
+      
+      // Кэш для данных о персонах
+      let cachedPersonsData = null;
+      let cachedPersonsTimestamp = 0;
+      const PERSONS_CACHE_TTL = 10000; // 10 секунд
+      
+      function invalidatePersonsCache() {
+        cachedPersonsData = null;
+        cachedPersonsTimestamp = 0;
+        personsSubtabsLoaded = false; // Сбрасываем флаг, чтобы список перезагрузился при следующем вызове
+      }
+      
+      async function fetchPersonsWithFiles() {
+        const now = Date.now();
+        // Используем кэш, если данные свежие
+        if (cachedPersonsData && (now - cachedPersonsTimestamp) < PERSONS_CACHE_TTL) {
+          return cachedPersonsData;
+        }
+        
+        const data = await fetchJson(`/api/faces/persons-with-files?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}`);
+        cachedPersonsData = data;
+        cachedPersonsTimestamp = now;
+        return data;
+      }
+      
+      // Флаг для отслеживания, был ли список подзакладок персон уже загружен
+      let personsSubtabsLoaded = false;
+      
+      async function loadPersonsSubtabs(force = false) {
+        if (!pipelineRunId || tab !== "faces") return;
+        
+        // Если список уже загружен и кэш актуален, и не требуется принудительная перезагрузка - пропускаем
+        if (!force && personsSubtabsLoaded && cachedPersonsData && (Date.now() - cachedPersonsTimestamp) < PERSONS_CACHE_TTL) {
+          console.log("[loadPersonsSubtabs] Список уже загружен, пропускаем");
+          return;
+        }
+        
+        const startTime = performance.now();
+        console.log("[loadPersonsSubtabs] Начало загрузки списка подзакладок персон");
+        
+        // Показываем индикатор загрузки
         const row = qs("#subtabsFaces");
         if (!row) return;
-        row.style.display = (tab === "faces") ? "flex" : "none";
-        const bAll = qs("#subFacesAll");
-        const bMany = qs("#subFacesMany");
-        if (bAll) bAll.classList.toggle("active", tab === "faces" && subtab === "all");
-        if (bMany) bMany.classList.toggle("active", tab === "faces" && subtab === "many_faces");
+        const loadingIndicator = document.createElement("span");
+        loadingIndicator.className = "muted";
+        loadingIndicator.textContent = "Загрузка персон...";
+        loadingIndicator.id = "personsLoading";
+        // Удаляем старый индикатор, если есть
+        const oldIndicator = row.querySelector("#personsLoading");
+        if (oldIndicator) oldIndicator.remove();
+        row.appendChild(loadingIndicator);
+        
+        try {
+          const fetchStartTime = performance.now();
+          const data = await fetchPersonsWithFiles();
+          const fetchTime = performance.now() - fetchStartTime;
+          console.log(`[loadPersonsSubtabs] API запрос занял: ${fetchTime.toFixed(2)}ms`);
+          
+          const persons = data?.persons || [];
+          
+          // Удаляем индикатор загрузки
+          const indicator = row.querySelector("#personsLoading");
+          if (indicator) indicator.remove();
+          
+          // Отмечаем, что список загружен
+          personsSubtabsLoaded = true;
+          
+          // Сохраняем имена персон в глобальную переменную для использования в cardHtml
+          if (!window.currentPersonName) {
+            window.currentPersonName = {};
+          }
+          persons.forEach(person => {
+            window.currentPersonName[person.id] = person.name || `Персона ${person.id}`;
+          });
+          
+          // Удаляем старые подзакладки персон (кроме "К разбору" и "Много лиц")
+          const existingPersonBtns = row.querySelectorAll('[data-person-id]');
+          existingPersonBtns.forEach(btn => btn.remove());
+          
+          // Добавляем подзакладки для каждой персоны
+          persons.forEach(person => {
+            const btn = document.createElement("button");
+            btn.className = "subtab";
+            btn.id = `subPerson_${person.id}`;
+            btn.setAttribute("data-person-id", String(person.id));
+            btn.type = "button";
+            btn.textContent = `${person.name || `Персона ${person.id}`} (${person.files_count || 0})`;
+            btn.onclick = () => setSubtab(`person_${person.id}`);
+            row.appendChild(btn);
+          });
+          
+          updateSubtabsVisibility();
+          
+          const totalTime = performance.now() - startTime;
+          console.log(`[loadPersonsSubtabs] Загрузка списка подзакладок завершена за ${totalTime.toFixed(2)}ms, персон: ${persons.length}`);
+        } catch (e) {
+          console.error("Ошибка загрузки подзакладок персон:", e);
+          // Удаляем индикатор загрузки при ошибке
+          const indicator = row.querySelector("#personsLoading");
+          if (indicator) indicator.remove();
+          const totalTime = performance.now() - startTime;
+          console.log(`[loadPersonsSubtabs] Ошибка после ${totalTime.toFixed(2)}ms`);
+        }
       }
-
+      
+      async function loadGroupsSubtabs() {
+        if (!pipelineRunId || tab !== "no_faces") return;
+        try {
+          const data = await fetchJson(`/api/faces/groups-with-files?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}`);
+          const groups = data?.groups || [];
+          const row = qs("#subtabsNoFaces");
+          if (!row) return;
+          
+          // Удаляем старые подзакладки групп (кроме "К разбору")
+          const existingGroupBtns = row.querySelectorAll('[data-group-path]');
+          existingGroupBtns.forEach(btn => btn.remove());
+          
+          // Сортируем группы: сначала поездки (по дате добавления - последние выше), потом остальные по алфавиту
+          const sortedGroups = [...groups].sort((a, b) => {
+            const nameA = (a.group_path || "").toLowerCase();
+            const nameB = (b.group_path || "").toLowerCase();
+            
+            // Проверяем, является ли группа поездкой (начинается с года)
+            const isTripA = /^\d{3,4}/.test(nameA);
+            const isTripB = /^\d{3,4}/.test(nameB);
+            
+            if (isTripA && isTripB) {
+              // Обе поездки - сортируем по дате добавления (последние выше)
+              const dateA = a.last_created_at || "";
+              const dateB = b.last_created_at || "";
+              if (dateA && dateB) {
+                const dateCompare = dateB.localeCompare(dateA); // Новые выше (по убыванию)
+                if (dateCompare !== 0) return dateCompare;
+              }
+              // Если даты одинаковые или отсутствуют, сортируем по алфавиту
+              return nameA.localeCompare(nameB);
+            } else if (isTripA) {
+              return -1; // Поездки в начале
+            } else if (isTripB) {
+              return 1;
+            } else {
+              // Обе не поездки - сортируем по алфавиту
+              return nameA.localeCompare(nameB);
+            }
+          });
+          
+          // Добавляем подзакладки для каждой группы
+          sortedGroups.forEach(group => {
+            const btn = document.createElement("button");
+            btn.className = "subtab";
+            btn.id = `subGroup_${encodeURIComponent(group.group_path)}`;
+            btn.setAttribute("data-group-path", String(group.group_path));
+            btn.type = "button";
+            btn.textContent = `${group.group_path || `Группа ${group.id}`} (${group.files_count || 0})`;
+            btn.onclick = () => setSubtab(`group_${encodeURIComponent(group.group_path)}`);
+            row.appendChild(btn);
+          });
+          
+          updateSubtabsVisibility();
+          
+          // НЕ обновляем выпадашки здесь - они будут обновлены в load() после рендеринга карточек
+        } catch (e) {
+          console.error("Ошибка загрузки подзакладок групп:", e);
+        }
+      }
+      
+      async function updateGroupSelects(groups) {
+        console.log("[updateGroupSelects] Начинаем обновление выпадашек, групп:", groups.length);
+        
+        // Предопределенные группы, которые должны быть доступны для выбора (даже если их нет в БД)
+        // Это шаблоны для быстрого создания групп
+        const predefinedGroups = [
+          "Здоровье",
+          "Чеки",
+          "Дом и ремонт",
+          "Артефакты людей"
+        ];
+        
+        // Определяем группы поездок динамически: группы, которые содержат год и название места
+        const tripsKeywords = ["Турция", "Минск", "Италия", "Испания", "Греция", "Франция", "Польша", "Чехия", "Германия", "Тургояк"];
+        const tripsGroups = new Set();
+        
+        // Собираем все группы из БД (API уже нормализует данные - убирает префикс "Поездки\")
+        const allGroups = new Set();
+        const groupsWithData = []; // Сохраняем группы с данными для сортировки
+        
+        groups.forEach(g => {
+          const groupName = g.group_path || "";
+          if (!groupName) return; // Пропускаем пустые группы
+          allGroups.add(groupName);
+          
+          // Определяем, является ли группа поездкой
+          // Вариант 1: Содержит год (4 цифры) и ключевое слово места из списка
+          const hasYear = /\d{4}/.test(groupName);
+          const hasPlace = tripsKeywords.some(keyword => groupName.includes(keyword));
+          
+          // Вариант 2: Начинается с года (YYYY) и содержит хотя бы одно слово после года
+          // Это более гибкая логика - если группа начинается с года и содержит текст, считаем ее поездкой
+          const startsWithYear = /^\d{4}\s/.test(groupName); // Начинается с 4 цифр и пробела
+          const hasTextAfterYear = startsWithYear && groupName.length > 5; // После года есть текст
+          
+          const isTrip = (hasYear && hasPlace) || (startsWithYear && hasTextAfterYear);
+          if (isTrip) {
+            tripsGroups.add(groupName);
+          }
+          
+          // Сохраняем данные группы для сортировки
+          groupsWithData.push({
+            name: groupName,
+            isTrip: isTrip,
+            last_created_at: g.last_created_at || ""
+          });
+        });
+        
+        // Добавляем предопределенные группы, которых еще нет в БД
+        predefinedGroups.forEach(predefined => {
+          if (!allGroups.has(predefined)) {
+            groupsWithData.push({
+              name: predefined,
+              isTrip: false,
+              last_created_at: "" // Нет даты, так как группы еще нет в БД
+            });
+            allGroups.add(predefined);
+          }
+        });
+        
+        // Группируем по категориям
+        const categoryMap = {};
+        const otherGroups = [];
+        
+        for (const groupData of groupsWithData) {
+          if (groupData.isTrip) {
+            const category = "Поездки";
+            if (!categoryMap[category]) categoryMap[category] = [];
+            categoryMap[category].push({
+              name: groupData.name,
+              last_created_at: groupData.last_created_at
+            });
+          } else {
+            otherGroups.push(groupData.name);
+          }
+        }
+        
+        // Обновляем все select'ы в карточках (ищем по data-file-path)
+        const selects = qsa('select[data-file-path]');
+        console.log("[updateGroupSelects] Найдено select'ов:", selects.length);
+        
+        selects.forEach(select => {
+          const currentValue = select.value;
+          select.innerHTML = '<option value="">Назначить группу...</option>';
+          
+          // Добавляем группы "Поездки"
+          if (categoryMap["Поездки"] && categoryMap["Поездки"].length > 0) {
+            const optgroup = document.createElement("optgroup");
+            optgroup.label = "Поездки";
+            // Сортируем поездки по дате добавления (последние добавленные - выше)
+            categoryMap["Поездки"].sort((a, b) => {
+              const dateA = a.last_created_at || "";
+              const dateB = b.last_created_at || "";
+              if (dateA && dateB) {
+                const dateCompare = dateB.localeCompare(dateA); // Новые выше (по убыванию)
+                if (dateCompare !== 0) return dateCompare;
+              }
+              // Если даты одинаковые или отсутствуют, сортируем по алфавиту
+              return a.name.localeCompare(b.name);
+            });
+            categoryMap["Поездки"].forEach(trip => {
+              const opt = document.createElement("option");
+              opt.value = trip.name; // Храним просто название без префикса
+              opt.textContent = trip.name;
+              optgroup.appendChild(opt);
+            });
+            select.appendChild(optgroup);
+          }
+          
+          // Добавляем остальные группы
+          otherGroups.sort();
+          otherGroups.forEach(groupPath => {
+            const opt = document.createElement("option");
+            opt.value = groupPath;
+            opt.textContent = groupPath;
+            select.appendChild(opt);
+          });
+          
+          // Добавляем опцию для создания новой группы в категории "Поездки"
+          if (categoryMap["Поездки"] && categoryMap["Поездки"].length > 0) {
+            const createOptInGroup = document.createElement("option");
+            createOptInGroup.value = "__create_new_Поездки__";
+            createOptInGroup.textContent = "+ Создать новую поездку...";
+            createOptInGroup.style.fontStyle = "italic";
+            // Находим optgroup "Поездки" и добавляем опцию в него
+            const tripsOptgroup = select.querySelector('optgroup[label="Поездки"]');
+            if (tripsOptgroup) {
+              tripsOptgroup.appendChild(createOptInGroup);
+            }
+          }
+          
+          // Добавляем опцию для создания новой группы (общая)
+          const createOpt = document.createElement("option");
+          createOpt.value = "__create_new__";
+          createOpt.textContent = "+ Создать новую группу...";
+          createOpt.style.fontStyle = "italic";
+          select.appendChild(createOpt);
+          
+          // Восстанавливаем выбранное значение
+          if (currentValue) {
+            select.value = currentValue;
+          }
+        });
+        
+        console.log("[updateGroupSelects] Обновлено select'ов:", selects.length);
+      }
+      
+      async function handleGroupSelectFromDropdown(selectEl, event) {
+        if (event) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        
+        // Получаем путь из data-file-path атрибута (надежный способ, избегает проблем с экранированием)
+        const filePath = selectEl.getAttribute("data-file-path");
+        if (!filePath) {
+          console.error("[handleGroupSelectFromDropdown] Не найден data-file-path атрибут");
+          return;
+        }
+        
+        console.log("[handleGroupSelectFromDropdown] filePath из атрибута:", filePath);
+        
+        const groupPath = selectEl.value;
+        console.log("[handleGroupSelectFromDropdown] groupPath:", groupPath);
+        
+        if (groupPath === "__create_new__" || groupPath === "__create_new_Поездки__") {
+          // Определяем, в какой категории создаем группу
+          const isTrips = groupPath === "__create_new_Поездки__";
+          const optgroup = selectEl.closest('optgroup');
+          const category = isTrips ? "Поездки" : (optgroup ? optgroup.label : null);
+          
+          let promptText = "Введите название новой группы:";
+          if (category === "Поездки" || isTrips) {
+            promptText = "Введите название поездки (например: 2025 Италия):";
+          }
+          
+          const newGroupName = prompt(promptText);
+          if (newGroupName && newGroupName.trim()) {
+            // Храним просто название без префикса категории
+            await assignGroupToFile(filePath, newGroupName.trim(), selectEl);
+          } else {
+            // Возвращаем select в исходное состояние
+            selectEl.value = "";
+          }
+        } else if (groupPath) {
+          await assignGroupToFile(filePath, groupPath, selectEl);
+        }
+      }
+      
+      async function handlePersonSelectFromDropdown(selectEl, event) {
+        if (event) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        
+        const filePath = selectEl.getAttribute("data-file-path");
+        if (!filePath) {
+          console.error("[handlePersonSelectFromDropdown] Не найден data-file-path атрибут");
+          return;
+        }
+        
+        const personId = selectEl.value;
+        if (!personId || personId === "") {
+          return;
+        }
+        
+        try {
+          await postJson("/api/persons/assign-file", {
+            pipeline_run_id: Number(pipelineRunId),
+            file_path: filePath,
+            person_id: parseInt(personId)
+          });
+          
+          // Инвалидируем кэш персон, так как данные изменились
+          invalidatePersonsCache();
+          // Инвалидируем кэш персон на файле
+          const cacheKey = `${pipelineRunId}:${filePath}`;
+          personsOnFileCache.delete(cacheKey);
+          
+          // Обновляем список персон на фото
+          await loadPersonsOnFile(filePath);
+          
+          // Не обновляем подзакладки персон - загрузка персон на конкретный файл не меняет список подзакладок
+          
+          // Возвращаем select в исходное состояние
+          selectEl.value = "";
+          
+          const person = allPersonsList.find(p => p.id === parseInt(personId));
+          const personName = person ? (person.name || `Персона ${personId}`) : `Персона ${personId}`;
+          setToast(`Персона "${personName}" добавлена к файлу.`);
+        } catch (e) {
+          setToast(e?.message || String(e), true);
+        }
+      }
+      
+      // Кэш для данных о персонах на файлах
+      const personsOnFileCache = new Map();
+      const PERSONS_ON_FILE_CACHE_TTL = 30000; // 30 секунд
+      
+      async function loadPersonsOnFile(filePath) {
+        if (!filePath || !pipelineRunId) {
+          return;
+        }
+        
+        // Проверяем кэш
+        const cacheKey = `${pipelineRunId}:${filePath}`;
+        const cached = personsOnFileCache.get(cacheKey);
+        if (cached && (Date.now() - cached.timestamp) < PERSONS_ON_FILE_CACHE_TTL) {
+          // Используем кэшированные данные
+          updatePersonsOnFileUI(filePath, cached.persons, cached.rects);
+          return;
+        }
+        
+        try {
+          // Загружаем данные параллельно
+          const [personsData, rectsData] = await Promise.all([
+            fetchJson(`/api/faces/file-persons?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}&path=${encodeURIComponent(filePath)}`).catch(() => ({ persons: [] })),
+            fetchJson(`/api/faces/rectangles?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}&path=${encodeURIComponent(filePath)}`).catch(() => ({ rectangles: [] }))
+          ]);
+          
+          const persons = personsData?.persons || [];
+          const allRects = rectsData?.rectangles || [];
+          
+          // Сохраняем в кэш
+          personsOnFileCache.set(cacheKey, {
+            persons,
+            rects: allRects,
+            timestamp: Date.now()
+          });
+          
+          // Обновляем UI
+          updatePersonsOnFileUI(filePath, persons, allRects);
+        } catch (e) {
+          console.error("Ошибка загрузки персон на фото:", e);
+        }
+      }
+      
+      function updatePersonsOnFileUI(filePath, persons, allRects) {
+        // Находим элемент для отображения персон
+        const allPersonsEls = qsa('div[id^="persons-on-file-"]');
+        let personsEl = null;
+        for (const el of allPersonsEls) {
+          const elPath = el.getAttribute("data-file-path");
+          if (elPath === filePath) {
+            personsEl = el;
+            break;
+          }
+        }
+        
+        if (personsEl) {
+          if (persons.length === 0) {
+            personsEl.innerHTML = `<span class="muted">Нет персон на фото</span>`;
+          } else {
+            // Создаем мапу face_rectangle_id -> индекс в списке
+            const rectIndexMap = {};
+            allRects.forEach((rect, idx) => {
+              if (rect.id) {
+                rectIndexMap[rect.id] = idx + 1; // Номер начинается с 1
+              }
+            });
+            
+            const personsList = persons.map(p => {
+              const name = p.name || `Персона ${p.id}`;
+              const faces = p.faces || [];
+              let facesInfo = "";
+              if (faces.length > 0) {
+                const facesDetails = faces.map(f => {
+                  const faceNum = rectIndexMap[f.id] || "?";
+                  return `#${faceNum} ${f.w}×${f.h}`;
+                }).join(", ");
+                facesInfo = ` (${facesDetails})`;
+              }
+              return `<span class="pill" style="background:#eef2ff; color:#1f2937;">${escapeHtml(name)}${facesInfo}</span>`;
+            }).join(" ");
+            personsEl.innerHTML = `<span class="muted">Персоны на фото:</span> ${personsList}`;
+          }
+        }
+        
+        // Обновляем кнопку "это не {PersonName}" если мы на подзакладке персоны
+        const isPersonSubtab = subtab && subtab.startsWith("person_");
+        if (isPersonSubtab) {
+          const currentPersonId = parseInt(subtab.replace("person_", ""));
+          const currentPerson = persons.find(p => p.id === currentPersonId);
+          
+          // Ищем кнопку во всех карточках с этим файлом
+          const card = qs(`.card[data-path="${escapeHtml(filePath)}"]`);
+          if (card) {
+            const notPersonBtn = card.querySelector(`button[data-action="not_person"][data-person-id="${currentPersonId}"]`);
+            if (notPersonBtn && currentPerson) {
+              const personName = currentPerson.name || `Персона ${currentPersonId}`;
+              notPersonBtn.textContent = `Это не ${personName}`;
+            }
+          }
+        }
+      }
+      
+      async function updatePersonSelects(persons) {
+        if (!persons || persons.length === 0) return;
+        
+        // Находим все выпадашки персон
+        const selects = qsa('select[onchange*="handlePersonSelectFromDropdown"]');
+        selects.forEach(selectEl => {
+          const currentPersonId = selectEl.getAttribute("data-current-person-id");
+          const filePath = selectEl.getAttribute("data-file-path");
+          
+          // Очищаем опции (кроме первой)
+          while (selectEl.options.length > 1) {
+            selectEl.remove(1);
+          }
+          
+          // Добавляем персон (исключая текущую)
+          persons.forEach(person => {
+            if (currentPersonId && person.id === parseInt(currentPersonId)) {
+              return; // Пропускаем текущую персону
+            }
+            const option = document.createElement("option");
+            option.value = String(person.id);
+            option.textContent = person.name || `Персона ${person.id}`;
+            selectEl.appendChild(option);
+          });
+        });
+        
+        // Загружаем персон на фото для всех карточек параллельно
+        const filePaths = new Set();
+        selects.forEach(selectEl => {
+          const filePath = selectEl.getAttribute("data-file-path");
+          if (filePath) filePaths.add(filePath);
+        });
+        
+        // Загружаем параллельно батчами по 10 файлов
+        const batchSize = 10;
+        const filePathsArray = Array.from(filePaths);
+        for (let i = 0; i < filePathsArray.length; i += batchSize) {
+          const batch = filePathsArray.slice(i, i + batchSize);
+          await Promise.all(batch.map(filePath => loadPersonsOnFile(filePath).catch(e => {
+            console.error("[updatePersonSelects] Ошибка загрузки персон для", filePath, ":", e);
+          })));
+        }
+      }
+      
+      async function assignGroupToFile(filePath, groupPath, selectEl = null) {
+        if (!groupPath) return;
+        
+        console.log("[assignGroupToFile] Начинаем назначение группы:", {
+          filePath: filePath,
+          groupPath: groupPath,
+          filePathType: typeof filePath,
+          groupPathType: typeof groupPath,
+          pipelineRunId: pipelineRunId
+        });
+        
+        try {
+          const payload = {
+            pipeline_run_id: Number(pipelineRunId),
+            path: filePath,
+            group_path: groupPath
+          };
+          console.log("[assignGroupToFile] Отправляем payload:", payload);
+          
+          const response = await postJson("/api/faces/assign-group", payload);
+          console.log("[assignGroupToFile] Ответ сервера:", response);
+          
+          // Удаляем карточку файла
+          // Ищем карточку через родительский элемент select'а или по data-path
+          let card = null;
+          if (selectEl) {
+            // Ищем карточку через родительский элемент
+            card = selectEl.closest('.card');
+          }
+          if (!card) {
+            // Пытаемся найти по data-path (используем escapeHtml для правильного экранирования)
+            const escapedPath = escapeHtml(filePath);
+            // Для CSS селектора нужно экранировать специальные символы
+            const cssEscapedPath = filePath.replace(/[!"#$%&'()*+,.\/:;<=>?@[\\\]^`{|}~]/g, '\\$&');
+            card = qs(`.card[data-path="${cssEscapedPath}"]`) || 
+                   document.querySelector(`.card[data-path="${escapedPath}"]`);
+          }
+          if (!card) {
+            // Последняя попытка - ищем все карточки и сравниваем пути
+            const allCards = qsa('.card');
+            for (const c of allCards) {
+              if (c.getAttribute('data-path') === filePath) {
+                card = c;
+                break;
+              }
+            }
+          }
+          
+          if (card) {
+            const row = _asInt(card.getAttribute("data-row"));
+            try { cardIo.unobserve(card); } catch (e) {}
+            if (row) visibleRows.delete(row);
+            card.remove();
+            console.log("[assignGroupToFile] Карточка удалена:", filePath);
+          } else {
+            console.warn("[assignGroupToFile] Карточка не найдена для удаления:", filePath);
+          }
+          
+          await refreshTabCounts();
+          await loadGroupsSubtabs();
+          
+          // Обновляем выпадашки групп после назначения (чтобы новая группа появилась в списке)
+          if (tab === "no_faces") {
+            try {
+              const groupsData = await fetchJson(`/api/faces/groups-with-files?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}`);
+              await updateGroupSelects(groupsData?.groups || []);
+              console.log("[assignGroupToFile] Выпадашки групп обновлены после назначения");
+            } catch (e) {
+              console.error("[assignGroupToFile] Ошибка обновления выпадашек:", e);
+            }
+          }
+          
+          // Если мы на подзакладке группы, перезагружаем список файлов
+          // чтобы новый файл появился в списке
+          if (tab === "no_faces" && subtab && subtab.startsWith("group_")) {
+            // Перезагружаем список файлов для текущей подзакладки
+            page = 1;
+            if (!loading) {
+              load(true);
+            }
+          } else if (tab === "no_faces" && (subtab === "unsorted_photos" || subtab === "unsorted_videos")) {
+            // Если мы на "К разбору" (фото или видео), перезагружаем список, чтобы убедиться, что файл исчез
+            // (файл с группой не должен показываться в "К разбору")
+            if (!loading) {
+              page = 1;
+              load(true);
+            } else {
+              // Если идет загрузка, ждем и перезагружаем
+              setTimeout(() => {
+                if (!loading) {
+                  page = 1;
+                  load(true);
+                }
+              }, 500);
+            }
+          }
+          
+          setToast(`Файл назначен в группу "${groupPath}".`);
+        } catch (e) {
+          setToast(`Ошибка назначения группы: ${e.message}`, true);
+          // Возвращаем select в исходное состояние
+          if (selectEl) {
+            selectEl.value = "";
+          } else {
+            // Пытаемся найти select по data-file-path
+            const selects = qsa(`select[data-file-path="${filePath.replace(/"/g, '&quot;').replace(/'/g, '&#039;')}"]`);
+            if (selects.length > 0) {
+              selects[0].value = "";
+            }
+          }
+        }
+      }
+      
+      let currentGroupAssignPath = null; // Путь файла, для которого выбираем группу
+      let currentPersonAssignPath = null; // Путь файла, для которого выбираем персону
+      let allPersonsList = []; // Список всех персон для модального окна
+      
+      // Функции для работы с модальным окном назначения персон
+      async function showPersonDialog(filePath) {
+        currentPersonAssignPath = filePath;
+        const modal = qs("#modalPerson");
+        if (!modal) return null;
+        
+        // Загружаем список персон
+        await loadPersonsForSelect();
+        
+        // Сбрасываем состояние
+        const checkboxMultiple = qs("#checkboxMultiplePersons");
+        if (checkboxMultiple) checkboxMultiple.checked = false;
+        updatePersonModalMode(false);
+        
+        // Очищаем поля ввода
+        const inputNew = qs("#inputNewPersonName");
+        const inputNewMultiple = qs("#inputNewPersonNameMultiple");
+        if (inputNew) inputNew.value = "";
+        if (inputNewMultiple) inputNewMultiple.value = "";
+        
+        // Показываем модальное окно
+        modal.style.display = "flex";
+        modal.setAttribute("aria-hidden", "false");
+        
+        // Возвращаем Promise, который разрешится с выбранными персонами или null
+        return new Promise((resolve) => {
+          window.__personDialogResolve = resolve;
+        });
+      }
+      
+      async function loadPersonsForSelect() {
+        try {
+          const resp = await fetch("/api/persons/list");
+          const data = await resp.json();
+          allPersonsList = data.persons || [];
+          
+          // Заполняем select для одной персоны
+          const select = qs("#selectPerson");
+          if (select) {
+            select.innerHTML = '<option value="">Выберите персону...</option>';
+            
+            // Группируем персон по группам
+            const groupedPersons = {};
+            const noGroupPersons = [];
+            
+            for (const p of allPersonsList) {
+              if (p.is_ignored) continue; // Пропускаем "Посторонние"
+              const groupName = p.group || null;
+              if (groupName) {
+                if (!groupedPersons[groupName]) {
+                  groupedPersons[groupName] = {
+                    order: p.group_order || 999,
+                    persons: []
+                  };
+                }
+                groupedPersons[groupName].persons.push(p);
+              } else {
+                noGroupPersons.push(p);
+              }
+            }
+            
+            // Сортируем группы по order
+            const sortedGroups = Object.entries(groupedPersons).sort((a, b) => {
+              return a[1].order - b[1].order;
+            });
+            
+            // Сортируем персон внутри каждой группы по имени
+            for (const [groupName, groupData] of sortedGroups) {
+              groupData.persons.sort((a, b) => {
+                const nameA = (a.name || "").toLowerCase();
+                const nameB = (b.name || "").toLowerCase();
+                return nameA.localeCompare(nameB);
+              });
+              
+              const optgroup = document.createElement("optgroup");
+              optgroup.label = groupName;
+              for (const person of groupData.persons) {
+                const opt = document.createElement("option");
+                opt.value = String(person.id);
+                opt.textContent = person.name || `Персона ${person.id}`;
+                optgroup.appendChild(opt);
+              }
+              select.appendChild(optgroup);
+            }
+            
+            // Добавляем персон без группы
+            noGroupPersons.sort((a, b) => {
+              const nameA = (a.name || "").toLowerCase();
+              const nameB = (b.name || "").toLowerCase();
+              return nameA.localeCompare(nameB);
+            });
+            
+            for (const person of noGroupPersons) {
+              const opt = document.createElement("option");
+              opt.value = String(person.id);
+              opt.textContent = person.name || `Персона ${person.id}`;
+              select.appendChild(opt);
+            }
+          }
+          
+          // Заполняем список с чекбоксами для нескольких персон
+          const checkboxList = qs("#personsCheckboxList");
+          if (checkboxList) {
+            checkboxList.innerHTML = "";
+            
+            // Используем ту же группировку
+            for (const [groupName, groupData] of sortedGroups) {
+              const groupDiv = document.createElement("div");
+              groupDiv.style.marginBottom = "8px";
+              
+              const groupLabel = document.createElement("div");
+              groupLabel.style.fontWeight = "700";
+              groupLabel.style.fontSize = "12px";
+              groupLabel.style.color = "#6b7280";
+              groupLabel.style.marginBottom = "4px";
+              groupLabel.textContent = groupName;
+              groupDiv.appendChild(groupLabel);
+              
+              for (const person of groupData.persons) {
+                const personDiv = document.createElement("div");
+                personDiv.style.display = "flex";
+                personDiv.style.alignItems = "center";
+                personDiv.style.gap = "8px";
+                personDiv.style.padding = "4px 0";
+                
+                const checkbox = document.createElement("input");
+                checkbox.type = "checkbox";
+                checkbox.id = `person_checkbox_${person.id}`;
+                checkbox.value = String(person.id);
+                checkbox.style.width = "18px";
+                checkbox.style.height = "18px";
+                checkbox.style.cursor = "pointer";
+                
+                const label = document.createElement("label");
+                label.htmlFor = `person_checkbox_${person.id}`;
+                label.textContent = person.name || `Персона ${person.id}`;
+                label.style.cursor = "pointer";
+                label.style.flex = "1";
+                
+                personDiv.appendChild(checkbox);
+                personDiv.appendChild(label);
+                groupDiv.appendChild(personDiv);
+              }
+              
+              checkboxList.appendChild(groupDiv);
+            }
+            
+            // Добавляем персон без группы
+            if (noGroupPersons.length > 0) {
+              for (const person of noGroupPersons) {
+                const personDiv = document.createElement("div");
+                personDiv.style.display = "flex";
+                personDiv.style.alignItems = "center";
+                personDiv.style.gap = "8px";
+                personDiv.style.padding = "4px 0";
+                
+                const checkbox = document.createElement("input");
+                checkbox.type = "checkbox";
+                checkbox.id = `person_checkbox_${person.id}`;
+                checkbox.value = String(person.id);
+                checkbox.style.width = "18px";
+                checkbox.style.height = "18px";
+                checkbox.style.cursor = "pointer";
+                
+                const label = document.createElement("label");
+                label.htmlFor = `person_checkbox_${person.id}`;
+                label.textContent = person.name || `Персона ${person.id}`;
+                label.style.cursor = "pointer";
+                label.style.flex = "1";
+                
+                personDiv.appendChild(checkbox);
+                personDiv.appendChild(label);
+                checkboxList.appendChild(personDiv);
+              }
+            }
+          }
+        } catch (e) {
+          console.error("Ошибка загрузки персон для выбора:", e);
+        }
+      }
+      
+      function updatePersonModalMode(isMultiple) {
+        const singleMode = qs("#singlePersonMode");
+        const multipleMode = qs("#multiplePersonsMode");
+        if (singleMode) singleMode.style.display = isMultiple ? "none" : "block";
+        if (multipleMode) multipleMode.style.display = isMultiple ? "block" : "none";
+      }
+      
+      function closePersonModal() {
+        const modal = qs("#modalPerson");
+        if (modal) {
+          modal.style.display = "none";
+          modal.setAttribute("aria-hidden", "true");
+        }
+        currentPersonAssignPath = null;
+        if (window.__personDialogResolve) {
+          window.__personDialogResolve(null);
+          window.__personDialogResolve = null;
+        }
+      }
+      
+      async function assignSelectedPerson() {
+        const checkboxMultiple = qs("#checkboxMultiplePersons");
+        const isMultiple = checkboxMultiple ? checkboxMultiple.checked : false;
+        
+        let personIds = [];
+        
+        if (isMultiple) {
+          // Режим нескольких персон - собираем выбранные чекбоксы
+          const checkboxes = qs("#personsCheckboxList")?.querySelectorAll('input[type="checkbox"]:checked');
+          if (checkboxes) {
+            personIds = Array.from(checkboxes).map(cb => parseInt(cb.value));
+          }
+          
+          // Проверяем, ввели ли новую персону
+          const inputNew = qs("#inputNewPersonNameMultiple");
+          const newPersonName = inputNew ? inputNew.value.trim() : "";
+          if (newPersonName && !personIds.length) {
+            // Если выбрана только новая персона, нужно сначала создать её
+            try {
+              const createResp = await fetch("/api/persons/create", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ name: newPersonName })
+              });
+              const createData = await createResp.json();
+              if (createData.person && createData.person.id) {
+                personIds = [createData.person.id];
+              } else {
+                setToast("Ошибка создания персоны", true);
+                return;
+              }
+            } catch (e) {
+              setToast(`Ошибка создания персоны: ${e.message}`, true);
+              return;
+            }
+          } else if (newPersonName && personIds.length) {
+            // Если выбраны существующие персоны + новая - создаём новую и добавляем к списку
+            try {
+              const createResp = await fetch("/api/persons/create", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ name: newPersonName })
+              });
+              const createData = await createResp.json();
+              if (createData.person && createData.person.id) {
+                personIds.push(createData.person.id);
+              }
+            } catch (e) {
+              console.error("Ошибка создания дополнительной персоны:", e);
+            }
+          }
+        } else {
+          // Режим одной персоны - берём из select или создаём новую
+          const select = qs("#selectPerson");
+          const selectedValue = select ? select.value : "";
+          
+          if (selectedValue) {
+            personIds = [parseInt(selectedValue)];
+          } else {
+            const inputNew = qs("#inputNewPersonName");
+            const newPersonName = inputNew ? inputNew.value.trim() : "";
+            if (newPersonName) {
+              try {
+                const createResp = await fetch("/api/persons/create", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ name: newPersonName })
+                });
+                const createData = await createResp.json();
+                if (createData.person && createData.person.id) {
+                  personIds = [createData.person.id];
+                } else {
+                  setToast("Ошибка создания персоны", true);
+                  return;
+                }
+              } catch (e) {
+                setToast(`Ошибка создания персоны: ${e.message}`, true);
+                return;
+              }
+            }
+          }
+        }
+        
+        if (personIds.length === 0) {
+          setToast("Выберите персону или введите имя новой персоны", true);
+          return;
+        }
+        
+        if (window.__personDialogResolve) {
+          window.__personDialogResolve(personIds);
+          window.__personDialogResolve = null;
+        }
+        closePersonModal();
+      }
+      
+      async function showGroupDialog(filePath) {
+        currentGroupAssignPath = filePath;
+        const modal = qs("#modalGroup");
+        if (!modal) return null;
+        
+        // Загружаем список существующих групп
+        await loadGroupsForSelect();
+        
+        // Очищаем поле ввода новой группы
+        const inputNew = qs("#inputNewGroupPath");
+        if (inputNew) inputNew.value = "";
+        
+        // Показываем модальное окно
+        modal.style.display = "flex";
+        modal.setAttribute("aria-hidden", "false");
+        
+        // Возвращаем Promise, который разрешится с выбранной группой или null
+        return new Promise((resolve) => {
+          window.__groupDialogResolve = resolve;
+        });
+      }
+      
+      async function loadGroupsForSelect() {
+        if (!pipelineRunId) return;
+        try {
+          const data = await fetchJson(`/api/faces/groups-with-files?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}`);
+          const groups = data?.groups || [];
+          const select = qs("#selectGroup");
+          if (!select) return;
+          
+          // Предопределенные группы, которые должны быть доступны для выбора (даже если их нет в БД)
+          const predefinedGroups = [
+            "Здоровье",
+            "Чеки",
+            "Дом и ремонт",
+            "Артефакты людей"
+          ];
+          
+          // Определяем группы поездок динамически (та же логика, что и в updateGroupSelects)
+          const tripsKeywords = ["Турция", "Минск", "Италия", "Испания", "Греция", "Франция", "Польша", "Чехия", "Германия", "Тургояк"];
+          const tripsGroups = new Set();
+          
+          select.innerHTML = '<option value="">Выберите группу...</option>';
+          
+          // Группируем по категориям (убираем префикс "Поездки\" из старых данных для совместимости)
+          const categoryMap = {};
+          const otherGroups = [];
+          const groupsFromDb = new Set(); // Отслеживаем группы из БД
+          
+          for (const group of groups) {
+            let groupName = group.group_path || "";
+            if (!groupName) continue; // Пропускаем пустые группы
+            // Убираем префикс "Поездки\" или "Поездки/" для совместимости со старыми данными
+            groupName = groupName.replace(/^Поездки[\\/]/, "");
+            groupsFromDb.add(groupName);
+            
+            // Определяем, является ли группа поездкой
+            // Вариант 1: Содержит год (4 цифры) и ключевое слово места из списка
+            const hasYear = /\d{4}/.test(groupName);
+            const hasPlace = tripsKeywords.some(keyword => groupName.includes(keyword));
+            
+            // Вариант 2: Начинается с года (YYYY) и содержит хотя бы одно слово после года
+            const startsWithYear = /^\d{4}\s/.test(groupName); // Начинается с 4 цифр и пробела
+            const hasTextAfterYear = startsWithYear && groupName.length > 5; // После года есть текст
+            
+            if ((hasYear && hasPlace) || (startsWithYear && hasTextAfterYear)) {
+              const category = "Поездки";
+              if (!categoryMap[category]) categoryMap[category] = [];
+              categoryMap[category].push({ 
+                ...group, 
+                group_path: groupName,
+                last_created_at: group.last_created_at || ""
+              });
+              tripsGroups.add(groupName); // Добавляем в Set для последующих проверок
+            } else {
+              otherGroups.push({ ...group, group_path: groupName });
+            }
+          }
+          
+          // Добавляем предопределенные группы, которых еще нет в БД
+          predefinedGroups.forEach(predefined => {
+            if (!groupsFromDb.has(predefined)) {
+              otherGroups.push({
+                group_path: predefined,
+                files_count: 0,
+                last_created_at: ""
+              });
+            }
+          });
+          
+          // Добавляем группы "Поездки"
+          if (categoryMap["Поездки"] && categoryMap["Поездки"].length > 0) {
+            const optgroup = document.createElement("optgroup");
+            optgroup.label = "Поездки";
+            // Сортируем поездки по дате добавления (последние добавленные - выше)
+            categoryMap["Поездки"].sort((a, b) => {
+              const dateA = a.last_created_at || "";
+              const dateB = b.last_created_at || "";
+              if (dateA && dateB) {
+                const dateCompare = dateB.localeCompare(dateA); // Новые выше
+                if (dateCompare !== 0) return dateCompare;
+              }
+              // Если даты одинаковые или отсутствуют, сортируем по алфавиту
+              return (a.group_path || "").localeCompare(b.group_path || "");
+            });
+            for (const group of categoryMap["Поездки"]) {
+              const opt = document.createElement("option");
+              opt.value = group.group_path; // Храним просто название без префикса
+              opt.textContent = `${group.group_path} (${group.files_count || 0})`;
+              optgroup.appendChild(opt);
+            }
+            select.appendChild(optgroup);
+          }
+          
+          // Добавляем остальные группы
+          if (otherGroups.length > 0) {
+            otherGroups.sort((a, b) => (a.group_path || "").localeCompare(b.group_path || ""));
+            for (const group of otherGroups) {
+              const opt = document.createElement("option");
+              opt.value = group.group_path;
+              opt.textContent = `${group.group_path} (${group.files_count || 0})`;
+              select.appendChild(opt);
+            }
+          }
+          
+          // Предопределенные группы больше не нужны - показываем только группы из БД
+          // Если нужна новая группа, пользователь может создать ее через "+ Создать новую группу..."
+        } catch (e) {
+          console.error("Ошибка загрузки групп для выбора:", e);
+        }
+      }
+      
+      function closeGroupModal() {
+        const modal = qs("#modalGroup");
+        if (modal) {
+          modal.style.display = "none";
+          modal.setAttribute("aria-hidden", "true");
+        }
+        currentGroupAssignPath = null;
+        if (window.__groupDialogResolve) {
+          window.__groupDialogResolve(null);
+          window.__groupDialogResolve = null;
+        }
+      }
+      
+      async function assignSelectedGroup() {
+        const select = qs("#selectGroup");
+        const inputNew = qs("#inputNewGroupPath");
+        const selectedValue = select ? select.value : "";
+        const newGroupPath = inputNew ? inputNew.value.trim() : "";
+        
+        let groupPath = null;
+        if (selectedValue) {
+          groupPath = selectedValue;
+        } else if (newGroupPath) {
+          groupPath = newGroupPath;
+        }
+        
+        if (!groupPath) {
+          setToast("Выберите группу или введите название новой группы", true);
+          return;
+        }
+        
+        if (window.__groupDialogResolve) {
+          window.__groupDialogResolve(groupPath);
+          window.__groupDialogResolve = null;
+        }
+        closeGroupModal();
+      }
+      
       function applyTabUI() {
         qs("#tabFaces").classList.toggle("active", tab === "faces");
         qs("#tabQuarantine").classList.toggle("active", tab === "quarantine");
@@ -351,22 +1651,68 @@
       }
 
       function setSubtab(st) {
-        if (tab !== "faces") return;
-        subtab = st;
-        if (!["all","many_faces"].includes(subtab)) subtab = "all";
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/6ba4f132-2ab7-473c-8c73-3e4f328ef941',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app/templates/faces.html:setSubtab',message:'ui_set_subtab',data:{tab:tab,subtab:subtab},timestamp:Date.now(),sessionId:'debug-session',runId:'pre-fix',hypothesisId:'HUI_SUBTAB'})}).catch(()=>{});
-        // #endregion agent log
+        if (tab === "faces") {
+          subtab = st;
+          // Поддерживаем старый формат "all" для совместимости, но переводим в "unsorted"
+          if (subtab === "all") subtab = "unsorted";
+          if (!["unsorted","many_faces"].includes(subtab) && !subtab.startsWith("person_")) {
+            subtab = "unsorted";
+          }
+        } else if (tab === "no_faces") {
+          subtab = st;
+          // Поддерживаем старый формат "all" и "unsorted" для совместимости (переводим в "unsorted_photos")
+          if (subtab === "all" || subtab === "unsorted") subtab = "unsorted_photos";
+          if (!["unsorted_photos", "unsorted_videos"].includes(subtab) && !subtab.startsWith("group_")) {
+            subtab = "unsorted_photos";
+          }
+        } else {
+          return;
+        }
         updateSubtabsVisibility();
         updateUrlParams();
+        // Перезагружаем список файлов для новой подзакладки
+        // Убеждаемся, что subtab валидный перед вызовом load()
+        if (tab === "faces" && !["unsorted","many_faces"].includes(subtab) && !subtab.startsWith("person_")) {
+          subtab = "unsorted";
+        } else if (tab === "no_faces" && !["unsorted_photos", "unsorted_videos"].includes(subtab) && !subtab.startsWith("group_")) {
+          subtab = "unsorted_photos";
+        }
         page = 1;
-        load(true);
+        // Проверяем, не идет ли уже загрузка
+        if (!loading) {
+          load(true);
+        } else {
+          // Если идет загрузка, ждем ее завершения
+          setTimeout(() => {
+            if (!loading) {
+              load(true);
+            }
+          }, 500);
+        }
       }
 
       function setTab(t) {
         tab = t;
-        if (!["faces","quarantine","animals","people_no_face","no_faces"].includes(tab)) tab = "faces";
-        if (tab !== "faces") subtab = "all";
+        // Карантин теперь показывается в "Нет людей"
+        if (tab === "quarantine") tab = "no_faces";
+        if (!["faces","animals","people_no_face","no_faces"].includes(tab)) tab = "faces";
+        if (tab === "faces") {
+          if (!subtab || subtab === "all") {
+            subtab = "unsorted";
+          }
+          // Валидируем subtab для faces
+          if (!["unsorted","many_faces"].includes(subtab) && !subtab.startsWith("person_")) {
+            subtab = "unsorted";
+          }
+          // Сбрасываем флаг при смене вкладки, чтобы список перезагрузился
+          personsSubtabsLoaded = false;
+          loadPersonsSubtabs();
+        } else if (tab === "no_faces") {
+          subtab = "unsorted";
+          loadGroupsSubtabs();
+        } else {
+          subtab = "unsorted";
+        }
         applyTabUI();
         updateUrlParams();
         page = 1;
@@ -377,7 +1723,9 @@
       qs("#tabAnimals").onclick = () => setTab("animals");
       qs("#tabPeopleNoFace").onclick = () => setTab("people_no_face");
       qs("#tabNoFaces").onclick = () => setTab("no_faces");
-      qs("#subFacesAll").onclick = () => setSubtab("all");
+      qs("#subFacesUnsorted").onclick = () => setSubtab("unsorted");
+      qs("#subNoFacesUnsortedPhotos").onclick = () => setSubtab("unsorted_photos");
+      qs("#subNoFacesUnsortedVideos").onclick = () => setSubtab("unsorted_videos");
       qs("#subFacesMany").onclick = () => setSubtab("many_faces");
       // Пагинацию заменяем на бесконечную подгрузку при скролле.
       qs("#btnPrev").style.display = "none";
@@ -411,15 +1759,44 @@
           const scFaces = data?.subcounts?.faces || {};
           const manyCnt = Number(scFaces.many_faces ?? 0);
           const unsortedCnt = Number(scFaces.unsorted ?? 0);
-          qs("#tabFaces").textContent = `Есть лица (${Number(c.faces ?? 0)})`;
-          qs("#tabQuarantine").textContent = `Карантин (${Number(c.quarantine ?? 0)})`;
+          const scNoFaces = data.subcounts?.no_faces || {};
+          const noFacesUnsortedPhotosCnt = Number(scNoFaces.unsorted_photos ?? 0);
+          const noFacesUnsortedVideosCnt = Number(scNoFaces.unsorted_videos ?? 0);
+          qs("#tabFaces").textContent = `Люди (${Number(c.faces ?? 0)})`;
+          // Вкладка "Карантин" скрыта - эти файлы теперь в подзакладке "Нет людей" -> "К разбору"
+          // qs("#tabQuarantine").textContent = `Карантин (${Number(c.quarantine ?? 0)})`;
           qs("#tabAnimals").textContent = `Животные (${Number(c.animals ?? 0)})`;
-          qs("#tabPeopleNoFace").textContent = `Есть люди (без лиц) (${Number(c.people_no_face ?? 0)})`;
-          qs("#tabNoFaces").textContent = `Нет лиц (${Number(c.no_faces ?? 0)})`;
+          // Вкладка "Есть люди (без лиц)" скрыта - эти файлы теперь в подзакладке "К разбору"
+          // qs("#tabPeopleNoFace").textContent = `Есть люди (без лиц) (${Number(c.people_no_face ?? 0)})`;
+          qs("#tabNoFaces").textContent = `Нет людей (${Number(c.no_faces ?? 0)})`;
           const bMany = qs("#subFacesMany");
           if (bMany) bMany.textContent = `Много лиц (${manyCnt})`;
-          const bAll = qs("#subFacesAll");
-          if (bAll) bAll.textContent = `Неотсортировано (${unsortedCnt})`;
+          const bUnsorted = qs("#subFacesUnsorted");
+          if (bUnsorted) bUnsorted.textContent = `К разбору (${unsortedCnt})`;
+          const bNoFacesUnsortedPhotos = qs("#subNoFacesUnsortedPhotos");
+          if (bNoFacesUnsortedPhotos) bNoFacesUnsortedPhotos.textContent = `Фото к разбору (${noFacesUnsortedPhotosCnt})`;
+          const bNoFacesUnsortedVideos = qs("#subNoFacesUnsortedVideos");
+          if (bNoFacesUnsortedVideos) bNoFacesUnsortedVideos.textContent = `Видео к разбору (${noFacesUnsortedVideosCnt})`;
+          
+          // Не вызываем loadPersonsSubtabs() здесь - обновление списка подзакладок персон
+          // происходит явно после действий, которые изменяют привязки (через loadPersonsSubtabs(true))
+          
+          // Обновляем выпадашки персон в карточках (используем кэшированные данные)
+          if (tab === "faces" && subtab && subtab.startsWith("person_")) {
+            const personsData = await fetchPersonsWithFiles();
+            const persons = personsData?.persons || [];
+            await updatePersonSelects(persons);
+            
+            // Сохраняем имя текущей персоны в глобальную переменную для использования в cardHtml
+            const currentPersonId = parseInt(subtab.replace("person_", ""));
+            const currentPerson = persons.find(p => p.id === currentPersonId);
+            if (currentPerson) {
+              if (!window.currentPersonName) {
+                window.currentPersonName = {};
+              }
+              window.currentPersonName[currentPersonId] = currentPerson.name || `Персона ${currentPersonId}`;
+            }
+          }
         } catch (e) {
           // best-effort
         }
@@ -453,36 +1830,88 @@
           : (kind === "video" && pv)
             ? `<video controls muted preload="metadata" src="${escapeHtml(pv)}"></video>`
             : `<div class="noimg">нет превью</div>`;
+        
+        // Определяем, находимся ли мы на подзакладке персоны (нужно для всех вкладок)
+        // Используем явную проверку, чтобы избежать ошибок, если tab или subtab не определены
+        const currentTab = typeof tab !== "undefined" ? tab : "faces";
+        const currentSubtab = typeof subtab !== "undefined" ? subtab : "";
+        const isPersonSubtab = currentTab === "faces" && currentSubtab && typeof currentSubtab === "string" && currentSubtab.startsWith("person_");
+        const escapedPath = escapeHtml(path);
+        
         let btn = "";
-        if (tab === "faces") {
-          btn = `
-            <button class="btn" data-action="mark_cat">Кот</button>
-            <button class="btn" data-action="mark_quarantine">Карантин</button>
-            <button class="btn" data-action="people_no_face">Люди без лиц</button>
-            <button class="btn danger" data-action="no_faces">Лиц нет</button>
-            <button class="btn danger" data-action="delete" title="Удалить файл (переместить в _delete)">🗑️</button>
-          `;
+        if (currentTab === "faces") {
+          // Если мы на подзакладке персоны, показываем выпадашку для добавления персоны и кнопку "это не {PersonName}"
+          const currentPersonId = isPersonSubtab ? parseInt(currentSubtab.replace("person_", "")) : null;
+          
+          let personSelectHtml = "";
+          let notPersonBtn = "";
+          
+          if (isPersonSubtab && currentPersonId) {
+            // Выпадашка для добавления персоны (как для групп)
+            const personSelectId = `person-select-${escapedPath.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 50)}`;
+            personSelectHtml = `<select class="btn" style="padding:6px 12px; cursor:pointer; border:1px solid #d1d5db; border-radius:4px; background:white; min-width:180px;" onchange="handlePersonSelectFromDropdown(this, event)" id="${personSelectId}" data-file-path="${escapedPath}" data-current-person-id="${currentPersonId}">
+              <option value="">Добавить персону...</option>
+            </select>`;
+            
+            // Кнопка "это не {PersonName}" - получаем имя персоны из глобального списка или используем ID
+            let personName = `Персона ${currentPersonId}`;
+            if (window.currentPersonName && window.currentPersonName[currentPersonId]) {
+              personName = window.currentPersonName[currentPersonId];
+            }
+            notPersonBtn = `<button class="btn danger" data-action="not_person" data-person-id="${currentPersonId}" title="Это не эта персона">Это не ${escapeHtml(personName)}</button>`;
+          } else {
+            personSelectHtml = `<button class="btn" data-action="assign_person" title="Назначить персону (можно несколько)">Персона</button>`;
+          }
+          
+          // На подзакладке персоны убираем кнопки "Люди без лиц", "Лиц нет" и "Карантин"
+          if (isPersonSubtab) {
+            btn = `
+              ${personSelectHtml}
+              <button class="btn" data-action="mark_cat">Кот</button>
+              ${notPersonBtn}
+              <button class="btn danger" data-action="delete" title="Удалить файл (переместить в _delete)">🗑️</button>
+            `;
+          } else {
+            btn = `
+              ${personSelectHtml}
+              <button class="btn" data-action="mark_cat">Кот</button>
+              <button class="btn" data-action="mark_quarantine">Карантин</button>
+              <button class="btn" data-action="people_no_face">Люди без лиц</button>
+              <button class="btn danger" data-action="no_faces">Лиц нет</button>
+              ${notPersonBtn}
+              <button class="btn danger" data-action="delete" title="Удалить файл (переместить в _delete)">🗑️</button>
+            `;
+          }
         } else if (tab === "no_faces") {
+          // Выпадашка для групп (как в кластерах)
+          const escapedPath = escapeHtml(path);
+          const groupSelectId = `group-select-${escapedPath.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 50)}`;
+          // Используем data-file-path атрибут для передачи пути, чтобы избежать проблем с экранированием в onchange
+          // Обработчик будет получать путь из атрибута
+          const groupSelectHtml = `<select class="btn" style="padding:6px 12px; cursor:pointer; border:1px solid #d1d5db; border-radius:4px; background:white; min-width:180px;" onchange="handleGroupSelectFromDropdown(this, event)" id="${groupSelectId}" data-file-path="${escapedPath}">
+            <option value="">Назначить группу...</option>
+          </select>`;
           btn = `
             <button class="btn" data-action="annotate_faces">Лица есть (разметить)</button>
             <button class="btn" data-action="mark_cat">Кот</button>
             <button class="btn" data-action="people_no_face">Есть люди (без лиц)</button>
+            ${groupSelectHtml}
             <button class="btn danger" data-action="delete" title="Удалить файл (переместить в _delete)">🗑️</button>
           `;
-        } else if (tab === "quarantine") {
+        } else if (currentTab === "quarantine") {
           btn = `
             <button class="btn" data-action="mark_faces">Нормальные лица</button>
             <button class="btn" data-action="mark_cat">Кот</button>
             <button class="btn danger" data-action="no_faces">Лиц нет</button>
             <button class="btn danger" data-action="delete" title="Удалить файл (переместить в _delete)">🗑️</button>
           `;
-        } else if (tab === "animals") {
+        } else if (currentTab === "animals") {
           btn = `
             <button class="btn" data-action="mark_faces">Это не животное (лица)</button>
             <button class="btn danger" data-action="not_animal_no_faces">Это не животное (нет лиц)</button>
             <button class="btn danger" data-action="delete" title="Удалить файл (переместить в _delete)">🗑️</button>
           `;
-        } else if (tab === "people_no_face") {
+        } else if (currentTab === "people_no_face") {
           btn = `
             <button class="btn" data-action="reset">Сброс</button>
             <button class="btn danger" data-action="delete" title="Удалить файл (переместить в _delete)">🗑️</button>
@@ -522,6 +1951,9 @@
                 ${datePill}
                 ${it.size_human ? `<span class="pill">${escapeHtml(it.size_human)}</span>` : ``}
               </div>
+              ${isPersonSubtab ? `<div class="kv" id="persons-on-file-${path.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 50)}" data-file-path="${path}" style="margin-top:6px; font-size:11px; color:#6b7280;">
+                <span class="muted">Загрузка персон на фото...</span>
+              </div>` : ``}
               <div class="actions">
                 ${btn}
               </div>
@@ -534,9 +1966,54 @@
         if (!pipelineRunId) return;
         if (loading) return;
         if (!reset && !hasMore) return;
+        
+        const loadStartTime = performance.now();
+        console.log(`[load] Начало загрузки карточек, reset=${reset}, tab=${tab}, subtab=${subtab}`);
         loading = true;
         setToast("");
         try {
+          // Виртуализация: удаляем старые элементы при большом количестве для экономии памяти
+          // Поддерживаем максимум 200 элементов в DOM, удаляя самые старые при превышении
+          const maxLoadedItems = 200; // максимум 200 элементов в DOM одновременно (очень агрессивная виртуализация)
+          const cards = _cards();
+          // Начинаем удалять элементы уже при 200, чтобы не допустить переполнения
+          if (!reset && cards.length >= maxLoadedItems) {
+            // Удаляем первые 80 элементов (40% от максимума), чтобы освободить память
+            const toRemove = cards.slice(0, 80);
+            toRemove.forEach(card => {
+              const row = _asInt(card.getAttribute("data-row"));
+              try { cardIo.unobserve(card); } catch (e) {}
+              if (row) visibleRows.delete(row);
+              // Очищаем изображения из памяти перед удалением
+              const img = card.querySelector("img");
+              if (img) {
+                img.src = "";
+                img.removeAttribute("src");
+                img.onload = null;
+                img.onerror = null;
+              }
+              const video = card.querySelector("video");
+              if (video) {
+                video.src = "";
+                video.removeAttribute("src");
+                video.onload = null;
+                video.onerror = null;
+                try { video.load(); } catch (e) {}
+              }
+              // Очищаем все обработчики событий
+              const clone = card.cloneNode(false);
+              card.parentNode?.replaceChild(clone, card);
+              clone.remove();
+            });
+            // Принудительная сборка мусора через requestIdleCallback
+            if (window.requestIdleCallback) {
+              requestIdleCallback(() => {
+                console.log(`[load] Удалено 80 старых элементов, осталось в DOM: ${_cards().length}`);
+              });
+            } else {
+              console.log(`[load] Удалено 80 старых элементов, осталось в DOM: ${_cards().length}`);
+            }
+          }
           if (reset && opts && typeof opts.forcePage === "number" && opts.forcePage >= 1) {
             page = Math.trunc(opts.forcePage);
           }
@@ -554,12 +2031,13 @@
           if (tab === "no_faces") {
             url += `&sort=${encodeURIComponent(nfSort)}`;
           }
+          const apiStartTime = performance.now();
           const data = await fetchJson(url);
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/6ba4f132-2ab7-473c-8c73-3e4f328ef941',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app/templates/faces.html:load',message:'ui_load_result',data:{tab:tab,subtab:subtab,total:Number(data?.total??-1),items_len:Array.isArray(data?.items)?data.items.length:-1},timestamp:Date.now(),sessionId:'debug-session',runId:'pre-fix',hypothesisId:'HAPI_FILTER'})}).catch(()=>{});
-          // #endregion agent log
+          const apiTime = performance.now() - apiStartTime;
+          console.log(`[load] API запрос /api/faces/results занял: ${apiTime.toFixed(2)}ms, получено элементов: ${(data?.items || []).length}`);
           qs("#prId").textContent = String(data.pipeline_run_id);
           qs("#frId").textContent = String(data.face_run_id);
+          
           qs("#rootPath").textContent = data.root_path || "—";
           totalCount = (data.total != null) ? Number(data.total) : totalCount;
           qs("#total").textContent = String(totalCount ?? "—");
@@ -569,47 +2047,126 @@
           if (!items.length && loadedCount === 0) {
             qs("#grid").innerHTML = `<div class="muted">Пусто.</div>`;
           } else if (items.length) {
-            // Группировка по поездкам для tab=no_faces и sort=place_date
-            if (tab === "no_faces" && nfSort === "place_date") {
-              let html = "";
-              let currentTripGroup = null;
-              let rowNum = startRow;
-              let tripHeadersCount = 0;
-              for (const it of items) {
-                const tripGroup = (it.trip_group && String(it.trip_group).trim()) || null;
-                const tripLabel = (it.trip_label && String(it.trip_label).trim()) || null;
-                
-                // Если сменилась группа поездки, добавляем заголовок
-                if (tripGroup !== currentTripGroup) {
-                  if (tripLabel) {
-                    // Есть поездка - показываем её название
-                    html += `<div class="trip-header" style="width: 100%; padding: 12px 8px 8px; font-weight: 600; font-size: 14px; color: #374151; border-bottom: 2px solid #e5e7eb; margin-bottom: 8px; background: #f9fafb;">${escapeHtml(tripLabel)}</div>`;
-                    tripHeadersCount += 1;
-                  } else {
-                    // Нет группы - показываем заголовок "Нет группы"
-                    html += `<div class="trip-header" style="width: 100%; padding: 12px 8px 8px; font-weight: 600; font-size: 14px; color: #6b7280; border-bottom: 2px solid #e5e7eb; margin-bottom: 8px; background: #f3f4f6;">Нет группы</div>`;
-                    tripHeadersCount += 1;
-                  }
-                  currentTripGroup = tripGroup;
+            // Обычное отображение - разбиваем на части для производительности
+            const chunkSize = 15;
+            let htmlChunk = "";
+            for (let i = 0; i < items.length; i++) {
+              htmlChunk += cardHtml(items[i], startRow + i);
+              if ((i + 1) % chunkSize === 0 || i === items.length - 1) {
+                qs("#grid").insertAdjacentHTML("beforeend", htmlChunk);
+                htmlChunk = "";
+                // Даем браузеру передышку между вставками (каждые 15 элементов)
+                if ((i + 1) % chunkSize === 0) {
+                  await new Promise(resolve => setTimeout(resolve, 10));
                 }
-                
-                html += cardHtml(it, rowNum);
-                rowNum += 1;
               }
-              // Отладочная информация (можно убрать позже)
-              if (tripHeadersCount === 0 && items.length > 0) {
-                console.warn("[trip-grouping] Заголовки поездок не найдены. Проверьте, есть ли у файлов place_country и trip_group/trip_label в ответе API.");
-                console.log("[trip-grouping] Пример первого файла:", items[0]);
-              }
-              qs("#grid").insertAdjacentHTML("beforeend", html);
-            } else {
-              // Обычное отображение без группировки
-              qs("#grid").insertAdjacentHTML("beforeend", items.map((it, i) => cardHtml(it, startRow + i)).join(""));
             }
           }
           loadedCount += items.length;
+          
+          // Загружаем имя текущей персоны ДО создания карточек, если мы на подзакладке персоны (используем кэш)
+          if (tab === "faces" && subtab && subtab.startsWith("person_")) {
+            const currentPersonId = parseInt(subtab.replace("person_", ""));
+            if (currentPersonId && (!window.currentPersonName || !window.currentPersonName[currentPersonId])) {
+              // Загружаем список персон для получения имени
+              try {
+                const personsData = await fetchPersonsWithFiles();
+                const persons = personsData?.persons || [];
+                if (!window.currentPersonName) {
+                  window.currentPersonName = {};
+                }
+                const currentPerson = persons.find(p => p.id === currentPersonId);
+                if (currentPerson) {
+                  window.currentPersonName[currentPersonId] = currentPerson.name || `Персона ${currentPersonId}`;
+                }
+              } catch (e) {
+                console.error("[load] Ошибка загрузки имени персоны:", e);
+              }
+            }
+          }
+          
+          // Загружаем персоны на фото для карточек, если мы на подзакладке персоны
+          if (tab === "faces" && subtab && subtab.startsWith("person_")) {
+            console.log("[load] Загружаем персоны для карточек, items:", items.length);
+            // Загружаем персоны для всех загруженных карточек асинхронно
+            // Используем requestAnimationFrame + setTimeout для гарантии, что DOM обновлен
+            requestAnimationFrame(() => {
+              setTimeout(async () => {
+                console.log("[load] Начинаем загрузку персон для", items.length, "карточек");
+                // Проверяем, что элементы уже в DOM
+                const testEls = qsa('div[id^="persons-on-file-"]');
+                console.log("[load] Элементов persons-on-file в DOM:", testEls.length);
+                
+                // Загружаем параллельно батчами по 10 файлов
+                const batchSize = 10;
+                for (let i = 0; i < items.length; i += batchSize) {
+                  const batch = items.slice(i, i + batchSize).filter(item => item.path);
+                  await Promise.all(batch.map(item => loadPersonsOnFile(item.path).catch(e => {
+                    console.error("[load] Ошибка загрузки персон для", item.path, ":", e);
+                  })));
+                  // Небольшая задержка между батчами
+                  if (i + batchSize < items.length) {
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                  }
+                }
+              }, 500); // Увеличиваем задержку до 500мс
+            });
+          }
+          
+          // hasMore определяется не только по количеству загруженных элементов,
+          // но и по общему количеству элементов (totalCount), чтобы поддерживать прокрутку до конца
           hasMore = items.length === pageSize && (totalCount == null || loadedCount < totalCount);
+          
+          const totalTime = performance.now() - loadStartTime;
+          console.log(`[load] Загрузка карточек завершена за ${totalTime.toFixed(2)}ms, элементов: ${items.length}, всего загружено: ${loadedCount}`);
+          
           await refreshTabCounts();
+          
+          // Если это вкладка "Нет людей", загружаем группы для выпадашек после рендеринга карточек
+          if (tab === "no_faces") {
+            // Используем requestAnimationFrame + setTimeout для гарантии, что DOM обновлен
+            // Также используем повторные попытки, если select'ы еще не появились
+            requestAnimationFrame(() => {
+              let attempts = 0;
+              const maxAttempts = 10;
+              const checkAndUpdate = async () => {
+                try {
+                  // Проверяем, есть ли select'ы в DOM
+                  const selectsBefore = qsa('select[data-file-path]');
+                  console.log(`[load] Попытка ${attempts + 1}/${maxAttempts}: Select'ов в DOM:`, selectsBefore.length);
+                  
+                  if (selectsBefore.length > 0) {
+                    // Select'ы есть, загружаем группы и обновляем
+                    console.log("[load] Загружаем группы для выпадашек, pipeline_run_id:", pipelineRunId);
+                    const groupsData = await fetchJson(`/api/faces/groups-with-files?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}`);
+                    console.log("[load] Получено групп:", groupsData?.groups?.length || 0, groupsData?.groups);
+                    
+                    await updateGroupSelects(groupsData?.groups || []);
+                    
+                    // Проверяем после обновления
+                    const selectsAfter = qsa('select[data-file-path]');
+                    console.log("[load] Select'ов в DOM после обновления:", selectsAfter.length);
+                    if (selectsAfter.length > 0) {
+                      const firstSelect = selectsAfter[0];
+                      console.log("[load] Первый select имеет опций:", firstSelect.options.length);
+                    }
+                  } else if (attempts < maxAttempts) {
+                    // Select'ы еще не появились, повторяем попытку через 200мс
+                    attempts++;
+                    setTimeout(checkAndUpdate, 200);
+                  } else {
+                    console.warn("[load] Select'ы не появились после", maxAttempts, "попыток, пропускаем обновление");
+                  }
+                } catch (e) {
+                  console.error("[load] Ошибка загрузки групп для выпадашек:", e);
+                }
+              };
+              
+              // Начинаем проверку через 300мс
+              setTimeout(checkAndUpdate, 300);
+            });
+          }
+          
           observeNewCards();
           _posScheduleUpdate();
 
@@ -627,179 +2184,13 @@
             }
           }
 
-          // actions
-          qsa(".card button[data-action]").slice(-items.length * 1 - 2000).forEach(btn => {
-            btn.addEventListener("click", async () => {
-              const card = btn.closest(".card");
-              const p = card?.getAttribute("data-path") || "";
-              const action = btn.getAttribute("data-action");
-              if (!p) return;
-              try {
-                const removeCard = () => removeCardByPath(p);
-
-                function _getPrevManualFromCard(cardEl) {
-                  const c = cardEl || {};
-                  const facesManual = (c.getAttribute?.("data-faces-manual") || "").toString().trim().toLowerCase();
-                  const qMan = Number(c.getAttribute?.("data-quarantine-manual") || 0);
-                  const pnfMan = Number(c.getAttribute?.("data-people-no-face-manual") || 0);
-                  const pnfPerson = (c.getAttribute?.("data-people-no-face-person") || "").toString() || "";
-                  const aMan = Number(c.getAttribute?.("data-animals-manual") || 0);
-                  const aManKind = (c.getAttribute?.("data-animals-manual-kind") || "").toString().trim().toLowerCase();
-                  // precedence for UNDO snapshot: pick current run-scoped manual state
-                  if (pnfMan === 1) return { label: "people_no_face", person: (pnfPerson || null) };
-                  if (facesManual === "faces") return { label: "faces", person: null };
-                  if (facesManual === "no_faces") return { label: "no_faces", person: null };
-                  if (qMan === 1) return { label: "quarantine", person: null };
-                  if (aMan === 1) return { label: (aManKind === "cat" ? "cat" : "cat"), person: null };
-                  return { label: "", person: null };
-                }
-
-                function _pushUndo(state) {
-                  if (!window.__undoStack) {
-                    window.__undoStack = [];
-                  }
-                  if (state && state.path) {
-                    window.__undoStack.push(state);
-                    // Ограничиваем стек 10 последними действиями
-                    if (window.__undoStack.length > 10) {
-                      window.__undoStack.shift();
-                    }
-                  }
-                  const b = qs("#btnUndo");
-                  if (!b) return;
-                  if (window.__undoStack && window.__undoStack.length > 0) {
-                    b.style.display = "";
-                  } else {
-                    b.style.display = "none";
-                  }
-                }
-
-                if (action === "delete") {
-                  try {
-                    const res = await postJson("/api/faces/delete", { pipeline_run_id: Number(pipelineRunId), path: p });
-                    if (res.ok && res.undo_data) {
-                      _pushUndo({
-                        action: "delete",
-                        path: res.undo_data.original_path,
-                        delete_path: res.undo_data.delete_path,
-                        undo_data: res.undo_data,
-                      });
-                    }
-                    removeCard();
-                    await refreshTabCounts();
-                    setToast(`Файл удалён. Удалено из gold: ${res.removed_from_gold || 0} записей.`);
-                  } catch (e) {
-                    setToast(e?.message || String(e), true);
-                  }
-                } else if (action === "no_faces") {
-                  const prev = _getPrevManualFromCard(card);
-                  await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "no_faces" });
-                  _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
-                  if (tab === "faces" || tab === "quarantine") {
-                    removeCard();
-                    await refreshTabCounts();
-                  } else {
-                    await load(true);
-                  }
-                } else if (action === "mark_faces") {
-                  const prev = _getPrevManualFromCard(card);
-                  await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "faces" });
-                  _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
-                  // В карантине/животных разметка идёт потоком: без перезагрузки списка.
-                  if (tab === "quarantine" || tab === "animals") {
-                    removeCard();
-                    await refreshTabCounts();
-                  } else {
-                    await load(true);
-                  }
-                } else if (action === "not_animal_no_faces") {
-                  const prev = _getPrevManualFromCard(card);
-                  await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "not_animal_no_faces" });
-                  _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
-                  // Потоковая чистка ложных котов: без reload списка, просто убираем карточку.
-                  if (tab === "animals") {
-                    removeCard();
-                    await refreshTabCounts();
-                  } else {
-                    await load(true);
-                  }
-                } else if (action === "mark_cat") {
-                  // #region agent log
-                  try {
-                    const bn = (p || "").split(/[\\\\/]/).pop();
-                    fetch('http://127.0.0.1:7242/ingest/6ba4f132-2ab7-473c-8c73-3e4f328ef941',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app/templates/faces.html:mark_cat',message:'ui_click_mark_cat',data:{tab:tab,basename:bn||""},timestamp:Date.now(),sessionId:'debug-session',runId:'pre-fix',hypothesisId:'HNOFACES_CAT'})}).catch(()=>{});
-                  } catch (e) {}
-                  // #endregion agent log
-                  const prev = _getPrevManualFromCard(card);
-                  await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "cat" });
-                  _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
-                  // Потоковое действие: без прыжков/перезагрузки списка
-                  if (tab === "faces" || tab === "quarantine" || tab === "no_faces") {
-                    removeCard();
-                    await refreshTabCounts();
-                  } else {
-                    await load(true);
-                  }
-                } else if (action === "mark_quarantine") {
-                  const prev = _getPrevManualFromCard(card);
-                  await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "quarantine" });
-                  _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
-                  // На вкладке Faces не хотим дёргать список/скролл — просто убираем карточку.
-                  if (tab === "faces") {
-                    removeCard();
-                    await refreshTabCounts();
-                  } else {
-                    await load(true);
-                  }
-                } else if (action === "annotate_faces") {
-                  const thumb = card?.querySelector(".thumb[data-src]");
-                  const src = thumb?.getAttribute("data-src") || "";
-                  await openAnnotate(p, src);
-                } else if (action === "people_no_face") {
-                  const prev = _getPrevManualFromCard(card);
-                  await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "people_no_face" });
-                  _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
-                  // Потоковая разметка: уводим карточку без reload (иначе прыгает список).
-                  removeCard();
-                  await refreshTabCounts();
-                } else if (action === "reset") {
-                  const prev = _getPrevManualFromCard(card);
-                  await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "" });
-                  _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
-                  // На вкладке people_no_face это "потоковый" сброс: просто убираем карточку.
-                  removeCard();
-                  await refreshTabCounts();
-                }
-              } catch (e) {
-                setToast(e?.message || String(e), true);
-              }
-            });
-          });
-
-          // double click: show rectangles overlay (images only)
-          qsa(".thumb[data-kind='image'][data-src]").slice(-items.length * 1 - 2000).forEach(el => {
-            el.addEventListener("dblclick", async () => {
-              const p = el.getAttribute("data-path") || "";
-              const src = el.getAttribute("data-src") || "";
-              if (!p || !src) return;
-              await openViewer(p, src, { mode: "view" });
-            });
-          });
-
-          // video frames button (do not rely on dblclick: <video controls> eats events)
-          qsa("button.vfbtn[data-act='frames']").slice(-items.length * 1 - 2000).forEach(el => {
-            el.addEventListener("click", async (e) => {
-              try { e.preventDefault(); e.stopPropagation(); } catch (ee) {}
-              const p = el.getAttribute("data-path") || "";
-              const src = el.getAttribute("data-src") || "";
-              if (!p || !src) return;
-              await openVideoViewer(p, src);
-            });
-          });
+          // actions - обработчики добавлены через делегирование событий (см. инициализацию ниже)
         } catch (e) {
+          console.error("[load] Ошибка загрузки:", e);
           setToast(e?.message || String(e), true);
           if (loadedCount === 0) qs("#grid").innerHTML = "";
           hasMore = false;
+          // Не перезагружаем страницу при ошибке, просто останавливаем загрузку
         } finally {
           loading = false;
         }
@@ -861,9 +2252,73 @@
       lb.addEventListener("click", (e) => { if (e.target === lb) closeLb(); });
       window.addEventListener("keydown", (e) => { if (e.key === "Escape") closeLb(); });
 
+      let curRectsWithPersons = []; // Храним информацию о прямоугольниках с персонами
+      
+      async function loadRectsWithPersons() {
+        if (!curPath || !pipelineRunId) {
+          curRectsWithPersons = [];
+          console.log('[loadRectsWithPersons] Нет curPath или pipelineRunId');
+          return;
+        }
+        
+        try {
+          console.log('[loadRectsWithPersons] Загружаем данные для:', { curPath, pipelineRunId });
+          const data = await fetchJson(`/api/faces/rectangles?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}&path=${encodeURIComponent(curPath)}`);
+          console.log('[loadRectsWithPersons] Получены данные:', { rectanglesCount: data?.rectangles?.length || 0, rectangles: data?.rectangles });
+          curRectsWithPersons = (data?.rectangles || []).map((r, i) => ({
+            index: i,
+            id: r.id,
+            x: Number(r.bbox_x || 0),
+            y: Number(r.bbox_y || 0),
+            w: Number(r.bbox_w || 0),
+            h: Number(r.bbox_h || 0),
+            person_id: r.person_id || null,
+            person_name: r.person_name || null,
+            is_manual: Number(r.is_manual || 0) === 1
+          }));
+          console.log('[loadRectsWithPersons] Обработанные данные:', { 
+            count: curRectsWithPersons.length, 
+            withPersons: curRectsWithPersons.filter(r => r.person_name).length,
+            rects: curRectsWithPersons.map(r => ({ x: r.x, y: r.y, person_name: r.person_name }))
+          });
+        } catch (e) {
+          console.error("Ошибка загрузки прямоугольников с персонами:", e);
+          curRectsWithPersons = [];
+        }
+      }
+      
       function renderRectList() {
         const all = [...(curAutoRects||[]), ...(curManualRects||[])];
-        rectList.innerHTML = all.map((r, i) => `<span class="rectpill">#${i+1} ${r.w}×${r.h}</span>`).join("") || `<span class="muted">—</span>`;
+        if (all.length === 0) {
+          rectList.innerHTML = `<span class="muted">—</span>`;
+          return;
+        }
+        
+        // Сопоставляем прямоугольники с информацией о персонах
+        const rectsHtml = all.map((r, i) => {
+          const rectInfo = curRectsWithPersons.find(ri => {
+            // Сопоставляем по индексу или по координатам
+            return (ri.index === i) || 
+                   (Math.abs(ri.x - r.x) < 5 && Math.abs(ri.y - r.y) < 5 && 
+                    Math.abs(ri.w - r.w) < 5 && Math.abs(ri.h - r.h) < 5);
+          });
+          
+          const personName = rectInfo?.person_name;
+          const personId = rectInfo?.person_id;
+          const rectId = rectInfo?.id;
+          
+          let pillContent = `#${i+1} ${r.w}×${r.h}`;
+          if (personName) {
+            pillContent += ` (${escapeHtml(personName)})`;
+          }
+          
+          const pillClass = personName ? "rectpill" : "rectpill";
+          const pillStyle = personName ? "background:#dbeafe; color:#1e40af;" : "";
+          
+          return `<span class="${pillClass}" style="${pillStyle}" data-rect-id="${rectId || ''}" data-rect-index="${i}" data-person-id="${personId || ''}" title="${personName ? `Персона: ${escapeHtml(personName)}. Двойной клик для изменения.` : 'Двойной клик для назначения персоны.'}">${pillContent}</span>`;
+        }).join("");
+        
+        rectList.innerHTML = rectsHtml;
       }
 
       function resizeCanvasToImage() {
@@ -887,16 +2342,56 @@
         const sx = lbCanvas.width / iw;
         const sy = lbCanvas.height / ih;
         lbCtx.lineWidth = 2;
-        // auto rects (yellow)
-        lbCtx.strokeStyle = "rgba(250,204,21,0.95)";
-        (curAutoRects || []).forEach(r => {
-          lbCtx.strokeRect(r.x * sx, r.y * sy, r.w * sx, r.h * sy);
+        
+        // Удаляем старые подписи
+        const imgWrap = qs("#imgWrap");
+        if (imgWrap) {
+          const oldLabels = imgWrap.querySelectorAll(".lb-rectangle-label");
+          oldLabels.forEach(el => el.remove());
+        }
+        
+        // Используем curRectsWithPersons как основной источник данных (там уже есть информация о персонах)
+        // Если curRectsWithPersons пуст, используем curAutoRects/curManualRects как fallback
+        const rectsToDraw = curRectsWithPersons.length > 0 ? curRectsWithPersons : 
+          [...(curAutoRects||[]).map((r, i) => ({...r, index: i, is_manual: false, person_name: null})),
+           ...(curManualRects||[]).map((r, i) => ({...r, index: i + (curAutoRects||[]).length, is_manual: true, person_name: null}))];
+        
+        console.log('[drawOverlay] Данные для отрисовки:', {
+          curRectsWithPersonsLength: curRectsWithPersons.length,
+          curAutoRectsLength: curAutoRects?.length || 0,
+          curManualRectsLength: curManualRects?.length || 0,
+          rectsToDrawLength: rectsToDraw.length,
+          rectsToDraw: rectsToDraw.map(r => ({ x: r.x, y: r.y, w: r.w, h: r.h, person_name: r.person_name, is_manual: r.is_manual }))
         });
-        // manual rects (blue)
-        lbCtx.strokeStyle = "rgba(59,130,246,0.95)";
-        (curManualRects || []).forEach(r => {
-          lbCtx.strokeRect(r.x * sx, r.y * sy, r.w * sx, r.h * sy);
+        
+        // Рисуем прямоугольники и создаем подписи
+        rectsToDraw.forEach((rectInfo, i) => {
+          const isManual = rectInfo.is_manual || false;
+          const personName = rectInfo.person_name || null;
+          
+          // Рисуем прямоугольник на canvas
+          lbCtx.strokeStyle = isManual ? "rgba(59,130,246,0.95)" : "rgba(250,204,21,0.95)";
+          const rectX = rectInfo.x * sx;
+          const rectY = rectInfo.y * sy;
+          const rectW = rectInfo.w * sx;
+          const rectH = rectInfo.h * sy;
+          lbCtx.strokeRect(rectX, rectY, rectW, rectH);
+          
+          // Создаем подпись как DOM-элемент (аналогично face_cluster_detail.html)
+          // Показываем имя персоны, если оно назначено
+          if (imgWrap && personName) {
+            const label = document.createElement('div');
+            label.className = `lb-rectangle-label ${isManual ? 'manual' : ''}`;
+            label.textContent = personName;
+            label.style.left = `${rectX}px`;
+            label.style.top = `${Math.max(0, rectY - 20)}px`;
+            imgWrap.appendChild(label);
+            console.log('[drawOverlay] Создана подпись:', { personName, rectX, rectY, isManual, i, label });
+          } else if (imgWrap) {
+            console.log('[drawOverlay] Подпись не создана (нет personName):', { i, personName, rectInfo, imgWrap: !!imgWrap });
+          }
         });
+        
         // temp
         if (tempRect) {
           lbCtx.strokeStyle = "rgba(16,185,129,0.95)";
@@ -949,8 +2444,24 @@
         const rr = await fetchRects(path).catch(() => ({ auto: [], manual: [] }));
         curAutoRects = rr.auto || [];
         curManualRects = rr.manual || [];
+        // Загружаем информацию о персонах для подписей
+        await loadRectsWithPersons();
         renderRectList();
         drawOverlay();
+        
+        // Обновляем подписи при изменении размера изображения
+        if (lbImg) {
+          const resizeObserver = new ResizeObserver(() => {
+            if (curPath && curKind === "image") {
+              drawOverlay();
+            }
+          });
+          resizeObserver.observe(lbImg);
+          // Сохраняем observer для очистки при закрытии
+          if (!window.lbImgResizeObserver) {
+            window.lbImgResizeObserver = resizeObserver;
+          }
+        }
       }
 
       function _lbTabSetActive(which) {
@@ -1023,6 +2534,8 @@
           lbImg.onload = () => resolve();
           lbImg.onerror = () => resolve();
         });
+        // Загружаем информацию о персонах для подписей (для видео-кадров)
+        await loadRectsWithPersons();
         renderRectList();
         drawOverlay();
       }
@@ -1137,7 +2650,7 @@
             await postJson("/api/faces/manual-rectangles", { pipeline_run_id: Number(pipelineRunId), path: curPath, rects: curManualRects });
           }
           closeLb();
-          // На вкладке "Нет лиц" это потоковая операция: карточка должна уйти в "Есть лица" без прыжков списка.
+          // На вкладке "Нет людей" это потоковая операция: карточка должна уйти в "Люди" без прыжков списка.
           if (tab === "no_faces") {
             removeCardByPath(savedPath);
           }
@@ -1177,6 +2690,24 @@
         }
       }
       applyTabUI();
+      if (tab === "faces") {
+        // Загружаем подзакладки асинхронно, не блокируя UI (не ждем завершения)
+        loadPersonsSubtabs();
+        // Обновляем выпадашки персон в карточках после загрузки подзакладок (используем кэш)
+        if (subtab && subtab.startsWith("person_")) {
+          // Загружаем асинхронно, не блокируя
+          fetchPersonsWithFiles().then(async (personsData) => {
+            try {
+              const persons = personsData?.persons || [];
+              await updatePersonSelects(persons);
+            } catch (e) {
+              console.error("Ошибка загрузки персон для выпадашек:", e);
+            }
+          });
+        }
+      } else if (tab === "no_faces") {
+        loadGroupsSubtabs();
+      }
       updateUrlParams();
       // open video modal directly (used by /gold "Кадры" button)
       try {
@@ -1196,17 +2727,370 @@
       sentinel.style.padding = "18px 0";
       sentinel.textContent = "…";
       qs("#grid").after(sentinel);
+      let lastLoadTime = 0;
+      const minLoadInterval = 500; // минимум 500мс между загрузками
       const io = new IntersectionObserver((entries) => {
-        const e = entries && entries[0];
-        if (e && e.isIntersecting) {
-          if (!loading && hasMore) {
-            page += 1;
-            load(false);
+        try {
+          const e = entries && entries[0];
+          if (e && e.isIntersecting) {
+            const now = Date.now();
+            if (!loading && hasMore && (now - lastLoadTime) >= minLoadInterval) {
+              lastLoadTime = now;
+              page += 1;
+              load(false).catch(err => {
+                console.error("[infinite-scroll] Ошибка загрузки:", err);
+                setToast("Ошибка загрузки следующей страницы", true);
+              });
+            }
           }
+        } catch (err) {
+          console.error("[infinite-scroll] Ошибка в IntersectionObserver:", err);
         }
-      }, { root: null, rootMargin: "800px 0px", threshold: 0.01 });
+      }, { root: null, rootMargin: "200px 0px", threshold: 0.01 });
       io.observe(sentinel);
 
+      // Делегирование событий для кнопок действий (один обработчик вместо тысяч)
+      function _getPrevManualFromCard(cardEl) {
+        const c = cardEl || {};
+        const facesManual = (c.getAttribute?.("data-faces-manual") || "").toString().trim().toLowerCase();
+        const qMan = Number(c.getAttribute?.("data-quarantine-manual") || 0);
+        const pnfMan = Number(c.getAttribute?.("data-people-no-face-manual") || 0);
+        const pnfPerson = (c.getAttribute?.("data-people-no-face-person") || "").toString() || "";
+        const aMan = Number(c.getAttribute?.("data-animals-manual") || 0);
+        const aManKind = (c.getAttribute?.("data-animals-manual-kind") || "").toString().trim().toLowerCase();
+        if (pnfMan === 1) return { label: "people_no_face", person: (pnfPerson || null) };
+        if (facesManual === "faces") return { label: "faces", person: null };
+        if (facesManual === "no_faces") return { label: "no_faces", person: null };
+        if (qMan === 1) return { label: "quarantine", person: null };
+        if (aMan === 1) return { label: (aManKind === "cat" ? "cat" : "cat"), person: null };
+        return { label: "", person: null };
+      }
+      function _pushUndo(state) {
+        if (!window.__undoStack) window.__undoStack = [];
+        if (state && state.path) {
+          window.__undoStack.push(state);
+          if (window.__undoStack.length > 10) window.__undoStack.shift();
+        }
+        const b = qs("#btnUndo");
+        if (!b) return;
+        b.style.display = (window.__undoStack && window.__undoStack.length > 0) ? "" : "none";
+      }
+      qs("#grid").addEventListener("click", async (e) => {
+        const btn = e.target.closest("button[data-action]");
+        if (!btn) return;
+        const card = btn.closest(".card");
+        const p = card?.getAttribute("data-path") || "";
+        const action = btn.getAttribute("data-action");
+        if (!p) return;
+        try {
+          const removeCard = () => removeCardByPath(p);
+          if (action === "delete") {
+            const res = await postJson("/api/faces/delete", { pipeline_run_id: Number(pipelineRunId), path: p });
+            if (res.ok && res.undo_data) {
+              _pushUndo({ action: "delete", path: res.undo_data.original_path, delete_path: res.undo_data.delete_path, undo_data: res.undo_data });
+            }
+            removeCard();
+            await refreshTabCounts();
+            setToast(`Файл удалён. Удалено из gold: ${res.removed_from_gold || 0} записей.`);
+          } else if (action === "no_faces") {
+            const prev = _getPrevManualFromCard(card);
+            await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "no_faces" });
+            _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
+            if (tab === "faces" || tab === "quarantine") { removeCard(); await refreshTabCounts(); } else { await load(true); }
+          } else if (action === "mark_faces") {
+            const prev = _getPrevManualFromCard(card);
+            await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "faces" });
+            _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
+            if (tab === "quarantine" || tab === "animals") { removeCard(); await refreshTabCounts(); } else { await load(true); }
+          } else if (action === "not_animal_no_faces") {
+            const prev = _getPrevManualFromCard(card);
+            await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "not_animal_no_faces" });
+            _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
+            if (tab === "animals") { removeCard(); await refreshTabCounts(); } else { await load(true); }
+          } else if (action === "mark_cat") {
+            const prev = _getPrevManualFromCard(card);
+            await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "cat" });
+            _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
+            if (tab === "faces" || tab === "quarantine" || tab === "no_faces") { removeCard(); await refreshTabCounts(); } else { await load(true); }
+          } else if (action === "mark_quarantine") {
+            const prev = _getPrevManualFromCard(card);
+            await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "quarantine" });
+            _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
+            if (tab === "faces") { removeCard(); await refreshTabCounts(); } else { await load(true); }
+          } else if (action === "annotate_faces") {
+            const thumb = card?.querySelector(".thumb[data-src]");
+            const src = thumb?.getAttribute("data-src") || "";
+            await openAnnotate(p, src);
+          } else if (action === "people_no_face") {
+            const prev = _getPrevManualFromCard(card);
+            await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "people_no_face" });
+            _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
+            removeCard();
+            await refreshTabCounts();
+          } else if (action === "assign_person" || action === "add_person") {
+            const personIds = await showPersonDialog(p);
+            if (personIds && personIds.length > 0) {
+              // Назначаем персону файлу напрямую (file_persons)
+              for (const personId of personIds) {
+                await postJson("/api/persons/assign-file", {
+                  pipeline_run_id: Number(pipelineRunId),
+                  file_path: p,
+                  person_id: personId
+                });
+              }
+              _pushUndo({ action: "assign_person", path: p, person_ids: personIds });
+              
+              // Если мы на подзакладке персоны и добавляем еще одну персону - файл не удаляется с текущей подзакладки
+              // Просто обновляем данные и подзакладки
+              if (action === "add_person") {
+                // Файл остается на текущей подзакладке, но также появляется на подзакладках новых персон
+                await refreshTabCounts();
+                await loadPersonsSubtabs(true); // Принудительная перезагрузка, т.к. изменились привязки
+                if (personIds.length === 1) {
+                  const person = allPersonsList.find(per => per.id === personIds[0]);
+                  const personName = person ? (person.name || `Персона ${personIds[0]}`) : `Персона ${personIds[0]}`;
+                  setToast(`Добавлена персона "${personName}". Файл будет виден на подзакладках всех назначенных персон.`);
+                } else {
+                  setToast(`Добавлено ${personIds.length} персон. Файл будет виден на подзакладках всех назначенных персон.`);
+                }
+              } else {
+                // Обычное назначение - файл улетает с текущей подзакладки
+                removeCard();
+                await refreshTabCounts();
+                await loadPersonsSubtabs(true); // Принудительная перезагрузка, т.к. изменились привязки
+                if (personIds.length === 1) {
+                  const person = allPersonsList.find(per => per.id === personIds[0]);
+                  const personName = person ? (person.name || `Персона ${personIds[0]}`) : `Персона ${personIds[0]}`;
+                  setToast(`Файл назначен персоне "${personName}".`);
+                } else {
+                  setToast(`Файл назначен ${personIds.length} персонам.`);
+                }
+              }
+            }
+          } else if (action === "assign_group") {
+            const groupPath = await showGroupDialog(p);
+            if (groupPath) {
+              await postJson("/api/faces/assign-group", { pipeline_run_id: Number(pipelineRunId), path: p, group_path: groupPath });
+              _pushUndo({ action: "assign_group", path: p, group_path: groupPath });
+              removeCard();
+              await refreshTabCounts();
+              await loadGroupsSubtabs();
+              setToast(`Файл назначен в группу "${groupPath}".`);
+            }
+          } else if (action === "not_person") {
+            // Отвязываем файл от персоны (удаляем все привязки к этой персоне)
+            const personId = parseInt(btn.getAttribute("data-person-id") || "0");
+            if (!personId) {
+              setToast("Не указан ID персоны", true);
+              return;
+            }
+            
+            try {
+              // Удаляем привязки через face_labels (для всех лиц на фото)
+              const rectsData = await fetchJson(`/api/faces/rectangles?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}&path=${encodeURIComponent(p)}`).catch(() => ({ rectangles: [] }));
+              const rects = rectsData?.rectangles || [];
+              
+              for (const rect of rects) {
+                if (rect.person_id === personId && rect.id) {
+                  // Удаляем face_label для этого лица
+                  invalidatePersonsCache();
+                  await postJson("/api/persons/remove-assignment", {
+                    assignment_type: "face",
+                    face_rectangle_id: rect.id,
+                    person_id: personId
+                  }).catch(() => {}); // Игнорируем ошибки, если привязки нет
+                }
+              }
+              
+              // Удаляем прямую привязку через file_persons
+              await postJson("/api/persons/remove-assignment", {
+                assignment_type: "file",
+                pipeline_run_id: Number(pipelineRunId),
+                file_path: p,
+                person_id: personId
+              }).catch(() => {}); // Игнорируем ошибки, если привязки нет
+              
+              // Файл улетает с текущей подзакладки
+              removeCard();
+              await refreshTabCounts();
+              await loadPersonsSubtabs(true); // Принудительная перезагрузка, т.к. изменились привязки
+              
+              const person = allPersonsList.find(per => per.id === personId);
+              const personName = person ? (person.name || `Персона ${personId}`) : `Персона ${personId}`;
+              setToast(`Файл отвязан от персоны "${personName}".`);
+            } catch (e) {
+              setToast(e?.message || String(e), true);
+            }
+          } else if (action === "reset") {
+            const prev = _getPrevManualFromCard(card);
+            await postJson("/api/faces/manual-label", { pipeline_run_id: Number(pipelineRunId), path: p, label: "" });
+            _pushUndo({ action: "manual_label", path: p, prev_label: prev.label, prev_person: prev.person });
+            removeCard();
+            await refreshTabCounts();
+          } else if (action === "not_person") {
+            const personId = parseInt(btn.getAttribute("data-person-id") || "0");
+            if (!personId) return;
+            
+            // Удаляем привязку файла к персоне
+            try {
+              await postJson("/api/persons/remove-assignment", {
+                assignment_type: "file",
+                pipeline_run_id: Number(pipelineRunId),
+                file_path: p,
+                person_id: personId
+              });
+              
+              removeCard();
+              await refreshTabCounts();
+              await loadPersonsSubtabs(true); // Принудительная перезагрузка, т.к. изменились привязки
+              setToast("Привязка к персоне удалена.");
+            } catch (e) {
+              setToast(e?.message || String(e), true);
+            }
+          }
+        } catch (e) {
+          setToast(e?.message || String(e), true);
+        }
+      });
+      
+      // Обработчик двойного клика на прямоугольник для назначения персоны
+      if (rectList) {
+        rectList.addEventListener("dblclick", async (e) => {
+          const pill = e.target.closest(".rectpill");
+          if (!pill) return;
+          
+          const rectId = pill.getAttribute("data-rect-id");
+          const rectIndex = parseInt(pill.getAttribute("data-rect-index") || "0");
+          const currentPersonId = pill.getAttribute("data-person-id");
+          
+          if (!rectId || !curPath || !pipelineRunId) return;
+          
+          // Показываем диалог выбора персоны
+          const personIds = await showPersonDialog(curPath);
+          if (personIds && personIds.length > 0) {
+            // Назначаем персону лицу
+            for (const personId of personIds) {
+              try {
+                invalidatePersonsCache();
+                await postJson("/api/faces/assign-face-person", {
+                  pipeline_run_id: Number(pipelineRunId),
+                  face_rectangle_id: parseInt(rectId),
+                  person_id: parseInt(personId)
+                });
+              } catch (e) {
+                setToast(e?.message || String(e), true);
+                return;
+              }
+            }
+            
+            // Инвалидируем кэш персон
+            invalidatePersonsCache();
+            // Инвалидируем кэш персон на файле
+            const cacheKey = `${pipelineRunId}:${curPath}`;
+            personsOnFileCache.delete(cacheKey);
+            
+            // Обновляем информацию о прямоугольниках
+            await loadRectsWithPersons();
+            renderRectList();
+            drawOverlay();
+            
+            // Обновляем список персон на фото в карточке
+            await loadPersonsOnFile(curPath);
+            
+            const person = allPersonsList.find(per => per.id === personIds[0]);
+            const personName = person ? (person.name || `Персона ${personIds[0]}`) : `Персона ${personIds[0]}`;
+            setToast(`Прямоугольник #${rectIndex + 1} назначен персоне "${personName}".`);
+          }
+        });
+      }
+      // Делегирование для двойного клика по превью
+      qs("#grid").addEventListener("dblclick", async (e) => {
+        const thumb = e.target.closest(".thumb[data-kind='image'][data-src]");
+        if (!thumb) return;
+        const p = thumb.getAttribute("data-path") || "";
+        const src = thumb.getAttribute("data-src") || "";
+        if (!p || !src) return;
+        await openViewer(p, src, { mode: "view" });
+      });
+      // Делегирование для кнопки кадров видео
+      qs("#grid").addEventListener("click", async (e) => {
+        const btn = e.target.closest("button.vfbtn[data-act='frames']");
+        if (!btn) return;
+        try { e.preventDefault(); e.stopPropagation(); } catch (ee) {}
+        const p = btn.getAttribute("data-path") || "";
+        const src = btn.getAttribute("data-src") || "";
+        if (!p || !src) return;
+        await openVideoViewer(p, src);
+      });
+
+      // Инициализация обработчиков модального окна персон
+      const checkboxMultiplePersonsEl = qs("#checkboxMultiplePersons");
+      if (checkboxMultiplePersonsEl) {
+        checkboxMultiplePersonsEl.addEventListener("change", (e) => {
+          updatePersonModalMode(e.target.checked);
+        });
+      }
+      
+      const inputNewPersonEl = qs("#inputNewPersonName");
+      if (inputNewPersonEl) {
+        inputNewPersonEl.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            assignSelectedPerson();
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            closePersonModal();
+          }
+        });
+      }
+      
+      const inputNewPersonMultipleEl = qs("#inputNewPersonNameMultiple");
+      if (inputNewPersonMultipleEl) {
+        inputNewPersonMultipleEl.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            assignSelectedPerson();
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            closePersonModal();
+          }
+        });
+      }
+      
+      // Закрытие модального окна персон по клику вне его
+      const modalPersonEl = qs("#modalPerson");
+      if (modalPersonEl) {
+        modalPersonEl.addEventListener("click", (e) => {
+          if (e.target === modalPersonEl) {
+            closePersonModal();
+          }
+        });
+      }
+      
+      // Инициализация обработчиков модального окна группы
+      const inputNewGroupEl = qs("#inputNewGroupPath");
+      if (inputNewGroupEl) {
+        inputNewGroupEl.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            assignSelectedGroup();
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            closeGroupModal();
+          }
+        });
+      }
+      
+      // Закрытие модального окна по клику вне его
+      const modalGroupEl = qs("#modalGroup");
+      if (modalGroupEl) {
+        modalGroupEl.addEventListener("click", (e) => {
+          if (e.target === modalGroupEl) {
+            closeGroupModal();
+          }
+        });
+      }
+      
       refreshTabCounts();
       load(true);
 

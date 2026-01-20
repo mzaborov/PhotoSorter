@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Request, Body
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
-from backend.common.db import get_connection
+from backend.common.db import get_connection, FaceStore, PipelineStore
 from backend.common.yadisk_client import get_disk
 from backend.logic.face_recognition import (
     get_cluster_info,
@@ -57,6 +57,22 @@ templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
 # Константа для специальной персоны "Посторонние"
 IGNORED_PERSON_NAME = "Посторонние"
+
+# Группы персон с порядком сортировки
+PERSON_GROUPS = {
+    "Я и Супруга": {"order": 1},
+    "Дети": {"order": 2},
+    "Родственники": {"order": 3},
+    "Синяя диагональ": {"order": 4},
+    "Работа": {"order": 5},
+}
+
+def get_group_order(group_name: str | None) -> int | None:
+    """Возвращает порядок группы по её названию. Если группы нет в PERSON_GROUPS, возвращает None."""
+    if not group_name:
+        return None
+    group_info = PERSON_GROUPS.get(group_name)
+    return group_info["order"] if group_info else None
 
 
 @router.get("/face-clusters", response_class=HTMLResponse)
@@ -798,9 +814,9 @@ async def api_persons_list() -> dict[str, Any]:
     
     cur.execute(
         """
-        SELECT id, name, mode, is_me, kinship, avatar_face_id, created_at, updated_at
+        SELECT id, name, mode, is_me, kinship, avatar_face_id, created_at, updated_at, "group", group_order
         FROM persons
-        ORDER BY name ASC
+        ORDER BY COALESCE(group_order, 999) ASC, name ASC
         """
     )
     
@@ -815,6 +831,8 @@ async def api_persons_list() -> dict[str, Any]:
             "avatar_face_id": row["avatar_face_id"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "group": row["group"],
+            "group_order": row["group_order"],
             "is_ignored": row["name"] == IGNORED_PERSON_NAME,  # Флаг для персоны "Посторонние"
         })
     
@@ -829,23 +847,33 @@ async def api_persons_stats() -> dict[str, Any]:
     conn = get_connection()
     cur = conn.cursor()
     
-    # Получаем всех персон
+    # Получаем всех персон со статистикой по 3 способам привязки
     cur.execute(
         """
         SELECT 
             p.id,
             p.name,
             p.avatar_face_id,
-            COUNT(DISTINCT fcm.cluster_id) as clusters_count,
-            COUNT(DISTINCT fl.face_rectangle_id) as faces_count
+            p."group",
+            p.group_order,
+            COUNT(DISTINCT CASE WHEN COALESCE(fr.ignore_flag, 0) = 0 THEN fcm.cluster_id ELSE NULL END) as clusters_count,
+            COUNT(DISTINCT CASE WHEN COALESCE(fr.ignore_flag, 0) = 0 THEN fl.face_rectangle_id ELSE NULL END) as faces_count,
+            -- Статистика через прямоугольники без лица (person_rectangles)
+            (SELECT COUNT(DISTINCT pr.file_path) 
+             FROM person_rectangles pr 
+             WHERE pr.person_id = p.id) as person_rectangles_files_count,
+            -- Статистика прямой привязки (file_persons)
+            (SELECT COUNT(DISTINCT fp.file_path) 
+             FROM file_persons fp 
+             WHERE fp.person_id = p.id) as file_persons_files_count
         FROM persons p
         LEFT JOIN face_labels fl ON fl.person_id = p.id
         LEFT JOIN face_cluster_members fcm ON fl.face_rectangle_id = fcm.face_rectangle_id
         LEFT JOIN face_rectangles fr ON fl.face_rectangle_id = fr.id
-        WHERE COALESCE(fr.ignore_flag, 0) = 0
-        GROUP BY p.id, p.name, p.avatar_face_id
+        GROUP BY p.id, p.name, p.avatar_face_id, p."group", p.group_order
         ORDER BY 
             CASE WHEN p.name = ? THEN 1 ELSE 0 END,
+            COALESCE(p.group_order, 999) ASC,
             p.name ASC
         """,
         (IGNORED_PERSON_NAME,),
@@ -880,6 +908,10 @@ async def api_persons_stats() -> dict[str, Any]:
             "avatar_preview_url": avatar_preview_url,
             "clusters_count": row["clusters_count"] or 0,
             "faces_count": row["faces_count"] or 0,
+            "person_rectangles_files_count": row["person_rectangles_files_count"] or 0,
+            "file_persons_files_count": row["file_persons_files_count"] or 0,
+            "group": row["group"],
+            "group_order": row["group_order"],
             "is_ignored": row["name"] == IGNORED_PERSON_NAME,
         })
     
@@ -895,7 +927,7 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
     # Получаем информацию о персоне
     cur.execute(
         """
-        SELECT id, name, mode, is_me, kinship, avatar_face_id, created_at, updated_at
+        SELECT id, name, mode, is_me, kinship, avatar_face_id, created_at, updated_at, "group", group_order
         FROM persons
         WHERE id = ?
         """,
@@ -965,6 +997,8 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
             "is_me": bool(person_row["is_me"]),
             "kinship": person_row["kinship"],
             "avatar_face_id": person_row["avatar_face_id"],
+            "group": person_row["group"],
+            "group_order": person_row["group_order"],
             "created_at": person_row["created_at"],
             "updated_at": person_row["updated_at"],
         },
@@ -974,10 +1008,12 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
 
 @router.put("/api/persons/{person_id}")
 async def api_person_update(*, person_id: int, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    """Обновляет имя персоны."""
+    """Обновляет имя и группу персоны."""
     from datetime import datetime, timezone
     
     name = payload.get("name")
+    group = payload.get("group")  # Может быть None для удаления группы
+    
     if not name:
         raise HTTPException(status_code=400, detail="Field 'name' is required")
     
@@ -989,20 +1025,23 @@ async def api_person_update(*, person_id: int, payload: dict[str, Any] = Body(..
     if not cur.fetchone():
         raise HTTPException(status_code=404, detail="Person not found")
     
-    # Обновляем имя
+    # Вычисляем group_order на основе группы
+    group_order = get_group_order(group)
+    
+    # Обновляем имя и группу
     now = datetime.now(timezone.utc).isoformat()
     cur.execute(
         """
         UPDATE persons
-        SET name = ?, updated_at = ?
+        SET name = ?, "group" = ?, group_order = ?, updated_at = ?
         WHERE id = ?
         """,
-        (name, now, person_id),
+        (name, group, group_order, now, person_id),
     )
     
     conn.commit()
     
-    return {"status": "ok", "person_id": person_id, "name": name}
+    return {"status": "ok", "person_id": person_id, "name": name, "group": group, "group_order": group_order}
 
 
 @router.post("/api/persons/{person_id}/set-avatar")
@@ -1413,6 +1452,10 @@ async def api_persons_create(payload: dict[str, Any] = Body(...)) -> dict[str, A
     mode = payload.get("mode", "active")
     is_me = payload.get("is_me", 0)
     kinship = payload.get("kinship")
+    group = payload.get("group")  # Может быть None
+    
+    # Вычисляем group_order на основе группы
+    group_order = get_group_order(group)
     
     now = datetime.now(timezone.utc).isoformat()
     
@@ -1428,10 +1471,10 @@ async def api_persons_create(payload: dict[str, Any] = Body(...)) -> dict[str, A
             try:
                 cur.execute(
                     """
-                    INSERT INTO persons (name, mode, is_me, kinship, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO persons (name, mode, is_me, kinship, "group", group_order, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (name, mode, is_me, kinship, now, now),
+                    (name, mode, is_me, kinship, group, group_order, now, now),
                 )
                 person_id = cur.lastrowid
                 conn.commit()
@@ -2267,3 +2310,269 @@ async def api_image_dimensions(path: str, save: bool = True) -> dict[str, Any]:
             "error": str(e),
             "path": path,
         }
+
+
+@router.post("/api/persons/assign-rectangle")
+async def api_persons_assign_rectangle(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Назначает персону через прямоугольник без лица (person_rectangles).
+    
+    Параметры:
+    - pipeline_run_id: int (обязательно)
+    - file_path: str (обязательно)
+    - frame_idx: int | None (для видео: 1..3, для фото: None)
+    - bbox_x, bbox_y, bbox_w, bbox_h: int (координаты прямоугольника)
+    - person_id: int (обязательно)
+    """
+    pipeline_run_id = payload.get("pipeline_run_id")
+    file_path = payload.get("file_path")
+    frame_idx = payload.get("frame_idx")
+    bbox_x = payload.get("bbox_x")
+    bbox_y = payload.get("bbox_y")
+    bbox_w = payload.get("bbox_w")
+    bbox_h = payload.get("bbox_h")
+    person_id = payload.get("person_id")
+    
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required and must be int")
+    if not isinstance(file_path, str):
+        raise HTTPException(status_code=400, detail="file_path is required and must be str")
+    if not isinstance(person_id, int):
+        raise HTTPException(status_code=400, detail="person_id is required and must be int")
+    
+    # Проверяем, что pipeline_run_id существует
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+        if not pr:
+            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    finally:
+        ps.close()
+    
+    # Проверяем, что персона существует
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM persons WHERE id = ?", (int(person_id),))
+    person_row = cur.fetchone()
+    if not person_row:
+        raise HTTPException(status_code=404, detail="person_id not found")
+    conn.close()
+    
+    # Валидация координат
+    try:
+        bbox_x = int(bbox_x) if bbox_x is not None else 0
+        bbox_y = int(bbox_y) if bbox_y is not None else 0
+        bbox_w = int(bbox_w) if bbox_w is not None else 0
+        bbox_h = int(bbox_h) if bbox_h is not None else 0
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="bbox coordinates must be integers")
+    
+    if bbox_w <= 0 or bbox_h <= 0:
+        raise HTTPException(status_code=400, detail="bbox width and height must be positive")
+    
+    # Валидация frame_idx для видео
+    if frame_idx is not None:
+        try:
+            frame_idx = int(frame_idx)
+            if frame_idx not in (1, 2, 3):
+                raise HTTPException(status_code=400, detail="frame_idx must be 1, 2, or 3 for video")
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="frame_idx must be integer")
+    
+    # Вставляем прямоугольник
+    fs = FaceStore()
+    try:
+        rectangle_id = fs.insert_person_rectangle(
+            pipeline_run_id=int(pipeline_run_id),
+            file_path=str(file_path),
+            frame_idx=frame_idx,
+            bbox_x=bbox_x,
+            bbox_y=bbox_y,
+            bbox_w=bbox_w,
+            bbox_h=bbox_h,
+            person_id=int(person_id),
+        )
+    finally:
+        fs.close()
+    
+    return {
+        "ok": True,
+        "rectangle_id": rectangle_id,
+        "pipeline_run_id": int(pipeline_run_id),
+        "file_path": str(file_path),
+        "person_id": int(person_id),
+        "person_name": person_row["name"],
+    }
+
+
+@router.post("/api/persons/assign-file")
+async def api_persons_assign_file(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Назначает персону файлу напрямую (без прямоугольника) - file_persons.
+    
+    Параметры:
+    - pipeline_run_id: int (обязательно)
+    - file_path: str (обязательно)
+    - person_id: int (обязательно)
+    """
+    pipeline_run_id = payload.get("pipeline_run_id")
+    file_path = payload.get("file_path")
+    person_id = payload.get("person_id")
+    
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required and must be int")
+    if not isinstance(file_path, str):
+        raise HTTPException(status_code=400, detail="file_path is required and must be str")
+    if not isinstance(person_id, int):
+        raise HTTPException(status_code=400, detail="person_id is required and must be int")
+    
+    # Проверяем, что pipeline_run_id существует
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+        if not pr:
+            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    finally:
+        ps.close()
+    
+    # Проверяем, что персона существует
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM persons WHERE id = ?", (int(person_id),))
+    person_row = cur.fetchone()
+    if not person_row:
+        raise HTTPException(status_code=404, detail="person_id not found")
+    conn.close()
+    
+    # Вставляем привязку
+    fs = FaceStore()
+    try:
+        fs.insert_file_person(
+            pipeline_run_id=int(pipeline_run_id),
+            file_path=str(file_path),
+            person_id=int(person_id),
+        )
+    finally:
+        fs.close()
+    
+    return {
+        "ok": True,
+        "pipeline_run_id": int(pipeline_run_id),
+        "file_path": str(file_path),
+        "person_id": int(person_id),
+        "person_name": person_row["name"],
+    }
+
+
+@router.post("/api/persons/remove-assignment")
+async def api_persons_remove_assignment(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Удаляет привязку к персоне (любого типа).
+    
+    Параметры:
+    - assignment_type: str (обязательно) - "face", "person_rectangle", "file"
+    - pipeline_run_id: int (обязательно для person_rectangle и file)
+    - file_path: str (обязательно для person_rectangle и file)
+    - person_id: int (обязательно)
+    - face_rectangle_id: int (обязательно для type="face")
+    - rectangle_id: int (обязательно для type="person_rectangle")
+    """
+    assignment_type = payload.get("assignment_type")
+    pipeline_run_id = payload.get("pipeline_run_id")
+    file_path = payload.get("file_path")
+    person_id = payload.get("person_id")
+    face_rectangle_id = payload.get("face_rectangle_id")
+    rectangle_id = payload.get("rectangle_id")
+    
+    if not isinstance(assignment_type, str):
+        raise HTTPException(status_code=400, detail="assignment_type is required and must be str")
+    if assignment_type not in ("face", "person_rectangle", "file"):
+        raise HTTPException(status_code=400, detail="assignment_type must be 'face', 'person_rectangle', or 'file'")
+    if not isinstance(person_id, int):
+        raise HTTPException(status_code=400, detail="person_id is required and must be int")
+    
+    fs = FaceStore()
+    conn = get_connection()
+    try:
+        if assignment_type == "face":
+            # Удаляем привязку через лицо (face_labels)
+            if not isinstance(face_rectangle_id, int):
+                raise HTTPException(status_code=400, detail="face_rectangle_id is required for type='face'")
+            cur = conn.cursor()
+            cur.execute(
+                """
+                DELETE FROM face_labels
+                WHERE face_rectangle_id = ? AND person_id = ?
+                """,
+                (int(face_rectangle_id), int(person_id)),
+            )
+            conn.commit()
+            
+        elif assignment_type == "person_rectangle":
+            # Удаляем привязку через прямоугольник без лица
+            if not isinstance(rectangle_id, int):
+                raise HTTPException(status_code=400, detail="rectangle_id is required for type='person_rectangle'")
+            fs.delete_person_rectangle(rectangle_id=int(rectangle_id))
+            
+        elif assignment_type == "file":
+            # Удаляем прямую привязку файла
+            if not isinstance(pipeline_run_id, int):
+                raise HTTPException(status_code=400, detail="pipeline_run_id is required for type='file'")
+            if not isinstance(file_path, str):
+                raise HTTPException(status_code=400, detail="file_path is required for type='file'")
+            fs.delete_file_person(
+                pipeline_run_id=int(pipeline_run_id),
+                file_path=str(file_path),
+                person_id=int(person_id),
+            )
+    finally:
+        fs.close()
+        conn.close()
+    
+    return {
+        "ok": True,
+        "assignment_type": assignment_type,
+        "person_id": int(person_id),
+    }
+
+
+@router.get("/api/persons/file-assignments")
+async def api_persons_file_assignments(
+    pipeline_run_id: int,
+    file_path: str,
+) -> dict[str, Any]:
+    """
+    Возвращает все привязки файла к персонам (через все 3 способа):
+    - через лица (face_labels через face_rectangles)
+    - через прямоугольники без лица (person_rectangles)
+    - прямая привязка (file_persons)
+    """
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id must be int")
+    if not isinstance(file_path, str):
+        raise HTTPException(status_code=400, detail="file_path must be str")
+    
+    # Проверяем, что pipeline_run_id существует
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+        if not pr:
+            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    finally:
+        ps.close()
+    
+    fs = FaceStore()
+    try:
+        assignments = fs.get_file_all_assignments(
+            pipeline_run_id=int(pipeline_run_id),
+            file_path=str(file_path),
+        )
+    finally:
+        fs.close()
+    
+    return {
+        "ok": True,
+        "pipeline_run_id": int(pipeline_run_id),
+        "file_path": str(file_path),
+        "assignments": assignments,
+    }

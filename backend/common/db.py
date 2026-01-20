@@ -532,6 +532,17 @@ class FaceStore:
                 updated_at       TEXT
             );
         """)
+        
+        # Миграция: добавление полей для групп персон
+        # ВАЖНО: "group" - зарезервированное слово в SQL, используем кавычки
+        _ensure_columns(
+            self.conn,
+            "persons",
+            {
+                "group": '"group" TEXT',  # Название группы персоны
+                "group_order": "group_order INTEGER",  # Порядок группы для сортировки
+            },
+        )
 
         # Кластеры лиц
         cur.execute("""
@@ -587,6 +598,72 @@ class FaceStore:
         # ВАЖНО: idx_face_labels_cluster удалён, т.к. cluster_id больше не хранится в face_labels
         # UNIQUE индекс для предотвращения дубликатов: одно лицо может быть назначено персоне только один раз
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_face_labels_unique ON face_labels(face_rectangle_id, person_id);")
+
+        # Прямоугольники без лица, но с человеком (для привязки к персоне)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS person_rectangles (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                pipeline_run_id     INTEGER NOT NULL,
+                file_path           TEXT NOT NULL,
+                frame_idx           INTEGER,                    -- для видео: 1..3 (NULL для фото)
+                bbox_x              INTEGER NOT NULL,
+                bbox_y              INTEGER NOT NULL,
+                bbox_w              INTEGER NOT NULL,
+                bbox_h              INTEGER NOT NULL,
+                person_id           INTEGER NOT NULL,
+                created_at          TEXT NOT NULL,
+                FOREIGN KEY (person_id) REFERENCES persons(id)
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rect_run ON person_rectangles(pipeline_run_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rect_file ON person_rectangles(file_path);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rect_person ON person_rectangles(person_id);")
+
+        # Простая привязка файла к персоне (без прямоугольника)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS file_persons (
+                pipeline_run_id     INTEGER NOT NULL,
+                file_path           TEXT NOT NULL,
+                person_id           INTEGER NOT NULL,
+                created_at          TEXT NOT NULL,
+                PRIMARY KEY (pipeline_run_id, file_path, person_id),
+                FOREIGN KEY (person_id) REFERENCES persons(id)
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_persons_run ON file_persons(pipeline_run_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_persons_file ON file_persons(file_path);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_persons_person ON file_persons(person_id);")
+
+        # Группы для файлов "Нет людей" (иерархические: Поездки/2023 Турция, Мемы и т.д.)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS file_groups (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                pipeline_run_id     INTEGER NOT NULL,
+                file_path           TEXT NOT NULL,
+                group_path          TEXT NOT NULL,              -- например, "Поездки/2023 Турция"
+                created_at          TEXT NOT NULL,
+                UNIQUE(pipeline_run_id, file_path, group_path)
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_groups_run ON file_groups(pipeline_run_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_groups_file ON file_groups(file_path);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_groups_path ON file_groups(group_path);")
+
+        # Привязка персон к файлам в группах "Артефакты людей"
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS file_group_persons (
+                pipeline_run_id     INTEGER NOT NULL,
+                file_path           TEXT NOT NULL,
+                group_path          TEXT NOT NULL,
+                person_id           INTEGER NOT NULL,
+                created_at          TEXT NOT NULL,
+                PRIMARY KEY (pipeline_run_id, file_path, group_path, person_id),
+                FOREIGN KEY (person_id) REFERENCES persons(id)
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_group_persons_run ON file_group_persons(pipeline_run_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_group_persons_file ON file_group_persons(file_path);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_group_persons_person ON file_group_persons(person_id);")
 
         self.conn.commit()
 
@@ -955,6 +1032,400 @@ class FaceStore:
             (new_file_path, old_file_path),
         )
         self.conn.commit()
+
+    def insert_person_rectangle(
+        self,
+        *,
+        pipeline_run_id: int,
+        file_path: str,
+        frame_idx: int | None,
+        bbox_x: int,
+        bbox_y: int,
+        bbox_w: int,
+        bbox_h: int,
+        person_id: int,
+    ) -> int:
+        """
+        Вставляет прямоугольник без лица, но с человеком (person_rectangles).
+        Возвращает id созданной записи.
+        """
+        now = _now_utc_iso()
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO person_rectangles (
+                pipeline_run_id, file_path, frame_idx,
+                bbox_x, bbox_y, bbox_w, bbox_h,
+                person_id, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(pipeline_run_id),
+                str(file_path),
+                int(frame_idx) if frame_idx is not None else None,
+                int(bbox_x),
+                int(bbox_y),
+                int(bbox_w),
+                int(bbox_h),
+                int(person_id),
+                now,
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def delete_person_rectangle(self, *, rectangle_id: int) -> None:
+        """Удаляет прямоугольник без лица по id."""
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM person_rectangles WHERE id = ?", (int(rectangle_id),))
+        self.conn.commit()
+
+    def list_person_rectangles(
+        self,
+        *,
+        pipeline_run_id: int | None = None,
+        file_path: str | None = None,
+        person_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Возвращает список прямоугольников без лица (person_rectangles).
+        Фильтры опциональны.
+        """
+        cur = self.conn.cursor()
+        where = []
+        params = []
+        if pipeline_run_id is not None:
+            where.append("pipeline_run_id = ?")
+            params.append(int(pipeline_run_id))
+        if file_path is not None:
+            where.append("file_path = ?")
+            params.append(str(file_path))
+        if person_id is not None:
+            where.append("person_id = ?")
+            params.append(int(person_id))
+        where_sql = " AND ".join(where) if where else "1=1"
+        cur.execute(
+            f"""
+            SELECT id, pipeline_run_id, file_path, frame_idx,
+                   bbox_x, bbox_y, bbox_w, bbox_h,
+                   person_id, created_at
+            FROM person_rectangles
+            WHERE {where_sql}
+            ORDER BY created_at DESC
+            """,
+            params,
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def insert_file_person(
+        self,
+        *,
+        pipeline_run_id: int,
+        file_path: str,
+        person_id: int,
+    ) -> None:
+        """
+        Вставляет простую привязку файла к персоне (file_persons).
+        Использует INSERT OR REPLACE для предотвращения дубликатов.
+        """
+        now = _now_utc_iso()
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO file_persons (
+                pipeline_run_id, file_path, person_id, created_at
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                int(pipeline_run_id),
+                str(file_path),
+                int(person_id),
+                now,
+            ),
+        )
+        self.conn.commit()
+
+    def delete_file_person(
+        self,
+        *,
+        pipeline_run_id: int,
+        file_path: str,
+        person_id: int,
+    ) -> None:
+        """Удаляет простую привязку файла к персоне."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            DELETE FROM file_persons
+            WHERE pipeline_run_id = ? AND file_path = ? AND person_id = ?
+            """,
+            (
+                int(pipeline_run_id),
+                str(file_path),
+                int(person_id),
+            ),
+        )
+        self.conn.commit()
+
+    def list_file_persons(
+        self,
+        *,
+        pipeline_run_id: int | None = None,
+        file_path: str | None = None,
+        person_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Возвращает список простых привязок файлов к персонам (file_persons).
+        Фильтры опциональны.
+        """
+        cur = self.conn.cursor()
+        where = []
+        params = []
+        if pipeline_run_id is not None:
+            where.append("pipeline_run_id = ?")
+            params.append(int(pipeline_run_id))
+        if file_path is not None:
+            where.append("file_path = ?")
+            params.append(str(file_path))
+        if person_id is not None:
+            where.append("person_id = ?")
+            params.append(int(person_id))
+        where_sql = " AND ".join(where) if where else "1=1"
+        cur.execute(
+            f"""
+            SELECT pipeline_run_id, file_path, person_id, created_at
+            FROM file_persons
+            WHERE {where_sql}
+            ORDER BY created_at DESC
+            """,
+            params,
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def insert_file_group(
+        self,
+        *,
+        pipeline_run_id: int,
+        file_path: str,
+        group_path: str,
+    ) -> None:
+        """
+        Вставляет файл в группу (file_groups).
+        Использует INSERT OR REPLACE для предотвращения дубликатов.
+        """
+        now = _now_utc_iso()
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO file_groups (
+                    pipeline_run_id, file_path, group_path, created_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    int(pipeline_run_id),
+                    str(file_path),
+                    str(group_path),
+                    now,
+                ),
+            )
+            self.conn.commit()
+            # Проверяем, что запись действительно вставлена
+            cur.execute(
+                """
+                SELECT id, pipeline_run_id, file_path, group_path
+                FROM file_groups
+                WHERE pipeline_run_id = ? AND file_path = ? AND group_path = ?
+                LIMIT 1
+                """,
+                (int(pipeline_run_id), str(file_path), str(group_path)),
+            )
+            check = cur.fetchone()
+            if not check:
+                raise RuntimeError(f"Failed to verify insert: pipeline_run_id={pipeline_run_id}, file_path={repr(file_path)}, group_path={repr(group_path)}")
+        except Exception as e:
+            self.conn.rollback()
+            raise
+
+    def delete_file_group(
+        self,
+        *,
+        pipeline_run_id: int,
+        file_path: str,
+        group_path: str,
+    ) -> None:
+        """Удаляет файл из группы."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            DELETE FROM file_groups
+            WHERE pipeline_run_id = ? AND file_path = ? AND group_path = ?
+            """,
+            (
+                int(pipeline_run_id),
+                str(file_path),
+                str(group_path),
+            ),
+        )
+        self.conn.commit()
+
+    def list_file_groups(
+        self,
+        *,
+        pipeline_run_id: int | None = None,
+        file_path: str | None = None,
+        group_path: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Возвращает список файлов в группах (file_groups).
+        Фильтры опциональны.
+        """
+        cur = self.conn.cursor()
+        where = []
+        params = []
+        if pipeline_run_id is not None:
+            where.append("pipeline_run_id = ?")
+            params.append(int(pipeline_run_id))
+        if file_path is not None:
+            where.append("file_path = ?")
+            params.append(str(file_path))
+        if group_path is not None:
+            where.append("group_path = ?")
+            params.append(str(group_path))
+        where_sql = " AND ".join(where) if where else "1=1"
+        cur.execute(
+            f"""
+            SELECT id, pipeline_run_id, file_path, group_path, created_at
+            FROM file_groups
+            WHERE {where_sql}
+            ORDER BY group_path ASC, created_at DESC
+            """,
+            params,
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_file_groups_with_counts(
+        self,
+        *,
+        pipeline_run_id: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Возвращает список групп с количеством файлов в каждой для прогона.
+        Используется для отображения подзакладок в UI.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT 
+                group_path,
+                COUNT(DISTINCT file_path) AS files_count,
+                MAX(created_at) AS last_created_at
+            FROM file_groups
+            WHERE pipeline_run_id = ?
+            GROUP BY group_path
+            ORDER BY group_path ASC
+            """,
+            (int(pipeline_run_id),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_file_all_assignments(
+        self,
+        *,
+        pipeline_run_id: int | None = None,
+        file_path: str,
+    ) -> dict[str, Any]:
+        """
+        Возвращает все привязки файла к персонам (через все 3 способа):
+        - через лица (face_labels через face_rectangles)
+        - через прямоугольники без лица (person_rectangles)
+        - прямая привязка (file_persons)
+        
+        Если указан pipeline_run_id, получает face_run_id из pipeline_runs для фильтрации face_rectangles.
+        """
+        cur = self.conn.cursor()
+        
+        # Если указан pipeline_run_id, получаем face_run_id для фильтрации
+        face_run_id = None
+        if pipeline_run_id is not None:
+            try:
+                from backend.common.db import PipelineStore
+                ps = PipelineStore()
+                try:
+                    pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+                    if pr:
+                        face_run_id = pr.get("face_run_id")
+                finally:
+                    ps.close()
+            except Exception:
+                pass
+        
+        # Привязки через лица
+        if face_run_id is not None:
+            # Фильтруем по face_run_id для локальных прогонов
+            cur.execute(
+                """
+                SELECT DISTINCT fl.person_id, p.name AS person_name
+                FROM face_labels fl
+                JOIN face_rectangles fr ON fr.id = fl.face_rectangle_id
+                LEFT JOIN persons p ON p.id = fl.person_id
+                WHERE fr.file_path = ? AND fr.run_id = ?
+                """,
+                (str(file_path), int(face_run_id)),
+            )
+        else:
+            # Для архивных данных (archive_scope='archive') или без фильтрации
+            cur.execute(
+                """
+                SELECT DISTINCT fl.person_id, p.name AS person_name
+                FROM face_labels fl
+                JOIN face_rectangles fr ON fr.id = fl.face_rectangle_id
+                LEFT JOIN persons p ON p.id = fl.person_id
+                WHERE fr.file_path = ?
+                """,
+                (str(file_path),),
+            )
+        face_assignments = [dict(r) for r in cur.fetchall()]
+        
+        # Привязки через прямоугольники без лица
+        person_rects = self.list_person_rectangles(
+            pipeline_run_id=pipeline_run_id,
+            file_path=file_path,
+        )
+        person_rect_assignments = []
+        for pr in person_rects:
+            cur.execute("SELECT id, name FROM persons WHERE id = ?", (pr["person_id"],))
+            person_row = cur.fetchone()
+            if person_row:
+                person_rect_assignments.append({
+                    "person_id": pr["person_id"],
+                    "person_name": person_row["name"],
+                    "rectangle_id": pr["id"],
+                })
+        
+        # Прямые привязки
+        file_persons_list = self.list_file_persons(
+            pipeline_run_id=pipeline_run_id,
+            file_path=file_path,
+        )
+        direct_assignments = []
+        for fp in file_persons_list:
+            cur.execute("SELECT id, name FROM persons WHERE id = ?", (fp["person_id"],))
+            person_row = cur.fetchone()
+            if person_row:
+                direct_assignments.append({
+                    "person_id": fp["person_id"],
+                    "person_name": person_row["name"],
+                })
+        
+        return {
+            "face_assignments": face_assignments,
+            "person_rectangle_assignments": person_rect_assignments,
+            "direct_assignments": direct_assignments,
+        }
 
 
 def list_folders(*, location: str | None = None, role: str | None = None) -> list[dict[str, Any]]:

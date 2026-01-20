@@ -102,6 +102,20 @@
             <button class="btn primary" id="btnUpdateName" type="button">Сохранить</button>
           </div>
         </div>
+        <div class="form-group" style="margin-top:12px;">
+          <label>Группа:</label>
+          <div style="display:flex; gap:8px;">
+            <select id="selectPersonGroup" style="flex:1; border:1px solid #d1d5db; border-radius:10px; padding:8px 10px; font-size:14px;">
+              <option value="">Без группы</option>
+              <option value="Я и Супруга">Я и Супруга</option>
+              <option value="Дети">Дети</option>
+              <option value="Родственники">Родственники</option>
+              <option value="Синяя диагональ">Синяя диагональ</option>
+              <option value="Работа">Работа</option>
+            </select>
+            <button class="btn primary" id="btnUpdateGroup" type="button">Сохранить</button>
+          </div>
+        </div>
         <div style="margin-top:12px; display:flex; gap:10px; flex-wrap:wrap;">
           <button class="btn primary" id="btnSaveToGold" type="button">Сохранить в gold</button>
         </div>
@@ -183,6 +197,12 @@
           // Обновляем заголовок
           document.getElementById('personName').textContent = personData.person.name;
           document.getElementById('inputPersonName').value = personData.person.name;
+          
+          // Обновляем группу
+          const groupSelect = document.getElementById('selectPersonGroup');
+          if (groupSelect) {
+            groupSelect.value = personData.person.group || '';
+          }
           
           // Загружаем аватар если есть
           if (personData.person.avatar_face_id) {
@@ -1050,6 +1070,36 @@
         }
       }
 
+      async function updatePersonGroup() {
+        const groupSelect = document.getElementById('selectPersonGroup');
+        const newGroup = groupSelect ? (groupSelect.value || null) : null;
+        const currentName = document.getElementById('inputPersonName').value.trim();
+        
+        if (!currentName) {
+          showToast('Имя не может быть пустым', true);
+          return;
+        }
+        
+        try {
+          const resp = await fetch(`/api/persons/${personId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: currentName, group: newGroup }),
+          });
+          
+          if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.detail || 'Ошибка обновления группы');
+          }
+          
+          showToast('Группа обновлена');
+          await loadPerson();
+        } catch (e) {
+          console.error('Ошибка обновления группы:', e);
+          showToast(`Ошибка: ${e.message}`, true);
+        }
+      }
+
       async function saveToGold() {
         const btn = document.getElementById('btnSaveToGold');
         if (!btn) return;
@@ -1125,26 +1175,90 @@
           
           // Добавляем 3 ближайших по embeddings
           if (similarFaces.length > 0) {
-            select.innerHTML += '<optgroup label="Ближайшие по embeddings:">';
+            const optgroupSimilar = document.createElement('optgroup');
+            optgroupSimilar.label = 'Ближайшие по embeddings:';
             for (const sf of similarFaces) {
               if (sf.person_id && sf.person_id !== personId) {
                 const person = allPersons.find(p => p.id === sf.person_id);
-                if (person) {
-                  select.innerHTML += `<option value="${sf.person_id}">${person.name} (расстояние: ${sf.distance.toFixed(3)})</option>`;
+                if (person && !person.is_ignored) {
+                  const opt = document.createElement('option');
+                  opt.value = sf.person_id;
+                  opt.textContent = `${person.name} (расстояние: ${sf.distance.toFixed(3)})`;
+                  optgroupSimilar.appendChild(opt);
                 }
               }
             }
-            select.innerHTML += '</optgroup>';
-          }
-          
-          // Добавляем всех персон
-          select.innerHTML += '<optgroup label="Все персоны:">';
-          for (const p of allPersons) {
-            if (p.id !== personId && !p.is_ignored) {
-              select.innerHTML += `<option value="${p.id}">${p.name}${p.is_me ? ' (я)' : ''}</option>`;
+            if (optgroupSimilar.children.length > 0) {
+              select.appendChild(optgroupSimilar);
             }
           }
-          select.innerHTML += '</optgroup>';
+          
+          // Группируем остальных персон по группам
+          const groupedPersons = {};
+          const noGroupPersons = [];
+          
+          for (const p of allPersons) {
+            if (p.id === personId || p.is_ignored) continue;
+            const groupName = p.group || null;
+            if (groupName) {
+              if (!groupedPersons[groupName]) {
+                groupedPersons[groupName] = {
+                  order: p.group_order || 999,
+                  persons: []
+                };
+              }
+              groupedPersons[groupName].persons.push(p);
+            } else {
+              noGroupPersons.push(p);
+            }
+          }
+          
+          // Сортируем группы по order
+          const sortedGroups = Object.entries(groupedPersons).sort((a, b) => {
+            return a[1].order - b[1].order;
+          });
+          
+          // Сортируем персон внутри каждой группы по имени
+          for (const [groupName, groupData] of sortedGroups) {
+            groupData.persons.sort((a, b) => {
+              const nameA = (a.name || '').toLowerCase();
+              const nameB = (b.name || '').toLowerCase();
+              return nameA.localeCompare(nameB);
+            });
+          }
+          
+          // Сортируем персон без группы по имени
+          noGroupPersons.sort((a, b) => {
+            const nameA = (a.name || '').toLowerCase();
+            const nameB = (b.name || '').toLowerCase();
+            return nameA.localeCompare(nameB);
+          });
+          
+          // Рендерим группы
+          for (const [groupName, groupData] of sortedGroups) {
+            const optgroup = document.createElement('optgroup');
+            optgroup.label = groupName;
+            for (const p of groupData.persons) {
+              const opt = document.createElement('option');
+              opt.value = p.id;
+              opt.textContent = p.name + (p.is_me ? ' (я)' : '');
+              optgroup.appendChild(opt);
+            }
+            select.appendChild(optgroup);
+          }
+          
+          // Рендерим персон без группы (если есть)
+          if (noGroupPersons.length > 0) {
+            const optgroup = document.createElement('optgroup');
+            optgroup.label = 'Без группы';
+            for (const p of noGroupPersons) {
+              const opt = document.createElement('option');
+              opt.value = p.id;
+              opt.textContent = p.name + (p.is_me ? ' (я)' : '');
+              optgroup.appendChild(opt);
+            }
+            select.appendChild(optgroup);
+          }
           
           openModal('modalReassign');
         } catch (e) {
@@ -1314,6 +1428,7 @@
 
       // Инициализация
       document.getElementById('btnUpdateName').addEventListener('click', updatePersonName);
+      document.getElementById('btnUpdateGroup').addEventListener('click', updatePersonGroup);
       document.getElementById('btnSaveToGold').addEventListener('click', saveToGold);
       document.getElementById('inputPersonName').addEventListener('keypress', (e) => {
         if (e.key === 'Enter') updatePersonName();

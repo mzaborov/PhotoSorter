@@ -865,7 +865,9 @@ def _create_face_recognition_model():
         from pathlib import Path
         
         # Путь к модели ArcFace ONNX
-        model_dir = Path(__file__).parent.parent.parent / "models" / "face_recognition"
+        # Ищем в корне проекта (models/face_recognition/), а не относительно backend/
+        repo_root = Path(__file__).parent.parent.parent.parent  # backend/logic/pipeline -> repo_root
+        model_dir = repo_root / "models" / "face_recognition"
         model_dir.mkdir(parents=True, exist_ok=True)
         
         # Пробуем найти ONNX модель ArcFace
@@ -1434,6 +1436,8 @@ def scan_faces_local(
     video_bad_std_luma: float = 10.0,
     video_bad_black_ratio: float = 0.85,
     video_black_luma_threshold: int = 16,
+    cluster_eps: float = 0.5,
+    cluster_min_samples: int = 2,
     run_id: int | None = None,
     pipeline: PipelineStore | None = None,
     pipeline_run_id: int | None = None,
@@ -1728,6 +1732,8 @@ def scan_faces_local(
                 pass
 
             # Resume-friendly: если уже есть сводка лиц для этого файла под этим run_id — пропускаем.
+            # ВАЖНО: проверяем не только faces_scanned_at, но и наличие face_rectangles,
+            # чтобы не пропускать файлы, где faces_scanned_at установлен, но face_rectangles не сохранены.
             stage = "dedup_get_row"
             row = dedup.get_row_by_path(path=db_path)
             if stats.images_scanned <= 3:
@@ -1738,7 +1744,21 @@ def scan_faces_local(
                     data={"i": int(stats.images_scanned), "has_row": bool(row), "row_keys": sorted(list(row.keys())) if row else None},
                 )
             if row and row.get("faces_run_id") is not None and int(row.get("faces_run_id")) == run_id_i and row.get("faces_scanned_at"):
-                continue
+                # Проверяем, есть ли face_rectangles для этого файла
+                cur_check = store.conn.cursor()
+                cur_check.execute(
+                    "SELECT COUNT(*) FROM face_rectangles WHERE run_id = ? AND file_path = ? AND COALESCE(ignore_flag, 0) = 0",
+                    (run_id_i, db_path)
+                )
+                has_rectangles = int(cur_check.fetchone()[0] or 0) > 0
+                if has_rectangles:
+                    continue  # Файл уже обработан корректно
+                # Если faces_scanned_at есть, но face_rectangles нет — пересканируем
+                _pipe_log(
+                    pipeline,
+                    pipeline_run_id,
+                    f"⚠️  Resume: файл {db_path} имеет faces_scanned_at, но нет face_rectangles. Пересканируем.\n",
+                )
             try:
                 # --- VIDEO: sample 1–3 frames and aggregate ---
                 if v_samples > 0 and _is_video(abspath):
@@ -2300,12 +2320,12 @@ def scan_faces_local(
         
         # Автоматическая кластеризация embeddings после завершения детекции
         try:
-            from backend.logic.face_recognition import cluster_face_embeddings
+            from logic.face_recognition import cluster_face_embeddings
             _pipe_log(pipeline, pipeline_run_id, f"clustering: starting clustering for run_id={run_id_i}\n")
             cluster_result = cluster_face_embeddings(
                 run_id=run_id_i,
-                eps=0.4,
-                min_samples=2,
+                eps=cluster_eps,
+                min_samples=cluster_min_samples,
                 use_folder_context=True,
             )
             _pipe_log(
@@ -2805,6 +2825,7 @@ def main() -> int:
     p.add_argument("--animals-dirname", default="_animals")
     p.add_argument("--no-faces-dirname", default="_no_faces")
     p.add_argument("--exclude-dirname", action="append", default=list(EXCLUDE_DIR_NAMES_DEFAULT))
+    p.add_argument("--include-excluded-dirs", action="store_true", help="Обрабатывать файлы даже в исключаемых папках (_faces, _no_faces и т.д.)")
     p.add_argument("--score-threshold", type=float, default=0.85)
     p.add_argument("--thumb-size", type=int, default=160)
     # Video (optional): sample 0..3 frames and run the same detectors.
@@ -2823,6 +2844,18 @@ def main() -> int:
         "--model-url",
         default="https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
     )
+    p.add_argument(
+        "--cluster-eps",
+        type=float,
+        default=0.5,
+        help="DBSCAN eps parameter for face clustering (default: 0.5, range: 0.0-1.0, cosine distance)",
+    )
+    p.add_argument(
+        "--cluster-min-samples",
+        type=int,
+        default=2,
+        help="DBSCAN min_samples parameter for face clustering (default: 2, minimum faces per cluster)",
+    )
     args = p.parse_args()
 
     root = str(args.root)
@@ -2830,7 +2863,16 @@ def main() -> int:
         raise SystemExit(f"Root dir not found: {root}")
 
     dry_run = not bool(args.apply)
-    exclude = tuple(dict.fromkeys([str(x) for x in args.exclude_dirname]))  # preserve order, unique
+    # Если включен флаг --include-excluded-dirs, исключаем только _delete и служебные папки
+    # (остальные папки _faces, _no_faces, _people_no_face, _animals обрабатываем)
+    exclude_list = list(args.exclude_dirname)
+    if bool(args.include_excluded_dirs):
+        # Оставляем только _delete и служебные папки (_duplicates, _non_media, _broken_media)
+        exclude_list = [x for x in exclude_list if x in ("_delete", "_duplicates", "_non_media", "_broken_media")]
+        # Если _delete не был в списке, добавляем его
+        if "_delete" not in exclude_list:
+            exclude_list.append("_delete")
+    exclude = tuple(dict.fromkeys([str(x) for x in exclude_list]))  # preserve order, unique
 
     pipeline: PipelineStore | None = None
     pipeline_run_id: int | None = int(args.pipeline_run_id) if args.pipeline_run_id else None
@@ -2977,6 +3019,8 @@ def main() -> int:
             video_bad_std_luma=float(args.video_bad_std_luma or 0.0),
             video_bad_black_ratio=float(args.video_bad_black_ratio or 0.0),
             video_black_luma_threshold=int(args.video_black_luma_threshold or 0),
+            cluster_eps=float(args.cluster_eps or 0.5),
+            cluster_min_samples=int(args.cluster_min_samples or 2),
             run_id=existing_face_run_id,
             pipeline=pipeline,
             pipeline_run_id=pipeline_run_id,

@@ -62,7 +62,9 @@
             <th>Аватар</th>
             <th>Имя</th>
             <th style="text-align: right;">Кластеры</th>
-            <th style="text-align: right;">Лица</th>
+            <th style="text-align: right;">Через лица</th>
+            <th style="text-align: right;">Через прямоугольники</th>
+            <th style="text-align: right;">Прямая привязка</th>
           </tr>
         </thead>
         <tbody id="personsTableBody">
@@ -118,34 +120,67 @@
 
           const persons = data.persons || [];
           
-          // Сначала рендерим таблицу с плейсхолдерами
-          tableBodyEl.innerHTML = persons.map(p => {
-            const isIgnored = p.is_ignored || false;
-            const nameClass = isIgnored ? "person-name ignored" : "person-name";
-            const nameHtml = `<a href="/persons/${p.id}" class="person-name-link ${nameClass}">${escapeHtml(p.name || `Person ${p.id}`)}</a>`;
+          // Группируем персон по группам
+          const groupedPersons = {};
+          const noGroupPersons = [];
+          
+          for (const p of persons) {
+            const groupName = p.group || null;
+            if (groupName) {
+              if (!groupedPersons[groupName]) {
+                groupedPersons[groupName] = {
+                  order: p.group_order || 999,
+                  persons: []
+                };
+              }
+              groupedPersons[groupName].persons.push(p);
+            } else {
+              noGroupPersons.push(p);
+            }
+          }
+          
+          // Сортируем группы по order
+          const sortedGroups = Object.entries(groupedPersons).sort((a, b) => {
+            return a[1].order - b[1].order;
+          });
+          
+          // Сортируем персон внутри каждой группы по имени
+          for (const [groupName, groupData] of sortedGroups) {
+            groupData.persons.sort((a, b) => {
+              const nameA = (a.name || '').toLowerCase();
+              const nameB = (b.name || '').toLowerCase();
+              return nameA.localeCompare(nameB);
+            });
+          }
+          
+          // Сортируем персон без группы по имени
+          noGroupPersons.sort((a, b) => {
+            const nameA = (a.name || '').toLowerCase();
+            const nameB = (b.name || '').toLowerCase();
+            return nameA.localeCompare(nameB);
+          });
+          
+          // Рендерим таблицу с группировкой
+          let html = '';
+          
+          // Рендерим группы
+          for (const [groupName, groupData] of sortedGroups) {
+            html += `<tr class="group-header"><td colspan="6" style="background: #f3f4f6; font-weight: 700; padding: 16px 10px; border-bottom: 2px solid #d1d5db;">${escapeHtml(groupName)}</td></tr>`;
             
-            // Плейсхолдер для аватара (будет заменён после загрузки)
-            const avatarPlaceholder = `<div class="person-avatar-placeholder" data-face-id="${p.avatar_face_id || ''}">👤</div>`;
-            
-            // Кликабельные числа для кластеров и лиц
-            const clustersCount = p.clusters_count || 0;
-            const facesCount = p.faces_count || 0;
-            const clustersHtml = clustersCount > 0 
-              ? `<a href="/persons/${p.id}/clusters" class="pill-link" title="Перейти к кластерам">${clustersCount}</a>`
-              : `<span class="pill">${clustersCount}</span>`;
-            const facesHtml = facesCount > 0
-              ? `<a href="/persons/${p.id}" class="pill-link" title="Перейти к карточке персоны">${facesCount}</a>`
-              : `<span class="pill">${facesCount}</span>`;
-            
-            return `
-              <tr ${isIgnored ? 'style="opacity: 0.7;"' : ""} data-person-id="${p.id}">
-                <td>${avatarPlaceholder}</td>
-                <td>${nameHtml}</td>
-                <td style="text-align: right;">${clustersHtml}</td>
-                <td style="text-align: right;">${facesHtml}</td>
-              </tr>
-            `;
-          }).join("");
+            for (const p of groupData.persons) {
+              html += renderPersonRow(p);
+            }
+          }
+          
+          // Рендерим персон без группы (если есть)
+          if (noGroupPersons.length > 0) {
+            html += `<tr class="group-header"><td colspan="6" style="background: #f3f4f6; font-weight: 700; padding: 16px 10px; border-bottom: 2px solid #d1d5db;">Без группы</td></tr>`;
+            for (const p of noGroupPersons) {
+              html += renderPersonRow(p);
+            }
+          }
+          
+          tableBodyEl.innerHTML = html;
 
           loadingEl.style.display = "none";
           errorEl.style.display = "none";
@@ -182,6 +217,45 @@
           errorEl.textContent = `Ошибка загрузки персон: ${err.message}`;
           errorEl.style.display = "block";
         }
+      }
+      
+      function renderPersonRow(p) {
+        const isIgnored = p.is_ignored || false;
+        const nameClass = isIgnored ? "person-name ignored" : "person-name";
+        const nameHtml = `<a href="/persons/${p.id}" class="person-name-link ${nameClass}">${escapeHtml(p.name || `Person ${p.id}`)}</a>`;
+        
+        // Плейсхолдер для аватара (будет заменён после загрузки)
+        const avatarPlaceholder = `<div class="person-avatar-placeholder" data-face-id="${p.avatar_face_id || ''}">👤</div>`;
+        
+        // Кликабельные числа для кластеров и лиц
+        const clustersCount = p.clusters_count || 0;
+        const facesCount = p.faces_count || 0;
+        const personRectanglesCount = p.person_rectangles_files_count || 0;
+        const filePersonsCount = p.file_persons_files_count || 0;
+        
+        const clustersHtml = clustersCount > 0 
+          ? `<a href="/persons/${p.id}/clusters" class="pill-link" title="Перейти к кластерам">${clustersCount}</a>`
+          : `<span class="pill">${clustersCount}</span>`;
+        const facesHtml = facesCount > 0
+          ? `<a href="/persons/${p.id}" class="pill-link" title="Перейти к карточке персоны">${facesCount}</a>`
+          : `<span class="pill">${facesCount}</span>`;
+        const personRectanglesHtml = personRectanglesCount > 0
+          ? `<span class="pill" title="Файлов с прямоугольниками без лица">${personRectanglesCount}</span>`
+          : `<span class="pill">${personRectanglesCount}</span>`;
+        const filePersonsHtml = filePersonsCount > 0
+          ? `<span class="pill" title="Файлов с прямой привязкой">${filePersonsCount}</span>`
+          : `<span class="pill">${filePersonsCount}</span>`;
+        
+        return `
+          <tr ${isIgnored ? 'style="opacity: 0.7;"' : ""} data-person-id="${p.id}">
+            <td>${avatarPlaceholder}</td>
+            <td>${nameHtml}</td>
+            <td style="text-align: right;">${clustersHtml}</td>
+            <td style="text-align: right;">${facesHtml}</td>
+            <td style="text-align: right;">${personRectanglesHtml}</td>
+            <td style="text-align: right;">${filePersonsHtml}</td>
+          </tr>
+        `;
       }
 
       function showToast(message, isError = false) {

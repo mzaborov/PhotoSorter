@@ -1,0 +1,32 @@
+---
+alwaysApply: true
+---
+Организация временных файлов и скриптов (PhotoSorter)
+
+## Правила размещения файлов
+
+### SQL запросы
+- **Место:** `backend/scripts/debug/` (рядом с `sqlite_select.py`)
+- **Использование:** `python backend/scripts/debug/sqlite_select.py --sql-file backend/scripts/debug/check_*.sql`
+- **НЕ размещать:** в корне проекта
+
+### Временные Python скрипты
+- **Место:** `backend/scripts/tools/` (для утилит) или `backend/scripts/debug/` (для отладки)
+- **НЕ размещать:** в корне проекта
+
+### Результаты прогонов и логи скриптов
+- **Место:** `backend/scripts/debug/data/` (для результатов) или `backend/scripts/debug/_logs/` (для логов)
+- **Примеры:** `recalc_all_faces.log`, результаты анализа, дампы данных
+- **НЕ размещать:** в корне проекта
+
+### Исключения (остаются в корне)
+- `History.log` - журнал вех проекта
+- `requirements.txt`, `requirements-face.txt` - зависимости проекта
+- `README.md`, `TODO.md` - документация проекта
+- `run_uvicorn.cmd` - скрипт запуска сервера
+
+## Ритуал закрытия сессии
+При закрытии сессии проверяю корень проекта и перемещаю временные файлы в соответствующие папки:
+- SQL файлы → `backend/scripts/debug/`
+- Временные Python скрипты → `backend/scripts/tools/` или `backend/scripts/debug/`
+- Логи и результаты → `backend/scripts/debug/data/` или `backend/scripts/debug/_logs/`

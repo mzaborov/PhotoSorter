@@ -29,7 +29,6 @@ local:C:\tmp\Photo\_faces\IMG-20241120-WA0027.jpeg
 local:C:\tmp\Photo\_faces\IMG-20241120-WA0028.jpg
 local:C:\tmp\Photo\_faces\IMG-20241202-WA0008.jpg
 local:C:\tmp\Photo\_faces\IMG-20241216-WA0006.jpg
-local:C:\tmp\Photo\_faces\IMG-20241218-WA0014.jpg
 local:C:\tmp\Photo\_faces\IMG-20241223-WA0040.jpg
 local:C:\tmp\Photo\_faces\IMG-20250102-WA0027.jpg
 local:C:\tmp\Photo\_faces\IMG-20250106-WA0016.jpeg

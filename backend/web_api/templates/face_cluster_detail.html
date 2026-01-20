@@ -275,11 +275,72 @@
           
           const select = document.getElementById('selectAssignPerson');
           select.innerHTML = '<option value="">Выберите персону...</option>';
+          
+          // Группируем персон по группам
+          const groupedPersons = {};
+          const noGroupPersons = [];
+          
           for (const p of persons) {
-            const opt = document.createElement('option');
-            opt.value = p.id;
-            opt.textContent = p.name;
-            select.appendChild(opt);
+            if (p.is_ignored) continue; // Пропускаем "Посторонние"
+            const groupName = p.group || null;
+            if (groupName) {
+              if (!groupedPersons[groupName]) {
+                groupedPersons[groupName] = {
+                  order: p.group_order || 999,
+                  persons: []
+                };
+              }
+              groupedPersons[groupName].persons.push(p);
+            } else {
+              noGroupPersons.push(p);
+            }
+          }
+          
+          // Сортируем группы по order
+          const sortedGroups = Object.entries(groupedPersons).sort((a, b) => {
+            return a[1].order - b[1].order;
+          });
+          
+          // Сортируем персон внутри каждой группы по имени
+          for (const [groupName, groupData] of sortedGroups) {
+            groupData.persons.sort((a, b) => {
+              const nameA = (a.name || '').toLowerCase();
+              const nameB = (b.name || '').toLowerCase();
+              return nameA.localeCompare(nameB);
+            });
+          }
+          
+          // Сортируем персон без группы по имени
+          noGroupPersons.sort((a, b) => {
+            const nameA = (a.name || '').toLowerCase();
+            const nameB = (b.name || '').toLowerCase();
+            return nameA.localeCompare(nameB);
+          });
+          
+          // Рендерим группы
+          for (const [groupName, groupData] of sortedGroups) {
+            const optgroup = document.createElement('optgroup');
+            optgroup.label = groupName;
+            for (const p of groupData.persons) {
+              const opt = document.createElement('option');
+              opt.value = p.id;
+              opt.textContent = p.name + (p.is_me ? ' (я)' : '');
+              optgroup.appendChild(opt);
+            }
+            select.appendChild(optgroup);
+          }
+          
+          // Рендерим персон без группы (если есть)
+          if (noGroupPersons.length > 0) {
+            const optgroup = document.createElement('optgroup');
+            optgroup.label = 'Без группы';
+            for (const p of noGroupPersons) {
+              const opt = document.createElement('option');
+              opt.value = p.id;
+              opt.textContent = p.name + (p.is_me ? ' (я)' : '');
+              optgroup.appendChild(opt);
+            }
+            select.appendChild(optgroup);
           }
         } catch (e) {
           console.error('Ошибка загрузки персон:', e);

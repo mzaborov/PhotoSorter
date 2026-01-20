@@ -163,30 +163,51 @@ def cluster_face_embeddings(
             "total_faces": 0,
         }
     
-    # Для архивного режима исключаем лица, которые уже находятся в кластерах
-    # (append без дублирования - не кластеризуем лица, которые уже были обработаны)
+    # Получаем список ID лиц, которые уже находятся в каких-то кластерах
+    # (для исключения из повторной кластеризации)
     if archive_scope == 'archive':
-        # Получаем список ID лиц, которые уже находятся в каких-то кластерах
         cur.execute("""
             SELECT DISTINCT fcm.face_rectangle_id
             FROM face_cluster_members fcm
             INNER JOIN face_clusters fc ON fcm.cluster_id = fc.id
             WHERE fc.archive_scope = 'archive'
         """)
-        clustered_face_ids = {row['face_rectangle_id'] for row in cur.fetchall()}
-        
-        # Фильтруем rows - оставляем только лица, которых ещё нет в кластерах
-        rows = [row for row in rows if row['id'] not in clustered_face_ids]
-        
-        if len(rows) == 0:
-            # Все лица уже в кластерах - нечего кластеризовать
-            return {
-                "clusters": {},
-                "noise": [],
-                "cluster_id": None,
-                "total_faces": 0,
-                "skipped_already_clustered": len(clustered_face_ids),
-            }
+    else:
+        # Для run_id проверяем ВСЕ существующие кластеры (не только для этого run_id)
+        # чтобы можно было добавлять новые лица в существующие кластеры
+        cur.execute("""
+            SELECT DISTINCT fcm.face_rectangle_id
+            FROM face_cluster_members fcm
+            INNER JOIN face_clusters fc ON fcm.cluster_id = fc.id
+        """)
+    
+    clustered_face_ids = {row['face_rectangle_id'] for row in cur.fetchall()}
+    
+    # Фильтруем rows - оставляем только лица, которых ещё нет в кластерах
+    new_face_rows = [row for row in rows if row['id'] not in clustered_face_ids]
+    
+    if len(new_face_rows) == 0:
+        # Все лица уже в кластерах - нечего кластеризовать
+        return {
+            "clusters": {},
+            "noise": [],
+            "cluster_id": None,
+            "total_faces": 0,
+            "skipped_already_clustered": len(clustered_face_ids),
+        }
+    
+    # Для run_id: пытаемся добавить новые лица в существующие кластеры
+    # (приоритет поиска существующих кластеров перед созданием новых)
+    faces_added_to_existing = 0
+    if run_id is not None and archive_scope != 'archive':
+        faces_added_to_existing, new_face_rows = _try_add_to_existing_clusters(
+            conn=conn,
+            new_face_rows=new_face_rows,
+            eps=eps,
+        )
+    
+    # Используем отфильтрованный список для кластеризации
+    rows = new_face_rows
     
     # Подготавливаем данные для кластеризации
     face_ids: list[int] = []
@@ -259,6 +280,24 @@ def cluster_face_embeddings(
         # Можно использовать веса для перераспределения или приоритизации кластеров
         # Пока просто сохраняем информацию о весах в метаданных
     
+    # Для run_id удаляем только старые кластеры, созданные для этого run_id
+    # (чтобы избежать дубликатов при повторном запуске, но сохранить кластеры из других run_id)
+    if run_id is not None and archive_scope != 'archive':
+        # Удаляем старые кластеры для этого run_id
+        # Сначала удаляем связи (face_cluster_members), затем сами кластеры
+        cur.execute("""
+            DELETE FROM face_cluster_members
+            WHERE cluster_id IN (
+                SELECT id FROM face_clusters WHERE run_id = ?
+            )
+        """, (run_id,))
+        
+        cur.execute("""
+            DELETE FROM face_clusters WHERE run_id = ?
+        """, (run_id,))
+        
+        conn.commit()
+    
     # Сохраняем кластеры в БД (только если есть хотя бы один кластер с лицами)
     cluster_id = None
     if len(clusters) > 0:
@@ -272,7 +311,7 @@ def cluster_face_embeddings(
             params={"eps": eps, "min_samples": min_samples},
         )
     
-    return {
+    result = {
         "clusters": clusters,
         "noise": noise,
         "cluster_id": cluster_id,
@@ -280,6 +319,183 @@ def cluster_face_embeddings(
         "clusters_count": len(clusters),
         "noise_count": len(noise),
     }
+    
+    # Добавляем информацию о лицах, добавленных в существующие кластеры
+    if run_id is not None and archive_scope != 'archive' and faces_added_to_existing > 0:
+        result["faces_added_to_existing"] = faces_added_to_existing
+    
+    return result
+
+
+def _try_add_to_existing_clusters(
+    *,
+    conn: Any,
+    new_face_rows: list[dict[str, Any]],
+    eps: float,
+) -> tuple[int, list[dict[str, Any]]]:
+    """
+    Пытается добавить новые лица в существующие кластеры по схожести embeddings.
+    
+    Args:
+        conn: соединение с БД
+        new_face_rows: список новых лиц (словари с 'id', 'file_path', 'embedding')
+        eps: порог схожести (косинусное расстояние)
+    
+    Returns:
+        tuple: (количество добавленных лиц, список оставшихся лиц для кластеризации)
+    """
+    if not ML_AVAILABLE or len(new_face_rows) == 0:
+        return 0, new_face_rows
+    
+    cur = conn.cursor()
+    
+    # Получаем все существующие кластеры с их лицами и embeddings
+    cur.execute("""
+        SELECT 
+            fc.id AS cluster_id,
+            fr.id AS face_rectangle_id,
+            fr.embedding
+        FROM face_clusters fc
+        JOIN face_cluster_members fcm ON fcm.cluster_id = fc.id
+        JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
+        WHERE fr.embedding IS NOT NULL
+          AND COALESCE(fr.ignore_flag, 0) = 0
+        ORDER BY fc.id
+    """)
+    
+    # Группируем по кластерам
+    clusters_data: dict[int, list[tuple[int, bytes]]] = {}  # cluster_id -> [(face_id, embedding), ...]
+    for row in cur.fetchall():
+        cluster_id = row['cluster_id']
+        face_id = row['face_rectangle_id']
+        embedding = row['embedding']
+        if cluster_id not in clusters_data:
+            clusters_data[cluster_id] = []
+        clusters_data[cluster_id].append((face_id, embedding))
+    
+    if len(clusters_data) == 0:
+        return 0, new_face_rows
+    
+    # Вычисляем центроиды для каждого кластера (средний embedding)
+    cluster_centroids: dict[int, np.ndarray] = {}
+    for cluster_id, faces_data in clusters_data.items():
+        embeddings_list = []
+        for face_id, emb_json in faces_data:
+            try:
+                emb_array = np.array(json.loads(emb_json.decode("utf-8")), dtype=np.float32)
+                if emb_array.size > 0 and not np.isnan(emb_array).any():
+                    # Нормализуем
+                    norm = np.linalg.norm(emb_array)
+                    if norm > 0:
+                        embeddings_list.append(emb_array / norm)
+            except Exception:
+                continue
+        
+        if len(embeddings_list) > 0:
+            # Вычисляем средний embedding (центроид)
+            centroid = np.mean(embeddings_list, axis=0)
+            norm = np.linalg.norm(centroid)
+            if norm > 0:
+                cluster_centroids[cluster_id] = centroid / norm
+    
+    if len(cluster_centroids) == 0:
+        return 0, new_face_rows
+    
+    # Получаем привязку кластеров к персонам (если есть)
+    # Если у кластера несколько персон, берем самую частую
+    if len(cluster_centroids) > 0:
+        cur.execute("""
+            SELECT 
+                fc.id AS cluster_id,
+                fl.person_id,
+                COUNT(*) AS person_count
+            FROM face_clusters fc
+            JOIN face_cluster_members fcm ON fcm.cluster_id = fc.id
+            JOIN face_labels fl ON fl.face_rectangle_id = fcm.face_rectangle_id
+            WHERE fc.id IN ({})
+            GROUP BY fc.id, fl.person_id
+            ORDER BY fc.id, person_count DESC
+        """.format(",".join("?" * len(cluster_centroids))), list(cluster_centroids.keys()))
+        
+        cluster_to_person: dict[int, int] = {}  # cluster_id -> person_id
+        for row in cur.fetchall():
+            cluster_id = row['cluster_id']
+            person_id = row['person_id']
+            # Берем первую (самую частую) персону для кластера
+            if cluster_id not in cluster_to_person:
+                cluster_to_person[cluster_id] = person_id
+    else:
+        cluster_to_person = {}
+    
+    # Пытаемся добавить новые лица в существующие кластеры
+    faces_to_add: list[tuple[int, int]] = []  # [(face_id, cluster_id), ...]
+    remaining_faces: list[dict[str, Any]] = []
+    
+    for face_row in new_face_rows:
+        face_id = face_row['id']
+        embedding_json = face_row['embedding']
+        
+        if not embedding_json:
+            remaining_faces.append(face_row)
+            continue
+        
+        try:
+            # Десериализуем и нормализуем embedding нового лица
+            emb_array = np.array(json.loads(embedding_json.decode("utf-8")), dtype=np.float32)
+            if emb_array.size == 0 or np.isnan(emb_array).any():
+                remaining_faces.append(face_row)
+                continue
+            
+            norm = np.linalg.norm(emb_array)
+            if norm == 0:
+                remaining_faces.append(face_row)
+                continue
+            emb_normalized = emb_array / norm
+            
+            # Ищем наиболее подходящий кластер
+            best_cluster_id = None
+            best_similarity = -1.0
+            
+            for cluster_id, centroid in cluster_centroids.items():
+                # Косинусное расстояние (1 - cosine similarity)
+                similarity = float(np.dot(emb_normalized, centroid))
+                # Для косинусного расстояния: чем больше similarity, тем ближе
+                # eps - это максимальное расстояние, поэтому similarity >= (1 - eps)
+                if similarity >= (1.0 - eps) and similarity > best_similarity:
+                    best_similarity = similarity
+                    best_cluster_id = cluster_id
+            
+            if best_cluster_id is not None:
+                faces_to_add.append((face_id, best_cluster_id))
+            else:
+                remaining_faces.append(face_row)
+        except Exception:
+            remaining_faces.append(face_row)
+    
+    # Добавляем найденные лица в существующие кластеры
+    # НЕ создаем face_labels - если кластер привязан к персоне, 
+    # то все лица в кластере автоматически относятся к персоне через JOIN
+    # (согласно архитектуре: face_labels только для ручных привязок,
+    # кластер определяется через face_cluster_members)
+    added_count = 0
+    
+    for face_id, cluster_id in faces_to_add:
+        try:
+            # Добавляем лицо в кластер
+            cur.execute("""
+                INSERT OR IGNORE INTO face_cluster_members (cluster_id, face_rectangle_id)
+                VALUES (?, ?)
+            """, (cluster_id, face_id))
+            
+            if cur.rowcount > 0:
+                added_count += 1
+        except Exception:
+            continue
+    
+    if added_count > 0:
+        conn.commit()
+    
+    return added_count, remaining_faces
 
 
 def _save_clusters_to_db(
@@ -310,6 +526,8 @@ def _save_clusters_to_db(
     params_json = json.dumps(params)
     
     first_cluster_id = None
+    total_clusters = len(clusters)
+    processed_clusters = 0
     
     # Создаём отдельную запись для каждого кластера
     for cluster_label, face_ids in clusters.items():
@@ -341,7 +559,9 @@ def _save_clusters_to_db(
             first_cluster_id = cluster_id
         
         # Сохраняем связи лиц с этим кластером
-        for face_id in face_ids:
+        # Для больших кластеров коммитим периодически
+        batch_size = 100  # Коммитим после каждых 100 лиц в кластере
+        for i, face_id in enumerate(face_ids):
             cur.execute(
                 """
                 INSERT INTO face_cluster_members (cluster_id, face_rectangle_id)
@@ -349,10 +569,19 @@ def _save_clusters_to_db(
                 """,
                 (cluster_id, face_id),
             )
+            # Периодический коммит для больших кластеров
+            if (i + 1) % batch_size == 0:
+                conn.commit()
+        
+        # Коммитим после каждого кластера, чтобы не блокировать БД
+        conn.commit()
+        processed_clusters += 1
+        
+        # Периодический вывод прогресса для больших наборов кластеров
+        if total_clusters > 100 and processed_clusters % 100 == 0:
+            print(f"Обработано кластеров: {processed_clusters}/{total_clusters}")
     
     # Шум (noise) не сохраняем в кластеры, они остаются без кластера
-    
-    conn.commit()
     
     return first_cluster_id
 

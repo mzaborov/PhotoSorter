@@ -116,12 +116,29 @@ def process_run(run_id: int, recognition_model: dict) -> tuple[int, int]:
     # Получаем информацию о прогоне
     cur.execute("SELECT scope, root_path FROM face_runs WHERE id = ?", (run_id,))
     run_info = cur.fetchone()
-    if not run_info:
-        print(f"  Run {run_id} не найден в БД")
-        return 0, 0
     
-    scope = run_info["scope"]
-    root_path = run_info["root_path"]
+    # Если run_id не найден в face_runs, определяем scope по file_path
+    if not run_info:
+        # Проверяем первый file_path, чтобы определить scope
+        if faces:
+            first_path = faces[0]["file_path"]
+            if first_path.startswith("local:"):
+                scope = "local"
+                root_path = None  # Не нужен для локальных файлов
+                print(f"  Run {run_id} не найден в face_runs, но определен scope='local' по file_path")
+            elif first_path.startswith("disk:"):
+                scope = "yadisk"
+                root_path = None
+                print(f"  Run {run_id} не найден в face_runs, но определен scope='yadisk' по file_path")
+            else:
+                print(f"  Run {run_id} не найден в БД и не удалось определить scope")
+                return 0, 0
+        else:
+            print(f"  Run {run_id} не найден в БД и нет лиц для определения scope")
+            return 0, 0
+    else:
+        scope = run_info["scope"]
+        root_path = run_info["root_path"]
     
     disk = None
     if scope == "yadisk":
@@ -139,6 +156,8 @@ def process_run(run_id: int, recognition_model: dict) -> tuple[int, int]:
         
         if (idx + 1) % 10 == 0:
             print(f"  Обработано: {idx + 1}/{total}")
+            # Коммитим каждые 10 записей, чтобы не блокировать БД
+            conn.commit()
         
         try:
             # Пробуем извлечь embedding из thumb_jpeg (если есть)
@@ -150,16 +169,18 @@ def process_run(run_id: int, recognition_model: dict) -> tuple[int, int]:
                     
                     if img is not None:
                         # Ресайзим до нужного размера для распознавания
-                        embedding = extract_embedding_from_face(img, recognition_model)
-                        
-                        if embedding:
-                            # Сохраняем embedding в БД
-                            cur.execute(
-                                "UPDATE face_rectangles SET embedding = ? WHERE id = ?",
-                                (embedding, face_id),
-                            )
-                            processed += 1
-                            continue
+                                embedding = extract_embedding_from_face(img, recognition_model)
+                                
+                                if embedding:
+                                    # Сохраняем embedding в БД
+                                    cur.execute(
+                                        "UPDATE face_rectangles SET embedding = ? WHERE id = ?",
+                                        (embedding, face_id),
+                                    )
+                                    processed += 1
+                                    # Коммитим сразу, чтобы не блокировать БД
+                                    conn.commit()
+                                    continue
                 except Exception:
                     pass
             
@@ -191,6 +212,8 @@ def process_run(run_id: int, recognition_model: dict) -> tuple[int, int]:
                                     (embedding, face_id),
                                 )
                                 processed += 1
+                                # Коммитим сразу, чтобы не блокировать БД
+                                conn.commit()
                                 os.unlink(tmp_path)
                                 continue
                     
@@ -223,6 +246,8 @@ def process_run(run_id: int, recognition_model: dict) -> tuple[int, int]:
                                         (embedding, face_id),
                                     )
                                     processed += 1
+                                    # Коммитим сразу, чтобы не блокировать БД
+                                    conn.commit()
                                     continue
                 except Exception as e:
                     errors += 1

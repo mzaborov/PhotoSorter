@@ -36,11 +36,13 @@ def main() -> int:
         print("=" * 60)
         print("Результаты кластеризации:")
         print("=" * 60)
-        print(f"Всего лиц: {result.get('total_faces', 0)}")
-        print(f"Кластеров: {result.get('clusters_count', 0)}")
+        if result.get('faces_added_to_existing', 0) > 0:
+            print(f"Лиц добавлено в существующие кластеры: {result['faces_added_to_existing']}")
+        print(f"Всего лиц обработано: {result.get('total_faces', 0)}")
+        print(f"Новых кластеров создано: {result.get('clusters_count', 0)}")
         print(f"Шум (не попали в кластеры): {result.get('noise_count', 0)}")
         if result.get('cluster_id'):
-            print(f"ID кластера в БД: {result['cluster_id']}")
+            print(f"ID первого нового кластера в БД: {result['cluster_id']}")
         print()
 
         clusters = result.get('clusters', {})
