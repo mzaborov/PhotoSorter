@@ -1116,7 +1116,8 @@ def _crop_thumb_jpeg(*, img: Image.Image, bbox: tuple[int, int, int, int], thumb
     iw, ih = img.size
     # #region agent log
     try:
-        with open(r'c:\Users\mzaborov\YandexDisk\Работы, тексты, презентации\PhotoSorter\.cursor\debug.log', 'a', encoding='utf-8') as f:
+        debug_log_path = Path(__file__).resolve().parents[2] / ".cursor" / "debug.log"
+        with open(str(debug_log_path), 'a', encoding='utf-8') as f:
             f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"local_sort.py:_crop_thumb_jpeg:entry","message":"Crop thumb called","data":{"bbox":{"x":x,"y":y,"w":w,"h":h},"img_size":{"w":iw,"h":ih},"thumb_size":thumb_size,"bbox_valid":x>=0 and y>=0 and w>0 and h>0 and x+w<=iw and y+h<=ih},"timestamp":int(time.time()*1000)})+'\n')
     except: pass
     # #endregion
@@ -1124,7 +1125,8 @@ def _crop_thumb_jpeg(*, img: Image.Image, bbox: tuple[int, int, int, int], thumb
     if x < 0 or y < 0 or w <= 0 or h <= 0:
         # #region agent log
         try:
-            with open(r'c:\Users\mzaborov\YandexDisk\Работы, тексты, презентации\PhotoSorter\.cursor\debug.log', 'a', encoding='utf-8') as f:
+            debug_log_path = Path(__file__).resolve().parents[2] / ".cursor" / "debug.log"
+            with open(str(debug_log_path), 'a', encoding='utf-8') as f:
                 f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"local_sort.py:_crop_thumb_jpeg:invalid_bbox","message":"Invalid bbox, clipping","data":{"bbox_original":{"x":x,"y":y,"w":w,"h":h},"img_size":{"w":iw,"h":ih}},"timestamp":int(time.time()*1000)})+'\n')
         except: pass
         # #endregion
@@ -1139,7 +1141,8 @@ def _crop_thumb_jpeg(*, img: Image.Image, bbox: tuple[int, int, int, int], thumb
     if w <= 0 or h <= 0:
         # #region agent log
         try:
-            with open(r'c:\Users\mzaborov\YandexDisk\Работы, тексты, презентации\PhotoSorter\.cursor\debug.log', 'a', encoding='utf-8') as f:
+            debug_log_path = Path(__file__).resolve().parents[2] / ".cursor" / "debug.log"
+            with open(str(debug_log_path), 'a', encoding='utf-8') as f:
                 f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"local_sort.py:_crop_thumb_jpeg:zero_size","message":"Bbox has zero size after clipping","data":{"bbox_final":{"x":x,"y":y,"w":w,"h":h},"img_size":{"w":iw,"h":ih}},"timestamp":int(time.time()*1000)})+'\n')
         except: pass
         # #endregion
@@ -1159,7 +1162,8 @@ def _crop_thumb_jpeg(*, img: Image.Image, bbox: tuple[int, int, int, int], thumb
     crop.save(buf, format="JPEG", quality=78, optimize=True)
     # #region agent log
     try:
-        with open(r'c:\Users\mzaborov\YandexDisk\Работы, тексты, презентации\PhotoSorter\.cursor\debug.log', 'a', encoding='utf-8') as f:
+        debug_log_path = Path(__file__).resolve().parents[2] / ".cursor" / "debug.log"
+        with open(str(debug_log_path), 'a', encoding='utf-8') as f:
             f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"local_sort.py:_crop_thumb_jpeg:exit","message":"Crop thumb done","data":{"bbox_final":{"x":x,"y":y,"w":w,"h":h},"crop_area":{"x0":x0,"y0":y0,"x1":x1,"y1":y1},"crop_size":{"w":x1-x0,"h":y1-y0},"thumb_bytes":len(buf.getvalue())},"timestamp":int(time.time()*1000)})+'\n')
     except: pass
     # #endregion
@@ -2164,7 +2168,8 @@ def scan_faces_local(
                     # #region agent log
                     import json
                     try:
-                        with open(r'c:\Users\mzaborov\YandexDisk\Работы, тексты, презентации\PhotoSorter\.cursor\debug.log', 'a', encoding='utf-8') as f:
+                        debug_log_path = Path(__file__).resolve().parents[2] / ".cursor" / "debug.log"
+                        with open(str(debug_log_path), 'a', encoding='utf-8') as f:
                             f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"local_sort.py:bbox_conversion","message":"Thumbnail bbox conversion","data":{"file_path":db_path,"face_index":i,"bbox_original":{"x":x,"y":y,"w":w,"h":h},"pil_size":{"w":pil_w,"h":pil_h},"bgr_full_size":{"w":bgr_full_w,"h":bgr_full_h},"sizes_match":pil_w==bgr_full_w and pil_h==bgr_full_h},"timestamp":int(__import__('time').time()*1000)})+'\n')
                     except: pass
                     # #endregion
@@ -2187,13 +2192,15 @@ def scan_faces_local(
                     
                     # #region agent log
                     try:
-                        with open(r'c:\Users\mzaborov\YandexDisk\Работы, тексты, презентации\PhotoSorter\.cursor\debug.log', 'a', encoding='utf-8') as f:
+                        debug_log_path = Path(__file__).resolve().parents[2] / ".cursor" / "debug.log"
+                        with open(str(debug_log_path), 'a', encoding='utf-8') as f:
                             f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"local_sort.py:bbox_clipped","message":"Thumbnail bbox clipped","data":{"file_path":db_path,"face_index":i,"bbox_original":{"x":x,"y":y,"w":w,"h":h},"bbox_clipped":{"x":x_pil,"y":y_pil,"w":w_pil,"h":h_pil},"pil_size":{"w":pil_w,"h":pil_h}},"timestamp":int(__import__('time').time()*1000)})+'\n')
                     except: pass
                     # #endregion
                     # #region agent log
                     try:
-                        with open(r'c:\Users\mzaborov\YandexDisk\Работы, тексты, презентации\PhotoSorter\.cursor\debug.log', 'a', encoding='utf-8') as f:
+                        debug_log_path = Path(__file__).resolve().parents[2] / ".cursor" / "debug.log"
+                        with open(str(debug_log_path), 'a', encoding='utf-8') as f:
                             f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"local_sort.py:2108","message":"Thumbnail crop params","data":{"file_path":db_path,"face_index":i,"bbox_final":{"x":x_pil,"y":y_pil,"w":w_pil,"h":h_pil},"pil_size":{"w":pil_w,"h":pil_h},"thumb_size":int(thumb_size)},"timestamp":int(__import__('time').time()*1000)})+'\n')
                     except: pass
                     # #endregion

@@ -481,7 +481,8 @@ netstat -ano | findstr :8000
 3) Запустить сервер:
 
 ```bash
-cd "C:\\Users\\mzaborov\\YandexDisk\\Работы, тексты, презентации\\PhotoSorter"
+# Перейти в корень проекта (замените на актуальный путь)
+cd /path/to/PhotoSorter
 C:\\Users\\mzaborov\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe -m uvicorn --app-dir . app.main:app --port 8000
 ```
 
