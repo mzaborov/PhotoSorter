@@ -332,10 +332,17 @@
       
       // Ждем загрузки изображения перед отрисовкой rectangles
       imgElement.onload = function() {
-        if (currentState.showRectangles) {
+        if (currentState.showRectangles && currentState.rectangles.length > 0) {
           drawRectangles();
         }
       };
+      
+      // Если изображение уже загружено, рисуем сразу
+      if (imgElement.complete && imgElement.naturalWidth > 0) {
+        if (currentState.showRectangles && currentState.rectangles.length > 0) {
+          drawRectangles();
+        }
+      }
     }
   }
 
@@ -363,10 +370,29 @@
       }
 
       const data = await response.json();
+      console.log('[photo_card] Loaded rectangles:', data.ok, data.rectangles?.length || 0, 'rectangles');
       if (data.ok && data.rectangles) {
         currentState.rectangles = data.rectangles;
-        drawRectangles();
+        console.log('[photo_card] Rectangles data:', currentState.rectangles.map(r => ({
+          id: r.id,
+          bbox_x: r.bbox_x,
+          bbox_y: r.bbox_y,
+          bbox_w: r.bbox_w,
+          bbox_h: r.bbox_h,
+          bbox: r.bbox,
+          person_name: r.person_name
+        })));
+        // Проверяем, загружено ли изображение перед отрисовкой
+        const imgElement = document.getElementById('photoCardImg');
+        if (imgElement && imgElement.complete && imgElement.naturalWidth > 0) {
+          console.log('[photo_card] Image already loaded, drawing rectangles');
+          drawRectangles();
+        } else {
+          console.log('[photo_card] Image not ready yet, will draw on load');
+        }
         updateRectanglesList();
+      } else {
+        console.warn('[photo_card] No rectangles in response:', data);
       }
     } catch (error) {
       console.error('[photo_card] Error loading rectangles:', error);
@@ -412,13 +438,38 @@
     const scaleX = imgDisplayWidth / imgNaturalWidth;
     const scaleY = imgDisplayHeight / imgNaturalHeight;
 
+    console.log('[photo_card] Drawing rectangles:', currentState.rectangles.length, 'scale:', scaleX, scaleY);
+    
     // Рисуем каждый rectangle
     currentState.rectangles.forEach((rect, index) => {
-      const bbox = rect.bbox || {};
-      const x = (bbox.x || 0) * scaleX;
-      const y = (bbox.y || 0) * scaleY;
-      const w = (bbox.w || 0) * scaleX;
-      const h = (bbox.h || 0) * scaleY;
+      // Поддерживаем оба формата: bbox объект или отдельные поля
+      let bbox_x, bbox_y, bbox_w, bbox_h;
+      if (rect.bbox && typeof rect.bbox === 'object') {
+        // Формат: {bbox: {x, y, w, h}}
+        bbox_x = rect.bbox.x || 0;
+        bbox_y = rect.bbox.y || 0;
+        bbox_w = rect.bbox.w || 0;
+        bbox_h = rect.bbox.h || 0;
+      } else {
+        // Формат: {bbox_x, bbox_y, bbox_w, bbox_h}
+        bbox_x = rect.bbox_x || 0;
+        bbox_y = rect.bbox_y || 0;
+        bbox_w = rect.bbox_w || 0;
+        bbox_h = rect.bbox_h || 0;
+      }
+      
+      // Пропускаем rectangles с нулевыми размерами
+      if (!bbox_w || !bbox_h || bbox_w <= 0 || bbox_h <= 0) {
+        console.warn('[photo_card] Skipping rectangle with invalid bbox:', rect.id, {bbox_x, bbox_y, bbox_w, bbox_h});
+        return;
+      }
+      
+      const x = bbox_x * scaleX;
+      const y = bbox_y * scaleY;
+      const w = bbox_w * scaleX;
+      const h = bbox_h * scaleY;
+      
+      console.log('[photo_card] Drawing rectangle', rect.id, 'at', x, y, w, h);
 
       // Определяем цвет rectangle
       let color = 'rgba(250, 204, 21, 0.3)'; // Желтый по умолчанию (кластеры)
@@ -736,13 +787,20 @@
     // Обновляем rectangle через API
     const rect = currentState.rectangles[dragState.rectIndex];
     if (rect && rect.id) {
-      // Сохраняем старое состояние для UNDO
-      const oldBbox = {
-        x: rect.bbox ? rect.bbox.x : 0,
-        y: rect.bbox ? rect.bbox.y : 0,
-        w: rect.bbox ? rect.bbox.w : 0,
-        h: rect.bbox ? rect.bbox.h : 0
-      };
+      // Сохраняем старое состояние для UNDO (поддерживаем оба формата)
+      let oldX, oldY, oldW, oldH;
+      if (rect.bbox && typeof rect.bbox === 'object') {
+        oldX = rect.bbox.x || 0;
+        oldY = rect.bbox.y || 0;
+        oldW = rect.bbox.w || 0;
+        oldH = rect.bbox.h || 0;
+      } else {
+        oldX = rect.bbox_x || 0;
+        oldY = rect.bbox_y || 0;
+        oldW = rect.bbox_w || 0;
+        oldH = rect.bbox_h || 0;
+      }
+      const oldBbox = { x: oldX, y: oldY, w: oldW, h: oldH };
       
       try {
         await updateRectangle(rect.id, {
