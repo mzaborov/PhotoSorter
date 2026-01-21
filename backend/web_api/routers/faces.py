@@ -901,6 +901,7 @@ def api_faces_results(
         cur.execute(
             f"""
             SELECT
+              f.id AS file_id,
               f.path, f.name, f.parent_path, f.size, f.mime_type, f.media_type,
               COALESCE(f.taken_at, '') AS taken_at,
               COALESCE(f.place_country, '') AS place_country,
