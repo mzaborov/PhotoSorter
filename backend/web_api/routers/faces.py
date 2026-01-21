@@ -1734,7 +1734,7 @@ def api_faces_assign_face_person(payload: dict[str, Any] = Body(...)) -> dict[st
     try:
         conn = fs.conn
         cur = conn.cursor()
-        cur.execute("SELECT id, file_path FROM face_rectangles WHERE id = ?", (int(face_rectangle_id),))
+        cur.execute("SELECT id FROM face_rectangles WHERE id = ?", (int(face_rectangle_id),))
         face_row = cur.fetchone()
         if not face_row:
             raise HTTPException(status_code=404, detail="face_rectangle_id not found")

@@ -860,9 +860,10 @@ async def api_face_rectangle_thumbnail(*, face_rectangle_id: int) -> dict[str, A
     
     cur.execute(
         """
-        SELECT thumb_jpeg, file_path, bbox_x, bbox_y, bbox_w, bbox_h
-        FROM face_rectangles
-        WHERE id = ?
+        SELECT fr.thumb_jpeg, f.path as file_path, fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
+        FROM face_rectangles fr
+        LEFT JOIN files f ON fr.file_id = f.id
+        WHERE fr.id = ?
         """,
         (face_rectangle_id,),
     )
@@ -1177,6 +1178,8 @@ async def api_persons_stats() -> dict[str, Any]:
 @router.get("/api/persons/{person_id}")
 async def api_person_detail(*, person_id: int) -> dict[str, Any]:
     """Получает детальную информацию о персоне и все её лица."""
+    import logging
+    logger = logging.getLogger(__name__)
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -1203,7 +1206,7 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 fr.id as face_id,
                 fr.run_id,
                 fr.archive_scope,
-                fr.file_path,
+                f.path as file_path,
                 fr.face_index,
                 fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
                 fr.confidence, fr.presence_score,
@@ -1215,31 +1218,51 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
             FROM face_cluster_members fcm
             JOIN face_clusters fc ON fcm.cluster_id = fc.id
             JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
+            LEFT JOIN files f ON fr.file_id = f.id
             WHERE fc.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
             ORDER BY 
                 CASE WHEN fr.archive_scope IS NULL OR fr.archive_scope != 'archive' THEN 1 ELSE 0 END,
-                fr.file_path, fr.face_index
+                COALESCE(f.path, ''), fr.face_index
             """,
             (person_id,),
         )
         
         faces = []
+        row_count = 0
         for row in cur.fetchall():
+            row_count += 1
             try:
                 thumb_base64 = None
-                if row["thumb_jpeg"]:
-                    import base64
-                    thumb_base64 = base64.b64encode(row["thumb_jpeg"]).decode("utf-8")
-                elif row["file_path"] and row["bbox_x"] is not None and row["bbox_y"] is not None and row["bbox_w"] is not None and row["bbox_h"] is not None:
-                    # Генерируем превью на лету, если thumb_jpeg отсутствует
+                try:
+                    thumb_jpeg_val = row["thumb_jpeg"]
+                    if thumb_jpeg_val:
+                        import base64
+                        thumb_base64 = base64.b64encode(thumb_jpeg_val).decode("utf-8")
+                except (KeyError, TypeError):
+                    thumb_jpeg_val = None
+                
+                # Если thumb_jpeg отсутствует, пытаемся сгенерировать превью на лету
+                if not thumb_base64:
                     try:
-                        thumb_base64 = _generate_face_thumbnail_on_fly(
-                            file_path=row["file_path"],
-                            bbox=(row["bbox_x"], row["bbox_y"], row["bbox_w"], row["bbox_h"])
-                        )
-                    except Exception as e:
-                        logger = logging.getLogger(__name__)
-                        logger.warning(f"Failed to generate thumbnail on fly for face_id={row['face_id']}: {e}")
+                        file_path_val = row["file_path"]
+                        bbox_x_val = row["bbox_x"]
+                        bbox_y_val = row["bbox_y"]
+                        bbox_w_val = row["bbox_w"]
+                        bbox_h_val = row["bbox_h"]
+                        if file_path_val and bbox_x_val is not None and bbox_y_val is not None and bbox_w_val is not None and bbox_h_val is not None:
+                            try:
+                                thumb_base64 = _generate_face_thumbnail_on_fly(
+                                    file_path=file_path_val,
+                                    bbox=(bbox_x_val, bbox_y_val, bbox_w_val, bbox_h_val)
+                                )
+                            except Exception as e:
+                                try:
+                                    face_id_val = row["face_id"]
+                                except (KeyError, TypeError):
+                                    face_id_val = "unknown"
+                                logger.warning(f"Failed to generate thumbnail on fly for face_id={face_id_val}: {e}")
+                                thumb_base64 = None
+                    except (KeyError, TypeError):
                         thumb_base64 = None
                 
                 # Определяем, относится ли лицо к архиву или текущему прогону
@@ -1262,9 +1285,9 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 is_run = not is_archive and (run_id_val is not None)
             except Exception as e:
                 # Логируем ошибку для отладки
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.error(f"Error processing face row: {e}, row keys: {list(row.keys()) if hasattr(row, 'keys') else 'N/A'}")
+                import traceback
+                error_trace = traceback.format_exc()
+                logger.error(f"Error processing face row {row_count}: {e}\nRow keys: {list(row.keys()) if hasattr(row, 'keys') else 'N/A'}\n{error_trace}")
                 continue
             
             try:
@@ -1288,18 +1311,41 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 cluster_id = row["cluster_id"] if row["cluster_id"] is not None else None
                 cluster_run_id = row["cluster_run_id"] if row["cluster_run_id"] is not None else None
             except (KeyError, TypeError) as e:
-                logger = logging.getLogger(__name__)
-                logger.error(f"Error extracting row values: {e}")
+                import traceback
+                error_trace = traceback.format_exc()
+                logger.error(f"Error extracting row values for row {row_count}: {e}\nRow keys: {list(row.keys()) if hasattr(row, 'keys') else 'N/A'}\n{error_trace}")
                 continue
             
+            # Безопасное извлечение значений из row
+            try:
+                face_id_val = row["face_id"]
+            except (KeyError, TypeError):
+                logger.error(f"Missing face_id in row {row_count}, skipping")
+                continue
+            
+            try:
+                file_path_val = row["file_path"] if row["file_path"] is not None else None
+            except (KeyError, TypeError):
+                file_path_val = None
+            
+            try:
+                face_index_val = row["face_index"]
+            except (KeyError, TypeError):
+                face_index_val = 0
+            
+            try:
+                has_embedding_val = bool(row["has_embedding"])
+            except (KeyError, TypeError):
+                has_embedding_val = False
+            
             faces.append({
-                "face_id": row["face_id"],
+                "face_id": face_id_val,
                 "run_id": run_id_val,
                 "archive_scope": archive_scope_val,
                 "is_archive": is_archive,
                 "is_run": is_run,
-                "file_path": row["file_path"],
-                "face_index": row["face_index"],
+                "file_path": file_path_val,
+                "face_index": face_index_val,
                 "bbox": {
                     "x": bbox_x,
                     "y": bbox_y,
@@ -1309,7 +1355,7 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 "confidence": confidence,
                 "presence_score": presence_score,
                 "thumb_jpeg_base64": thumb_base64,
-                "has_embedding": bool(row["has_embedding"]),
+                "has_embedding": has_embedding_val,
                 "cluster_id": cluster_id,
                 "cluster_run_id": cluster_run_id,
             })
@@ -1332,8 +1378,9 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
     except HTTPException:
         raise
     except Exception as e:
-        logger = logging.getLogger(__name__)
-        logger.error(f"Error in api_person_detail for person_id={person_id}: {e}", exc_info=True)
+        import traceback
+        error_trace = traceback.format_exc()
+        logger.error(f"Error in api_person_detail for person_id={person_id}: {e}\n{error_trace}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
