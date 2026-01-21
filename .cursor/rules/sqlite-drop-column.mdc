@@ -1,0 +1,94 @@
+---
+alwaysApply: true
+---
+
+# Использование DROP COLUMN в SQLite
+
+## Цель
+Использовать простой и эффективный способ удаления колонок в SQLite, когда это возможно.
+
+## Правило
+
+**При удалении колонок из таблиц SQLite НУЖНО сначала проверить версию SQLite и использовать `ALTER TABLE ... DROP COLUMN`, если версия >= 3.35.0.**
+
+### Поддержка DROP COLUMN
+
+SQLite поддерживает `ALTER TABLE ... DROP COLUMN` начиная с версии **3.35.0** (март 2021).
+
+### Проверка версии SQLite
+
+Перед удалением колонок проверить версию:
+```python
+import sqlite3
+version = sqlite3.sqlite_version_info  # (3, 50, 4)
+if version >= (3, 35, 0):
+    # Можно использовать DROP COLUMN
+    conn.execute("ALTER TABLE table_name DROP COLUMN column_name")
+else:
+    # Использовать пересоздание таблицы
+    # ...
+```
+
+### Ограничения DROP COLUMN
+
+`ALTER TABLE ... DROP COLUMN` **НЕ работает**, если:
+1. Колонка входит в PRIMARY KEY (составной или одиночный)
+2. На колонку есть FOREIGN KEY constraint
+3. Колонка используется в индексе (нужно удалить индекс сначала)
+4. Колонка используется в CHECK constraint
+5. Колонка используется в GENERATED ALWAYS AS (вычисляемая колонка)
+
+### Когда использовать DROP COLUMN
+
+✅ **Использовать DROP COLUMN**, если:
+- SQLite версия >= 3.35.0
+- Колонка не в PRIMARY KEY
+- На колонку нет FOREIGN KEY
+- Индекс на колонку можно удалить перед DROP COLUMN
+- Колонка не используется в constraints
+
+❌ **Использовать пересоздание таблицы**, если:
+- SQLite версия < 3.35.0
+- Колонка в PRIMARY KEY
+- На колонку есть FOREIGN KEY
+- Нужна универсальность (работа на всех версиях)
+- Нужен полный контроль над constraints и индексами
+
+### Пример использования
+
+```python
+def remove_column_simple(conn, table_name: str, column_name: str):
+    """Простой способ удаления колонки через DROP COLUMN."""
+    import sqlite3
+    
+    # Проверяем версию
+    version = sqlite3.sqlite_version_info
+    if version < (3, 35, 0):
+        raise ValueError(f"DROP COLUMN requires SQLite >= 3.35.0, got {version}")
+    
+    cur = conn.cursor()
+    
+    # Удаляем индексы на колонку (если есть)
+    cur.execute("SELECT name FROM sqlite_master WHERE type='index' AND sql LIKE ?", 
+                (f'%{column_name}%',))
+    indexes = [row[0] for row in cur.fetchall()]
+    for idx_name in indexes:
+        cur.execute(f"DROP INDEX IF EXISTS {idx_name}")
+    
+    # Удаляем колонку
+    cur.execute(f"ALTER TABLE {table_name} DROP COLUMN {column_name}")
+    conn.commit()
+```
+
+### История
+
+- **2026-01-21**: Создано правило после обсуждения использования DROP COLUMN вместо пересоздания таблиц
+- В проекте используется SQLite 3.50.4, поэтому DROP COLUMN доступен
+- Для универсальности и безопасности использовалось пересоздание таблиц, но для будущих миграций можно использовать DROP COLUMN
+
+### Рекомендации
+
+1. **Для новых миграций**: Использовать DROP COLUMN, если версия SQLite >= 3.35.0 и нет ограничений
+2. **Для обратной совместимости**: Использовать пересоздание таблиц, если нужна поддержка старых версий SQLite
+3. **Перед удалением**: Всегда проверять версию SQLite и ограничения колонки
+4. **Резервные копии**: Создавать резервные копии БД перед удалением колонок (независимо от метода)

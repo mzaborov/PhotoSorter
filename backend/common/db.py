@@ -21,6 +21,8 @@ def get_connection():
     conn.row_factory = sqlite3.Row
     try:
         conn.execute(f"PRAGMA busy_timeout={int(timeout_sec * 1000)}")
+        # Включаем поддержку FOREIGN KEY constraints
+        conn.execute("PRAGMA foreign_keys = ON")
     except Exception:
         pass
     return conn
@@ -223,12 +225,9 @@ def init_db():
             "faces_count": "faces_count INTEGER",
             "faces_run_id": "faces_run_id INTEGER",
             "faces_scanned_at": "faces_scanned_at TEXT",
-            # Ручные правки (UI шага 2: лица/нет лиц)
-            # faces_manual_label: 'faces'|'no_faces'|NULL
-            "faces_manual_label": "faces_manual_label TEXT",
-            "faces_manual_at": "faces_manual_at TEXT",
-
             # Локальная сортировка: дополнительные категории
+            # ПРИМЕЧАНИЕ: Ручные метки (*_manual_*) удалены из files (приведение к 3NF, ЭТАП 1.9).
+            # Метки хранятся только в files_manual_labels (run-scoped).
             # Авто-карантин (экраны/технические фото/сомнительные кейсы)
             "faces_auto_quarantine": "faces_auto_quarantine INTEGER NOT NULL DEFAULT 0",
             "faces_quarantine_reason": "faces_quarantine_reason TEXT",
@@ -238,13 +237,18 @@ def init_db():
             # Авто-детект животных (MVP: кошки)
             "animals_auto": "animals_auto INTEGER NOT NULL DEFAULT 0",
             "animals_kind": "animals_kind TEXT",
-            # Ручная разметка животных (ground truth для метрик; не смешивать с animals_auto)
-            "animals_manual": "animals_manual INTEGER NOT NULL DEFAULT 0",
-            "animals_manual_kind": "animals_manual_kind TEXT",
-            "animals_manual_at": "animals_manual_at TEXT",
             # Люди, но лица не найдены (пока в основном manual)
-            "people_no_face_manual": "people_no_face_manual INTEGER NOT NULL DEFAULT 0",
-            "people_no_face_person": "people_no_face_person TEXT",
+            # ПРИМЕЧАНИЕ: people_no_face_manual удален из files (приведение к 3NF, ЭТАП 1.9).
+            # Метки хранятся только в files_manual_labels (run-scoped).
+            # 
+            # ВАЖНО: people_no_face_person в files - это ДЛЯ АРХИВНЫХ ФАЙЛОВ.
+            # Это глобальная привязка персоны к файлу, которая сохраняется после переезда в архив.
+            # При переезде файла в архив нужно копировать значение из files_manual_labels.people_no_face_person
+            # в files.people_no_face_person, чтобы привязка сохранилась.
+            # 
+            # TODO: Реализовать копирование people_no_face_person при переезде в архив
+            # (см. migrate_archive_faces.py или API для перемещения в архив).
+            "people_no_face_person": "people_no_face_person TEXT",  # ТОЛЬКО для архивных файлов
 
             # --- Photo geo/time metadata for UI sorting (No Faces) ---
             # taken_at: ISO string (best-effort, from EXIF DateTimeOriginal; fallback: mtime in UTC)
@@ -385,7 +389,7 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS files_manual_labels (
             pipeline_run_id       INTEGER NOT NULL,
-            path                  TEXT NOT NULL,
+            file_id               INTEGER NOT NULL,
             faces_manual_label    TEXT,                      -- 'faces'|'no_faces'|NULL
             faces_manual_at       TEXT,
             people_no_face_manual INTEGER NOT NULL DEFAULT 0,
@@ -395,7 +399,8 @@ def init_db():
             animals_manual_at     TEXT,
             quarantine_manual     INTEGER NOT NULL DEFAULT 0,
             quarantine_manual_at  TEXT,
-            PRIMARY KEY (pipeline_run_id, path)
+            PRIMARY KEY (pipeline_run_id, file_id),
+            FOREIGN KEY (file_id) REFERENCES files(id)
         );
         """
     )
@@ -418,16 +423,17 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS video_manual_frames (
             pipeline_run_id   INTEGER NOT NULL,
-            path              TEXT NOT NULL,
+            file_id           INTEGER NOT NULL,
             frame_idx         INTEGER NOT NULL, -- 1..3
             t_sec             REAL,             -- таймкод кадра (секунды), best-effort
             rects_json        TEXT,             -- JSON: [{"x":..,"y":..,"w":..,"h":..}, ...]
             updated_at        TEXT NOT NULL,
-            PRIMARY KEY (pipeline_run_id, path, frame_idx)
+            PRIMARY KEY (pipeline_run_id, file_id, frame_idx),
+            FOREIGN KEY (file_id) REFERENCES files(id)
         );
         """
     )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_video_manual_frames_path ON video_manual_frames(path);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_video_manual_frames_file_id ON video_manual_frames(file_id);")
     
     # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
     _ensure_columns(
@@ -515,7 +521,7 @@ class FaceStore:
             CREATE TABLE IF NOT EXISTS face_rectangles (
               id             INTEGER PRIMARY KEY AUTOINCREMENT,
               run_id         INTEGER NOT NULL,
-              file_path      TEXT NOT NULL,    -- 'disk:/...'
+              file_id        INTEGER NOT NULL,    -- FOREIGN KEY на files.id
               face_index     INTEGER NOT NULL, -- индекс лица внутри файла в рамках текущего прогона
               bbox_x         INTEGER NOT NULL,
               bbox_y         INTEGER NOT NULL,
@@ -526,13 +532,14 @@ class FaceStore:
               thumb_jpeg     BLOB,             -- маленький кроп лица для UI/Inbox
               manual_person  TEXT,             -- имя/код персоны (пока строка; схему персон сделаем позже)
               ignore_flag    INTEGER NOT NULL DEFAULT 0,
-              created_at     TEXT NOT NULL
+              created_at     TEXT NOT NULL,
+              FOREIGN KEY (file_id) REFERENCES files(id)
             );
             """
         )
 
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_rect_run ON face_rectangles(run_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_rect_file ON face_rectangles(file_path);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_rect_file ON face_rectangles(file_id);")
 
         # Ручная разметка (UI шага 2: корректировка лиц/нет лиц)
         _ensure_columns(
@@ -668,7 +675,7 @@ class FaceStore:
             CREATE TABLE IF NOT EXISTS person_rectangles (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                 pipeline_run_id     INTEGER NOT NULL,
-                file_path           TEXT NOT NULL,
+                file_id             INTEGER NOT NULL,
                 frame_idx           INTEGER,                    -- для видео: 1..3 (NULL для фото)
                 bbox_x              INTEGER NOT NULL,
                 bbox_y              INTEGER NOT NULL,
@@ -676,11 +683,12 @@ class FaceStore:
                 bbox_h              INTEGER NOT NULL,
                 person_id           INTEGER NOT NULL,
                 created_at          TEXT NOT NULL,
+                FOREIGN KEY (file_id) REFERENCES files(id),
                 FOREIGN KEY (person_id) REFERENCES persons(id)
             );
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rect_run ON person_rectangles(pipeline_run_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rect_file ON person_rectangles(file_path);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rect_file ON person_rectangles(file_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rect_person ON person_rectangles(person_id);")
         
         # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
@@ -697,15 +705,16 @@ class FaceStore:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS file_persons (
                 pipeline_run_id     INTEGER NOT NULL,
-                file_path           TEXT NOT NULL,
+                file_id             INTEGER NOT NULL,
                 person_id           INTEGER NOT NULL,
                 created_at          TEXT NOT NULL,
-                PRIMARY KEY (pipeline_run_id, file_path, person_id),
+                PRIMARY KEY (pipeline_run_id, file_id, person_id),
+                FOREIGN KEY (file_id) REFERENCES files(id),
                 FOREIGN KEY (person_id) REFERENCES persons(id)
             );
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_file_persons_run ON file_persons(pipeline_run_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_persons_file ON file_persons(file_path);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_persons_file ON file_persons(file_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_file_persons_person ON file_persons(person_id);")
         
         # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
@@ -723,14 +732,15 @@ class FaceStore:
             CREATE TABLE IF NOT EXISTS file_groups (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                 pipeline_run_id     INTEGER NOT NULL,
-                file_path           TEXT NOT NULL,
+                file_id             INTEGER NOT NULL,
                 group_path          TEXT NOT NULL,              -- например, "Поездки/2023 Турция"
                 created_at          TEXT NOT NULL,
-                UNIQUE(pipeline_run_id, file_path, group_path)
+                UNIQUE(pipeline_run_id, file_id, group_path),
+                FOREIGN KEY (file_id) REFERENCES files(id)
             );
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_file_groups_run ON file_groups(pipeline_run_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_groups_file ON file_groups(file_path);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_groups_file ON file_groups(file_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_file_groups_path ON file_groups(group_path);")
         
         # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
@@ -747,16 +757,17 @@ class FaceStore:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS file_group_persons (
                 pipeline_run_id     INTEGER NOT NULL,
-                file_path           TEXT NOT NULL,
+                file_id             INTEGER NOT NULL,
                 group_path          TEXT NOT NULL,
                 person_id           INTEGER NOT NULL,
                 created_at          TEXT NOT NULL,
-                PRIMARY KEY (pipeline_run_id, file_path, group_path, person_id),
+                PRIMARY KEY (pipeline_run_id, file_id, group_path, person_id),
+                FOREIGN KEY (file_id) REFERENCES files(id),
                 FOREIGN KEY (person_id) REFERENCES persons(id)
             );
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_file_group_persons_run ON file_group_persons(pipeline_run_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_group_persons_file ON file_group_persons(file_path);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_group_persons_file ON file_group_persons(file_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_file_group_persons_person ON file_group_persons(person_id);")
         
         # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
@@ -786,16 +797,17 @@ class FaceStore:
         cur.execute(
             """
             SELECT
-              id, run_id, file_path, face_index,
-              bbox_x, bbox_y, bbox_w, bbox_h,
-              confidence, presence_score,
-              manual_person, ignore_flag,
-              created_at,
-              COALESCE(is_manual, 0) AS is_manual,
-              manual_created_at
-            FROM face_rectangles
-            WHERE run_id = ? AND file_id = ?
-            ORDER BY COALESCE(is_manual, 0) ASC, face_index ASC, id ASC
+              fr.id, fr.run_id, f.path AS file_path, fr.face_index,
+              fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
+              fr.confidence, fr.presence_score,
+              fr.manual_person, fr.ignore_flag,
+              fr.created_at,
+              COALESCE(fr.is_manual, 0) AS is_manual,
+              fr.manual_created_at
+            FROM face_rectangles fr
+            JOIN files f ON f.id = fr.file_id
+            WHERE fr.run_id = ? AND fr.file_id = ?
+            ORDER BY COALESCE(fr.is_manual, 0) ASC, fr.face_index ASC, fr.id ASC
             """,
             (int(run_id), resolved_file_id),
         )
@@ -837,16 +849,16 @@ class FaceStore:
             cur.execute(
                 """
                 INSERT INTO face_rectangles(
-                  run_id, file_path, file_id, face_index,
+                  run_id, file_id, face_index,
                   bbox_x, bbox_y, bbox_w, bbox_h,
                   confidence, presence_score,
                   thumb_jpeg, manual_person, ignore_flag,
                   created_at,
                   is_manual, manual_created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, ?, 1, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, ?, 1, ?)
                 """,
-                (int(run_id), str(file_path), resolved_file_id, int(i), x, y, w, h, now, now),
+                (int(run_id), resolved_file_id, int(i), x, y, w, h, now, now),
             )
         self.conn.commit()
 
@@ -963,21 +975,26 @@ class FaceStore:
         """
         cur = self.conn.cursor()
         
+        # Получаем file_id из file_path
+        resolved_file_id = _get_file_id_from_path(self.conn, file_path)
+        if resolved_file_id is None:
+            raise ValueError(f"File not found in files table: {file_path}")
+        
         # Для архивного режима проверяем дубликаты (append без дублирования)
         if archive_scope == 'archive':
-            # Проверяем существование по file_path + bbox
+            # Проверяем существование по file_id + bbox
             cur.execute(
                 """
                 SELECT id FROM face_rectangles
                 WHERE archive_scope = 'archive'
-                  AND file_path = ?
+                  AND file_id = ?
                   AND bbox_x = ?
                   AND bbox_y = ?
                   AND bbox_w = ?
                   AND bbox_h = ?
                 LIMIT 1
                 """,
-                (file_path, int(bbox_x), int(bbox_y), int(bbox_w), int(bbox_h)),
+                (resolved_file_id, int(bbox_x), int(bbox_y), int(bbox_w), int(bbox_h)),
             )
             existing = cur.fetchone()
             if existing is not None:
@@ -990,7 +1007,7 @@ class FaceStore:
             cur.execute(
                 """
                 INSERT INTO face_rectangles(
-                  run_id, archive_scope, file_path, face_index,
+                  run_id, archive_scope, file_id, face_index,
                   bbox_x, bbox_y, bbox_w, bbox_h,
                   confidence, presence_score, thumb_jpeg,
                   embedding, manual_person, ignore_flag, created_at,
@@ -1001,7 +1018,7 @@ class FaceStore:
                 (
                     run_id,  # может быть NULL для архива
                     archive_scope,
-                    file_path,
+                    resolved_file_id,
                     int(face_index),
                     int(bbox_x),
                     int(bbox_y),
@@ -1021,7 +1038,7 @@ class FaceStore:
             cur.execute(
                 """
                 INSERT INTO face_rectangles(
-                  run_id, archive_scope, file_path, face_index,
+                  run_id, archive_scope, file_id, face_index,
                   bbox_x, bbox_y, bbox_w, bbox_h,
                   confidence, presence_score, thumb_jpeg,
                   embedding, manual_person, ignore_flag, created_at,
@@ -1031,7 +1048,7 @@ class FaceStore:
                 """,
                 (
                     run_id,
-                    file_path,
+                    resolved_file_id,
                     int(face_index),
                     int(bbox_x),
                     int(bbox_y),
@@ -1094,20 +1111,22 @@ class FaceStore:
             if run_id is not None:
                 cur.execute(
                     """
-                    SELECT id, run_id, file_path, face_index, bbox_x, bbox_y, bbox_w, bbox_h,
-                           confidence, embedding
-                    FROM face_rectangles
-                    WHERE run_id = ? AND embedding IS NOT NULL AND COALESCE(ignore_flag, 0) = 0
+                    SELECT fr.id, fr.run_id, f.path AS file_path, fr.face_index, fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
+                           fr.confidence, fr.embedding
+                    FROM face_rectangles fr
+                    JOIN files f ON f.id = fr.file_id
+                    WHERE fr.run_id = ? AND fr.embedding IS NOT NULL AND COALESCE(fr.ignore_flag, 0) = 0
                     """,
                     (int(run_id),),
                 )
             else:
                 cur.execute(
                     """
-                    SELECT id, run_id, file_path, face_index, bbox_x, bbox_y, bbox_w, bbox_h,
-                           confidence, embedding
-                    FROM face_rectangles
-                    WHERE embedding IS NOT NULL AND COALESCE(ignore_flag, 0) = 0
+                    SELECT fr.id, fr.run_id, f.path AS file_path, fr.face_index, fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
+                           fr.confidence, fr.embedding
+                    FROM face_rectangles fr
+                    JOIN files f ON f.id = fr.file_id
+                    WHERE fr.embedding IS NOT NULL AND COALESCE(fr.ignore_flag, 0) = 0
                     """,
                 )
             
@@ -1189,12 +1208,17 @@ class FaceStore:
         Вставляет прямоугольник без лица, но с человеком (person_rectangles).
         Возвращает id созданной записи.
         """
+        # Получаем file_id из file_path
+        resolved_file_id = _get_file_id_from_path(self.conn, file_path)
+        if resolved_file_id is None:
+            raise ValueError(f"File not found in files table: {file_path}")
+        
         now = _now_utc_iso()
         cur = self.conn.cursor()
         cur.execute(
             """
             INSERT INTO person_rectangles (
-                pipeline_run_id, file_path, frame_idx,
+                pipeline_run_id, file_id, frame_idx,
                 bbox_x, bbox_y, bbox_w, bbox_h,
                 person_id, created_at
             )
@@ -1202,7 +1226,7 @@ class FaceStore:
             """,
             (
                 int(pipeline_run_id),
-                str(file_path),
+                resolved_file_id,
                 int(frame_idx) if frame_idx is not None else None,
                 int(bbox_x),
                 int(bbox_y),
@@ -1255,12 +1279,13 @@ class FaceStore:
         where_sql = " AND ".join(where) if where else "1=1"
         cur.execute(
             f"""
-            SELECT id, pipeline_run_id, file_path, frame_idx,
-                   bbox_x, bbox_y, bbox_w, bbox_h,
-                   person_id, created_at
-            FROM person_rectangles
+            SELECT pr.id, pr.pipeline_run_id, f.path AS file_path, pr.frame_idx,
+                   pr.bbox_x, pr.bbox_y, pr.bbox_w, pr.bbox_h,
+                   pr.person_id, pr.created_at
+            FROM person_rectangles pr
+            JOIN files f ON f.id = pr.file_id
             WHERE {where_sql}
-            ORDER BY created_at DESC
+            ORDER BY pr.created_at DESC
             """,
             params,
         )
@@ -1297,13 +1322,12 @@ class FaceStore:
         cur.execute(
             """
             INSERT OR REPLACE INTO file_persons (
-                pipeline_run_id, file_path, file_id, person_id, created_at
+                pipeline_run_id, file_id, person_id, created_at
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?)
             """,
             (
                 int(pipeline_run_id),
-                str(file_path),
                 resolved_file_id,
                 int(person_id),
                 now,
@@ -1374,10 +1398,11 @@ class FaceStore:
         where_sql = " AND ".join(where) if where else "1=1"
         cur.execute(
             f"""
-            SELECT pipeline_run_id, file_path, person_id, created_at
-            FROM file_persons
+            SELECT fp.pipeline_run_id, f.path AS file_path, fp.person_id, fp.created_at
+            FROM file_persons fp
+            JOIN files f ON f.id = fp.file_id
             WHERE {where_sql}
-            ORDER BY created_at DESC
+            ORDER BY fp.created_at DESC
             """,
             params,
         )
@@ -1415,13 +1440,12 @@ class FaceStore:
             cur.execute(
                 """
                 INSERT OR REPLACE INTO file_groups (
-                    pipeline_run_id, file_path, file_id, group_path, created_at
+                    pipeline_run_id, file_id, group_path, created_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?)
                 """,
                 (
                     int(pipeline_run_id),
-                    str(file_path),
                     resolved_file_id,
                     str(group_path),
                     now,
@@ -1431,9 +1455,10 @@ class FaceStore:
             # Проверяем, что запись действительно вставлена
             cur.execute(
                 """
-                SELECT id, pipeline_run_id, file_path, group_path
-                FROM file_groups
-                WHERE pipeline_run_id = ? AND file_id = ? AND group_path = ?
+                SELECT fg.id, fg.pipeline_run_id, f.path AS file_path, fg.group_path
+                FROM file_groups fg
+                JOIN files f ON f.id = fg.file_id
+                WHERE fg.pipeline_run_id = ? AND fg.file_id = ? AND fg.group_path = ?
                 LIMIT 1
                 """,
                 (int(pipeline_run_id), resolved_file_id, str(group_path)),
@@ -1508,10 +1533,11 @@ class FaceStore:
         where_sql = " AND ".join(where) if where else "1=1"
         cur.execute(
             f"""
-            SELECT id, pipeline_run_id, file_path, group_path, created_at
-            FROM file_groups
+            SELECT fg.id, fg.pipeline_run_id, f.path AS file_path, fg.group_path, fg.created_at
+            FROM file_groups fg
+            JOIN files f ON f.id = fg.file_id
             WHERE {where_sql}
-            ORDER BY group_path ASC, created_at DESC
+            ORDER BY fg.group_path ASC, fg.created_at DESC
             """,
             params,
         )
@@ -2105,51 +2131,37 @@ class DedupStore:
 
     def set_faces_manual_label(self, *, path: str, label: str | None) -> None:
         """
-        Ручная правка результата "лица/нет лиц" для файла.
-        label: 'faces' | 'no_faces' | None (сброс)
+        DEPRECATED: Метод удален - метки должны быть run-scoped.
+        Используйте set_run_faces_manual_label() с pipeline_run_id.
         """
-        lab = (label or "").strip().lower()
-        if lab == "":
-            lab = ""
-        if lab not in ("", "faces", "no_faces"):
-            raise ValueError("label must be one of: faces, no_faces, (empty)")
-        cur = self.conn.cursor()
-        if lab == "":
-            cur.execute(
-                """
-                UPDATE files
-                SET faces_manual_label = NULL, faces_manual_at = NULL
-                WHERE path = ?
-                """,
-                (path,),
-            )
-        else:
-            cur.execute(
-                """
-                UPDATE files
-                SET faces_manual_label = ?, faces_manual_at = ?
-                WHERE path = ?
-                """,
-                (lab, _now_utc_iso(), path),
-            )
-        self.conn.commit()
+        raise DeprecationWarning(
+            "set_faces_manual_label() is deprecated. Use set_run_faces_manual_label() with pipeline_run_id instead."
+        )
 
-    # --- run-scoped manual labels (pipeline_run_id + path) ---
+    # --- run-scoped manual labels (pipeline_run_id + file_id) ---
     def _ensure_run_manual_row(self, *, pipeline_run_id: int, path: str) -> None:
+        # Получаем file_id из path
+        resolved_file_id = _get_file_id_from_path(self.conn, path)
+        if resolved_file_id is None:
+            raise ValueError(f"File not found in files table: {path}")
         cur = self.conn.cursor()
         cur.execute(
-            "INSERT OR IGNORE INTO files_manual_labels(pipeline_run_id, path) VALUES (?, ?)",
-            (int(pipeline_run_id), str(path)),
+            "INSERT OR IGNORE INTO files_manual_labels(pipeline_run_id, file_id) VALUES (?, ?)",
+            (int(pipeline_run_id), resolved_file_id),
         )
 
     def delete_run_manual_labels(self, *, pipeline_run_id: int, path: str) -> None:
         """
         Полный сброс ручных меток для конкретного прогона и пути.
         """
+        # Получаем file_id из path
+        resolved_file_id = _get_file_id_from_path(self.conn, path)
+        if resolved_file_id is None:
+            raise ValueError(f"File not found in files table: {path}")
         cur = self.conn.cursor()
         cur.execute(
-            "DELETE FROM files_manual_labels WHERE pipeline_run_id = ? AND path = ?",
-            (int(pipeline_run_id), str(path)),
+            "DELETE FROM files_manual_labels WHERE pipeline_run_id = ? AND file_id = ?",
+            (int(pipeline_run_id), resolved_file_id),
         )
         self.conn.commit()
 
@@ -2158,6 +2170,11 @@ class DedupStore:
         Ручная правка результата "лица/нет лиц" для файла В РАМКАХ ПРОГОНА.
         label: 'faces' | 'no_faces' | None (сброс)
         """
+        # Получаем file_id из path
+        resolved_file_id = _get_file_id_from_path(self.conn, path)
+        if resolved_file_id is None:
+            raise ValueError(f"File not found in files table: {path}")
+        
         lab = (label or "").strip().lower()
         if lab == "":
             lab = ""
@@ -2170,57 +2187,76 @@ class DedupStore:
                 """
                 UPDATE files_manual_labels
                 SET faces_manual_label = NULL, faces_manual_at = NULL
-                WHERE pipeline_run_id = ? AND path = ?
+                WHERE pipeline_run_id = ? AND file_id = ?
                 """,
-                (int(pipeline_run_id), str(path)),
+                (int(pipeline_run_id), resolved_file_id),
             )
         else:
             cur.execute(
                 """
                 UPDATE files_manual_labels
                 SET faces_manual_label = ?, faces_manual_at = ?
-                WHERE pipeline_run_id = ? AND path = ?
+                WHERE pipeline_run_id = ? AND file_id = ?
                 """,
-                (lab, _now_utc_iso(), int(pipeline_run_id), str(path)),
+                (lab, _now_utc_iso(), int(pipeline_run_id), resolved_file_id),
             )
         self.conn.commit()
 
     def update_run_manual_labels_path(self, *, pipeline_run_id: int, old_path: str, new_path: str) -> None:
         """
         При перемещении файла (и обновлении files.path) нужно переносить run-scoped manual метки,
-        иначе они "теряются" после move (labels привязаны к path).
+        иначе они "теряются" после move (labels привязаны к file_id, который не меняется при move).
 
         Поведение:
         - если old_path отсутствует в files_manual_labels для этого прогона — ничего не делаем
         - если new_path уже есть — сливаем значения (бережно) и удаляем old_path
-        - иначе просто обновляем path -> new_path
+        - иначе просто обновляем file_id (если файл переместился, file_id должен остаться тем же)
+        
+        ПРИМЕЧАНИЕ: После миграции на file_id этот метод может быть упрощен или удален,
+        так как file_id не меняется при перемещении файла.
         """
         oldp = str(old_path or "")
         newp = str(new_path or "")
         if not oldp or not newp or oldp == newp:
             return
+        
+        # Получаем file_id из old_path и new_path
+        old_file_id = _get_file_id_from_path(self.conn, oldp)
+        new_file_id = _get_file_id_from_path(self.conn, newp)
+        
+        if old_file_id is None:
+            return  # Старый файл не найден
+        
+        if new_file_id is None:
+            return  # Новый файл не найден
+        
+        # Если file_id одинаковый - файл не переместился, только путь изменился
+        # В этом случае ничего делать не нужно, так как метки привязаны к file_id
+        if old_file_id == new_file_id:
+            return
+        
         rid = int(pipeline_run_id)
         cur = self.conn.cursor()
 
         cur.execute(
-            "SELECT * FROM files_manual_labels WHERE pipeline_run_id = ? AND path = ? LIMIT 1",
-            (rid, oldp),
+            "SELECT * FROM files_manual_labels WHERE pipeline_run_id = ? AND file_id = ? LIMIT 1",
+            (rid, old_file_id),
         )
         old_row = cur.fetchone()
         if not old_row:
             return
 
         cur.execute(
-            "SELECT * FROM files_manual_labels WHERE pipeline_run_id = ? AND path = ? LIMIT 1",
-            (rid, newp),
+            "SELECT * FROM files_manual_labels WHERE pipeline_run_id = ? AND file_id = ? LIMIT 1",
+            (rid, new_file_id),
         )
         new_row = cur.fetchone()
 
         if not new_row:
-            # Simple rename
+            # Simple rename - обновляем file_id
             cur.execute(
-                "UPDATE files_manual_labels SET path = ? WHERE pipeline_run_id = ? AND path = ?",
-                (newp, rid, oldp),
+                "UPDATE files_manual_labels SET file_id = ? WHERE pipeline_run_id = ? AND file_id = ?",
+                (new_file_id, rid, old_file_id),
             )
             self.conn.commit()
             return
@@ -2277,7 +2313,7 @@ class DedupStore:
               animals_manual_at = ?,
               quarantine_manual = ?,
               quarantine_manual_at = ?
-            WHERE pipeline_run_id = ? AND path = ?
+            WHERE pipeline_run_id = ? AND file_id = ?
             """,
             (
                 merged.get("faces_manual_label"),
@@ -2290,11 +2326,11 @@ class DedupStore:
                 int(merged.get("quarantine_manual") or 0),
                 merged.get("quarantine_manual_at"),
                 rid,
-                newp,
+                new_file_id,
             ),
         )
         # Drop old row (we merged it)
-        cur.execute("DELETE FROM files_manual_labels WHERE pipeline_run_id = ? AND path = ?", (rid, oldp))
+        cur.execute("DELETE FROM files_manual_labels WHERE pipeline_run_id = ? AND file_id = ?", (rid, old_file_id))
         self.conn.commit()
 
     # --- video manual frames (run-scoped) ---
@@ -2302,15 +2338,20 @@ class DedupStore:
         """
         Returns mapping: frame_idx -> {frame_idx, t_sec, rects:[...], updated_at}
         """
+        # Получаем file_id из path
+        resolved_file_id = _get_file_id_from_path(self.conn, path)
+        if resolved_file_id is None:
+            raise ValueError(f"File not found in files table: {path}")
+        
         cur = self.conn.cursor()
         cur.execute(
             """
             SELECT frame_idx, t_sec, rects_json, updated_at
             FROM video_manual_frames
-            WHERE pipeline_run_id = ? AND path = ?
+            WHERE pipeline_run_id = ? AND file_id = ?
             ORDER BY frame_idx ASC
             """,
-            (int(pipeline_run_id), str(path)),
+            (int(pipeline_run_id), resolved_file_id),
         )
         out: dict[int, dict[str, Any]] = {}
         for r in cur.fetchall():
@@ -2367,19 +2408,24 @@ class DedupStore:
             h = int(r.get("h") or 0)
             if w > 0 and h > 0:
                 clean.append({"x": x, "y": y, "w": w, "h": h})
+        # Получаем file_id из path
+        resolved_file_id = _get_file_id_from_path(self.conn, path)
+        if resolved_file_id is None:
+            raise ValueError(f"File not found in files table: {path}")
+        
         cur = self.conn.cursor()
         cur.execute(
             """
-            INSERT INTO video_manual_frames(pipeline_run_id, path, frame_idx, t_sec, rects_json, updated_at)
+            INSERT INTO video_manual_frames(pipeline_run_id, file_id, frame_idx, t_sec, rects_json, updated_at)
             VALUES(?, ?, ?, ?, ?, ?)
-            ON CONFLICT(pipeline_run_id, path, frame_idx) DO UPDATE SET
+            ON CONFLICT(pipeline_run_id, file_id, frame_idx) DO UPDATE SET
               t_sec = excluded.t_sec,
               rects_json = excluded.rects_json,
               updated_at = excluded.updated_at
             """,
             (
                 int(pipeline_run_id),
-                str(path),
+                resolved_file_id,
                 idx,
                 float(t_sec) if t_sec is not None else None,
                 json.dumps(clean, ensure_ascii=False),
@@ -2392,6 +2438,11 @@ class DedupStore:
         """
         Ручная пометка: "есть люди, но лица не найдены" В РАМКАХ ПРОГОНА.
         """
+        # Получаем file_id из path
+        resolved_file_id = _get_file_id_from_path(self.conn, path)
+        if resolved_file_id is None:
+            raise ValueError(f"File not found in files table: {path}")
+        
         self._ensure_run_manual_row(pipeline_run_id=int(pipeline_run_id), path=str(path))
         cur = self.conn.cursor()
         if bool(is_people_no_face):
@@ -2399,18 +2450,18 @@ class DedupStore:
                 """
                 UPDATE files_manual_labels
                 SET people_no_face_manual = 1, people_no_face_person = ?
-                WHERE pipeline_run_id = ? AND path = ?
+                WHERE pipeline_run_id = ? AND file_id = ?
                 """,
-                ((person or "").strip() or None, int(pipeline_run_id), str(path)),
+                ((person or "").strip() or None, int(pipeline_run_id), resolved_file_id),
             )
         else:
             cur.execute(
                 """
                 UPDATE files_manual_labels
                 SET people_no_face_manual = 0, people_no_face_person = NULL
-                WHERE pipeline_run_id = ? AND path = ?
+                WHERE pipeline_run_id = ? AND file_id = ?
                 """,
-                (int(pipeline_run_id), str(path)),
+                (int(pipeline_run_id), resolved_file_id),
             )
         self.conn.commit()
 
@@ -2418,6 +2469,11 @@ class DedupStore:
         """
         Ручная разметка животных (ground truth) В РАМКАХ ПРОГОНА.
         """
+        # Получаем file_id из path
+        resolved_file_id = _get_file_id_from_path(self.conn, path)
+        if resolved_file_id is None:
+            raise ValueError(f"File not found in files table: {path}")
+        
         self._ensure_run_manual_row(pipeline_run_id=int(pipeline_run_id), path=str(path))
         cur = self.conn.cursor()
         if bool(is_animal):
@@ -2425,18 +2481,18 @@ class DedupStore:
                 """
                 UPDATE files_manual_labels
                 SET animals_manual = 1, animals_manual_kind = ?, animals_manual_at = ?
-                WHERE pipeline_run_id = ? AND path = ?
+                WHERE pipeline_run_id = ? AND file_id = ?
                 """,
-                ((kind or "").strip() or None, _now_utc_iso(), int(pipeline_run_id), str(path)),
+                ((kind or "").strip() or None, _now_utc_iso(), int(pipeline_run_id), resolved_file_id),
             )
         else:
             cur.execute(
                 """
                 UPDATE files_manual_labels
                 SET animals_manual = 0, animals_manual_kind = NULL, animals_manual_at = NULL
-                WHERE pipeline_run_id = ? AND path = ?
+                WHERE pipeline_run_id = ? AND file_id = ?
                 """,
-                (int(pipeline_run_id), str(path)),
+                (int(pipeline_run_id), resolved_file_id),
             )
         self.conn.commit()
 
@@ -2636,54 +2692,21 @@ class DedupStore:
 
     def set_animals_manual(self, *, path: str, is_animal: bool, kind: str | None = None) -> None:
         """
-        Ручная разметка животных (ground truth для метрик).
-        ВАЖНО: не смешивать с animals_auto (который пишет автоматика).
+        DEPRECATED: Метод удален - метки должны быть run-scoped.
+        Используйте set_run_animals_manual() с pipeline_run_id.
         """
-        cur = self.conn.cursor()
-        if bool(is_animal):
-            cur.execute(
-                """
-                UPDATE files
-                SET animals_manual = 1, animals_manual_kind = ?, animals_manual_at = ?
-                WHERE path = ?
-                """,
-                ((kind or "").strip() or None, _now_utc_iso(), path),
-            )
-        else:
-            cur.execute(
-                """
-                UPDATE files
-                SET animals_manual = 0, animals_manual_kind = NULL, animals_manual_at = NULL
-                WHERE path = ?
-                """,
-                (path,),
-            )
-        self.conn.commit()
+        raise DeprecationWarning(
+            "set_animals_manual() is deprecated. Use set_run_animals_manual() with pipeline_run_id instead."
+        )
 
     def set_people_no_face_manual(self, *, path: str, is_people_no_face: bool, person: str | None = None) -> None:
         """
-        Ручная пометка: "есть люди, но лица не найдены".
+        DEPRECATED: Метод удален - метки должны быть run-scoped.
+        Используйте set_run_people_no_face_manual() с pipeline_run_id.
         """
-        cur = self.conn.cursor()
-        if bool(is_people_no_face):
-            cur.execute(
-                """
-                UPDATE files
-                SET people_no_face_manual = 1, people_no_face_person = ?
-                WHERE path = ?
-                """,
-                ((person or "").strip() or None, path),
-            )
-        else:
-            cur.execute(
-                """
-                UPDATE files
-                SET people_no_face_manual = 0, people_no_face_person = NULL
-                WHERE path = ?
-                """,
-                (path,),
-            )
-        self.conn.commit()
+        raise DeprecationWarning(
+            "set_people_no_face_manual() is deprecated. Use set_run_people_no_face_manual() with pipeline_run_id instead."
+        )
 
     def get_row_by_resource_id(self, *, resource_id: str) -> dict[str, Any] | None:
         cur = self.conn.cursor()

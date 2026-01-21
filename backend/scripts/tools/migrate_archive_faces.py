@@ -7,6 +7,10 @@
 (archive_scope='archive', run_id=NULL для кластеров).
 
 Сохраняет все связи: face_cluster_members, face_labels.
+
+TODO: При переезде файлов в архив нужно копировать people_no_face_person
+из files_manual_labels в files.people_no_face_person, чтобы привязка сохранилась.
+См. комментарий в backend/common/db.py около строки 243.
 """
 
 import sys
@@ -144,7 +148,7 @@ def main() -> int:
               AND NOT EXISTS (
                   SELECT 1 FROM face_rectangles fr2
                   WHERE fr2.archive_scope = 'archive'
-                    AND fr2.file_path = face_rectangles.file_path
+                    AND fr2.file_id = face_rectangles.file_id
                     AND fr2.bbox_x = face_rectangles.bbox_x
                     AND fr2.bbox_y = face_rectangles.bbox_y
                     AND fr2.bbox_w = face_rectangles.bbox_w
@@ -166,7 +170,7 @@ def main() -> int:
               AND EXISTS (
                   SELECT 1 FROM face_rectangles fr2
                   WHERE fr2.archive_scope = 'archive'
-                    AND fr2.file_path = face_rectangles.file_path
+                    AND fr2.file_id = face_rectangles.file_id
                     AND fr2.bbox_x = face_rectangles.bbox_x
                     AND fr2.bbox_y = face_rectangles.bbox_y
                     AND fr2.bbox_w = face_rectangles.bbox_w

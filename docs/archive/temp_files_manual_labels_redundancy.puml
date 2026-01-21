@@ -1,0 +1,234 @@
+@startuml
+hide circle
+skinparam linetype ortho
+skinparam classAttributeIconSize 0
+
+title Проблема дублирования: files_manual_labels vs files
+
+' Текущая ситуация (НАРУШЕНИЕ 3NF)
+package "Текущая структура (НАРУШЕНИЕ 3NF)" {
+    class files <<table>> {
+        +id: INTEGER <<PK>>
+        path: TEXT <<UNIQUE>>
+        --
+        ' Метки лиц
+        faces_manual_label: TEXT
+        faces_manual_at: TEXT
+        --
+        ' Метки людей без лиц
+        people_no_face_manual: INTEGER
+        people_no_face_person: TEXT
+        --
+        ' Метки животных
+        animals_manual: INTEGER
+        animals_manual_kind: TEXT
+        animals_manual_at: TEXT
+        --
+        ' Карантин
+        quarantine_manual: INTEGER
+        quarantine_manual_at: TEXT
+    }
+    
+    class files_manual_labels <<table>> {
+        +pipeline_run_id: INTEGER <<PK>>
+        path: TEXT <<REDUNDANT>>  ' Дублирует files.path
+        +file_id: INTEGER <<PK,FK>>  ' FK на files.id
+        --
+        ' ДУБЛИРУЕТ files:
+        faces_manual_label: TEXT <<REDUNDANT>>  ' 10.8% рассинхронизации
+        faces_manual_at: TEXT <<REDUNDANT>>    ' 28.3% рассинхронизации
+        people_no_face_manual: INTEGER <<REDUNDANT>>  ' 4.7% рассинхронизации
+        people_no_face_person: TEXT <<REDUNDANT>>     ' 0% рассинхронизации
+        animals_manual: INTEGER <<REDUNDANT>>         ' 42.7% рассинхронизации
+        animals_manual_kind: TEXT <<REDUNDANT>>       ' 42.7% рассинхронизации
+        animals_manual_at: TEXT <<REDUNDANT>>         ' 42.7% рассинхронизации
+        quarantine_manual: INTEGER
+        quarantine_manual_at: TEXT
+    }
+    
+    files "1" -- "*" files_manual_labels : file_id
+}
+
+note right of files_manual_labels
+  **ПРОБЛЕМА ДУБЛИРОВАНИЯ:**
+  
+  Таблица files_manual_labels дублирует
+  8 колонок из files:
+  
+  ✅ path: 0% рассинхронизации
+  ⚠️ faces_manual_label: 10.8%
+  ⚠️ faces_manual_at: 28.3%
+  ⚠️ people_no_face_manual: 4.7%
+  ✅ people_no_face_person: 0%
+  ⚠️ animals_manual: 42.7%
+  ⚠️ animals_manual_kind: 42.7%
+  ⚠️ animals_manual_at: 42.7%
+  
+  **НАРУШЕНИЕ 3NF:**
+  Эти колонки можно получить через
+  JOIN к files по file_id.
+end note
+
+note right of files
+  **ЛОГИКА:**
+  
+  files.*_manual_* - ГЛОБАЛЬНЫЕ метки
+  (последние примененные, не привязаны к прогону)
+  
+  files_manual_labels.*_manual_* - МЕТКИ ДЛЯ ПРОГОНА
+  (специфичны для pipeline_run_id)
+  
+  **ПРОБЛЕМА:**
+  Один и тот же файл может иметь
+  разные метки в разных прогонах,
+  но они дублируются в files.
+  
+  **ВОПРОС:**
+  Нужны ли глобальные метки в files,
+  или достаточно только run-scoped?
+end note
+
+' Вариант решения 1: Удалить дублирование
+package "Вариант 1: Убрать дублирование" {
+    class files_v1 <<table>> {
+        +id: INTEGER <<PK>>
+        path: TEXT <<UNIQUE>>
+        --
+        ' Метки (глобальные)
+        faces_manual_label: TEXT
+        faces_manual_at: TEXT
+        people_no_face_manual: INTEGER
+        people_no_face_person: TEXT
+        animals_manual: INTEGER
+        animals_manual_kind: TEXT
+        animals_manual_at: TEXT
+        quarantine_manual: INTEGER
+        quarantine_manual_at: TEXT
+    }
+    
+    class files_manual_labels_v1 <<table>> {
+        +pipeline_run_id: INTEGER <<PK>>
+        +file_id: INTEGER <<PK,FK>>
+        --
+        ' Только специфичные для прогона метки
+        ' (если они нужны)
+        quarantine_manual: INTEGER
+        quarantine_manual_at: TEXT
+    }
+    
+    files_v1 "1" -- "*" files_manual_labels_v1 : file_id
+}
+
+note right of files_manual_labels_v1
+  **РЕШЕНИЕ 1:**
+  
+  Убрать все дублирующие колонки из
+  files_manual_labels.
+  
+  Оставить только:
+  - pipeline_run_id
+  - file_id (FK)
+  - quarantine_manual (если специфичен для прогона)
+  
+  Все остальные метки получать
+  через JOIN к files.
+  
+  **НО:** Если метки специфичны для прогона,
+  то они НЕ должны быть в files!
+end note
+
+' Вариант решения 2: Удалить таблицу
+package "Вариант 2: Удалить таблицу" {
+    class files_v2 <<table>> {
+        +id: INTEGER <<PK>>
+        path: TEXT <<UNIQUE>>
+        --
+        ' Метки (глобальные)
+        faces_manual_label: TEXT
+        faces_manual_at: TEXT
+        people_no_face_manual: INTEGER
+        people_no_face_person: TEXT
+        animals_manual: INTEGER
+        animals_manual_kind: TEXT
+        animals_manual_at: TEXT
+        quarantine_manual: INTEGER
+        quarantine_manual_at: TEXT
+        --
+        ' Добавить связь с прогоном?
+        last_manual_label_pipeline_run_id: INTEGER <<FK>>
+    }
+}
+
+note right of files_v2
+  **РЕШЕНИЕ 2:**
+  
+  Если метки ГЛОБАЛЬНЫЕ (не зависят
+  от pipeline_run_id), то можно
+  полностью удалить files_manual_labels.
+  
+  Хранить метки только в files.
+  
+  **НО:** По коду видно, что метки
+  ДОЛЖНЫ быть привязаны к прогону:
+  "ручные метки должны быть привязаны
+  к прогону, иначе они 'утекают' между
+  разными папками/прогонами"
+end note
+
+' Вариант решения 3: Оставить только уникальные метки
+package "Вариант 3: Только уникальные метки" {
+    class files_v3 <<table>> {
+        +id: INTEGER <<PK>>
+        path: TEXT <<UNIQUE>>
+        --
+        ' Метки (глобальные)
+        faces_manual_label: TEXT
+        faces_manual_at: TEXT
+        people_no_face_manual: INTEGER
+        people_no_face_person: TEXT
+        animals_manual: INTEGER
+        animals_manual_kind: TEXT
+        animals_manual_at: TEXT
+        quarantine_manual: INTEGER
+        quarantine_manual_at: TEXT
+    }
+    
+    class files_manual_labels_v3 <<table>> {
+        +pipeline_run_id: INTEGER <<PK>>
+        +file_id: INTEGER <<PK,FK>>
+        --
+        ' Только метки, специфичные для прогона
+        ' (если такие есть)
+        ' Например: временные метки для сортировки
+    }
+    
+    files_v3 "1" -- "*" files_manual_labels_v3 : file_id
+}
+
+note right of files_manual_labels_v3
+  **РЕШЕНИЕ 3 (РЕКОМЕНДУЕМОЕ):**
+  
+  Метки в files_manual_labels специфичны
+  для pipeline_run_id (run-scoped).
+  
+  **УБРАТЬ из files все *_manual_* колонки:**
+  - faces_manual_label
+  - faces_manual_at
+  - people_no_face_manual
+  - people_no_face_person
+  - animals_manual
+  - animals_manual_kind
+  - animals_manual_at
+  - quarantine_manual
+  - quarantine_manual_at
+  
+  Хранить метки ТОЛЬКО в files_manual_labels.
+  Получать через JOIN при необходимости.
+  
+  **ПРЕИМУЩЕСТВА:**
+  ✅ Нет дублирования
+  ✅ Метки привязаны к прогону
+  ✅ Соответствие 3NF
+end note
+
+@enduml

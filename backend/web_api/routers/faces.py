@@ -725,14 +725,14 @@ def api_faces_results(
           NOT EXISTS (
               SELECT 1 FROM face_person_manual_assignments fpma
               JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
-              WHERE fr.file_path = f.path AND fr.run_id = ? AND fpma.person_id IS NOT NULL
+              WHERE fr.file_id = f.id AND fr.run_id = ? AND fpma.person_id IS NOT NULL
           )
           AND NOT EXISTS (
               -- Файл не привязан ни к одной персоне через кластеры
               SELECT 1 FROM face_rectangles fr_cluster
               JOIN face_cluster_members fcm_all ON fcm_all.face_rectangle_id = fr_cluster.id
               JOIN face_clusters fc ON fc.id = fcm_all.cluster_id
-              WHERE fr_cluster.file_path = f.path 
+              WHERE fr_cluster.file_id = f.id 
                 AND fr_cluster.run_id = ? 
                 AND COALESCE(fr_cluster.ignore_flag, 0) = 0
                 AND fc.person_id IS NOT NULL
@@ -741,12 +741,12 @@ def api_faces_results(
           AND NOT EXISTS (
               -- Файл не привязан ни к одной персоне через прямоугольники
               SELECT 1 FROM person_rectangles pr
-              WHERE pr.file_path = f.path AND pr.pipeline_run_id = ? AND pr.person_id IS NOT NULL
+              WHERE pr.file_id = f.id AND pr.pipeline_run_id = ? AND pr.person_id IS NOT NULL
           )
           AND NOT EXISTS (
               -- Файл не привязан ни к одной персоне напрямую
               SELECT 1 FROM file_persons fp
-              WHERE fp.file_path = f.path AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL
+              WHERE fp.file_id = f.id AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL
           )
         ) OR COALESCE(m.people_no_face_manual, 0) = 1
         """
@@ -798,13 +798,13 @@ def api_faces_results(
             -- Через ручные привязки (прямая привязка)
             SELECT 1 FROM face_person_manual_assignments fpma
             JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
-            WHERE fr.file_path = f.path AND fr.run_id = ? AND fpma.person_id = ?
+            WHERE fr.file_id = f.id AND fr.run_id = ? AND fpma.person_id = ?
         ) OR EXISTS (
             -- Через кластеры (оптимизированный вариант)
             SELECT 1 FROM face_rectangles fr_cluster
             JOIN face_cluster_members fcm_all ON fcm_all.face_rectangle_id = fr_cluster.id
             JOIN face_clusters fc ON fc.id = fcm_all.cluster_id
-            WHERE fr_cluster.file_path = f.path 
+            WHERE fr_cluster.file_id = f.id 
               AND fr_cluster.run_id = ? 
               AND COALESCE(fr_cluster.ignore_flag, 0) = 0
               AND fc.person_id = ?
@@ -812,11 +812,11 @@ def api_faces_results(
         ) OR EXISTS (
             -- Через прямоугольники без лица
             SELECT 1 FROM person_rectangles pr
-            WHERE pr.file_path = f.path AND pr.pipeline_run_id = ? AND pr.person_id = ?
+            WHERE pr.file_id = f.id AND pr.pipeline_run_id = ? AND pr.person_id = ?
         ) OR EXISTS (
             -- Прямая привязка
             SELECT 1 FROM file_persons fp
-            WHERE fp.file_path = f.path AND fp.pipeline_run_id = ? AND fp.person_id = ?
+            WHERE fp.file_id = f.id AND fp.pipeline_run_id = ? AND fp.person_id = ?
         )
         """
         # Параметры для оптимизированного запроса:
@@ -885,7 +885,7 @@ def api_faces_results(
             SELECT COUNT(*) AS cnt
             FROM files f
             LEFT JOIN files_manual_labels m
-              ON m.pipeline_run_id = ? AND m.path = f.path{group_join}
+              ON m.pipeline_run_id = ? AND m.file_id = f.id{group_join}
             WHERE {where_sql} AND ({eff_sql}) = ? AND ({sub_where}) AND ({person_filter_sql}) AND ({group_filter_sql}) AND ({media_filter_sql})
             """,
             group_count_params + [int(pipeline_run_id)] + params + [tab_n] + sub_params + person_filter_params + group_filter_params,
@@ -918,7 +918,7 @@ def api_faces_results(
               COALESCE(m.people_no_face_person, '') AS people_no_face_person{group_select}
             FROM files f
             LEFT JOIN files_manual_labels m
-              ON m.pipeline_run_id = ? AND m.path = f.path{group_join}
+              ON m.pipeline_run_id = ? AND m.file_id = f.id{group_join}
             WHERE {where_sql} AND ({eff_sql}) = ? AND ({sub_where}) AND ({person_filter_sql}) AND ({group_filter_sql}) AND ({media_filter_sql})
             ORDER BY
               {group_order}
@@ -959,7 +959,7 @@ def api_faces_results(
                     test_cur.execute(f"""
                         SELECT COUNT(*) as cnt
                         FROM files f
-                        LEFT JOIN files_manual_labels m ON m.pipeline_run_id = ? AND m.path = f.path
+                        LEFT JOIN files_manual_labels m ON m.pipeline_run_id = ? AND m.file_id = f.id
                         WHERE f.faces_run_id = ? AND f.status != 'deleted'
                         AND EXISTS (
                             SELECT 1 FROM file_groups fg
@@ -974,7 +974,7 @@ def api_faces_results(
                     test_cur.execute(f"""
                         SELECT COUNT(*) as cnt
                         FROM files f
-                        LEFT JOIN files_manual_labels m ON m.pipeline_run_id = ? AND m.path = f.path
+                        LEFT JOIN files_manual_labels m ON m.pipeline_run_id = ? AND m.file_id = f.id
                         WHERE f.faces_run_id = ? AND f.status != 'deleted'
                         AND ({eff_sql}) = 'no_faces'
                         AND EXISTS (
@@ -991,7 +991,7 @@ def api_faces_results(
                         SELECT f.path, ({eff_sql}) as eff_tab, f.faces_count, 
                                COALESCE(m.faces_manual_label, '') as manual_label
                         FROM files f
-                        LEFT JOIN files_manual_labels m ON m.pipeline_run_id = ? AND m.path = f.path
+                        LEFT JOIN files_manual_labels m ON m.pipeline_run_id = ? AND m.file_id = f.id
                         WHERE EXISTS (
                             SELECT 1 FROM file_groups fg
                             WHERE fg.file_path = f.path AND fg.pipeline_run_id = ? 
@@ -1160,7 +1160,7 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
             SELECT ({eff_sql}) AS tab, COUNT(*) AS cnt
             FROM files f
             LEFT JOIN files_manual_labels m
-              ON m.pipeline_run_id = ? AND m.path = f.path
+              ON m.pipeline_run_id = ? AND m.file_id = f.id
             WHERE {where_sql}
             GROUP BY ({eff_sql})
             """,
@@ -1173,7 +1173,7 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
             SELECT COUNT(*) AS cnt
             FROM files f
             LEFT JOIN files_manual_labels m
-              ON m.pipeline_run_id = ? AND m.path = f.path
+              ON m.pipeline_run_id = ? AND m.file_id = f.id
             WHERE {where_sql}
               AND ({eff_sql}) = 'faces'
               AND COALESCE(faces_count, 0) >= 8
@@ -1187,7 +1187,7 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
             SELECT COUNT(*) AS cnt
             FROM files f
             LEFT JOIN files_manual_labels m
-              ON m.pipeline_run_id = ? AND m.path = f.path
+              ON m.pipeline_run_id = ? AND m.file_id = f.id
             WHERE {where_sql}
               AND ({eff_sql}) = 'faces'
               AND COALESCE(faces_count, 0) < 8
@@ -1198,22 +1198,22 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
                       -- Ручные привязки
                       SELECT 1 FROM face_person_manual_assignments fpma
                       JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
-                      WHERE fr.file_path = f.path AND fr.run_id = ? AND fpma.person_id IS NOT NULL
+                      WHERE fr.file_id = f.id AND fr.run_id = ? AND fpma.person_id IS NOT NULL
                   )
                   AND NOT EXISTS (
                       -- Привязки через кластеры
                       SELECT 1 FROM face_cluster_members fcm
                       JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
                       JOIN face_clusters fc ON fc.id = fcm.cluster_id
-                      WHERE fr.file_path = f.path AND fr.run_id = ? AND fc.person_id IS NOT NULL
+                      WHERE fr.file_id = f.id AND fr.run_id = ? AND fc.person_id IS NOT NULL
                   )
                   AND NOT EXISTS (
                       SELECT 1 FROM person_rectangles pr
-                      WHERE pr.file_path = f.path AND pr.pipeline_run_id = ? AND pr.person_id IS NOT NULL
+                      WHERE pr.file_id = f.id AND pr.pipeline_run_id = ? AND pr.person_id IS NOT NULL
                   )
                   AND NOT EXISTS (
                       SELECT 1 FROM file_persons fp
-                      WHERE fp.file_path = f.path AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL
+                      WHERE fp.file_id = f.id AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL
                   )
                 )
                 -- ИЛИ это люди без лиц
@@ -1230,7 +1230,7 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
             SELECT COUNT(*) AS cnt
             FROM files f
             LEFT JOIN files_manual_labels m
-              ON m.pipeline_run_id = ? AND m.path = f.path
+              ON m.pipeline_run_id = ? AND m.file_id = f.id
             WHERE {where_sql}
               AND ({eff_sql}) = 'no_faces'
               AND NOT EXISTS (
@@ -1250,7 +1250,7 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
             SELECT COUNT(*) AS cnt
             FROM files f
             LEFT JOIN files_manual_labels m
-              ON m.pipeline_run_id = ? AND m.path = f.path
+              ON m.pipeline_run_id = ? AND m.file_id = f.id
             WHERE {where_sql}
               AND ({eff_sql}) = 'no_faces'
               AND NOT EXISTS (
@@ -1329,7 +1329,7 @@ def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
         where_parts = ["fr.run_id = ?"]
         params = [face_run_id_i]
         if root_like:
-            where_parts.append("fr.file_path LIKE ?")
+            where_parts.append("f.path LIKE ?")
             params.append(root_like)
         where_sql = " AND ".join(where_parts)
         
@@ -1337,9 +1337,10 @@ def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
         query1_start = time.time()
         cur.execute(
             f"""
-            SELECT DISTINCT fpma.person_id, p.name AS person_name, COUNT(DISTINCT fr.file_path) AS files_count
+            SELECT DISTINCT fpma.person_id, p.name AS person_name, COUNT(DISTINCT f.path) AS files_count
             FROM face_person_manual_assignments fpma
             JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
+            JOIN files f ON f.id = fr.file_id
             LEFT JOIN persons p ON p.id = fpma.person_id
             WHERE {where_sql} AND fpma.person_id IS NOT NULL
             GROUP BY fpma.person_id, p.name
@@ -1356,7 +1357,7 @@ def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
         where_parts_cluster = ["fr_cluster.run_id = ?"]
         params_cluster = [face_run_id_i]
         if root_like:
-            where_parts_cluster.append("fr_cluster.file_path LIKE ?")
+            where_parts_cluster.append("f_cluster.path LIKE ?")
             params_cluster.append(root_like)
         where_sql_cluster = " AND ".join(where_parts_cluster)
         
@@ -1368,10 +1369,11 @@ def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
             SELECT 
                 fc.person_id,
                 p.name AS person_name,
-                COUNT(DISTINCT fr_cluster.file_path) AS files_count
+                COUNT(DISTINCT f_cluster.path) AS files_count
             FROM face_cluster_members fcm_all
             JOIN face_clusters fc ON fc.id = fcm_all.cluster_id
             JOIN face_rectangles fr_cluster ON fr_cluster.id = fcm_all.face_rectangle_id
+            JOIN files f_cluster ON f_cluster.id = fr_cluster.file_id
             LEFT JOIN persons p ON p.id = fc.person_id
             WHERE {where_sql_cluster}
               AND COALESCE(fr_cluster.ignore_flag, 0) = 0
@@ -1397,15 +1399,16 @@ def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
         where_parts2 = ["pr.pipeline_run_id = ?"]
         params2 = [int(pipeline_run_id)]
         if root_like:
-            where_parts2.append("pr.file_path LIKE ?")
+            where_parts2.append("f_pr.path LIKE ?")
             params2.append(root_like)
         where_sql2 = " AND ".join(where_parts2)
         
         query3_start = time.time()
         cur.execute(
             f"""
-            SELECT DISTINCT pr.person_id, p.name AS person_name, COUNT(DISTINCT pr.file_path) AS files_count
+            SELECT DISTINCT pr.person_id, p.name AS person_name, COUNT(DISTINCT f_pr.path) AS files_count
             FROM person_rectangles pr
+            JOIN files f_pr ON f_pr.id = pr.file_id
             LEFT JOIN persons p ON p.id = pr.person_id
             WHERE {where_sql2} AND pr.person_id IS NOT NULL
             GROUP BY pr.person_id, p.name
@@ -1422,15 +1425,16 @@ def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
         where_parts3 = ["fp.pipeline_run_id = ?"]
         params3 = [int(pipeline_run_id)]
         if root_like:
-            where_parts3.append("fp.file_path LIKE ?")
+            where_parts3.append("f_fp.path LIKE ?")
             params3.append(root_like)
         where_sql3 = " AND ".join(where_parts3)
         
         query4_start = time.time()
         cur.execute(
             f"""
-            SELECT DISTINCT fp.person_id, p.name AS person_name, COUNT(DISTINCT fp.file_path) AS files_count
+            SELECT DISTINCT fp.person_id, p.name AS person_name, COUNT(DISTINCT f_fp.path) AS files_count
             FROM file_persons fp
+            JOIN files f_fp ON f_fp.id = fp.file_id
             LEFT JOIN persons p ON p.id = fp.person_id
             WHERE {where_sql3} AND fp.person_id IS NOT NULL
             GROUP BY fp.person_id, p.name
@@ -2209,7 +2213,7 @@ def api_faces_sort_into_folders(payload: dict[str, Any] = Body(...)) -> dict[str
               COALESCE(f.faces_count, 0) AS faces_count
             FROM files f
             LEFT JOIN files_manual_labels m
-              ON m.pipeline_run_id = ? AND m.path = f.path
+              ON m.pipeline_run_id = ? AND m.file_id = f.id
             WHERE f.faces_run_id = ? AND f.status != 'deleted'
             """,
             (int(pipeline_run_id), face_run_id_i),
@@ -2564,7 +2568,7 @@ def api_faces_delete(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
               COALESCE(f.faces_count, 0) AS faces_count
             FROM files f
             LEFT JOIN files_manual_labels m
-              ON m.pipeline_run_id = ? AND m.path = f.path
+              ON m.pipeline_run_id = ? AND m.file_id = f.id
             WHERE f.path = ? AND f.status != 'deleted'
             LIMIT 1
             """,
