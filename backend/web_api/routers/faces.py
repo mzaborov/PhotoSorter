@@ -2067,6 +2067,661 @@ def api_faces_manual_rectangles(payload: dict[str, Any] = Body(...)) -> dict[str
     return {"ok": True}
 
 
+@router.post("/api/faces/rectangle/update")
+def api_faces_rectangle_update(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Обновляет rectangle (координаты, тип, персона).
+    Приоритет: file_id (если передан), иначе path (если передан).
+    
+    Параметры:
+    - pipeline_run_id: int (обязательно)
+    - face_rectangle_id: int (обязательно)
+    - bbox: dict (опционально) - {"x": int, "y": int, "w": int, "h": int}
+    - person_id: int | None (опционально) - если None, удаляет привязку к персоне
+    - assignment_type: str (опционально) - "cluster" | "manual_face" | None
+    """
+    from backend.common.db import _get_file_id, get_connection
+    
+    pipeline_run_id = payload.get("pipeline_run_id")
+    face_rectangle_id = payload.get("face_rectangle_id")
+    bbox = payload.get("bbox")
+    person_id = payload.get("person_id")
+    assignment_type = payload.get("assignment_type")
+    
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required and must be int")
+    if not isinstance(face_rectangle_id, int):
+        raise HTTPException(status_code=400, detail="face_rectangle_id is required and must be int")
+    
+    # Проверяем, что pipeline_run_id существует
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+        if not pr:
+            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+        face_run_id = pr.get("face_run_id")
+        if not face_run_id:
+            raise HTTPException(status_code=400, detail="face_run_id is not set yet")
+        face_run_id_i = int(face_run_id)
+    finally:
+        ps.close()
+    
+    fs = FaceStore()
+    try:
+        conn = fs.conn
+        cur = conn.cursor()
+        
+        # Проверяем, что rectangle существует
+        cur.execute("SELECT id, file_id, bbox_x, bbox_y, bbox_w, bbox_h FROM face_rectangles WHERE id = ? AND run_id = ?", 
+                   (int(face_rectangle_id), face_run_id_i))
+        rect_row = cur.fetchone()
+        if not rect_row:
+            raise HTTPException(status_code=404, detail="face_rectangle_id not found")
+        
+        file_id = rect_row["file_id"]
+        
+        # Обновляем координаты bbox, если переданы
+        if bbox and isinstance(bbox, dict):
+            bbox_x = int(bbox.get("x", 0))
+            bbox_y = int(bbox.get("y", 0))
+            bbox_w = int(bbox.get("w", 0))
+            bbox_h = int(bbox.get("h", 0))
+            
+            if bbox_w > 0 and bbox_h > 0:
+                cur.execute("""
+                    UPDATE face_rectangles 
+                    SET bbox_x = ?, bbox_y = ?, bbox_w = ?, bbox_h = ?
+                    WHERE id = ?
+                """, (bbox_x, bbox_y, bbox_w, bbox_h, int(face_rectangle_id)))
+        
+        # Обрабатываем привязку к персоне
+        if person_id is not None:
+            if isinstance(person_id, int) and person_id > 0:
+                # Проверяем, что персона существует
+                cur.execute("SELECT id, name FROM persons WHERE id = ?", (int(person_id),))
+                person_row = cur.fetchone()
+                if not person_row:
+                    raise HTTPException(status_code=404, detail="person_id not found")
+                
+                # Определяем тип привязки
+                if assignment_type == "manual_face":
+                    # Создаем/обновляем ручную привязку
+                    # Сначала удаляем из кластера (если был)
+                    cur.execute("""
+                        DELETE FROM face_cluster_members 
+                        WHERE face_rectangle_id = ?
+                    """, (int(face_rectangle_id),))
+                    
+                    # Создаем/обновляем ручную привязку
+                    from datetime import datetime, timezone
+                    now = datetime.now(timezone.utc).isoformat()
+                    cur.execute("""
+                        INSERT OR REPLACE INTO face_person_manual_assignments 
+                        (face_rectangle_id, person_id, source, created_at)
+                        VALUES (?, ?, 'manual', ?)
+                    """, (int(face_rectangle_id), int(person_id), now))
+                    
+                elif assignment_type == "cluster":
+                    # Добавляем в кластер (нужно найти или создать кластер для персоны)
+                    # Сначала удаляем ручную привязку (если была)
+                    cur.execute("""
+                        DELETE FROM face_person_manual_assignments 
+                        WHERE face_rectangle_id = ?
+                    """, (int(face_rectangle_id),))
+                    
+                    # Ищем существующий кластер для персоны в этом run_id
+                    cur.execute("""
+                        SELECT id FROM face_clusters 
+                        WHERE person_id = ? AND run_id = ? 
+                        LIMIT 1
+                    """, (int(person_id), face_run_id_i))
+                    cluster_row = cur.fetchone()
+                    
+                    if cluster_row:
+                        cluster_id = cluster_row["id"]
+                    else:
+                        # Создаем новый кластер для персоны
+                        from datetime import datetime, timezone
+                        now = datetime.now(timezone.utc).isoformat()
+                        cur.execute("""
+                            INSERT INTO face_clusters (run_id, person_id, created_at)
+                            VALUES (?, ?, ?)
+                        """, (face_run_id_i, int(person_id), now))
+                        cluster_id = cur.lastrowid
+                    
+                    # Добавляем rectangle в кластер
+                    cur.execute("""
+                        INSERT OR IGNORE INTO face_cluster_members (cluster_id, face_rectangle_id)
+                        VALUES (?, ?)
+                    """, (cluster_id, int(face_rectangle_id)))
+            else:
+                # person_id = None или 0 - удаляем все привязки
+                cur.execute("""
+                    DELETE FROM face_person_manual_assignments 
+                    WHERE face_rectangle_id = ?
+                """, (int(face_rectangle_id),))
+                cur.execute("""
+                    DELETE FROM face_cluster_members 
+                    WHERE face_rectangle_id = ?
+                """, (int(face_rectangle_id),))
+        
+        conn.commit()
+        
+        # Возвращаем обновленный rectangle
+        cur.execute("""
+            SELECT 
+                fr.id,
+                fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
+                fpma.person_id,
+                p.name AS person_name,
+                p.is_me
+            FROM face_rectangles fr
+            LEFT JOIN face_person_manual_assignments fpma ON fpma.face_rectangle_id = fr.id
+            LEFT JOIN persons p ON p.id = fpma.person_id
+            WHERE fr.id = ?
+            LIMIT 1
+        """, (int(face_rectangle_id),))
+        updated_row = cur.fetchone()
+        
+        result = {
+            "ok": True,
+            "face_rectangle_id": int(face_rectangle_id),
+            "bbox": {
+                "x": updated_row["bbox_x"] if updated_row else None,
+                "y": updated_row["bbox_y"] if updated_row else None,
+                "w": updated_row["bbox_w"] if updated_row else None,
+                "h": updated_row["bbox_h"] if updated_row else None,
+            } if updated_row else None,
+            "person_id": updated_row["person_id"] if updated_row else None,
+            "person_name": updated_row["person_name"] if updated_row else None,
+            "is_me": bool(updated_row["is_me"]) if updated_row and updated_row["is_me"] else False,
+        }
+        
+    finally:
+        fs.close()
+    
+    return result
+
+
+@router.post("/api/faces/rectangle/delete")
+def api_faces_rectangle_delete(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Удаляет rectangle (помечает как ignore_flag = 1).
+    Приоритет: file_id (если передан), иначе path (если передан).
+    
+    Параметры:
+    - pipeline_run_id: int (обязательно)
+    - face_rectangle_id: int (обязательно)
+    """
+    pipeline_run_id = payload.get("pipeline_run_id")
+    face_rectangle_id = payload.get("face_rectangle_id")
+    
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required and must be int")
+    if not isinstance(face_rectangle_id, int):
+        raise HTTPException(status_code=400, detail="face_rectangle_id is required and must be int")
+    
+    # Проверяем, что pipeline_run_id существует
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+        if not pr:
+            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+        face_run_id = pr.get("face_run_id")
+        if not face_run_id:
+            raise HTTPException(status_code=400, detail="face_run_id is not set yet")
+        face_run_id_i = int(face_run_id)
+    finally:
+        ps.close()
+    
+    fs = FaceStore()
+    try:
+        conn = fs.conn
+        cur = conn.cursor()
+        
+        # Проверяем, что rectangle существует
+        cur.execute("SELECT id FROM face_rectangles WHERE id = ? AND run_id = ?", 
+                   (int(face_rectangle_id), face_run_id_i))
+        rect_row = cur.fetchone()
+        if not rect_row:
+            raise HTTPException(status_code=404, detail="face_rectangle_id not found")
+        
+        # Помечаем как игнорируемый
+        cur.execute("""
+            UPDATE face_rectangles 
+            SET ignore_flag = 1
+            WHERE id = ?
+        """, (int(face_rectangle_id),))
+        
+        # Удаляем все привязки
+        cur.execute("""
+            DELETE FROM face_person_manual_assignments 
+            WHERE face_rectangle_id = ?
+        """, (int(face_rectangle_id),))
+        cur.execute("""
+            DELETE FROM face_cluster_members 
+            WHERE face_rectangle_id = ?
+        """, (int(face_rectangle_id),))
+        
+        conn.commit()
+    finally:
+        fs.close()
+    
+    return {"ok": True, "face_rectangle_id": int(face_rectangle_id)}
+
+
+@router.post("/api/faces/rectangles/assign-outsider")
+def api_faces_rectangles_assign_outsider(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Назначает все неназначенные rectangles персоне "Посторонний".
+    Приоритет: file_id (если передан), иначе path (если передан).
+    
+    Параметры:
+    - pipeline_run_id: int (обязательно)
+    - file_id: int (опционально)
+    - path: str (опционально)
+    """
+    from backend.common.db import _get_file_id, get_connection
+    
+    pipeline_run_id = payload.get("pipeline_run_id")
+    file_id = payload.get("file_id")
+    path = payload.get("path")
+    
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required and must be int")
+    if file_id is None and path is None:
+        raise HTTPException(status_code=400, detail="Either file_id or path must be provided")
+    
+    # Проверяем, что pipeline_run_id существует
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+        if not pr:
+            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+        face_run_id = pr.get("face_run_id")
+        if not face_run_id:
+            raise HTTPException(status_code=400, detail="face_run_id is not set yet")
+        face_run_id_i = int(face_run_id)
+    finally:
+        ps.close()
+    
+    # Получаем file_id
+    conn = get_connection()
+    try:
+        resolved_file_id = _get_file_id(conn, file_id=file_id, file_path=path)
+        if resolved_file_id is None:
+            raise HTTPException(status_code=404, detail="File not found")
+    finally:
+        conn.close()
+    
+    # Находим или создаем персону "Посторонний"
+    fs = FaceStore()
+    try:
+        conn = fs.conn
+        cur = conn.cursor()
+        
+        # Ищем персону "Посторонний"
+        cur.execute("SELECT id FROM persons WHERE name = 'Посторонний' LIMIT 1")
+        person_row = cur.fetchone()
+        if person_row:
+            outsider_person_id = person_row["id"]
+        else:
+            # Создаем персону "Посторонний"
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+            cur.execute("""
+                INSERT INTO persons (name, is_me, created_at)
+                VALUES ('Посторонний', 0, ?)
+            """, (now,))
+            outsider_person_id = cur.lastrowid
+        
+        # Находим все неназначенные rectangles для файла
+        cur.execute("""
+            SELECT fr.id
+            FROM face_rectangles fr
+            WHERE fr.file_id = ? 
+              AND fr.run_id = ?
+              AND COALESCE(fr.ignore_flag, 0) = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM face_person_manual_assignments fpma 
+                  WHERE fpma.face_rectangle_id = fr.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM face_cluster_members fcm
+                  JOIN face_clusters fc ON fc.id = fcm.cluster_id
+                  WHERE fcm.face_rectangle_id = fr.id AND fc.person_id IS NOT NULL
+              )
+        """, (resolved_file_id, face_run_id_i))
+        
+        unassigned_rects = cur.fetchall()
+        assigned_count = 0
+        
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        
+        for rect_row in unassigned_rects:
+            rect_id = rect_row["id"]
+            # Удаляем из кластеров (если был)
+            cur.execute("DELETE FROM face_cluster_members WHERE face_rectangle_id = ?", (rect_id,))
+            # Создаем ручную привязку
+            cur.execute("""
+                INSERT OR REPLACE INTO face_person_manual_assignments 
+                (face_rectangle_id, person_id, source, created_at)
+                VALUES (?, ?, 'manual', ?)
+            """, (rect_id, outsider_person_id, now))
+            assigned_count += 1
+        
+        conn.commit()
+    finally:
+        fs.close()
+    
+    return {
+        "ok": True,
+        "assigned_count": assigned_count,
+        "person_id": outsider_person_id,
+        "person_name": "Посторонний"
+    }
+
+
+@router.post("/api/faces/file/mark-as-cat")
+def api_faces_file_mark_as_cat(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Помечает файл как "кот" (удаляет все rectangles, устанавливает метку animals_manual).
+    Приоритет: file_id (если передан), иначе path (если передан).
+    
+    Параметры:
+    - pipeline_run_id: int (обязательно)
+    - file_id: int (опционально)
+    - path: str (опционально)
+    """
+    from backend.common.db import _get_file_id, get_connection
+    
+    pipeline_run_id = payload.get("pipeline_run_id")
+    file_id = payload.get("file_id")
+    path = payload.get("path")
+    
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required and must be int")
+    if file_id is None and path is None:
+        raise HTTPException(status_code=400, detail="Either file_id or path must be provided")
+    
+    # Проверяем, что pipeline_run_id существует
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+        if not pr:
+            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+        face_run_id = pr.get("face_run_id")
+        if not face_run_id:
+            raise HTTPException(status_code=400, detail="face_run_id is not set yet")
+        face_run_id_i = int(face_run_id)
+    finally:
+        ps.close()
+    
+    # Получаем file_id и path
+    conn = get_connection()
+    try:
+        resolved_file_id = _get_file_id(conn, file_id=file_id, file_path=path)
+        if resolved_file_id is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # Получаем path, если не передан
+        if path is None:
+            cur = conn.cursor()
+            cur.execute("SELECT path FROM files WHERE id = ? LIMIT 1", (resolved_file_id,))
+            row = cur.fetchone()
+            if row:
+                path = row["path"]
+    finally:
+        conn.close()
+    
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+    
+    # Удаляем все rectangles для файла
+    fs = FaceStore()
+    try:
+        conn = fs.conn
+        cur = conn.cursor()
+        
+        # Помечаем все rectangles как игнорируемые
+        cur.execute("""
+            UPDATE face_rectangles 
+            SET ignore_flag = 1
+            WHERE file_id = ? AND run_id = ?
+        """, (resolved_file_id, face_run_id_i))
+        
+        # Удаляем все привязки
+        cur.execute("""
+            DELETE FROM face_person_manual_assignments 
+            WHERE face_rectangle_id IN (
+                SELECT id FROM face_rectangles 
+                WHERE file_id = ? AND run_id = ?
+            )
+        """, (resolved_file_id, face_run_id_i))
+        cur.execute("""
+            DELETE FROM face_cluster_members 
+            WHERE face_rectangle_id IN (
+                SELECT id FROM face_rectangles 
+                WHERE file_id = ? AND run_id = ?
+            )
+        """, (resolved_file_id, face_run_id_i))
+        
+        conn.commit()
+    finally:
+        fs.close()
+    
+    # Устанавливаем метку animals_manual
+    ds = DedupStore()
+    try:
+        ds.set_run_animals_manual(pipeline_run_id=int(pipeline_run_id), path=str(path), is_animal=True, kind="cat")
+    finally:
+        ds.close()
+    
+    return {"ok": True, "file_id": resolved_file_id, "path": path}
+
+
+@router.post("/api/faces/file/mark-as-no-people")
+def api_faces_file_mark_as_no_people(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Помечает файл как "нет людей" (удаляет все rectangles, устанавливает метку no_faces).
+    Приоритет: file_id (если передан), иначе path (если передан).
+    
+    Параметры:
+    - pipeline_run_id: int (обязательно)
+    - file_id: int (опционально)
+    - path: str (опционально)
+    """
+    from backend.common.db import _get_file_id, get_connection
+    
+    pipeline_run_id = payload.get("pipeline_run_id")
+    file_id = payload.get("file_id")
+    path = payload.get("path")
+    
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required and must be int")
+    if file_id is None and path is None:
+        raise HTTPException(status_code=400, detail="Either file_id or path must be provided")
+    
+    # Проверяем, что pipeline_run_id существует
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+        if not pr:
+            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+        face_run_id = pr.get("face_run_id")
+        if not face_run_id:
+            raise HTTPException(status_code=400, detail="face_run_id is not set yet")
+        face_run_id_i = int(face_run_id)
+    finally:
+        ps.close()
+    
+    # Получаем file_id и path
+    conn = get_connection()
+    try:
+        resolved_file_id = _get_file_id(conn, file_id=file_id, file_path=path)
+        if resolved_file_id is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # Получаем path, если не передан
+        if path is None:
+            cur = conn.cursor()
+            cur.execute("SELECT path FROM files WHERE id = ? LIMIT 1", (resolved_file_id,))
+            row = cur.fetchone()
+            if row:
+                path = row["path"]
+    finally:
+        conn.close()
+    
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+    
+    # Удаляем все rectangles для файла
+    fs = FaceStore()
+    try:
+        conn = fs.conn
+        cur = conn.cursor()
+        
+        # Помечаем все rectangles как игнорируемые
+        cur.execute("""
+            UPDATE face_rectangles 
+            SET ignore_flag = 1
+            WHERE file_id = ? AND run_id = ?
+        """, (resolved_file_id, face_run_id_i))
+        
+        # Удаляем все привязки
+        cur.execute("""
+            DELETE FROM face_person_manual_assignments 
+            WHERE face_rectangle_id IN (
+                SELECT id FROM face_rectangles 
+                WHERE file_id = ? AND run_id = ?
+            )
+        """, (resolved_file_id, face_run_id_i))
+        cur.execute("""
+            DELETE FROM face_cluster_members 
+            WHERE face_rectangle_id IN (
+                SELECT id FROM face_rectangles 
+                WHERE file_id = ? AND run_id = ?
+            )
+        """, (resolved_file_id, face_run_id_i))
+        
+        conn.commit()
+    finally:
+        fs.close()
+    
+    # Устанавливаем метку no_faces
+    ds = DedupStore()
+    try:
+        ds.set_run_faces_manual_label(pipeline_run_id=int(pipeline_run_id), path=str(path), label="no_faces")
+    finally:
+        ds.close()
+    
+    return {"ok": True, "file_id": resolved_file_id, "path": path}
+
+
+@router.get("/api/faces/rectangles/duplicates-check")
+def api_faces_rectangles_duplicates_check(
+    pipeline_run_id: int,
+    file_id: int | None = None,
+    path: str | None = None
+) -> dict[str, Any]:
+    """
+    Проверяет дубликаты персоны на фото (один человек не должен быть дважды на одном фото).
+    Приоритет: file_id (если передан), иначе path (если передан).
+    
+    Возвращает список rectangles с информацией о дубликатах.
+    """
+    from backend.common.db import _get_file_id, get_connection
+    
+    if file_id is None and path is None:
+        raise HTTPException(status_code=400, detail="Either file_id or path must be provided")
+    
+    # Проверяем, что pipeline_run_id существует
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+        if not pr:
+            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+        face_run_id = pr.get("face_run_id")
+        if not face_run_id:
+            raise HTTPException(status_code=400, detail="face_run_id is not set yet")
+        face_run_id_i = int(face_run_id)
+    finally:
+        ps.close()
+    
+    # Получаем file_id
+    conn = get_connection()
+    try:
+        resolved_file_id = _get_file_id(conn, file_id=file_id, file_path=path)
+        if resolved_file_id is None:
+            raise HTTPException(status_code=404, detail="File not found")
+    finally:
+        conn.close()
+    
+    fs = FaceStore()
+    try:
+        conn = fs.conn
+        cur = conn.cursor()
+        
+        # Получаем все rectangles с привязками к персонам
+        cur.execute("""
+            SELECT 
+                fr.id AS face_rectangle_id,
+                COALESCE(fpma.person_id, fc.person_id) AS person_id,
+                p.name AS person_name
+            FROM face_rectangles fr
+            LEFT JOIN face_person_manual_assignments fpma ON fpma.face_rectangle_id = fr.id
+            LEFT JOIN face_cluster_members fcm ON fcm.face_rectangle_id = fr.id
+            LEFT JOIN face_clusters fc ON fc.id = fcm.cluster_id AND fc.person_id IS NOT NULL
+            LEFT JOIN persons p ON p.id = COALESCE(fpma.person_id, fc.person_id)
+            WHERE fr.file_id = ? 
+              AND fr.run_id = ?
+              AND COALESCE(fr.ignore_flag, 0) = 0
+              AND (fpma.person_id IS NOT NULL OR fc.person_id IS NOT NULL)
+        """, (resolved_file_id, face_run_id_i))
+        
+        rectangles = cur.fetchall()
+        
+        # Группируем по person_id для поиска дубликатов
+        person_rects: dict[int, list[int]] = {}
+        for rect in rectangles:
+            person_id = rect["person_id"]
+            if person_id:
+                if person_id not in person_rects:
+                    person_rects[person_id] = []
+                person_rects[person_id].append(rect["face_rectangle_id"])
+        
+        # Находим дубликаты (персоны с более чем одним rectangle)
+        duplicates: dict[int, list[int]] = {}
+        for person_id, rect_ids in person_rects.items():
+            if len(rect_ids) > 1:
+                duplicates[person_id] = rect_ids
+        
+        # Формируем результат
+        result_rectangles = []
+        for rect in rectangles:
+            person_id = rect["person_id"]
+            is_duplicate = person_id is not None and person_id in duplicates
+            
+            result_rectangles.append({
+                "face_rectangle_id": rect["face_rectangle_id"],
+                "person_id": person_id,
+                "person_name": rect["person_name"],
+                "is_duplicate": is_duplicate,
+                "duplicate_person_ids": [person_id] if is_duplicate else []
+            })
+        
+    finally:
+        fs.close()
+    
+    return {
+        "ok": True,
+        "file_id": resolved_file_id,
+        "rectangles": result_rectangles,
+        "has_duplicates": len(duplicates) > 0
+    }
+
+
 def _normalize_yadisk_path(path: str) -> str:
     """Нормализует путь YaDisk: убирает лишние пробелы, приводит к единому формату."""
     p = str(path or "").strip()
