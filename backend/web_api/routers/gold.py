@@ -1290,73 +1290,73 @@ def api_gold_apply_to_db(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
                     "INSERT OR IGNORE INTO files_manual_labels(pipeline_run_id, file_id) VALUES (?, ?)",
                     (int(pipeline_run_id), file_id),
                 )
-                    if op in ("faces", "no_faces"):
-                        cur.execute(
-                            """
-                            UPDATE files_manual_labels
-                            SET faces_manual_label = ?, faces_manual_at = ?
-                            WHERE pipeline_run_id = ?
-                              AND file_id = ?
-                              AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
-                              AND COALESCE(people_no_face_manual, 0) = 0
-                              AND COALESCE(animals_manual, 0) = 0
-                              AND COALESCE(quarantine_manual, 0) = 0
-                            """,
-                            [op, _now_utc_iso(), int(pipeline_run_id), file_id],
-                        )
-                    elif op == "people_no_face":
-                        cur.execute(
-                            """
-                            UPDATE files_manual_labels
-                            SET
-                              people_no_face_manual = 1,
-                              people_no_face_person = NULL,
-                              faces_manual_label = NULL,
-                              faces_manual_at = NULL,
-                              quarantine_manual = 0,
-                              quarantine_manual_at = NULL,
-                              animals_manual = 0,
-                              animals_manual_kind = NULL,
-                              animals_manual_at = NULL
-                            WHERE pipeline_run_id = ?
-                              AND file_id = ?
-                              AND (
-                                COALESCE(people_no_face_manual, 0) = 0
-                                OR (faces_manual_label IS NOT NULL AND trim(coalesce(faces_manual_label,'')) != '')
-                                OR COALESCE(animals_manual, 0) != 0
-                                OR COALESCE(quarantine_manual, 0) != 0
-                              )
-                            """,
-                            [int(pipeline_run_id), file_id],
-                        )
-                    elif op == "cat":
-                        cur.execute(
-                            """
-                            UPDATE files_manual_labels
-                            SET animals_manual = 1, animals_manual_kind = 'cat', animals_manual_at = ?
-                            WHERE pipeline_run_id = ?
-                              AND file_id = ?
-                              AND COALESCE(animals_manual, 0) = 0
-                              AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
-                              AND COALESCE(people_no_face_manual, 0) = 0
-                              AND COALESCE(quarantine_manual, 0) = 0
-                            """,
-                            [_now_utc_iso(), int(pipeline_run_id), file_id],
-                        )
-                    elif op == "quarantine_manual":
-                        cur.execute(
-                            """
-                            UPDATE files_manual_labels
-                            SET quarantine_manual = 1, quarantine_manual_at = ?
-                            WHERE pipeline_run_id = ?
-                              AND file_id = ?
-                              AND COALESCE(quarantine_manual, 0) = 0
-                              AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
-                              AND COALESCE(people_no_face_manual, 0) = 0
-                              AND COALESCE(animals_manual, 0) = 0
-                            """,
-                            [_now_utc_iso(), int(pipeline_run_id), file_id],
-                        )
+                if op in ("faces", "no_faces"):
+                    cur.execute(
+                        """
+                        UPDATE files_manual_labels
+                        SET faces_manual_label = ?, faces_manual_at = ?
+                        WHERE pipeline_run_id = ?
+                          AND file_id = ?
+                          AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
+                          AND COALESCE(people_no_face_manual, 0) = 0
+                          AND COALESCE(animals_manual, 0) = 0
+                          AND COALESCE(quarantine_manual, 0) = 0
+                        """,
+                        [op, _now_utc_iso(), int(pipeline_run_id), file_id],
+                    )
+                elif op == "people_no_face":
+                    cur.execute(
+                        """
+                        UPDATE files_manual_labels
+                        SET
+                          people_no_face_manual = 1,
+                          people_no_face_person = NULL,
+                          faces_manual_label = NULL,
+                          faces_manual_at = NULL,
+                          quarantine_manual = 0,
+                          quarantine_manual_at = NULL,
+                          animals_manual = 0,
+                          animals_manual_kind = NULL,
+                          animals_manual_at = NULL
+                        WHERE pipeline_run_id = ?
+                          AND file_id = ?
+                          AND (
+                            COALESCE(people_no_face_manual, 0) = 0
+                            OR (faces_manual_label IS NOT NULL AND trim(coalesce(faces_manual_label,'')) != '')
+                            OR COALESCE(animals_manual, 0) != 0
+                            OR COALESCE(quarantine_manual, 0) != 0
+                          )
+                        """,
+                        [int(pipeline_run_id), file_id],
+                    )
+                elif op == "cat":
+                    cur.execute(
+                        """
+                        UPDATE files_manual_labels
+                        SET animals_manual = 1, animals_manual_kind = 'cat', animals_manual_at = ?
+                        WHERE pipeline_run_id = ?
+                          AND file_id = ?
+                          AND COALESCE(animals_manual, 0) = 0
+                          AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
+                          AND COALESCE(people_no_face_manual, 0) = 0
+                          AND COALESCE(quarantine_manual, 0) = 0
+                        """,
+                        [_now_utc_iso(), int(pipeline_run_id), file_id],
+                    )
+                elif op == "quarantine_manual":
+                    cur.execute(
+                        """
+                        UPDATE files_manual_labels
+                        SET quarantine_manual = 1, quarantine_manual_at = ?
+                        WHERE pipeline_run_id = ?
+                          AND file_id = ?
+                          AND COALESCE(quarantine_manual, 0) = 0
+                          AND (faces_manual_label IS NULL OR trim(coalesce(faces_manual_label,'')) = '')
+                          AND COALESCE(people_no_face_manual, 0) = 0
+                          AND COALESCE(animals_manual, 0) = 0
+                        """,
+                        [_now_utc_iso(), int(pipeline_run_id), file_id],
+                    )
                 # Legacy mode удален - всегда используем files_manual_labels
 
                 rc = int(cur.rowcount or 0)
