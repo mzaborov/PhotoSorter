@@ -1,0 +1,134 @@
+<!-- Единая карточка фотографий для отображения и редактирования фото с rectangles -->
+<style>
+  /* Стили для photo-card-modal (аналогично .lb) */
+  .photo-card-modal { 
+    position: fixed; 
+    inset: 0; 
+    background: rgba(17,24,39,0.82); 
+    display: none; 
+    align-items: center; 
+    justify-content: center; 
+    padding: 18px; 
+    z-index: 9999; 
+  }
+  .photo-card-modal[aria-hidden="false"] { 
+    display: flex; 
+  }
+  .photo-card-panel { 
+    background: #fff; 
+    border-radius: 14px; 
+    max-width: 94vw; 
+    max-height: 94vh; 
+    width: min(1200px, 94vw); 
+    overflow: hidden; 
+    box-shadow: 0 20px 60px rgba(0,0,0,0.35); 
+    display: flex;
+    flex-direction: column;
+  }
+  .photo-card-top { 
+    display: flex; 
+    align-items: center; 
+    justify-content: space-between; 
+    gap: 12px; 
+    padding: 10px 12px; 
+    border-bottom: 1px solid #e5e7eb; 
+  }
+  .photo-card-top code { 
+    font-size: 11px; 
+  }
+  .photo-card-actions { 
+    display: flex; 
+    gap: 10px; 
+    align-items: center; 
+    flex-wrap: wrap; 
+  }
+  .photo-card-tabs { 
+    display:flex; 
+    gap:8px; 
+    padding: 10px 12px; 
+    border-bottom: 1px solid #e5e7eb; 
+    background:#f9fafb; 
+    flex-wrap:wrap; 
+  }
+  .photo-card-body { 
+    background: #111827; 
+    display: flex; 
+    align-items: center; 
+    justify-content: center; 
+    padding: 10px; 
+    flex: 1;
+    overflow: auto;
+  }
+  .photo-card-navigation {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 10px 12px;
+    border-top: 1px solid #e5e7eb;
+    border-bottom: 1px solid #e5e7eb;
+    background: #f9fafb;
+  }
+  .photo-card-position {
+    font-weight: 700;
+    font-size: 14px;
+  }
+  .photo-card-bottom { 
+    padding: 10px 12px; 
+    border-top: 1px solid #e5e7eb; 
+    display:flex; 
+    gap:10px; 
+    flex-wrap:wrap; 
+    align-items:center; 
+  }
+  .photo-card-rectangle {
+    position: absolute;
+    pointer-events: auto;
+    cursor: pointer;
+    z-index: 1000;
+  }
+</style>
+
+<div class="photo-card-modal" id="photoCardModal" aria-hidden="true" style="display: none;">
+  <div class="photo-card-panel" role="dialog" aria-modal="true">
+    <!-- Заголовок -->
+    <div class="photo-card-top">
+      <code class="photo-card-path" id="photoCardPath">—</code>
+      <div class="photo-card-actions">
+        <span class="pill" id="photoCardMode">просмотр</span>
+        <button class="btn" id="photoCardToggleRectangles" type="button">Скрыть квадраты</button>
+        <button class="btn" id="photoCardClose" type="button">Закрыть</button>
+      </div>
+    </div>
+    
+    <!-- Вкладки для видео (если нужно) -->
+    <div class="photo-card-tabs" id="photoCardTabs" style="display:none;">
+      <button class="lb-tab" id="photoCardTabVideo" type="button">Видео</button>
+      <button class="lb-tab" id="photoCardTabF1" type="button">Кадр 1</button>
+      <button class="lb-tab" id="photoCardTabF2" type="button">Кадр 2</button>
+      <button class="lb-tab" id="photoCardTabF3" type="button">Кадр 3</button>
+    </div>
+    
+    <!-- Область изображения -->
+    <div class="photo-card-body">
+      <div class="imgwrap" id="photoCardImgWrap">
+        <img id="photoCardImg" alt="preview" />
+        <video id="photoCardVideo" controls preload="metadata" style="display:none;"></video>
+        <canvas id="photoCardCanvas"></canvas>
+      </div>
+    </div>
+    
+    <!-- Навигация -->
+    <div class="photo-card-navigation" id="photoCardNavigation" style="display:none;">
+      <button class="btn" id="photoCardPrev" type="button">←</button>
+      <span class="photo-card-position" id="photoCardPosition">1 из 1</span>
+      <button class="btn" id="photoCardNext" type="button">→</button>
+    </div>
+    
+    <!-- Плашки со списком rectangles -->
+    <div class="photo-card-bottom">
+      <div class="muted">Прямоугольники:</div>
+      <div class="rectlist" id="photoCardRectList"></div>
+    </div>
+  </div>
+</div>
