@@ -58,6 +58,30 @@ def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _get_file_id_from_path(conn: sqlite3.Connection, file_path: str) -> int | None:
+    """
+    Получает file_id из таблицы files по file_path.
+    Возвращает None, если файл не найден.
+    """
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM files WHERE path = ? LIMIT 1", (file_path,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _get_file_id(conn: sqlite3.Connection, *, file_id: int | None = None, file_path: str | None = None) -> int | None:
+    """
+    Универсальная функция для получения file_id.
+    Приоритет: file_id (если передан), иначе file_path (если передан).
+    Возвращает None, если ни file_id, ни file_path не передан, или файл не найден.
+    """
+    if file_id is not None:
+        return int(file_id)
+    if file_path is not None:
+        return _get_file_id_from_path(conn, file_path)
+    return None
+
+
 def init_db():
     # на всякий случай создаём папку data
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -747,8 +771,18 @@ class FaceStore:
 
         self.conn.commit()
 
-    def list_rectangles(self, *, run_id: int, file_path: str) -> list[dict[str, Any]]:
+    def list_rectangles(self, *, run_id: int, file_id: int | None = None, file_path: str | None = None) -> list[dict[str, Any]]:
+        """
+        Возвращает список rectangles для файла.
+        Приоритет: file_id (если передан), иначе file_path (если передан).
+        """
+        # Получаем file_id
+        resolved_file_id = _get_file_id(self.conn, file_id=file_id, file_path=file_path)
+        if resolved_file_id is None:
+            raise ValueError("Either file_id or file_path must be provided")
+        
         cur = self.conn.cursor()
+        # Используем file_id для запроса (приоритет над file_path)
         cur.execute(
             """
             SELECT
@@ -760,23 +794,38 @@ class FaceStore:
               COALESCE(is_manual, 0) AS is_manual,
               manual_created_at
             FROM face_rectangles
-            WHERE run_id = ? AND file_path = ?
+            WHERE run_id = ? AND file_id = ?
             ORDER BY COALESCE(is_manual, 0) ASC, face_index ASC, id ASC
             """,
-            (int(run_id), str(file_path)),
+            (int(run_id), resolved_file_id),
         )
         return [dict(r) for r in cur.fetchall()]
 
-    def replace_manual_rectangles(self, *, run_id: int, file_path: str, rects: list[dict[str, int]]) -> None:
+    def replace_manual_rectangles(self, *, run_id: int, file_id: int | None = None, file_path: str | None = None, rects: list[dict[str, int]]) -> None:
         """
-        Заменяет ручные прямоугольники для файла (run_id + file_path).
+        Заменяет ручные прямоугольники для файла (run_id + file_id/file_path).
+        Приоритет: file_id (если передан), иначе file_path (если передан).
         rects: [{"x":int,"y":int,"w":int,"h":int}, ...]
         """
+        # Получаем file_id
+        resolved_file_id = _get_file_id(self.conn, file_id=file_id, file_path=file_path)
+        if resolved_file_id is None:
+            raise ValueError("Either file_id or file_path must be provided")
+        
+        # Получаем file_path для обратной совместимости (если не передан, получаем из files)
+        if file_path is None:
+            cur = self.conn.cursor()
+            cur.execute("SELECT path FROM files WHERE id = ? LIMIT 1", (resolved_file_id,))
+            row = cur.fetchone()
+            if not row:
+                raise ValueError(f"File with id={resolved_file_id} not found in files table")
+            file_path = row[0]
+        
         now = _now_utc_iso()
         cur = self.conn.cursor()
         cur.execute(
-            "DELETE FROM face_rectangles WHERE run_id = ? AND file_path = ? AND COALESCE(is_manual, 0) = 1",
-            (int(run_id), str(file_path)),
+            "DELETE FROM face_rectangles WHERE run_id = ? AND file_id = ? AND COALESCE(is_manual, 0) = 1",
+            (int(run_id), resolved_file_id),
         )
         for i, r in enumerate(rects or []):
             x = int(r.get("x") or 0)
@@ -788,16 +837,16 @@ class FaceStore:
             cur.execute(
                 """
                 INSERT INTO face_rectangles(
-                  run_id, file_path, face_index,
+                  run_id, file_path, file_id, face_index,
                   bbox_x, bbox_y, bbox_w, bbox_h,
                   confidence, presence_score,
                   thumb_jpeg, manual_person, ignore_flag,
                   created_at,
                   is_manual, manual_created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, ?, 1, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, ?, 1, ?)
                 """,
-                (int(run_id), str(file_path), int(i), x, y, w, h, now, now),
+                (int(run_id), str(file_path), resolved_file_id, int(i), x, y, w, h, now, now),
             )
         self.conn.commit()
 
@@ -859,20 +908,31 @@ class FaceStore:
         cur.execute(f"UPDATE face_runs SET {', '.join(fields)} WHERE id = ?", params)
         self.conn.commit()
 
-    def clear_run_detections_for_file(self, *, run_id: int, file_path: str) -> None:
+    def clear_run_detections_for_file(self, *, run_id: int, file_id: int | None = None, file_path: str | None = None) -> None:
+        """
+        Удаляет все детекции для файла в рамках прогона.
+        Приоритет: file_id (если передан), иначе file_path (если передан).
+        """
+        resolved_file_id = _get_file_id(self.conn, file_id=file_id, file_path=file_path)
+        if resolved_file_id is None:
+            raise ValueError("Either file_id or file_path must be provided")
         cur = self.conn.cursor()
-        cur.execute("DELETE FROM face_rectangles WHERE run_id = ? AND file_path = ?", (run_id, file_path))
+        cur.execute("DELETE FROM face_rectangles WHERE run_id = ? AND file_id = ?", (run_id, resolved_file_id))
         self.conn.commit()
 
-    def clear_run_auto_rectangles_for_file(self, *, run_id: int, file_path: str) -> None:
+    def clear_run_auto_rectangles_for_file(self, *, run_id: int, file_id: int | None = None, file_path: str | None = None) -> None:
         """
         Удаляет только авто-прямоугольники (is_manual=0) для файла в рамках прогона.
         Ручные прямоугольники (is_manual=1) сохраняем.
+        Приоритет: file_id (если передан), иначе file_path (если передан).
         """
+        resolved_file_id = _get_file_id(self.conn, file_id=file_id, file_path=file_path)
+        if resolved_file_id is None:
+            raise ValueError("Either file_id or file_path must be provided")
         cur = self.conn.cursor()
         cur.execute(
-            "DELETE FROM face_rectangles WHERE run_id = ? AND file_path = ? AND COALESCE(is_manual, 0) = 0",
-            (int(run_id), str(file_path)),
+            "DELETE FROM face_rectangles WHERE run_id = ? AND file_id = ? AND COALESCE(is_manual, 0) = 0",
+            (int(run_id), resolved_file_id),
         )
         self.conn.commit()
 
@@ -1165,12 +1225,14 @@ class FaceStore:
         self,
         *,
         pipeline_run_id: int | None = None,
+        file_id: int | None = None,
         file_path: str | None = None,
         person_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """
         Возвращает список прямоугольников без лица (person_rectangles).
         Фильтры опциональны.
+        Приоритет для file_id/file_path: file_id (если передан), иначе file_path (если передан).
         """
         cur = self.conn.cursor()
         where = []
@@ -1178,7 +1240,13 @@ class FaceStore:
         if pipeline_run_id is not None:
             where.append("pipeline_run_id = ?")
             params.append(int(pipeline_run_id))
-        if file_path is not None:
+        # Обрабатываем file_id/file_path
+        resolved_file_id = _get_file_id(self.conn, file_id=file_id, file_path=file_path) if (file_id is not None or file_path is not None) else None
+        if resolved_file_id is not None:
+            where.append("file_id = ?")
+            params.append(resolved_file_id)
+        elif file_path is not None:
+            # Fallback на file_path для обратной совместимости
             where.append("file_path = ?")
             params.append(str(file_path))
         if person_id is not None:
@@ -1202,25 +1270,41 @@ class FaceStore:
         self,
         *,
         pipeline_run_id: int,
-        file_path: str,
+        file_id: int | None = None,
+        file_path: str | None = None,
         person_id: int,
     ) -> None:
         """
         Вставляет простую привязку файла к персоне (file_persons).
         Использует INSERT OR REPLACE для предотвращения дубликатов.
+        Приоритет: file_id (если передан), иначе file_path (если передан).
         """
+        resolved_file_id = _get_file_id(self.conn, file_id=file_id, file_path=file_path)
+        if resolved_file_id is None:
+            raise ValueError("Either file_id or file_path must be provided")
+        
+        # Получаем file_path для обратной совместимости
+        if file_path is None:
+            cur = self.conn.cursor()
+            cur.execute("SELECT path FROM files WHERE id = ? LIMIT 1", (resolved_file_id,))
+            row = cur.fetchone()
+            if not row:
+                raise ValueError(f"File with id={resolved_file_id} not found in files table")
+            file_path = row[0]
+        
         now = _now_utc_iso()
         cur = self.conn.cursor()
         cur.execute(
             """
             INSERT OR REPLACE INTO file_persons (
-                pipeline_run_id, file_path, person_id, created_at
+                pipeline_run_id, file_path, file_id, person_id, created_at
             )
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
                 int(pipeline_run_id),
                 str(file_path),
+                resolved_file_id,
                 int(person_id),
                 now,
             ),
@@ -1231,19 +1315,26 @@ class FaceStore:
         self,
         *,
         pipeline_run_id: int,
-        file_path: str,
+        file_id: int | None = None,
+        file_path: str | None = None,
         person_id: int,
     ) -> None:
-        """Удаляет простую привязку файла к персоне."""
+        """
+        Удаляет простую привязку файла к персоне.
+        Приоритет: file_id (если передан), иначе file_path (если передан).
+        """
+        resolved_file_id = _get_file_id(self.conn, file_id=file_id, file_path=file_path)
+        if resolved_file_id is None:
+            raise ValueError("Either file_id or file_path must be provided")
         cur = self.conn.cursor()
         cur.execute(
             """
             DELETE FROM file_persons
-            WHERE pipeline_run_id = ? AND file_path = ? AND person_id = ?
+            WHERE pipeline_run_id = ? AND file_id = ? AND person_id = ?
             """,
             (
                 int(pipeline_run_id),
-                str(file_path),
+                resolved_file_id,
                 int(person_id),
             ),
         )
@@ -1253,12 +1344,14 @@ class FaceStore:
         self,
         *,
         pipeline_run_id: int | None = None,
+        file_id: int | None = None,
         file_path: str | None = None,
         person_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """
         Возвращает список простых привязок файлов к персонам (file_persons).
         Фильтры опциональны.
+        Приоритет для file_id/file_path: file_id (если передан), иначе file_path (если передан).
         """
         cur = self.conn.cursor()
         where = []
@@ -1266,7 +1359,13 @@ class FaceStore:
         if pipeline_run_id is not None:
             where.append("pipeline_run_id = ?")
             params.append(int(pipeline_run_id))
-        if file_path is not None:
+        # Обрабатываем file_id/file_path
+        resolved_file_id = _get_file_id(self.conn, file_id=file_id, file_path=file_path) if (file_id is not None or file_path is not None) else None
+        if resolved_file_id is not None:
+            where.append("file_id = ?")
+            params.append(resolved_file_id)
+        elif file_path is not None:
+            # Fallback на file_path для обратной совместимости
             where.append("file_path = ?")
             params.append(str(file_path))
         if person_id is not None:
@@ -1288,26 +1387,42 @@ class FaceStore:
         self,
         *,
         pipeline_run_id: int,
-        file_path: str,
+        file_id: int | None = None,
+        file_path: str | None = None,
         group_path: str,
     ) -> None:
         """
         Вставляет файл в группу (file_groups).
         Использует INSERT OR REPLACE для предотвращения дубликатов.
+        Приоритет: file_id (если передан), иначе file_path (если передан).
         """
+        resolved_file_id = _get_file_id(self.conn, file_id=file_id, file_path=file_path)
+        if resolved_file_id is None:
+            raise ValueError("Either file_id or file_path must be provided")
+        
+        # Получаем file_path для обратной совместимости
+        if file_path is None:
+            cur = self.conn.cursor()
+            cur.execute("SELECT path FROM files WHERE id = ? LIMIT 1", (resolved_file_id,))
+            row = cur.fetchone()
+            if not row:
+                raise ValueError(f"File with id={resolved_file_id} not found in files table")
+            file_path = row[0]
+        
         now = _now_utc_iso()
         cur = self.conn.cursor()
         try:
             cur.execute(
                 """
                 INSERT OR REPLACE INTO file_groups (
-                    pipeline_run_id, file_path, group_path, created_at
+                    pipeline_run_id, file_path, file_id, group_path, created_at
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     int(pipeline_run_id),
                     str(file_path),
+                    resolved_file_id,
                     str(group_path),
                     now,
                 ),
@@ -1318,14 +1433,14 @@ class FaceStore:
                 """
                 SELECT id, pipeline_run_id, file_path, group_path
                 FROM file_groups
-                WHERE pipeline_run_id = ? AND file_path = ? AND group_path = ?
+                WHERE pipeline_run_id = ? AND file_id = ? AND group_path = ?
                 LIMIT 1
                 """,
-                (int(pipeline_run_id), str(file_path), str(group_path)),
+                (int(pipeline_run_id), resolved_file_id, str(group_path)),
             )
             check = cur.fetchone()
             if not check:
-                raise RuntimeError(f"Failed to verify insert: pipeline_run_id={pipeline_run_id}, file_path={repr(file_path)}, group_path={repr(group_path)}")
+                raise RuntimeError(f"Failed to verify insert: pipeline_run_id={pipeline_run_id}, file_id={resolved_file_id}, group_path={repr(group_path)}")
         except Exception as e:
             self.conn.rollback()
             raise
@@ -1334,19 +1449,26 @@ class FaceStore:
         self,
         *,
         pipeline_run_id: int,
-        file_path: str,
+        file_id: int | None = None,
+        file_path: str | None = None,
         group_path: str,
     ) -> None:
-        """Удаляет файл из группы."""
+        """
+        Удаляет файл из группы.
+        Приоритет: file_id (если передан), иначе file_path (если передан).
+        """
+        resolved_file_id = _get_file_id(self.conn, file_id=file_id, file_path=file_path)
+        if resolved_file_id is None:
+            raise ValueError("Either file_id or file_path must be provided")
         cur = self.conn.cursor()
         cur.execute(
             """
             DELETE FROM file_groups
-            WHERE pipeline_run_id = ? AND file_path = ? AND group_path = ?
+            WHERE pipeline_run_id = ? AND file_id = ? AND group_path = ?
             """,
             (
                 int(pipeline_run_id),
-                str(file_path),
+                resolved_file_id,
                 str(group_path),
             ),
         )
@@ -1356,12 +1478,14 @@ class FaceStore:
         self,
         *,
         pipeline_run_id: int | None = None,
+        file_id: int | None = None,
         file_path: str | None = None,
         group_path: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Возвращает список файлов в группах (file_groups).
         Фильтры опциональны.
+        Приоритет для file_id/file_path: file_id (если передан), иначе file_path (если передан).
         """
         cur = self.conn.cursor()
         where = []
@@ -1369,7 +1493,13 @@ class FaceStore:
         if pipeline_run_id is not None:
             where.append("pipeline_run_id = ?")
             params.append(int(pipeline_run_id))
-        if file_path is not None:
+        # Обрабатываем file_id/file_path
+        resolved_file_id = _get_file_id(self.conn, file_id=file_id, file_path=file_path) if (file_id is not None or file_path is not None) else None
+        if resolved_file_id is not None:
+            where.append("file_id = ?")
+            params.append(resolved_file_id)
+        elif file_path is not None:
+            # Fallback на file_path для обратной совместимости
             where.append("file_path = ?")
             params.append(str(file_path))
         if group_path is not None:
@@ -1416,7 +1546,8 @@ class FaceStore:
         self,
         *,
         pipeline_run_id: int | None = None,
-        file_path: str,
+        file_id: int | None = None,
+        file_path: str | None = None,
     ) -> dict[str, Any]:
         """
         Возвращает все привязки файла к персонам (через все 3 способа):
@@ -1425,7 +1556,13 @@ class FaceStore:
         - прямая привязка (file_persons)
         
         Если указан pipeline_run_id, получает face_run_id из pipeline_runs для фильтрации face_rectangles.
+        Приоритет: file_id (если передан), иначе file_path (если передан).
         """
+        # Получаем file_id
+        resolved_file_id = _get_file_id(self.conn, file_id=file_id, file_path=file_path)
+        if resolved_file_id is None:
+            raise ValueError("Either file_id or file_path must be provided")
+        
         cur = self.conn.cursor()
         
         # Если указан pipeline_run_id, получаем face_run_id для фильтрации
@@ -1455,7 +1592,7 @@ class FaceStore:
                     FROM face_person_manual_assignments fpma
                     JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
                     LEFT JOIN persons p ON p.id = fpma.person_id
-                    WHERE fr.file_path = ? AND fr.run_id = ?
+                    WHERE fr.file_id = ? AND fr.run_id = ?
                     
                     UNION
                     
@@ -1465,10 +1602,10 @@ class FaceStore:
                     JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
                     JOIN face_clusters fc ON fc.id = fcm.cluster_id
                     LEFT JOIN persons p ON p.id = fc.person_id
-                    WHERE fr.file_path = ? AND fr.run_id = ? AND fc.person_id IS NOT NULL
+                    WHERE fr.file_id = ? AND fr.run_id = ? AND fc.person_id IS NOT NULL
                 )
                 """,
-                (str(file_path), int(face_run_id), str(file_path), int(face_run_id)),
+                (resolved_file_id, int(face_run_id), resolved_file_id, int(face_run_id)),
             )
         else:
             # Для архивных данных (archive_scope='archive') или без фильтрации
@@ -1481,7 +1618,7 @@ class FaceStore:
                     FROM face_person_manual_assignments fpma
                     JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
                     LEFT JOIN persons p ON p.id = fpma.person_id
-                    WHERE fr.file_path = ?
+                    WHERE fr.file_id = ?
                     
                     UNION
                     
@@ -1491,17 +1628,17 @@ class FaceStore:
                     JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
                     JOIN face_clusters fc ON fc.id = fcm.cluster_id
                     LEFT JOIN persons p ON p.id = fc.person_id
-                    WHERE fr.file_path = ? AND fc.person_id IS NOT NULL
+                    WHERE fr.file_id = ? AND fc.person_id IS NOT NULL
                 )
                 """,
-                (str(file_path), str(file_path)),
+                (resolved_file_id, resolved_file_id),
             )
         face_assignments = [dict(r) for r in cur.fetchall()]
         
         # Привязки через прямоугольники без лица
         person_rects = self.list_person_rectangles(
             pipeline_run_id=pipeline_run_id,
-            file_path=file_path,
+            file_id=resolved_file_id,
         )
         person_rect_assignments = []
         for pr in person_rects:
@@ -1517,7 +1654,7 @@ class FaceStore:
         # Прямые привязки
         file_persons_list = self.list_file_persons(
             pipeline_run_id=pipeline_run_id,
-            file_path=file_path,
+            file_id=resolved_file_id,
         )
         direct_assignments = []
         for fp in file_persons_list:

@@ -2432,14 +2432,27 @@ async def api_face_runs_list() -> dict[str, Any]:
 
 
 @router.get("/api/file-faces")
-async def api_file_faces(file_path: str) -> dict[str, Any]:
-    """Получает все лица на указанном файле с информацией о назначенных персонах."""
+async def api_file_faces(file_id: int | None = None, file_path: str | None = None) -> dict[str, Any]:
+    """Получает все лица на указанном файле с информацией о назначенных персонах.
+    
+    Приоритет: file_id (если передан), иначе file_path (если передан).
+    """
     import logging
+    from backend.common.db import _get_file_id
+    
     logger = logging.getLogger(__name__)
+    
+    if file_id is None and file_path is None:
+        raise HTTPException(status_code=400, detail="Either file_id or file_path must be provided")
     
     try:
         conn = get_connection()
         cur = conn.cursor()
+        
+        # Получаем file_id
+        resolved_file_id = _get_file_id(conn, file_id=file_id, file_path=file_path)
+        if resolved_file_id is None:
+            raise HTTPException(status_code=404, detail="File not found")
         
         # Получаем все лица на этом файле
         # Фильтруем дубликаты: для одинаковых позиций (face_index + bbox) выбираем:
@@ -2463,7 +2476,7 @@ async def api_file_faces(file_path: str) -> dict[str, Any]:
                 COALESCE(p_manual.is_me, p_cluster.is_me, 0) as is_me,
                 fcm.cluster_id,
                 ROW_NUMBER() OVER (
-                    PARTITION BY fr.file_path, fr.face_index, fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
+                    PARTITION BY fr.file_id, fr.face_index, fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
                     ORDER BY 
                         CASE WHEN fcm.cluster_id IS NOT NULL THEN 0 ELSE 1 END,  -- Сначала кластеризованные
                         CASE WHEN fr.archive_scope = 'archive' THEN 0 ELSE 1 END,  -- Приоритет архивным лицам
@@ -2476,7 +2489,7 @@ async def api_file_faces(file_path: str) -> dict[str, Any]:
             LEFT JOIN persons p_cluster ON fc.person_id = p_cluster.id
             LEFT JOIN face_person_manual_assignments fpma ON fr.id = fpma.face_rectangle_id
             LEFT JOIN persons p_manual ON fpma.person_id = p_manual.id
-            WHERE fr.file_path = ? AND COALESCE(fr.ignore_flag, 0) = 0
+            WHERE fr.file_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
         )
         SELECT 
             face_id,
@@ -2490,7 +2503,7 @@ async def api_file_faces(file_path: str) -> dict[str, Any]:
         WHERE rn = 1
         ORDER BY face_index
         """,
-        (file_path,),
+        (resolved_file_id,),
     )
     
         faces = []
@@ -2515,10 +2528,12 @@ async def api_file_faces(file_path: str) -> dict[str, Any]:
                 "cluster_id": row["cluster_id"],
             })
         
-        logger.info(f"api_file_faces: file_path={file_path}, faces_count={len(faces)}")
+        logger.info(f"api_file_faces: file_id={resolved_file_id}, file_path={file_path}, faces_count={len(faces)}")
         return {"faces": faces}
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error in api_file_faces for {file_path}: {e}", exc_info=True)
+        logger.error(f"Error in api_file_faces for file_id={file_id}, file_path={file_path}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
     finally:
         if 'conn' in locals():
@@ -2849,17 +2864,19 @@ async def api_persons_assign_file(payload: dict[str, Any] = Body(...)) -> dict[s
     
     Параметры:
     - pipeline_run_id: int (обязательно)
-    - file_path: str (обязательно)
+    - file_id: int (опционально, приоритет над file_path)
+    - file_path: str (опционально, fallback если file_id не передан)
     - person_id: int (обязательно)
     """
     pipeline_run_id = payload.get("pipeline_run_id")
+    file_id = payload.get("file_id")
     file_path = payload.get("file_path")
     person_id = payload.get("person_id")
     
     if not isinstance(pipeline_run_id, int):
         raise HTTPException(status_code=400, detail="pipeline_run_id is required and must be int")
-    if not isinstance(file_path, str):
-        raise HTTPException(status_code=400, detail="file_path is required and must be str")
+    if file_id is None and file_path is None:
+        raise HTTPException(status_code=400, detail="Either file_id or file_path must be provided")
     if not isinstance(person_id, int):
         raise HTTPException(status_code=400, detail="person_id is required and must be int")
     
@@ -2882,11 +2899,17 @@ async def api_persons_assign_file(payload: dict[str, Any] = Body(...)) -> dict[s
     conn.close()
     
     # Вставляем привязку
+    # Получаем file_id если передан file_path
+    file_id = payload.get("file_id")
+    if file_id is None and file_path is None:
+        raise HTTPException(status_code=400, detail="Either file_id or file_path must be provided")
+    
     fs = FaceStore()
     try:
         fs.insert_file_person(
             pipeline_run_id=int(pipeline_run_id),
-            file_path=str(file_path),
+            file_id=file_id,
+            file_path=file_path,
             person_id=int(person_id),
         )
     finally:
@@ -2895,7 +2918,8 @@ async def api_persons_assign_file(payload: dict[str, Any] = Body(...)) -> dict[s
     return {
         "ok": True,
         "pipeline_run_id": int(pipeline_run_id),
-        "file_path": str(file_path),
+        "file_id": file_id,
+        "file_path": str(file_path) if file_path else None,
         "person_id": int(person_id),
         "person_name": person_row["name"],
     }
@@ -2909,13 +2933,17 @@ async def api_persons_remove_assignment(payload: dict[str, Any] = Body(...)) -> 
     Параметры:
     - assignment_type: str (обязательно) - "face", "person_rectangle", "file"
     - pipeline_run_id: int (обязательно для person_rectangle и file)
-    - file_path: str (обязательно для person_rectangle и file)
+    - file_id: int (опционально, приоритет над file_path)
+    - file_path: str (опционально, fallback если file_id не передан)
     - person_id: int (обязательно)
     - face_rectangle_id: int (обязательно для type="face")
     - rectangle_id: int (обязательно для type="person_rectangle")
     """
+    from backend.common.db import _get_file_id
+    
     assignment_type = payload.get("assignment_type")
     pipeline_run_id = payload.get("pipeline_run_id")
+    file_id = payload.get("file_id")
     file_path = payload.get("file_path")
     person_id = payload.get("person_id")
     face_rectangle_id = payload.get("face_rectangle_id")
@@ -2955,11 +2983,12 @@ async def api_persons_remove_assignment(payload: dict[str, Any] = Body(...)) -> 
             # Удаляем прямую привязку файла
             if not isinstance(pipeline_run_id, int):
                 raise HTTPException(status_code=400, detail="pipeline_run_id is required for type='file'")
-            if not isinstance(file_path, str):
-                raise HTTPException(status_code=400, detail="file_path is required for type='file'")
+            if file_id is None and file_path is None:
+                raise HTTPException(status_code=400, detail="Either file_id or file_path is required for type='file'")
             fs.delete_file_person(
                 pipeline_run_id=int(pipeline_run_id),
-                file_path=str(file_path),
+                file_id=file_id,
+                file_path=file_path,
                 person_id=int(person_id),
             )
     finally:
@@ -2976,18 +3005,21 @@ async def api_persons_remove_assignment(payload: dict[str, Any] = Body(...)) -> 
 @router.get("/api/persons/file-assignments")
 async def api_persons_file_assignments(
     pipeline_run_id: int,
-    file_path: str,
+    file_id: int | None = None,
+    file_path: str | None = None,
 ) -> dict[str, Any]:
     """
     Возвращает все привязки файла к персонам (через все 3 способа):
     - через лица (face_person_manual_assignments + face_clusters.person_id через face_cluster_members)
     - через прямоугольники без лица (person_rectangles)
     - прямая привязка (file_persons)
+    
+    Приоритет: file_id (если передан), иначе file_path (если передан).
     """
     if not isinstance(pipeline_run_id, int):
         raise HTTPException(status_code=400, detail="pipeline_run_id must be int")
-    if not isinstance(file_path, str):
-        raise HTTPException(status_code=400, detail="file_path must be str")
+    if file_id is None and file_path is None:
+        raise HTTPException(status_code=400, detail="Either file_id or file_path must be provided")
     
     # Проверяем, что pipeline_run_id существует
     ps = PipelineStore()
@@ -3002,7 +3034,8 @@ async def api_persons_file_assignments(
     try:
         assignments = fs.get_file_all_assignments(
             pipeline_run_id=int(pipeline_run_id),
-            file_path=str(file_path),
+            file_id=file_id,
+            file_path=file_path,
         )
     finally:
         fs.close()
@@ -3010,6 +3043,7 @@ async def api_persons_file_assignments(
     return {
         "ok": True,
         "pipeline_run_id": int(pipeline_run_id),
-        "file_path": str(file_path),
+        "file_id": file_id,
+        "file_path": file_path,
         "assignments": assignments,
     }

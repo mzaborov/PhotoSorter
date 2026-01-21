@@ -1619,7 +1619,16 @@ def api_faces_remove_group(payload: dict[str, Any] = Body(...)) -> dict[str, Any
 
 
 @router.get("/api/faces/rectangles")
-def api_faces_rectangles(pipeline_run_id: int, path: str) -> dict[str, Any]:
+def api_faces_rectangles(pipeline_run_id: int, file_id: int | None = None, path: str | None = None) -> dict[str, Any]:
+    """
+    Возвращает список rectangles для файла.
+    Приоритет: file_id (если передан), иначе path (если передан).
+    """
+    from backend.common.db import _get_file_id, get_connection
+    
+    if file_id is None and path is None:
+        raise HTTPException(status_code=400, detail="Either file_id or path must be provided")
+    
     ps = PipelineStore()
     try:
         pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
@@ -1634,7 +1643,7 @@ def api_faces_rectangles(pipeline_run_id: int, path: str) -> dict[str, Any]:
     
     fs = FaceStore()
     try:
-        rects = fs.list_rectangles(run_id=face_run_id_i, file_path=str(path))
+        rects = fs.list_rectangles(run_id=face_run_id_i, file_id=file_id, file_path=path)
         
         # Добавляем информацию о персонах для каждого прямоугольника
         # face_clusters, face_person_manual_assignments и persons находятся в FaceStore
@@ -1754,10 +1763,15 @@ def api_faces_assign_face_person(payload: dict[str, Any] = Body(...)) -> dict[st
 
 
 @router.get("/api/faces/file-persons")
-def api_faces_file_persons(pipeline_run_id: int, path: str) -> dict[str, Any]:
+def api_faces_file_persons(pipeline_run_id: int, file_id: int | None = None, path: str | None = None) -> dict[str, Any]:
     """
     Возвращает список персон, привязанных к файлу (через любые способы), с информацией о лицах.
+    Приоритет: file_id (если передан), иначе path (если передан).
     """
+    from backend.common.db import _get_file_id, get_connection
+    
+    if file_id is None and path is None:
+        raise HTTPException(status_code=400, detail="Either file_id or path must be provided")
     ps = PipelineStore()
     try:
         pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
@@ -1769,6 +1783,15 @@ def api_faces_file_persons(pipeline_run_id: int, path: str) -> dict[str, Any]:
     if not face_run_id:
         raise HTTPException(status_code=400, detail="face_run_id is not set yet")
     face_run_id_i = int(face_run_id)
+    
+    # Получаем file_id
+    conn = get_connection()
+    try:
+        resolved_file_id = _get_file_id(conn, file_id=file_id, file_path=path)
+        if resolved_file_id is None:
+            raise HTTPException(status_code=404, detail="File not found")
+    finally:
+        conn.close()
     
     fs = FaceStore()
     ds = DedupStore()
@@ -1792,9 +1815,9 @@ def api_faces_file_persons(pipeline_run_id: int, path: str) -> dict[str, Any]:
             FROM face_person_manual_assignments fpma
             JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
             LEFT JOIN persons p ON p.id = fpma.person_id
-            WHERE fr.file_path = ? AND fr.run_id = ? AND fpma.person_id IS NOT NULL
+            WHERE fr.file_id = ? AND fr.run_id = ? AND fpma.person_id IS NOT NULL
             ORDER BY fr.id
-        """, (str(path), face_run_id_i))
+        """, (resolved_file_id, face_run_id_i))
         for row in fs_cur.fetchall():
             pid = row["person_id"]
             if pid not in persons_set:
@@ -1832,7 +1855,7 @@ def api_faces_file_persons(pipeline_run_id: int, path: str) -> dict[str, Any]:
             JOIN face_clusters fc ON fc.id = fcm_file.cluster_id
             -- Для каждого кластера определяем персону через face_clusters.person_id
             LEFT JOIN persons p ON p.id = fc.person_id
-            WHERE fr_file.file_path = ?
+            WHERE fr_file.file_id = ?
               AND fr_file.run_id = ?
               AND COALESCE(fr_file.ignore_flag, 0) = 0
               AND fc.person_id IS NOT NULL
@@ -1844,7 +1867,7 @@ def api_faces_file_persons(pipeline_run_id: int, path: str) -> dict[str, Any]:
                     AND fpma_direct.person_id = fc.person_id
               )
             ORDER BY fc.person_id, fr_file.id
-        """, (str(path), face_run_id_i, face_run_id_i))
+        """, (resolved_file_id, face_run_id_i, face_run_id_i))
         for row in fs_cur.fetchall():
             pid = row["person_id"]
             if pid not in persons_set:
@@ -1869,8 +1892,8 @@ def api_faces_file_persons(pipeline_run_id: int, path: str) -> dict[str, Any]:
             SELECT DISTINCT pr.person_id, p.name AS person_name
             FROM person_rectangles pr
             LEFT JOIN persons p ON p.id = pr.person_id
-            WHERE pr.file_path = ? AND pr.pipeline_run_id = ? AND pr.person_id IS NOT NULL
-        """, (str(path), int(pipeline_run_id)))
+            WHERE pr.file_id = ? AND pr.pipeline_run_id = ? AND pr.person_id IS NOT NULL
+        """, (resolved_file_id, int(pipeline_run_id)))
         for row in ds_cur.fetchall():
             pid = row["person_id"]
             if pid not in persons_set:
@@ -1881,8 +1904,8 @@ def api_faces_file_persons(pipeline_run_id: int, path: str) -> dict[str, Any]:
             SELECT DISTINCT fp.person_id, p.name AS person_name
             FROM file_persons fp
             LEFT JOIN persons p ON p.id = fp.person_id
-            WHERE fp.file_path = ? AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL
-        """, (str(path), int(pipeline_run_id)))
+            WHERE fp.file_id = ? AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL
+        """, (resolved_file_id, int(pipeline_run_id)))
         for row in ds_cur.fetchall():
             pid = row["person_id"]
             if pid not in persons_set:
@@ -1896,6 +1919,7 @@ def api_faces_file_persons(pipeline_run_id: int, path: str) -> dict[str, Any]:
     return {
         "ok": True,
         "pipeline_run_id": int(pipeline_run_id),
+        "file_id": resolved_file_id,
         "path": path,
         "persons": persons_list,
     }
@@ -1971,23 +1995,41 @@ def api_faces_manual_label(payload: dict[str, Any] = Body(...)) -> dict[str, Any
             ps.close()
         face_run_id = int(pr.get("face_run_id") or 0) if pr else 0
         if face_run_id:
-            fs = FaceStore()
+            from backend.common.db import _get_file_id, get_connection
+            conn = get_connection()
             try:
-                fs.replace_manual_rectangles(run_id=face_run_id, file_path=path, rects=[])
+                resolved_file_id = _get_file_id(conn, file_path=path)
             finally:
-                fs.close()
+                conn.close()
+            if resolved_file_id:
+                fs = FaceStore()
+                try:
+                    fs.replace_manual_rectangles(run_id=face_run_id, file_id=resolved_file_id, file_path=path, rects=[])
+                finally:
+                    fs.close()
 
     return {"ok": True}
 
 
 @router.post("/api/faces/manual-rectangles")
 def api_faces_manual_rectangles(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Сохраняет ручные прямоугольники для файла.
+    Приоритет: file_id (если передан), иначе path (если передан).
+    """
+    from backend.common.db import _get_file_id, get_connection
+    
     pipeline_run_id = payload.get("pipeline_run_id")
+    file_id = payload.get("file_id")
     path = payload.get("path")
     rects = payload.get("rects")
     if not isinstance(pipeline_run_id, int):
         raise HTTPException(status_code=400, detail="pipeline_run_id is required")
-    if not isinstance(path, str) or not path.startswith("local:"):
+    if file_id is None and path is None:
+        raise HTTPException(status_code=400, detail="Either file_id or path must be provided")
+    if path is not None and not isinstance(path, str):
+        raise HTTPException(status_code=400, detail="path must be str")
+    if path is not None and not path.startswith("local:"):
         raise HTTPException(status_code=400, detail="path must start with local:")
     if rects is None:
         rects = []
@@ -2008,7 +2050,7 @@ def api_faces_manual_rectangles(payload: dict[str, Any] = Body(...)) -> dict[str
 
     fs = FaceStore()
     try:
-        fs.replace_manual_rectangles(run_id=face_run_id_i, file_path=str(path), rects=rects)
+        fs.replace_manual_rectangles(run_id=face_run_id_i, file_id=file_id, file_path=path, rects=rects)
     finally:
         fs.close()
 
