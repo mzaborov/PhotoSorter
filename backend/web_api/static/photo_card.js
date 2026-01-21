@@ -28,6 +28,7 @@
    * @param {Object} options - Параметры открытия
    * @param {number|null} options.file_id - ID файла из таблицы files (приоритет)
    * @param {string|null} options.file_path - Путь к файлу (fallback)
+   * @param {number|null} options.pipeline_run_id - ID pipeline run (приоритет)
    * @param {Object|null} options.list_context - Контекст списка для навигации
    * @param {Object|null} options.highlight_rectangle - Rectangle для выделения
    */
@@ -69,8 +70,26 @@
       return;
     }
 
-    // Определяем pipeline_run_id из глобальной переменной или URL
-    currentState.pipeline_run_id = window.pipelineRunId || getPipelineRunIdFromUrl();
+    // Определяем pipeline_run_id: из options, затем из list_context, затем из глобальной переменной или URL
+    currentState.pipeline_run_id = options.pipeline_run_id || null;
+    if (!currentState.pipeline_run_id && currentState.list_context && currentState.list_context.api_fallback) {
+      currentState.pipeline_run_id = currentState.list_context.api_fallback.params?.pipeline_run_id || null;
+    }
+    if (!currentState.pipeline_run_id) {
+      currentState.pipeline_run_id = window.pipelineRunId || getPipelineRunIdFromUrl();
+    }
+    
+    // Если pipeline_run_id всё ещё нет, но есть run_id в list_context, пытаемся получить через API
+    if (!currentState.pipeline_run_id && currentState.list_context && currentState.list_context.items) {
+      const currentItem = currentState.list_context.items[currentState.list_context.current_index || 0];
+      if (currentItem && currentItem.run_id) {
+        // Пытаемся получить pipeline_run_id из API по run_id
+        // Но для этого нужен отдельный эндпойнт, пока пропускаем
+        console.warn('[photo_card] Has run_id but no pipeline_run_id, rectangles may not load');
+      }
+    }
+    
+    console.log('[photo_card] pipeline_run_id:', currentState.pipeline_run_id, 'mode:', currentState.mode);
 
     // Определяем режим (archive/sorting)
     if (currentState.file_path) {

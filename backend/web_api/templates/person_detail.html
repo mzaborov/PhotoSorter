@@ -483,9 +483,14 @@
             api_fallback: null
           };
           
+          // Определяем pipeline_run_id из данных лица (если есть)
+          const faceData = allFaces.find(f => f.face_id === currentFaceId);
+          const pipelineRunId = faceData?.pipeline_run_id || faceData?.run_id || null;
+          
           window.openPhotoCard({
             file_id: face?.file_id || null,
             file_path: path,
+            pipeline_run_id: pipelineRunId,
             list_context: listContext,
             highlight_rectangle: {
               type: 'face_rectangle',
