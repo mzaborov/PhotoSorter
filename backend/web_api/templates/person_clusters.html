@@ -291,7 +291,8 @@
                 ${mergeIndicator}
               </div>
               <div class="muted" style="font-size:11px; margin-top:4px;">
-                ${cluster.faces_count} лиц | Run ${cluster.run_id}
+                ${cluster.faces_count} лиц<br/>
+                <span style="color: #6b7280;">Архив: ${cluster.faces_count_archive || 0} / Прогон: ${cluster.faces_count_run || 0}</span>
               </div>
             </div>
           </div>

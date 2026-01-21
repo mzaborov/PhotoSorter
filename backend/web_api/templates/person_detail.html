@@ -3,6 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.ico" />
     <meta name="referrer" content="no-referrer" />
     <title>PhotoSorter — Персона</title>
     <style>
@@ -124,7 +125,16 @@
       <div>
         <h3>Все лица персоны (<span id="facesCount">-</span>)</h3>
         <div class="muted" style="margin-top:6px;">Двойной клик на лицо — открыть полную фотографию</div>
-        <div class="thumb-grid" id="facesGrid"></div>
+        <div id="facesGridContainer">
+          <div id="facesGridArchive" style="margin-bottom:24px;">
+            <h4 style="margin:0 0 12px 0; font-size:16px; font-weight:600; color:#1f2937;">Архив</h4>
+            <div class="thumb-grid" id="facesGridArchiveContent"></div>
+          </div>
+          <div id="facesGridRun">
+            <h4 style="margin:0 0 12px 0; font-size:16px; font-weight:600; color:#1f2937;">Текущий прогон</h4>
+            <div class="thumb-grid" id="facesGridRunContent"></div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -171,6 +181,7 @@
       </div>
     </div>
 
+    <script src="/static/face_rectangles_viewer.js"></script>
     <script>
       const personId = {{ person_id }};
       let personData = null;
@@ -181,6 +192,34 @@
       let currentFilePath = null; // Путь к текущему файлу для исправления клиппинга
       let allFacesOnImage = []; // Все лица на текущем изображении
       let isDrawingFaces = false; // Флаг для предотвращения множественных вызовов drawAllFaceRectangles
+      
+      // Сохраняем ссылку на функцию из модуля ПЕРЕД любыми переопределениями
+      // Проверяем сразу после загрузки скрипта
+      let drawAllFaceRectanglesFromModule = null;
+      let drawFaceRectangleFromModule = null;
+      
+      // Пробуем получить функции из глобальной области видимости
+      if (typeof drawAllFaceRectangles !== 'undefined') {
+        drawAllFaceRectanglesFromModule = drawAllFaceRectangles;
+        console.log('Module loaded: drawAllFaceRectangles found', typeof drawAllFaceRectangles);
+      } else {
+        console.warn('Module not loaded: drawAllFaceRectangles is undefined');
+      }
+      
+      if (typeof drawFaceRectangle !== 'undefined') {
+        drawFaceRectangleFromModule = drawFaceRectangle;
+        console.log('Module loaded: drawFaceRectangle found', typeof drawFaceRectangle);
+      } else {
+        console.warn('Module not loaded: drawFaceRectangle is undefined');
+      }
+      
+      // Проверяем, что модуль загрузился
+      if (!drawAllFaceRectanglesFromModule || !drawFaceRectangleFromModule) {
+        console.error('face_rectangles_viewer.js module not loaded!', {
+          drawAllFaceRectangles: typeof drawAllFaceRectangles,
+          drawFaceRectangle: typeof drawFaceRectangle
+        });
+      }
 
       function showToast(msg, isError = false) {
         alert(msg);
@@ -214,10 +253,12 @@
             }
           }
           
-          // Обновляем информацию
+          // Обновляем информацию с разделением на архив и текущий прогон
           const facesCount = personData.faces.length;
+          const facesArchive = personData.faces.filter(f => f.is_archive).length;
+          const facesRun = personData.faces.filter(f => f.is_run).length;
           document.getElementById('facesCount').textContent = facesCount;
-          document.getElementById('personInfo').textContent = `${facesCount} лиц`;
+          document.getElementById('personInfo').textContent = `${facesCount} лиц (Архив: ${facesArchive}, Прогон: ${facesRun})`;
           
           // Рендерим лица
           renderFaces();
@@ -242,38 +283,63 @@
       }
 
       async function renderFaces() {
-        const grid = document.getElementById('facesGrid');
+        const archiveGrid = document.getElementById('facesGridArchiveContent');
+        const runGrid = document.getElementById('facesGridRunContent');
+        const archiveSection = document.getElementById('facesGridArchive');
+        const runSection = document.getElementById('facesGridRun');
+        
         if (!personData || !personData.faces) {
-          grid.innerHTML = '<div class="muted">Нет лиц</div>';
+          archiveGrid.innerHTML = '<div class="muted">Нет лиц</div>';
+          runGrid.innerHTML = '<div class="muted">Нет лиц</div>';
           return;
         }
         
         const faces = personData.faces;
         if (faces.length === 0) {
-          grid.innerHTML = '<div class="muted">Нет лиц</div>';
+          archiveGrid.innerHTML = '<div class="muted">Нет лиц</div>';
+          runGrid.innerHTML = '<div class="muted">Нет лиц</div>';
           return;
         }
         
-        grid.innerHTML = await Promise.all(faces.map(async (face) => {
-          const thumbUrl = face.thumb_jpeg_base64 ? 
-            `data:image/jpeg;base64,${face.thumb_jpeg_base64}` : null;
-          
-          const isAvatar = personData.person.avatar_face_id === face.face_id;
-          const avatarClass = isAvatar ? ' avatar' : '';
-          
-          const escapedPath = (face.file_path || '').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
-          const bboxJson = face.bbox ? JSON.stringify(face.bbox).replace(/"/g, '&quot;') : '';
-          return `
-            <div class="thumb${avatarClass}" data-face-id="${face.face_id}" data-file-path="${escapedPath}" data-bbox="${bboxJson}" ondblclick="handleFaceDoubleClick(this)">
-              ${thumbUrl ? `<img src="${thumbUrl}" alt="Face ${face.face_id}" />` : '<div class="noimg">Нет превью</div>'}
-              <div class="face-actions">
-                <button class="face-btn" onclick="event.stopPropagation(); ignoreFace(${face.face_id})" title="Это не лицо">Не лицо</button>
-                <button class="face-btn" onclick="event.stopPropagation(); reassignFace(${face.face_id})" title="Это другой человек">Другой</button>
-                <button class="face-btn" onclick="event.stopPropagation(); setAvatar(${face.face_id})" title="Назначить аватаром" ${isAvatar ? 'disabled' : ''}>Аватар</button>
-              </div>
+        // Разделяем лица на архивные и из текущего прогона
+        const archiveFaces = faces.filter(f => f.is_archive);
+        const runFaces = faces.filter(f => f.is_run);
+        
+        // Скрываем секцию, если нет лиц
+        if (archiveFaces.length === 0) {
+          archiveSection.style.display = 'none';
+        } else {
+          archiveSection.style.display = 'block';
+          archiveGrid.innerHTML = await Promise.all(archiveFaces.map(async (face) => renderFaceThumb(face))).then(h => h.join(''));
+        }
+        
+        if (runFaces.length === 0) {
+          runSection.style.display = 'none';
+        } else {
+          runSection.style.display = 'block';
+          runGrid.innerHTML = await Promise.all(runFaces.map(async (face) => renderFaceThumb(face))).then(h => h.join(''));
+        }
+      }
+      
+      async function renderFaceThumb(face) {
+        const thumbUrl = face.thumb_jpeg_base64 ? 
+          `data:image/jpeg;base64,${face.thumb_jpeg_base64}` : null;
+        
+        const isAvatar = personData.person.avatar_face_id === face.face_id;
+        const avatarClass = isAvatar ? ' avatar' : '';
+        
+        const escapedPath = (face.file_path || '').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+        const bboxJson = face.bbox ? JSON.stringify(face.bbox).replace(/"/g, '&quot;') : '';
+        return `
+          <div class="thumb${avatarClass}" data-face-id="${face.face_id}" data-file-path="${escapedPath}" data-bbox="${bboxJson}" ondblclick="handleFaceDoubleClick(this)">
+            ${thumbUrl ? `<img src="${thumbUrl}" alt="Face ${face.face_id}" />` : '<div class="noimg">Нет превью</div>'}
+            <div class="face-actions">
+              <button class="face-btn" onclick="event.stopPropagation(); ignoreFace(${face.face_id})" title="Это не лицо">Не лицо</button>
+              <button class="face-btn" onclick="event.stopPropagation(); reassignFace(${face.face_id})" title="Это другой человек">Другой</button>
+              <button class="face-btn" onclick="event.stopPropagation(); setAvatar(${face.face_id})" title="Назначить аватаром" ${isAvatar ? 'disabled' : ''}>Аватар</button>
             </div>
-          `;
-        })).then(html => html.join(''));
+          </div>
+        `;
       }
 
       function handleFaceDoubleClick(element) {
@@ -355,7 +421,13 @@
                 }
                 // Перерисовываем rectangles с новыми размерами
                 if (lbImg && lbImg.complete) {
-                  drawAllFaceRectangles();
+                  // Получаем размеры исходного изображения для масштабирования
+                  const face = personData?.faces?.find(f => f.face_id === currentFaceId);
+                  const originalImageSize = face?.image_size;
+                  if (drawAllFaceRectanglesFromModule) {
+                    drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+                  }
+                  drawFaceRectangleLocal();
                 }
               }
             })
@@ -398,12 +470,19 @@
           .then(res => res.json())
           .then(data => {
             allFacesOnImage = data.faces || [];
+            console.log('Loaded faces on image:', allFacesOnImage.length, 'currentFaceId:', currentFaceId, 'faces:', allFacesOnImage);
             // Данные о лицах загружены, но изображение может еще не загрузиться
             // tryDrawAllFaces будет вызван из onload, когда изображение точно загрузится
             // Но если изображение уже загружено, вызываем сразу
             const lbImgCheck = document.getElementById('lbImg');
             if (lbImgCheck && lbImgCheck.complete) {
-              drawAllFaceRectangles();
+              // Получаем размеры исходного изображения для масштабирования
+              const face = personData?.faces?.find(f => f.face_id === currentFaceId);
+              const originalImageSize = face?.image_size;
+              if (drawAllFaceRectanglesFromModule) {
+                drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+              }
+              drawFaceRectangleLocal();
             }
           })
           .catch(err => {
@@ -412,7 +491,13 @@
             // Даже если ошибка, пытаемся нарисовать текущее лицо, если изображение уже загружено
             const lbImgCheck = document.getElementById('lbImg');
             if (lbImgCheck && lbImgCheck.complete) {
-              drawAllFaceRectangles();
+              // Получаем размеры исходного изображения для масштабирования
+              const face = personData?.faces?.find(f => f.face_id === currentFaceId);
+              const originalImageSize = face?.image_size;
+              if (drawAllFaceRectanglesFromModule) {
+                drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+              }
+              drawFaceRectangleLocal();
             }
           });
         
@@ -427,7 +512,13 @@
               if (lbImgCheck && lbBodyCheck && lbImgCheck.complete) {
                 // Теперь изображение точно загружено, рисуем rectangles (если данные о лицах уже загружены)
                 if (allFacesOnImage !== undefined) {
-                  drawAllFaceRectangles();
+                  // Получаем размеры исходного изображения для масштабирования
+                  const face = personData?.faces?.find(f => f.face_id === currentFaceId);
+                  const originalImageSize = face?.image_size;
+                  if (drawAllFaceRectanglesFromModule) {
+                    drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+                  }
+                  drawFaceRectangleLocal();
                 }
               } else {
                 requestAnimationFrame(checkAndDraw);
@@ -460,12 +551,24 @@
                     // Перерисовываем rectangle с новыми размерами
                     // Используем один requestAnimationFrame для уменьшения задержки
                     requestAnimationFrame(() => {
-                      drawAllFaceRectangles();
+                      // Получаем размеры исходного изображения для масштабирования
+                  const face = personData?.faces?.find(f => f.face_id === currentFaceId);
+                  const originalImageSize = face?.image_size;
+                  if (drawAllFaceRectanglesFromModule) {
+                    drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+                  }
+                  drawFaceRectangleLocal();
                     });
                   } else {
                     // Если не удалось получить размеры, рисуем с эвристикой
                     requestAnimationFrame(() => {
-                      drawAllFaceRectangles();
+                      // Получаем размеры исходного изображения для масштабирования
+                  const face = personData?.faces?.find(f => f.face_id === currentFaceId);
+                  const originalImageSize = face?.image_size;
+                  if (drawAllFaceRectanglesFromModule) {
+                    drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+                  }
+                  drawFaceRectangleLocal();
                     });
                   }
                 })
@@ -474,14 +577,20 @@
                   // В случае ошибки рисуем с эвристикой
                   requestAnimationFrame(() => {
                     requestAnimationFrame(() => {
-                      drawAllFaceRectangles();
+                      // Получаем размеры исходного изображения для масштабирования
+                  const face = personData?.faces?.find(f => f.face_id === currentFaceId);
+                  const originalImageSize = face?.image_size;
+                  if (drawAllFaceRectanglesFromModule) {
+                    drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+                  }
+                  drawFaceRectangleLocal();
                     });
                   });
                 });
             } else {
               // Размеры уже есть, просто рисуем
               requestAnimationFrame(() => {
-                drawAllFaceRectangles();
+                drawAllFaceRectanglesLocal();
               });
             }
           };
@@ -498,7 +607,7 @@
             // Функция для отрисовки после проверки данных о лицах
             const drawWhenReady = () => {
               if (allFacesOnImage !== undefined) {
-                drawAllFaceRectangles();
+                drawAllFaceRectanglesLocal();
               }
             };
             
@@ -549,252 +658,8 @@
         document.getElementById('lightbox').classList.add('open');
       }
       
-      function drawAllFaceRectangles() {
-        // Защита от множественных вызовов
-        if (isDrawingFaces) {
-          return;
-        }
-        isDrawingFaces = true;
-        
-        try {
-          // Сначала рисуем остальные лица (желтые rectangles с подписями)
-          // Синий rectangle нарисуем в конце, чтобы он был поверх желтых
-          const lbImg = document.getElementById('lbImg');
-          const lbBody = document.getElementById('lbBody');
-          
-          // Детальная диагностика
-          if (!lbImg) {
-            console.error('drawAllFaceRectangles: lbImg не найден', {
-              lightboxExists: !!document.getElementById('lightbox'),
-              lightboxOpen: document.getElementById('lightbox')?.classList.contains('open')
-            });
-            return;
-          }
-          if (!lbBody) {
-            console.error('drawAllFaceRectangles: lbBody не найден', {
-              lightboxExists: !!document.getElementById('lightbox'),
-              lightboxOpen: document.getElementById('lightbox')?.classList.contains('open'),
-              lbBodyElements: document.querySelectorAll('.lb-body').length,
-              allLbBodyIds: Array.from(document.querySelectorAll('[id*="lb"]')).map(el => el.id)
-            });
-            return;
-          }
-          if (!lbImg.complete) {
-            console.error('drawAllFaceRectangles: lbImg.complete === false', {
-              src: lbImg.src,
-              naturalWidth: lbImg.naturalWidth,
-              naturalHeight: lbImg.naturalHeight,
-              width: lbImg.width,
-              height: lbImg.height
-            });
-            return;
-          }
-        // Если currentFaceBbox не установлен, пытаемся получить из personData
-        if (!currentFaceBbox && currentFaceId) {
-          const face = personData?.faces?.find(f => f.face_id === currentFaceId);
-          if (face && face.bbox) {
-            currentFaceBbox = face.bbox;
-          }
-        }
-        
-        // Удаляем старые желтые rectangles (но НЕ основной синий rectangle #lbRectangle)
-        const oldRects = lbBody.querySelectorAll('.lb-rectangle.other, .lb-rectangle-label:not(.current)');
-        oldRects.forEach(el => el.remove());
-        
-        // Если данные о лицах еще не загружены (undefined), не рисуем ничего
-        // Если данные загружены, но лиц нет - рисуем только текущее лицо
-        if (allFacesOnImage === undefined) {
-          return;
-        }
-        
-        // Если нет других лиц, просто рисуем текущее лицо
-        if (allFacesOnImage.length === 0) {
-          drawFaceRectangle();
-          return;
-        }
-          
-          // Получаем размеры изображения
-          const imgRect = lbImg.getBoundingClientRect();
-          const imgNaturalWidth = lbImg.naturalWidth;
-          const imgNaturalHeight = lbImg.naturalHeight;
-          const imgDisplayWidth = imgRect.width;
-          const imgDisplayHeight = imgRect.height;
-          
-          if (imgNaturalWidth === 0 || imgNaturalHeight === 0) {
-            return;
-          }
-          
-          // Получаем размеры исходного изображения для масштабирования
-          const face = personData?.faces?.find(f => f.face_id === currentFaceId);
-          const originalImageSize = face?.image_size;
-          
-          // Если размеры исходного изображения еще не получены, не рисуем желтые квадраты
-          // Они будут нарисованы после получения размеров
-          if (!originalImageSize || !originalImageSize.width || !originalImageSize.height) {
-            drawFaceRectangle();
-            return;
-          }
-        
-        // Рисуем каждое лицо (кроме текущего)
-        for (const otherFace of allFacesOnImage) {
-          // Сравниваем как числа и как строки
-          const otherFaceIdNum = Number(otherFace.face_id);
-          const currentFaceIdNum = Number(currentFaceId);
-          const isCurrent = otherFaceIdNum === currentFaceIdNum || 
-                           otherFace.face_id === currentFaceId;
-          
-          if (isCurrent) {
-            continue; // Пропускаем текущее лицо (оно будет нарисовано синим в конце)
-          }
-          
-          let bboxX = otherFace.bbox.x;
-          let bboxY = otherFace.bbox.y;
-          let bboxW = otherFace.bbox.w;
-          let bboxH = otherFace.bbox.h;
-          
-          // Масштабируем координаты
-          if (originalImageSize && originalImageSize.width && originalImageSize.height) {
-            const originalWidth = originalImageSize.width;
-            const originalHeight = originalImageSize.height;
-            const exifOrientation = originalImageSize.exif_orientation;
-            const originalRatio = originalWidth / originalHeight;
-            const previewRatio = imgNaturalWidth / imgNaturalHeight;
-            const isRotated90 = Math.abs(originalRatio - 1/previewRatio) < 0.1;
-            
-            if (isRotated90 && exifOrientation) {
-              const scaleX = imgNaturalWidth / originalHeight;
-              const scaleY = imgNaturalHeight / originalWidth;
-              
-              if (exifOrientation === 6) {
-                const tempX = bboxX;
-                const tempW = bboxW;
-                bboxX = bboxY * scaleX;
-                bboxY = (originalWidth - tempX - tempW) * scaleY;
-                bboxW = bboxH * scaleX;
-                bboxH = tempW * scaleY;
-              } else if (exifOrientation === 8) {
-                const tempX = bboxX;
-                const tempW = bboxW;
-                bboxX = (originalHeight - bboxY - bboxH) * scaleX;
-                bboxY = tempX * scaleY;
-                bboxW = bboxH * scaleX;
-                bboxH = tempW * scaleY;
-              } else if (exifOrientation === 3) {
-                const scaleX2 = imgNaturalWidth / originalWidth;
-                const scaleY2 = imgNaturalHeight / originalHeight;
-                bboxX = (originalWidth - bboxX - bboxW) * scaleX2;
-                bboxY = (originalHeight - bboxY - bboxH) * scaleY2;
-                bboxW = bboxW * scaleX2;
-                bboxH = bboxH * scaleY2;
-              } else {
-                const scaleX2 = imgNaturalWidth / originalWidth;
-                const scaleY2 = imgNaturalHeight / originalHeight;
-                bboxX = bboxX * scaleX2;
-                bboxY = bboxY * scaleY2;
-                bboxW = bboxW * scaleX2;
-                bboxH = bboxH * scaleY2;
-              }
-            } else {
-              const scaleX = imgNaturalWidth / originalWidth;
-              const scaleY = imgNaturalHeight / originalHeight;
-              bboxX = bboxX * scaleX;
-              bboxY = bboxY * scaleY;
-              bboxW = bboxW * scaleX;
-              bboxH = bboxH * scaleY;
-            }
-          } else if (bboxX >= imgNaturalWidth || bboxY >= imgNaturalHeight || (bboxX + bboxW) > imgNaturalWidth || (bboxY + bboxH) > imgNaturalHeight) {
-            const originalWidth = Math.max(bboxX + bboxW, imgNaturalWidth);
-            const originalHeight = Math.max(bboxY + bboxH, imgNaturalHeight);
-            const scaleX = imgNaturalWidth / originalWidth;
-            const scaleY = imgNaturalHeight / originalHeight;
-            bboxX = bboxX * scaleX;
-            bboxY = bboxY * scaleY;
-            bboxW = bboxW * scaleX;
-            bboxH = bboxH * scaleY;
-          }
-          
-          // Ограничиваем границы
-          bboxX = Math.max(0, Math.min(bboxX, imgNaturalWidth));
-          bboxY = Math.max(0, Math.min(bboxY, imgNaturalHeight));
-          if (bboxX + bboxW > imgNaturalWidth) {
-            bboxW = Math.max(1, imgNaturalWidth - bboxX);
-          }
-          if (bboxY + bboxH > imgNaturalHeight) {
-            bboxH = Math.max(1, imgNaturalHeight - bboxY);
-          }
-          bboxW = Math.max(1, Math.min(bboxW, imgNaturalWidth - bboxX));
-          bboxH = Math.max(1, Math.min(bboxH, imgNaturalHeight - bboxY));
-          
-          // Масштабируем к отображаемому размеру
-          const scaleX = imgDisplayWidth / imgNaturalWidth;
-          const scaleY = imgDisplayHeight / imgNaturalHeight;
-          const rectX = bboxX * scaleX;
-          const rectY = bboxY * scaleY;
-          const rectW = bboxW * scaleX;
-          const rectH = bboxH * scaleY;
-          
-          // Позиционируем относительно body
-          const bodyRect = lbBody.getBoundingClientRect();
-          const left = (imgRect.left - bodyRect.left) + rectX;
-          const top = (imgRect.top - bodyRect.top) + rectY;
-          
-          // Создаем желтый rectangle
-          const rect = document.createElement('div');
-          rect.className = 'lb-rectangle other';
-          rect.style.left = `${left}px`;
-          rect.style.top = `${top}px`;
-          rect.style.width = `${rectW}px`;
-          rect.style.height = `${rectH}px`;
-          rect.style.display = 'block';
-          rect.style.position = 'absolute';
-          rect.style.zIndex = '1000';
-          rect.style.cursor = 'pointer';
-          rect.style.pointerEvents = 'auto';
-          
-          // Добавляем клик для перехода к кластеру или назначения персоны
-          if (otherFace.cluster_id) {
-            rect.onclick = function(e) {
-              e.stopPropagation();
-              const clusterUrl = `/face-clusters/${otherFace.cluster_id}`;
-              window.open(clusterUrl, '_blank');
-            };
-            rect.title = (otherFace.person_name || '') + (otherFace.cluster_id ? ` | Кластер #${otherFace.cluster_id} (клик для открытия)` : '');
-          }
-          
-          lbBody.appendChild(rect);
-          
-          // Добавляем подпись с именем персоны (если назначена)
-          const labelText = otherFace.person_name 
-            ? (otherFace.person_name + (otherFace.is_me ? ' (я)' : ''))
-            : (otherFace.cluster_id ? `Кластер #${otherFace.cluster_id}` : 'Не назначено');
-          
-          const label = document.createElement('div');
-          label.className = 'lb-rectangle-label';
-          label.textContent = labelText;
-          label.style.left = `${left}px`;
-          label.style.top = `${top - 20}px`;
-          label.style.position = 'absolute';
-          label.style.zIndex = '10001';
-          label.style.pointerEvents = 'none';
-          if (otherFace.cluster_id) {
-            label.style.cursor = 'pointer';
-            label.onclick = function(e) {
-              e.stopPropagation();
-              const clusterUrl = `/face-clusters/${otherFace.cluster_id}`;
-              window.open(clusterUrl, '_blank');
-            };
-          }
-          lbBody.appendChild(label);
-        }
-        
-          // В конце рисуем текущее лицо (синий rectangle) поверх желтых
-          drawFaceRectangle();
-        } finally {
-          isDrawingFaces = false;
-        }
-      }
 
-      function drawFaceRectangle() {
+      function drawFaceRectangleLocal() {
         // Всегда пытаемся получить bbox из personData, если currentFaceBbox не установлен
         if (!currentFaceBbox && currentFaceId) {
           const face = personData?.faces?.find(f => f.face_id === currentFaceId);
@@ -810,207 +675,25 @@
         }
         
         const lbImg = document.getElementById('lbImg');
-        const lbRectangle = document.getElementById('lbRectangle');
-        if (!lbImg || !lbRectangle) {
+        if (!lbImg || !lbImg.complete) {
           return;
         }
-        
-        if (!lbImg.complete) {
-          return;
-        }
-        
-        // Получаем реальные размеры отображаемого изображения
-        const imgRect = lbImg.getBoundingClientRect();
-        const imgNaturalWidth = lbImg.naturalWidth;
-        const imgNaturalHeight = lbImg.naturalHeight;
-        const imgDisplayWidth = imgRect.width;
-        const imgDisplayHeight = imgRect.height;
-        
-        // Проверяем, что изображение загружено и имеет правильные размеры
-        if (imgNaturalWidth === 0 || imgNaturalHeight === 0) {
-          // Скрываем rectangle до получения правильных размеров
-          if (lbRectangle) {
-            lbRectangle.style.display = 'none';
-          }
-          // Удаляем надпись, если она уже была создана
-          const lbBody = lbImg.parentElement;
-          if (lbBody) {
-            const oldLabel = lbBody.querySelector('.lb-rectangle-label.current');
-            if (oldLabel) oldLabel.remove();
-          }
-          return;
-        }
-        
-        // Проверяем, что отображаемые размеры тоже правильные
-        if (imgDisplayWidth === 0 || imgDisplayHeight === 0) {
-          // Скрываем rectangle до получения правильных размеров
-          if (lbRectangle) {
-            lbRectangle.style.display = 'none';
-          }
-          // Удаляем надпись, если она уже была создана
-          const lbBody = lbImg.parentElement;
-          if (lbBody) {
-            const oldLabel = lbBody.querySelector('.lb-rectangle-label.current');
-            if (oldLabel) oldLabel.remove();
-          }
-          return;
-        }
-        
-        // Масштабируем bbox координаты от исходного изображения к preview
-        let bboxX = currentFaceBbox.x;
-        let bboxY = currentFaceBbox.y;
-        let bboxW = currentFaceBbox.w;
-        let bboxH = currentFaceBbox.h;
         
         // Получаем размеры исходного изображения из данных лица
         const face = personData?.faces?.find(f => f.face_id === currentFaceId);
         const originalImageSize = face?.image_size;
-        
-        // Если размеры исходного изображения еще не получены, скрываем rectangle и надпись, выходим
-        // Размеры будут получены из API и rectangle будет перерисован
-        if (!originalImageSize || !originalImageSize.width || !originalImageSize.height) {
-          if (lbRectangle) {
-            lbRectangle.style.display = 'none';
-          }
-          // Удаляем надпись, если она уже была создана
-          const lbBody = lbImg.parentElement;
-          if (lbBody) {
-            const oldLabel = lbBody.querySelector('.lb-rectangle-label.current');
-            if (oldLabel) oldLabel.remove();
-          }
-          return;
-        }
-        
-        // Если есть размеры исходного изображения и они отличаются от preview, масштабируем
-        if (originalImageSize && originalImageSize.width && originalImageSize.height) {
-          const originalWidth = originalImageSize.width;
-          const originalHeight = originalImageSize.height;
-          const exifOrientation = originalImageSize.exif_orientation;
-          const originalRatio = originalWidth / originalHeight;
-          const previewRatio = imgNaturalWidth / imgNaturalHeight;
-          const isRotated90 = Math.abs(originalRatio - 1/previewRatio) < 0.1;
-          
-          if (isRotated90 && exifOrientation) {
-            const scaleX = imgNaturalWidth / originalHeight;
-            const scaleY = imgNaturalHeight / originalWidth;
-            
-            if (exifOrientation === 6) {
-              const tempX = bboxX;
-              const tempW = bboxW;
-              bboxX = bboxY * scaleX;
-              bboxY = (originalWidth - tempX - tempW) * scaleY;
-              bboxW = bboxH * scaleX;
-              bboxH = tempW * scaleY;
-            } else if (exifOrientation === 8) {
-              const tempX = bboxX;
-              const tempW = bboxW;
-              bboxX = (originalHeight - bboxY - bboxH) * scaleX;
-              bboxY = tempX * scaleY;
-              bboxW = bboxH * scaleX;
-              bboxH = tempW * scaleY;
-            } else if (exifOrientation === 3) {
-              const scaleX2 = imgNaturalWidth / originalWidth;
-              const scaleY2 = imgNaturalHeight / originalHeight;
-              bboxX = (originalWidth - bboxX - bboxW) * scaleX2;
-              bboxY = (originalHeight - bboxY - bboxH) * scaleY2;
-              bboxW = bboxW * scaleX2;
-              bboxH = bboxH * scaleY2;
-            } else {
-              const scaleX2 = imgNaturalWidth / originalWidth;
-              const scaleY2 = imgNaturalHeight / originalHeight;
-              bboxX = bboxX * scaleX2;
-              bboxY = bboxY * scaleY2;
-              bboxW = bboxW * scaleX2;
-              bboxH = bboxH * scaleY2;
-            }
-          } else {
-            const scaleX = imgNaturalWidth / originalWidth;
-            const scaleY = imgNaturalHeight / originalHeight;
-            bboxX = bboxX * scaleX;
-            bboxY = bboxY * scaleY;
-            bboxW = bboxW * scaleX;
-            bboxH = bboxH * scaleY;
-          }
-        } else if (bboxX >= imgNaturalWidth || bboxY >= imgNaturalHeight || (bboxX + bboxW) > imgNaturalWidth || (bboxY + bboxH) > imgNaturalHeight) {
-          const originalWidth = Math.max(bboxX + bboxW, imgNaturalWidth);
-          const originalHeight = Math.max(bboxY + bboxH, imgNaturalHeight);
-          const scaleX = imgNaturalWidth / originalWidth;
-          const scaleY = imgNaturalHeight / originalHeight;
-          bboxX = bboxX * scaleX;
-          bboxY = bboxY * scaleY;
-          bboxW = bboxW * scaleX;
-          bboxH = bboxH * scaleY;
-        }
-        
-        // Убеждаемся, что bbox координаты не выходят за границы preview
-        bboxX = Math.max(0, Math.min(bboxX, imgNaturalWidth));
-        bboxY = Math.max(0, Math.min(bboxY, imgNaturalHeight));
-        if (bboxX + bboxW > imgNaturalWidth) {
-          bboxW = Math.max(1, imgNaturalWidth - bboxX);
-        }
-        if (bboxY + bboxH > imgNaturalHeight) {
-          bboxH = Math.max(1, imgNaturalHeight - bboxY);
-        }
-        bboxW = Math.max(1, Math.min(bboxW, imgNaturalWidth - bboxX));
-        bboxH = Math.max(1, Math.min(bboxH, imgNaturalHeight - bboxY));
-        
-        // Вычисляем масштаб от preview к отображаемому размеру
-        const scaleX = imgDisplayWidth / imgNaturalWidth;
-        const scaleY = imgDisplayHeight / imgNaturalHeight;
-        
-        // Вычисляем позицию и размер rectangle на отображаемом изображении
-        const rectX = bboxX * scaleX;
-        const rectY = bboxY * scaleY;
-        const rectW = bboxW * scaleX;
-        const rectH = bboxH * scaleY;
-        
-        // Позиционируем rectangle относительно изображения
-        const lbBody = lbImg.parentElement;
-        if (!lbBody) {
-          return;
-        }
-        
-        const bodyRect = lbBody.getBoundingClientRect();
-        
-        // Удаляем старую подпись для синего rectangle (если есть)
-        const oldLabel = lbBody.querySelector('.lb-rectangle-label.current');
-        if (oldLabel) oldLabel.remove();
-        
-        const left = (imgRect.left - bodyRect.left) + rectX;
-        const top = (imgRect.top - bodyRect.top) + rectY;
-        
-        // Сначала показываем rectangle
-        lbRectangle.style.left = left + 'px';
-        lbRectangle.style.top = top + 'px';
-        lbRectangle.style.width = rectW + 'px';
-        lbRectangle.style.height = rectH + 'px';
-        lbRectangle.style.display = 'block';
-        
-        // Только после того, как rectangle показан, добавляем подпись
-        // Это гарантирует, что надпись не появится раньше rectangle
         const currentPerson = personData?.person;
-        const labelText = currentPerson?.name 
-          ? (currentPerson.name + (currentPerson.is_me ? ' (я)' : ''))
-          : 'Не назначено';
         
-        const label = document.createElement('div');
-        label.className = 'lb-rectangle-label current';
-        label.textContent = labelText;
-        label.style.left = `${left}px`;
-        label.style.top = `${top - 20}px`;
-        label.style.position = 'absolute';
-        label.style.zIndex = '10002';
-        label.style.pointerEvents = 'none';
-        label.style.background = 'rgba(11, 87, 208, 0.95)';
-        label.style.color = '#fff';
-        label.style.padding = '3px 8px';
-        label.style.fontSize = '12px';
-        label.style.fontWeight = '700';
-        label.style.borderRadius = '4px';
-        label.style.boxShadow = '0 2px 4px rgba(0, 0, 0, 0.3)';
-        label.style.border = '1px solid rgba(11, 87, 208, 1)';
-        label.style.whiteSpace = 'nowrap';
-        lbBody.appendChild(label);
+        // Вызываем функцию из модуля
+        if (drawFaceRectangleFromModule) {
+          drawFaceRectangleFromModule(
+            currentFaceBbox,
+            originalImageSize,
+            currentPerson?.name,
+            currentPerson?.is_me,
+            face?.cluster_id
+          );
+        }
       }
 
       function closeLightbox() {
@@ -1039,7 +722,13 @@
       // Перерисовка rectangles при изменении размера окна
       window.addEventListener('resize', () => {
         if (document.getElementById('lightbox').classList.contains('open')) {
-          drawAllFaceRectangles();
+          // Получаем размеры исходного изображения для масштабирования
+          const face = personData?.faces?.find(f => f.face_id === currentFaceId);
+          const originalImageSize = face?.image_size;
+          if (drawAllFaceRectanglesFromModule) {
+            drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+          }
+          drawFaceRectangleLocal();
         }
       });
 

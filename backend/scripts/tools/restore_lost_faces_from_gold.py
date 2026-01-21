@@ -129,22 +129,37 @@ def restore_lost_faces(person_id: int | None = None, dry_run: bool = False) -> N
         return
     
     # Сначала получаем все персоны, у которых есть лица на файлах из gold
+    # Используем новую схему: face_person_manual_assignments + face_clusters.person_id
     placeholders = ",".join(["?"] * len(gold_file_paths))
     cur.execute(
         f"""
         SELECT DISTINCT
             p.id as person_id,
             p.name as person_name
-        FROM face_labels fl
-        JOIN persons p ON fl.person_id = p.id
-        JOIN face_rectangles fr ON fl.face_rectangle_id = fr.id
-        WHERE fr.file_path IN ({placeholders})
-          AND COALESCE(fr.ignore_flag, 0) = 0
+        FROM (
+            -- Ручные привязки
+            SELECT fpma.person_id
+            FROM face_person_manual_assignments fpma
+            JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
+            WHERE fr.file_path IN ({placeholders})
+            
+            UNION
+            
+            -- Привязки через кластеры
+            SELECT fc.person_id
+            FROM face_cluster_members fcm
+            JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
+            JOIN face_clusters fc ON fc.id = fcm.cluster_id
+            WHERE fr.file_path IN ({placeholders})
+              AND fc.person_id IS NOT NULL
+        ) person_ids
+        JOIN persons p ON p.id = person_ids.person_id
+        WHERE COALESCE((SELECT ignore_flag FROM face_rectangles fr WHERE fr.file_path IN ({placeholders}) LIMIT 1), 0) = 0
         ORDER BY 
           CASE WHEN p.name = ? THEN 1 ELSE 0 END,
           p.name
         """,
-        gold_file_paths + ["Посторонние"],
+        gold_file_paths + gold_file_paths + gold_file_paths + ["Посторонние"],
     )
     
     persons_dict = {}
@@ -185,17 +200,21 @@ def restore_lost_faces(person_id: int | None = None, dry_run: bool = False) -> N
                 continue
             
             # Находим лицо в БД по file_path и bbox (с небольшой погрешностью)
-            # Используем логику из api_gold_faces_by_persons
+            # Используем новую схему: face_person_manual_assignments + face_clusters.person_id
             cur.execute(
                 """
                 SELECT 
                     fr.id as face_id,
                     fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
-                    fl.person_id,
-                    p.name as person_name
+                    COALESCE(fpma.person_id, fc.person_id) as person_id,
+                    COALESCE(p_manual.name, p_cluster.name) as person_name,
+                    fcm.cluster_id
                 FROM face_rectangles fr
-                LEFT JOIN face_labels fl ON fl.face_rectangle_id = fr.id
-                LEFT JOIN persons p ON fl.person_id = p.id
+                LEFT JOIN face_person_manual_assignments fpma ON fpma.face_rectangle_id = fr.id
+                LEFT JOIN persons p_manual ON p_manual.id = fpma.person_id
+                LEFT JOIN face_cluster_members fcm ON fcm.face_rectangle_id = fr.id
+                LEFT JOIN face_clusters fc ON fc.id = fcm.cluster_id
+                LEFT JOIN persons p_cluster ON p_cluster.id = fc.person_id
                 WHERE fr.file_path = ? 
                   AND ABS(fr.bbox_x - ?) <= 10
                   AND ABS(fr.bbox_y - ?) <= 10
@@ -203,7 +222,7 @@ def restore_lost_faces(person_id: int | None = None, dry_run: bool = False) -> N
                   AND ABS(fr.bbox_h - ?) <= 10
                   AND COALESCE(fr.ignore_flag, 0) = 0
                 ORDER BY 
-                  CASE WHEN fl.person_id IS NOT NULL THEN 0 ELSE 1 END,
+                  CASE WHEN COALESCE(fpma.person_id, fc.person_id) IS NOT NULL THEN 0 ELSE 1 END,
                   (ABS(fr.bbox_x - ?) + ABS(fr.bbox_y - ?) + ABS(fr.bbox_w - ?) + ABS(fr.bbox_h - ?)) ASC,
                   fr.id ASC
                 LIMIT 1
@@ -301,15 +320,26 @@ def restore_lost_faces(person_id: int | None = None, dry_run: bool = False) -> N
         print(f"\nПерсона: {person_name} (ID: {person_id_val})")
         print(f"  Лиц в Gold: {len(gold_faces)}")
         
-        # Проверяем текущее состояние в БД
+        # Проверяем текущее состояние в БД (ручные привязки + через кластеры)
         cur.execute(
             """
-            SELECT COUNT(DISTINCT fl.face_rectangle_id) as faces_count
-            FROM face_labels fl
-            JOIN face_rectangles fr ON fl.face_rectangle_id = fr.id
-            WHERE fl.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+            SELECT COUNT(DISTINCT face_id) as faces_count
+            FROM (
+                SELECT fr.id as face_id
+                FROM face_person_manual_assignments fpma
+                JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
+                WHERE fpma.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+                
+                UNION
+                
+                SELECT fr.id as face_id
+                FROM face_cluster_members fcm
+                JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
+                JOIN face_clusters fc ON fc.id = fcm.cluster_id
+                WHERE fc.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+            )
             """,
-            (person_id_val,),
+            (person_id_val, person_id_val),
         )
         db_row = cur.fetchone()
         db_faces_count = db_row["faces_count"] if db_row else 0
@@ -327,14 +357,20 @@ def restore_lost_faces(person_id: int | None = None, dry_run: bool = False) -> N
             face_id = gold_face["face_id"]
             total_checked += 1
             
-            # Проверяем, есть ли face_label для этого лица и персоны
+            # Проверяем, есть ли привязка для этого лица и персоны (ручная или через кластер)
             cur.execute(
                 """
-                SELECT fl.id, fl.cluster_id
-                FROM face_labels fl
-                WHERE fl.face_rectangle_id = ? AND fl.person_id = ?
+                SELECT 
+                    COALESCE(fpma.id, 1) as id,
+                    fcm.cluster_id
+                FROM face_rectangles fr
+                LEFT JOIN face_person_manual_assignments fpma ON fpma.face_rectangle_id = fr.id AND fpma.person_id = ?
+                LEFT JOIN face_cluster_members fcm ON fcm.face_rectangle_id = fr.id
+                LEFT JOIN face_clusters fc ON fc.id = fcm.cluster_id AND fc.person_id = ?
+                WHERE fr.id = ?
+                LIMIT 1
                 """,
-                (face_id, person_id_val),
+                (person_id_val, person_id_val, face_id),
             )
             
             existing_label = cur.fetchone()
@@ -352,7 +388,13 @@ def restore_lost_faces(person_id: int | None = None, dry_run: bool = False) -> N
                         "bbox": gold_face["bbox"],
                     })
                 else:
-                    print(f"    ⚠ Face ID {face_id} не найден в кластерах, пропускаем")
+                    # Лицо не в кластере - тоже можно восстановить (создать ручную привязку)
+                    faces_to_restore.append({
+                        "face_id": face_id,
+                        "cluster_id": None,
+                        "file_path": gold_face["file_path"],
+                        "bbox": gold_face["bbox"],
+                    })
         
         if faces_to_restore:
             print(f"  ⚠ Найдено потерянных лиц: {len(faces_to_restore)}")
@@ -370,15 +412,32 @@ def restore_lost_faces(person_id: int | None = None, dry_run: bool = False) -> N
                 
                 for face_info in faces_to_restore:
                     face_id = face_info["face_id"]
-                    cluster_id = face_info["cluster_id"]
+                    cluster_id = face_info.get("cluster_id")
                     
-                    # Проверяем, нет ли уже такой записи
+                    # ВАЖНО: НЕ создаем записи для лиц, которые уже в кластерах с правильной персоной
+                    # Проверяем, есть ли уже привязка через кластер
                     cur.execute(
                         """
-                        SELECT id FROM face_labels
-                        WHERE face_rectangle_id = ? AND person_id = ? AND cluster_id = ?
+                        SELECT fc.person_id
+                        FROM face_cluster_members fcm
+                        JOIN face_clusters fc ON fc.id = fcm.cluster_id
+                        WHERE fcm.face_rectangle_id = ? AND fc.person_id = ?
                         """,
-                        (face_id, person_id_val, cluster_id),
+                        (face_id, person_id_val),
+                    )
+                    cluster_assignment = cur.fetchone()
+                    
+                    if cluster_assignment:
+                        # Лицо уже в кластере с правильной персоной - НЕ создаем ручную привязку
+                        continue
+                    
+                    # Проверяем, нет ли уже ручной привязки
+                    cur.execute(
+                        """
+                        SELECT id FROM face_person_manual_assignments
+                        WHERE face_rectangle_id = ? AND person_id = ?
+                        """,
+                        (face_id, person_id_val),
                     )
                     existing = cur.fetchone()
                     
@@ -386,14 +445,14 @@ def restore_lost_faces(person_id: int | None = None, dry_run: bool = False) -> N
                         # Запись уже существует, пропускаем
                         continue
                     
-                    # Создаем face_label для этого лица
+                    # Создаем ручную привязку ТОЛЬКО если лицо НЕ в кластере с правильной персоной
                     try:
                         cur.execute(
                             """
-                            INSERT INTO face_labels (face_rectangle_id, person_id, cluster_id, source, confidence, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?)
+                            INSERT INTO face_person_manual_assignments (face_rectangle_id, person_id, source, confidence, created_at)
+                            VALUES (?, ?, ?, ?, ?)
                             """,
-                            (face_id, person_id_val, cluster_id, "restored_from_gold", 0.9, now),
+                            (face_id, person_id_val, "restored_from_gold", 0.9, now),
                         )
                         restored_count += 1
                     except Exception as e:

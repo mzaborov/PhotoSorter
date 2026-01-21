@@ -718,31 +718,25 @@ def api_faces_results(
         # "К разбору": файлы без привязки к персонам ИЛИ люди без лиц (people_no_face_manual=1)
         sub_where = "COALESCE(faces_count, 0) < 8"
         # person_filter_sql будет исключать файлы с привязкой к персонам, но включать people_no_face_manual=1
-        # Привязка может быть через: face_labels, person_rectangles, file_persons, или через кластеры
+        # Привязка может быть через: face_person_manual_assignments, person_rectangles, file_persons, или через кластеры
         person_filter_sql = """
         (
-          -- Файл не привязан ни к одной персоне через лица (прямая привязка)
+          -- Файл не привязан ни к одной персоне через ручные привязки (прямая привязка)
           NOT EXISTS (
-              SELECT 1 FROM face_labels fl
-              JOIN face_rectangles fr ON fr.id = fl.face_rectangle_id
-              WHERE fr.file_path = f.path AND fr.run_id = ? AND fl.person_id IS NOT NULL
+              SELECT 1 FROM face_person_manual_assignments fpma
+              JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
+              WHERE fr.file_path = f.path AND fr.run_id = ? AND fpma.person_id IS NOT NULL
           )
           AND NOT EXISTS (
-              -- Файл не привязан ни к одной персоне через кластеры (оптимизированный вариант)
+              -- Файл не привязан ни к одной персоне через кластеры
               SELECT 1 FROM face_rectangles fr_cluster
               JOIN face_cluster_members fcm_all ON fcm_all.face_rectangle_id = fr_cluster.id
-              JOIN (
-                  -- Находим кластеры с персонами через подзапрос
-                  SELECT DISTINCT fcm_labeled.cluster_id
-                  FROM face_labels fl_cluster
-                  JOIN face_cluster_members fcm_labeled ON fcm_labeled.face_rectangle_id = fl_cluster.face_rectangle_id
-                  JOIN face_clusters fc ON fc.id = fcm_labeled.cluster_id
-                  WHERE fl_cluster.person_id IS NOT NULL
-                    AND (fc.run_id = ? OR fc.archive_scope = 'archive')
-              ) person_clusters ON person_clusters.cluster_id = fcm_all.cluster_id
+              JOIN face_clusters fc ON fc.id = fcm_all.cluster_id
               WHERE fr_cluster.file_path = f.path 
                 AND fr_cluster.run_id = ? 
                 AND COALESCE(fr_cluster.ignore_flag, 0) = 0
+                AND fc.person_id IS NOT NULL
+                AND (fc.run_id = ? OR fc.archive_scope = 'archive')
           )
           AND NOT EXISTS (
               -- Файл не привязан ни к одной персоне через прямоугольники
@@ -756,8 +750,8 @@ def api_faces_results(
           )
         ) OR COALESCE(m.people_no_face_manual, 0) = 1
         """
-        # Параметры для оптимизированного запроса через кластеры: [face_run_id для подзапроса, face_run_id для fr_cluster]
-        person_filter_params = [face_run_id_i, face_run_id_i, int(pipeline_run_id), int(pipeline_run_id)]
+        # Параметры для оптимизированного запроса: [face_run_id для ручных привязок, face_run_id для кластеров, face_run_id для кластеров (OR), int(pipeline_run_id) для person_rectangles, int(pipeline_run_id) для file_persons]
+        person_filter_params = [face_run_id_i, face_run_id_i, face_run_id_i, int(pipeline_run_id), int(pipeline_run_id)]
     elif tab_n == "no_faces" and subtab_n in ("unsorted", "unsorted_photos", "unsorted_videos"):
         # "К разбору" для "Нет людей": файлы без группы
         group_filter_sql = """
@@ -801,26 +795,20 @@ def api_faces_results(
         # Фильтр по персоне: файл должен быть привязан к персоне через любой из 4 способов
         person_filter_sql = """
         EXISTS (
-            -- Через лица (прямая привязка)
-            SELECT 1 FROM face_labels fl
-            JOIN face_rectangles fr ON fr.id = fl.face_rectangle_id
-            WHERE fr.file_path = f.path AND fr.run_id = ? AND fl.person_id = ?
+            -- Через ручные привязки (прямая привязка)
+            SELECT 1 FROM face_person_manual_assignments fpma
+            JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
+            WHERE fr.file_path = f.path AND fr.run_id = ? AND fpma.person_id = ?
         ) OR EXISTS (
-            -- Через кластеры (оптимизированный вариант с подзапросом)
+            -- Через кластеры (оптимизированный вариант)
             SELECT 1 FROM face_rectangles fr_cluster
             JOIN face_cluster_members fcm_all ON fcm_all.face_rectangle_id = fr_cluster.id
-            JOIN (
-                -- Находим кластеры с конкретной персоной через подзапрос
-                SELECT DISTINCT fcm_labeled.cluster_id
-                FROM face_labels fl_cluster
-                JOIN face_cluster_members fcm_labeled ON fcm_labeled.face_rectangle_id = fl_cluster.face_rectangle_id
-                JOIN face_clusters fc ON fc.id = fcm_labeled.cluster_id
-                WHERE fl_cluster.person_id = ?
-                  AND (fc.run_id = ? OR fc.archive_scope = 'archive')
-            ) person_clusters ON person_clusters.cluster_id = fcm_all.cluster_id
+            JOIN face_clusters fc ON fc.id = fcm_all.cluster_id
             WHERE fr_cluster.file_path = f.path 
               AND fr_cluster.run_id = ? 
               AND COALESCE(fr_cluster.ignore_flag, 0) = 0
+              AND fc.person_id = ?
+              AND (fc.run_id = ? OR fc.archive_scope = 'archive')
         ) OR EXISTS (
             -- Через прямоугольники без лица
             SELECT 1 FROM person_rectangles pr
@@ -832,16 +820,16 @@ def api_faces_results(
         )
         """
         # Параметры для оптимизированного запроса:
-        # 1. face_run_id_i - для EXISTS (face_labels) - fr.run_id
-        # 2. person_id_filter - для EXISTS (face_labels) - fl.person_id
-        # 3. person_id_filter - для подзапроса кластеров - fl_cluster.person_id
-        # 4. face_run_id_i - для подзапроса кластеров - fc.run_id
-        # 5. face_run_id_i - для основного запроса кластеров - fr_cluster.run_id
+        # 1. face_run_id_i - для EXISTS (face_person_manual_assignments) - fr.run_id
+        # 2. person_id_filter - для EXISTS (face_person_manual_assignments) - fpma.person_id
+        # 3. face_run_id_i - для EXISTS (кластеры) - fr_cluster.run_id
+        # 4. person_id_filter - для EXISTS (кластеры) - fc.person_id
+        # 5. face_run_id_i - для EXISTS (кластеры) - fc.run_id (для условия OR)
         # 6. int(pipeline_run_id) - для person_rectangles
         # 7. person_id_filter - для person_rectangles
         # 8. int(pipeline_run_id) - для file_persons
         # 9. person_id_filter - для file_persons
-        person_filter_params = [face_run_id_i, person_id_filter, person_id_filter, face_run_id_i, face_run_id_i, int(pipeline_run_id), person_id_filter, int(pipeline_run_id), person_id_filter]
+        person_filter_params = [face_run_id_i, person_id_filter, face_run_id_i, person_id_filter, face_run_id_i, int(pipeline_run_id), person_id_filter, int(pipeline_run_id), person_id_filter]
 
     def _norm_dt(s: str | None, *, is_to: bool) -> str | None:
         if not s:
@@ -1207,9 +1195,17 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
                 -- Файл не привязан ни к одной персоне
                 (
                   NOT EXISTS (
-                      SELECT 1 FROM face_labels fl
-                      JOIN face_rectangles fr ON fr.id = fl.face_rectangle_id
-                      WHERE fr.file_path = f.path AND fr.run_id = ? AND fl.person_id IS NOT NULL
+                      -- Ручные привязки
+                      SELECT 1 FROM face_person_manual_assignments fpma
+                      JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
+                      WHERE fr.file_path = f.path AND fr.run_id = ? AND fpma.person_id IS NOT NULL
+                  )
+                  AND NOT EXISTS (
+                      -- Привязки через кластеры
+                      SELECT 1 FROM face_cluster_members fcm
+                      JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
+                      JOIN face_clusters fc ON fc.id = fcm.cluster_id
+                      WHERE fr.file_path = f.path AND fr.run_id = ? AND fc.person_id IS NOT NULL
                   )
                   AND NOT EXISTS (
                       SELECT 1 FROM person_rectangles pr
@@ -1329,7 +1325,7 @@ def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
         cur = conn.cursor()
         
         # Получаем персон с файлами через все 4 способа привязки
-        # 1. Через лица (face_labels) - прямая привязка
+        # 1. Через лица (face_person_manual_assignments) - ручные привязки
         where_parts = ["fr.run_id = ?"]
         params = [face_run_id_i]
         if root_like:
@@ -1341,22 +1337,22 @@ def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
         query1_start = time.time()
         cur.execute(
             f"""
-            SELECT DISTINCT fl.person_id, p.name AS person_name, COUNT(DISTINCT fr.file_path) AS files_count
-            FROM face_labels fl
-            JOIN face_rectangles fr ON fr.id = fl.face_rectangle_id
-            LEFT JOIN persons p ON p.id = fl.person_id
-            WHERE {where_sql} AND fl.person_id IS NOT NULL
-            GROUP BY fl.person_id, p.name
+            SELECT DISTINCT fpma.person_id, p.name AS person_name, COUNT(DISTINCT fr.file_path) AS files_count
+            FROM face_person_manual_assignments fpma
+            JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
+            LEFT JOIN persons p ON p.id = fpma.person_id
+            WHERE {where_sql} AND fpma.person_id IS NOT NULL
+            GROUP BY fpma.person_id, p.name
             """,
             params,
         )
         persons_from_faces = {r["person_id"]: {"id": r["person_id"], "name": r["person_name"], "files_count": int(r["files_count"] or 0)} for r in cur.fetchall()}
         query1_time = time.time() - query1_start
-        msg = f"[API] api_faces_persons_with_files: запрос 1 (face_labels) занял {query1_time:.3f}с, персон: {len(persons_from_faces)}"
+        msg = f"[API] api_faces_persons_with_files: запрос 1 (face_person_manual_assignments) занял {query1_time:.3f}с, персон: {len(persons_from_faces)}"
         logger.info(msg)
         print(msg)
         
-        # 1b. Через кластеры (лицо в файле находится в кластере, где есть другие лица с face_labels для персоны)
+        # 1b. Через кластеры (лицо в файле находится в кластере, привязанном к персоне через face_clusters.person_id)
         where_parts_cluster = ["fr_cluster.run_id = ?"]
         params_cluster = [face_run_id_i]
         if root_like:
@@ -1370,35 +1366,26 @@ def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
         cur.execute(
             f"""
             SELECT 
-                person_clusters.person_id,
+                fc.person_id,
                 p.name AS person_name,
                 COUNT(DISTINCT fr_cluster.file_path) AS files_count
-            FROM (
-                -- Находим все кластеры, где есть лица с привязанными персонами
-                SELECT DISTINCT
-                    fl_cluster.person_id,
-                    fcm_labeled.cluster_id
-                FROM face_labels fl_cluster
-                JOIN face_cluster_members fcm_labeled ON fcm_labeled.face_rectangle_id = fl_cluster.face_rectangle_id
-                JOIN face_clusters fc ON fc.id = fcm_labeled.cluster_id
-                WHERE fl_cluster.person_id IS NOT NULL
-                  AND (fc.run_id = ? OR fc.archive_scope = 'archive')
-            ) person_clusters
-            -- Находим все лица в этих кластерах
-            JOIN face_cluster_members fcm_all ON fcm_all.cluster_id = person_clusters.cluster_id
+            FROM face_cluster_members fcm_all
+            JOIN face_clusters fc ON fc.id = fcm_all.cluster_id
             JOIN face_rectangles fr_cluster ON fr_cluster.id = fcm_all.face_rectangle_id
-            LEFT JOIN persons p ON p.id = person_clusters.person_id
+            LEFT JOIN persons p ON p.id = fc.person_id
             WHERE {where_sql_cluster}
               AND COALESCE(fr_cluster.ignore_flag, 0) = 0
+              AND fc.person_id IS NOT NULL
+              AND (fc.run_id = ? OR fc.archive_scope = 'archive')
               -- Исключаем лица, которые уже учтены в запросе 1 (прямая привязка)
               AND NOT EXISTS (
-                  SELECT 1 FROM face_labels fl_direct
-                  WHERE fl_direct.face_rectangle_id = fr_cluster.id
-                    AND fl_direct.person_id = person_clusters.person_id
+                  SELECT 1 FROM face_person_manual_assignments fpma_direct
+                  WHERE fpma_direct.face_rectangle_id = fr_cluster.id
+                    AND fpma_direct.person_id = fc.person_id
               )
-            GROUP BY person_clusters.person_id, p.name
+            GROUP BY fc.person_id, p.name
             """,
-            [face_run_id_i] + params_cluster,
+            params_cluster + [face_run_id_i],
         )
         persons_from_clusters = {r["person_id"]: {"id": r["person_id"], "name": r["person_name"], "files_count": int(r["files_count"] or 0)} for r in cur.fetchall()}
         query2_time = time.time() - query2_start
@@ -1650,34 +1637,49 @@ def api_faces_rectangles(pipeline_run_id: int, path: str) -> dict[str, Any]:
         rects = fs.list_rectangles(run_id=face_run_id_i, file_path=str(path))
         
         # Добавляем информацию о персонах для каждого прямоугольника
-        ds = DedupStore()
-        try:
-            conn = ds.conn
-            cur = conn.cursor()
-            
-            # Получаем информацию о персонах для каждого прямоугольника
-            for rect in rects:
+        # face_clusters, face_person_manual_assignments и persons находятся в FaceStore
+        fs_conn = fs.conn
+        fs_cur = fs_conn.cursor()
+        
+        # Получаем информацию о персонах для каждого прямоугольника
+        for rect in rects:
                 rect_id = rect.get("id")
                 if not rect_id:
                     continue
                 
-                # Ищем персону через face_labels
-                cur.execute("""
-                    SELECT fl.person_id, p.name AS person_name
-                    FROM face_labels fl
-                    LEFT JOIN persons p ON p.id = fl.person_id
-                    WHERE fl.face_rectangle_id = ? AND fl.person_id IS NOT NULL
+                # Ищем персону через кластеры (FaceStore)
+                fs_cur.execute("""
+                    SELECT fc.person_id
+                    FROM face_cluster_members fcm
+                    JOIN face_clusters fc ON fcm.cluster_id = fc.id
+                    WHERE fcm.face_rectangle_id = ? AND fc.person_id IS NOT NULL
                     LIMIT 1
                 """, (rect_id,))
-                person_row = cur.fetchone()
-                if person_row:
-                    rect["person_id"] = person_row["person_id"]
-                    rect["person_name"] = person_row["person_name"]
+                cluster_row = fs_cur.fetchone()
+                person_id = cluster_row["person_id"] if cluster_row else None
+                
+                # Если не нашли через кластер, ищем через ручные привязки (FaceStore)
+                if not person_id:
+                    fs_cur.execute("""
+                        SELECT person_id
+                        FROM face_person_manual_assignments
+                        WHERE face_rectangle_id = ? AND person_id IS NOT NULL
+                        LIMIT 1
+                    """, (rect_id,))
+                    manual_row = fs_cur.fetchone()
+                    person_id = manual_row["person_id"] if manual_row else None
+                
+                # Если нашли person_id, получаем имя из FaceStore (persons находится там же)
+                if person_id:
+                    fs_cur.execute("SELECT name, is_me FROM persons WHERE id = ?", (person_id,))
+                    person_row = fs_cur.fetchone()
+                    rect["person_id"] = person_id
+                    rect["person_name"] = person_row["name"] if person_row else None
+                    rect["is_me"] = bool(person_row["is_me"]) if person_row and person_row["is_me"] else False
                 else:
                     rect["person_id"] = None
                     rect["person_name"] = None
-        finally:
-            ds.close()
+                    rect["is_me"] = False
     finally:
         fs.close()
     
@@ -1730,12 +1732,12 @@ def api_faces_assign_face_person(payload: dict[str, Any] = Body(...)) -> dict[st
         if not person_row:
             raise HTTPException(status_code=404, detail="person_id not found")
         
-        # Создаем или обновляем face_labels
+        # Создаем или обновляем ручную привязку в face_person_manual_assignments
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
         
         cur.execute("""
-            INSERT OR REPLACE INTO face_labels (face_rectangle_id, person_id, source, created_at)
+            INSERT OR REPLACE INTO face_person_manual_assignments (face_rectangle_id, person_id, source, created_at)
             VALUES (?, ?, 'manual', ?)
         """, (int(face_rectangle_id), int(person_id), now))
         conn.commit()
@@ -1777,20 +1779,20 @@ def api_faces_file_persons(pipeline_run_id: int, path: str) -> dict[str, Any]:
         ds_cur = ds.conn.cursor()
         persons_set = {}
         
-        # 1. Через face_labels (лица) - получаем информацию о лицах (прямая привязка)
+        # 1. Через ручные привязки (face_person_manual_assignments) - получаем информацию о лицах (прямая привязка)
         fs_cur.execute("""
             SELECT 
-                fl.person_id, 
+                fpma.person_id, 
                 p.name AS person_name,
                 fr.id AS face_rectangle_id,
                 fr.bbox_x AS x,
                 fr.bbox_y AS y,
                 fr.bbox_w AS w,
                 fr.bbox_h AS h
-            FROM face_labels fl
-            JOIN face_rectangles fr ON fr.id = fl.face_rectangle_id
-            LEFT JOIN persons p ON p.id = fl.person_id
-            WHERE fr.file_path = ? AND fr.run_id = ? AND fl.person_id IS NOT NULL
+            FROM face_person_manual_assignments fpma
+            JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
+            LEFT JOIN persons p ON p.id = fpma.person_id
+            WHERE fr.file_path = ? AND fr.run_id = ? AND fpma.person_id IS NOT NULL
             ORDER BY fr.id
         """, (str(path), face_run_id_i))
         for row in fs_cur.fetchall():
@@ -1809,47 +1811,39 @@ def api_faces_file_persons(pipeline_run_id: int, path: str) -> dict[str, Any]:
                 "h": row["h"]
             })
         
-        # 1b. Через кластеры (лицо в файле находится в кластере, где есть другие лица с face_labels для персоны)
-        # Логика из analyze_person_distribution.py:
-        # - Находим кластеры, где есть лица с face_labels для персоны
-        # - Находим ВСЕ лица в этих кластерах (включая новые, без face_labels)
-        # - Если лицо из файла находится в таком кластере, оно считается привязанным к персоне
-        # Важно: показываем персону только если хотя бы одно лицо в файле находится в кластере с этой персоной
+        # 1b. Через кластеры (лицо в файле находится в кластере, привязанном к персоне)
+        # Логика:
+        # - Находим все кластеры, где есть лица из файла
+        # - Для каждого кластера определяем персону из face_clusters.person_id
+        # - ВСЕ лица в кластере наследуют эту персону (включая лица из файла)
+        # Важно: если в кластере person_id = NULL - кластер не назначен персоне
         fs_cur.execute("""
             SELECT DISTINCT
-                fl_cluster.person_id,
+                fc.person_id,
                 p.name AS person_name,
                 fr_file.id AS face_rectangle_id,
                 fr_file.bbox_x AS x,
                 fr_file.bbox_y AS y,
                 fr_file.bbox_w AS w,
                 fr_file.bbox_h AS h
-            FROM persons p
-            JOIN face_labels fl_cluster ON fl_cluster.person_id = p.id
-            -- Находим кластеры, где есть лица с face_labels для этой персоны
-            JOIN face_cluster_members fcm_labeled ON fcm_labeled.face_rectangle_id = fl_cluster.face_rectangle_id
-            JOIN face_clusters fc ON fc.id = fcm_labeled.cluster_id
-            -- Находим ВСЕ лица в этих кластерах (включая лица из нашего файла)
-            JOIN face_cluster_members fcm_all ON fcm_all.cluster_id = fc.id
-            JOIN face_rectangles fr_file ON fr_file.id = fcm_all.face_rectangle_id
+            FROM face_rectangles fr_file
+            -- Находим кластеры, где есть лица из файла
+            JOIN face_cluster_members fcm_file ON fcm_file.face_rectangle_id = fr_file.id
+            JOIN face_clusters fc ON fc.id = fcm_file.cluster_id
+            -- Для каждого кластера определяем персону через face_clusters.person_id
+            LEFT JOIN persons p ON p.id = fc.person_id
             WHERE fr_file.file_path = ?
               AND fr_file.run_id = ?
               AND COALESCE(fr_file.ignore_flag, 0) = 0
+              AND fc.person_id IS NOT NULL
               AND (fc.run_id = ? OR fc.archive_scope = 'archive')
-              -- Исключаем лица, которые уже есть в прямой привязке (face_labels) для этой персоны
+              -- Исключаем лица, которые уже есть в прямой привязке (face_person_manual_assignments) для этой персоны
               AND NOT EXISTS (
-                  SELECT 1 FROM face_labels fl_direct
-                  WHERE fl_direct.face_rectangle_id = fr_file.id
-                    AND fl_direct.person_id = fl_cluster.person_id
+                  SELECT 1 FROM face_person_manual_assignments fpma_direct
+                  WHERE fpma_direct.face_rectangle_id = fr_file.id
+                    AND fpma_direct.person_id = fc.person_id
               )
-              -- Исключаем случаи, когда лицо из файла само имеет face_label для другой персоны
-              -- (т.е. если лицо уже привязано к другой персоне напрямую, не показываем его через кластеры)
-              AND NOT EXISTS (
-                  SELECT 1 FROM face_labels fl_other
-                  WHERE fl_other.face_rectangle_id = fr_file.id
-                    AND fl_other.person_id IS NOT NULL
-              )
-            ORDER BY fl_cluster.person_id, fr_file.id
+            ORDER BY fc.person_id, fr_file.id
         """, (str(path), face_run_id_i, face_run_id_i))
         for row in fs_cur.fetchall():
             pid = row["person_id"]

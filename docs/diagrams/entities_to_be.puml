@@ -135,30 +135,28 @@ persons "0..1" -- "0..1" face_rectangles : аватар (лицо)
 folders "0..1" -- "*" media_files : файлы в папке (parent_path)
 pipeline_runs "0..1" -- "0..1" face_runs : шаг (лица)
 
-class face_labels <<table>> {
+class face_person_manual_assignments <<table>> {
   +id: INTEGER <<PK>>
   face_rectangle_id: INTEGER <<FK>>
   person_id: INTEGER <<FK>>
-  source: TEXT                  ' manual|cluster|ai
+  source: TEXT                  ' manual|restored_from_gold|ai
   confidence: REAL
   created_at: TEXT
 }
 
-face_rectangles "1" -- "0..1" face_labels : назначение персоны
-persons "1" -- "*" face_labels : метки лица
+face_rectangles "1" -- "0..*" face_person_manual_assignments : ручные привязки лица
+persons "1" -- "*" face_person_manual_assignments : ручная привязка к персоне
 
-note right of face_labels
-  ВАЖНО: cluster_id удалён из face_labels
-  (рефакторинг для устранения избыточности)
+note right of face_person_manual_assignments
+  ТОЛЬКО для ручных привязок отдельных лиц
+  (не через кластеры)
   
-  Кластер определяется через JOIN:
-  face_labels → face_cluster_members → face_clusters
+  Кластеры привязаны к персонам через
+  face_clusters.person_id напрямую
   
-  face_cluster_members — единственный источник истины
-  о том, в каком кластере находится лицо
-  
-  Если лицо не в кластере (noise) —
-  face_labels хранит только связь с персоной
+  Лица в кластере наследуют персону через:
+  face_rectangles → face_cluster_members → 
+  face_clusters.person_id
 end note
 
 class face_identity_candidates <<table>> {
@@ -218,6 +216,7 @@ face_rectangles "1" -- "0..*" face_embeddings : эмбеддинги (модел
 class face_clusters <<table>> {
   +id: INTEGER <<PK>>
   run_id: INTEGER <<FK>>
+  person_id: INTEGER <<FK>>        ' прямая привязка кластера к персоне
   method: TEXT
   params_json: TEXT
   created_at: TEXT
@@ -230,7 +229,17 @@ class face_cluster_members <<table>> {
 
 face_runs "1" -- "*" face_clusters : кластеры
 face_clusters "1" -- "*" face_cluster_members : элементы кластера
+face_clusters "0..1" -- "0..1" persons : привязка кластера к персоне (person_id)
 face_rectangles "1" -- "*" face_cluster_members : участие в кластере
+
+note right of face_clusters
+  person_id: прямая привязка кластера к персоне
+  
+  Все лица в кластере наследуют персону
+  через JOIN с face_cluster_members
+  
+  Если person_id = NULL — кластер не назначен
+end note
 
 note bottom
   Семантика только:[X]:

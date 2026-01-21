@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 
 from fastapi import Body, FastAPI, HTTPException, Request, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from common.db import DedupStore, FaceStore, PipelineStore, list_folders
@@ -50,6 +51,42 @@ except Exception:
     pass
 
 app = FastAPI(title="PhotoSorter")
+
+# Favicon должен быть ДО mount static, чтобы не конфликтовать
+@app.get("/favicon.ico")
+def favicon():
+    """Возвращает favicon для PhotoSorter (ICO, PNG или SVG)."""
+    # Сначала пробуем ICO (стандартный формат)
+    favicon_ico = APP_DIR / "static" / "favicon.ico"
+    if favicon_ico.exists():
+        return FileResponse(
+            path=str(favicon_ico),
+            media_type="image/x-icon",
+            headers={"Cache-Control": "public, max-age=86400"}  # Кеш на 1 день
+        )
+    # Fallback на PNG
+    favicon_png = APP_DIR / "static" / "favicon.png"
+    if favicon_png.exists():
+        return FileResponse(
+            path=str(favicon_png),
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"}  # Кеш на 1 день
+        )
+    # Fallback на SVG
+    favicon_svg = APP_DIR / "static" / "favicon.svg"
+    if favicon_svg.exists():
+        return FileResponse(
+            path=str(favicon_svg),
+            media_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=86400"}  # Кеш на 1 день
+        )
+    return Response(status_code=204)  # No Content если файл не найден
+
+# Подключаем статические файлы
+static_dir = APP_DIR / "static"
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
 app.include_router(gold_router)
 app.include_router(preclean_router)
 app.include_router(dedup_results_router)

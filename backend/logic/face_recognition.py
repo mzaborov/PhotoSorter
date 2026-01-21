@@ -401,29 +401,22 @@ def _try_add_to_existing_clusters(
     if len(cluster_centroids) == 0:
         return 0, new_face_rows
     
-    # Получаем привязку кластеров к персонам (если есть)
-    # Если у кластера несколько персон, берем самую частую
+    # Получаем привязку кластеров к персонам через face_clusters.person_id
     if len(cluster_centroids) > 0:
         cur.execute("""
             SELECT 
                 fc.id AS cluster_id,
-                fl.person_id,
-                COUNT(*) AS person_count
+                fc.person_id
             FROM face_clusters fc
-            JOIN face_cluster_members fcm ON fcm.cluster_id = fc.id
-            JOIN face_labels fl ON fl.face_rectangle_id = fcm.face_rectangle_id
             WHERE fc.id IN ({})
-            GROUP BY fc.id, fl.person_id
-            ORDER BY fc.id, person_count DESC
+            AND fc.person_id IS NOT NULL
         """.format(",".join("?" * len(cluster_centroids))), list(cluster_centroids.keys()))
         
         cluster_to_person: dict[int, int] = {}  # cluster_id -> person_id
         for row in cur.fetchall():
             cluster_id = row['cluster_id']
             person_id = row['person_id']
-            # Берем первую (самую частую) персону для кластера
-            if cluster_id not in cluster_to_person:
-                cluster_to_person[cluster_id] = person_id
+            cluster_to_person[cluster_id] = person_id
     else:
         cluster_to_person = {}
     
@@ -588,68 +581,27 @@ def _save_clusters_to_db(
 
 def assign_cluster_to_person(*, cluster_id: int, person_id: int | None) -> None:
     """
-    Назначает кластер персоне (создаёт face_labels для всех лиц в кластере).
-    При назначении новой персоны удаляет все старые назначения для этого кластера.
-    Если person_id=None, только удаляет назначения (снимает назначение).
+    Назначает кластер персоне (устанавливает face_clusters.person_id).
+    Лица в кластере наследуют персону через JOIN с face_clusters.person_id.
+    НЕ создаёт face_person_manual_assignments (кластер привязан через person_id).
     
     Args:
         cluster_id: ID кластера
         person_id: ID персоны из справочника, или None для снятия назначения
     """
-    from datetime import datetime, timezone
-    
     conn = get_connection()
     cur = conn.cursor()
     
-    # УДАЛЯЕМ все старые назначения для этого кластера
-    # Получаем все лица из кластера и удаляем их face_labels
+    # Устанавливаем person_id в face_clusters
+    # Если person_id=None, снимаем назначение (устанавливаем NULL)
     cur.execute(
         """
-        DELETE FROM face_labels
-        WHERE face_rectangle_id IN (
-            SELECT face_rectangle_id
-            FROM face_cluster_members
-            WHERE cluster_id = ?
-        )
+        UPDATE face_clusters
+        SET person_id = ?
+        WHERE id = ?
         """,
-        (cluster_id,),
+        (person_id, cluster_id),
     )
-    
-    # Если person_id=None, только удаляем назначения и выходим
-    if person_id is None:
-        conn.commit()
-        return
-    
-    # Получаем все лица из кластера
-    cur.execute(
-        """
-        SELECT face_rectangle_id
-        FROM face_cluster_members
-        WHERE cluster_id = ?
-        """,
-        (cluster_id,),
-    )
-    
-    face_ids = [row["face_rectangle_id"] for row in cur.fetchall()]
-    
-    if len(face_ids) == 0:
-        conn.commit()
-        return
-    
-    # Создаём новые face_labels для всех лиц в кластере с новой персоной
-    now = datetime.now(timezone.utc).isoformat()
-    
-    for face_id in face_ids:
-        # Создаём новую метку (старые уже удалены)
-        # ВАЖНО: cluster_id больше не храним в face_labels, кластер определяется через face_cluster_members
-        # Используем INSERT OR REPLACE для предотвращения дубликатов (UNIQUE индекс на face_rectangle_id, person_id)
-        cur.execute(
-            """
-            INSERT OR REPLACE INTO face_labels (face_rectangle_id, person_id, source, confidence, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (face_id, person_id, "cluster", 0.8, now),
-        )
     
     conn.commit()
 
@@ -672,6 +624,7 @@ def get_cluster_info(*, cluster_id: int, limit: int | None = None) -> dict[str, 
             fc.id, fc.run_id, fc.method, fc.params_json, fc.created_at,
             fr.id as face_rectangle_id, fr.file_path, fr.face_index, 
             fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
+            fr.archive_scope, fr.run_id as face_run_id,
             f.image_width, f.image_height, f.exif_orientation,
             fr.thumb_jpeg, fr.confidence,
             (fr.bbox_w * fr.bbox_h) as bbox_area
@@ -680,7 +633,9 @@ def get_cluster_info(*, cluster_id: int, limit: int | None = None) -> dict[str, 
         JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
         LEFT JOIN files f ON fr.file_path = f.path
         WHERE fc.id = ? AND COALESCE(fr.ignore_flag, 0) = 0
-        ORDER BY bbox_area DESC, fr.confidence DESC
+        ORDER BY 
+            CASE WHEN fr.archive_scope = 'archive' THEN 0 ELSE 1 END,
+            bbox_area DESC, fr.confidence DESC
     """
     params = [cluster_id]
     
@@ -698,10 +653,26 @@ def get_cluster_info(*, cluster_id: int, limit: int | None = None) -> dict[str, 
             import base64
             thumb_base64 = base64.b64encode(row["thumb_jpeg"]).decode("utf-8")
         
+        # Добавляем информацию об archive_scope для сортировки
+        archive_scope = None
+        run_id = None
+        
+        if "archive_scope" in row.keys():
+            archive_scope = row["archive_scope"]
+        
+        if "face_run_id" in row.keys():
+            run_id = row["face_run_id"]
+        is_archive = archive_scope == 'archive' if archive_scope else False
+        is_run = not is_archive and run_id is not None
+        
         faces.append({
             "face_id": row["face_rectangle_id"],
             "file_path": row["file_path"],
             "face_index": row["face_index"],
+            "archive_scope": archive_scope,
+            "run_id": run_id,
+            "is_archive": is_archive,
+            "is_run": is_run,
             "bbox": {
                 "x": row["bbox_x"],
                 "y": row["bbox_y"],
@@ -731,19 +702,21 @@ def get_cluster_info(*, cluster_id: int, limit: int | None = None) -> dict[str, 
     count_row = cur.fetchone()
     total_faces = count_row["count"] if count_row else 0
     
-    # Получаем связанные персоны (если есть)
+    # Получаем связанную персону (если есть) через face_clusters.person_id
     cur.execute(
         """
-        SELECT DISTINCT fl.person_id, p.name
-        FROM face_labels fl
-        JOIN persons p ON fl.person_id = p.id
-        JOIN face_cluster_members fcm ON fl.face_rectangle_id = fcm.face_rectangle_id
-        WHERE fcm.cluster_id = ?
+        SELECT fc.person_id, p.name
+        FROM face_clusters fc
+        LEFT JOIN persons p ON fc.person_id = p.id
+        WHERE fc.id = ? AND fc.person_id IS NOT NULL
         """,
         (cluster_id,),
     )
     
-    persons = [{"id": row["person_id"], "name": row["name"]} for row in cur.fetchall()]
+    person_row = cur.fetchone()
+    persons = []
+    if person_row and person_row["person_id"]:
+        persons = [{"id": person_row["person_id"], "name": person_row["name"]}]
     
     # Получаем информацию о кластере (run_id, method, created_at)
     cur.execute(
@@ -947,17 +920,17 @@ def find_closest_cluster_with_person_for_face(
         f"""
         SELECT 
             fc.id as cluster_id,
-            fl.person_id,
+            fc.person_id,
             p.name as person_name,
             fr.embedding
         FROM face_clusters fc
         JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
         JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
-        JOIN face_labels fl ON fcm.face_rectangle_id = fl.face_rectangle_id
-        JOIN persons p ON fl.person_id = p.id
+        LEFT JOIN persons p ON fc.person_id = p.id
         WHERE fr.embedding IS NOT NULL
           AND COALESCE(fr.ignore_flag, 0) = 0
-          AND p.name != ?
+          AND fc.person_id IS NOT NULL
+          AND (p.name IS NULL OR p.name != ?)
           {exclude_clause}
         GROUP BY fc.id, fl.person_id, p.name
         """,
@@ -1091,19 +1064,19 @@ def find_closest_cluster_with_person_for_face_by_min_distance(
         f"""
         SELECT 
             fc.id as cluster_id,
-            fl.person_id,
+            fc.person_id,
             p.name as person_name,
             fr.embedding
         FROM face_clusters fc
         JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
         JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
-        JOIN face_labels fl ON fcm.face_rectangle_id = fl.face_rectangle_id
-        JOIN persons p ON fl.person_id = p.id
+        JOIN persons p ON fc.person_id = p.id
         WHERE fr.embedding IS NOT NULL
           AND COALESCE(fr.ignore_flag, 0) = 0
+          AND fc.person_id IS NOT NULL
           AND p.name != ?
           {exclude_clause}
-        GROUP BY fc.id, fl.person_id, p.name
+        GROUP BY fc.id, fc.person_id, p.name
         """,
         tuple(exclude_params),
     )
@@ -1267,12 +1240,7 @@ def find_similar_single_face_clusters(
                FROM face_cluster_members fcm2
                JOIN face_rectangles fr2 ON fcm2.face_rectangle_id = fr2.id
                WHERE fcm2.cluster_id = fc.id AND COALESCE(fr2.ignore_flag, 0) = 0) = 1
-          AND (SELECT p2.id 
-               FROM face_labels fl2 
-               JOIN persons p2 ON fl2.person_id = p2.id 
-               JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id
-WHERE fcm2.cluster_id = fc.id 
-               LIMIT 1) IS NULL
+          AND fc.person_id IS NULL
         ORDER BY fc.id
         """,
         tuple(where_params),
@@ -1393,7 +1361,7 @@ def find_small_clusters_to_merge_in_person(
     # Фильтр по person_id используем через подзапрос
     person_id_condition = ""
     if person_id is not None:
-        person_id_condition = "AND (SELECT fl2.person_id FROM face_labels fl2 JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id WHERE fcm2.cluster_id = fc.id LIMIT 1) = ?"
+        person_id_condition = "AND fc.person_id = ?"
         where_params.append(person_id)
     
     # Отладочное логирование
@@ -1402,38 +1370,25 @@ def find_small_clusters_to_merge_in_person(
     logger.debug(f"[find_small_clusters_to_merge_in_person] person_id={person_id}, max_size={max_size}, max_distance={max_distance}")
     logger.debug(f"[find_small_clusters_to_merge_in_person] WHERE clause: {where_clause}, person_id_condition: {person_id_condition}, params: {where_params}")
     
-    # Находим все маленькие кластеры с персоной
-    # Используем подзапрос для получения person_id, чтобы избежать дубликатов от JOIN с face_labels
+    # Находим все маленькие кластеры с персоной через face_clusters.person_id
     sql_query = f"""
         SELECT 
-            (SELECT fl2.person_id 
-             FROM face_labels fl2 
-             JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id
-WHERE fcm2.cluster_id = fc.id 
-             LIMIT 1) as person_id,
-            (SELECT p2.name 
-             FROM face_labels fl2 
-             JOIN persons p2 ON fl2.person_id = p2.id 
-             JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id
-WHERE fcm2.cluster_id = fc.id 
-             LIMIT 1) as person_name,
+            fc.person_id,
+            p.name as person_name,
             fc.id as cluster_id,
             COUNT(DISTINCT fcm.face_rectangle_id) as cluster_size
         FROM face_clusters fc
         JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
         JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
+        LEFT JOIN persons p ON fc.person_id = p.id
         WHERE {where_clause}
           AND COALESCE(fr.ignore_flag, 0) = 0
           AND fr.embedding IS NOT NULL
-          AND (SELECT fl2.person_id 
-               FROM face_labels fl2 
-               JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id
-WHERE fcm2.cluster_id = fc.id 
-               LIMIT 1) IS NOT NULL
+          AND fc.person_id IS NOT NULL
           {person_id_condition}
-        GROUP BY fc.id
+        GROUP BY fc.id, fc.person_id, p.name
         HAVING cluster_size <= ?
-        ORDER BY person_id, fc.id
+        ORDER BY fc.person_id, fc.id
     """
     
     logger.debug(f"[find_small_clusters_to_merge_in_person] SQL query: {sql_query}")
@@ -1647,40 +1602,28 @@ def find_optimal_clusters_to_merge_in_person(
     # ВАЖНО: person_id НЕ добавляем в where_params, т.к. он передается отдельно в параметрах запросов
     person_id_condition = ""
     if person_id is not None:
-        person_id_condition = "AND (SELECT fl2.person_id FROM face_labels fl2 JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id WHERE fcm2.cluster_id = fc.id LIMIT 1) = ?"
+        person_id_condition = "AND fc.person_id = ?"
     logger.info(f"[find_optimal_clusters_to_merge_in_person] person_id={person_id}, max_source_size={max_source_size}, max_distance={max_distance}")
     
     # Шаг 1: Находим маленькие кластеры (источники)
     sql_query_sources = f"""
         SELECT 
-            (SELECT fl2.person_id 
-             FROM face_labels fl2 
-             JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id
-WHERE fcm2.cluster_id = fc.id 
-             LIMIT 1) as person_id,
-            (SELECT p2.name 
-             FROM face_labels fl2 
-             JOIN persons p2 ON fl2.person_id = p2.id 
-             JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id
-WHERE fcm2.cluster_id = fc.id 
-             LIMIT 1) as person_name,
+            fc.person_id,
+            p.name as person_name,
             fc.id as cluster_id,
             COUNT(DISTINCT fcm.face_rectangle_id) as cluster_size
         FROM face_clusters fc
         JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
         JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
+        LEFT JOIN persons p ON fc.person_id = p.id
         WHERE {where_clause}
           AND COALESCE(fr.ignore_flag, 0) = 0
           AND fr.embedding IS NOT NULL
-          AND (SELECT fl2.person_id 
-               FROM face_labels fl2 
-               JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id
-WHERE fcm2.cluster_id = fc.id 
-               LIMIT 1) IS NOT NULL
+          AND fc.person_id IS NOT NULL
           {person_id_condition}
-        GROUP BY fc.id
+        GROUP BY fc.id, fc.person_id, p.name
         HAVING cluster_size <= ?
-        ORDER BY person_id, fc.id
+        ORDER BY fc.person_id, fc.id
     """
     
     # Формируем параметры для первого запроса
@@ -1745,11 +1688,7 @@ WHERE fcm2.cluster_id = fc.id
             WHERE {where_clause}
               AND COALESCE(fr.ignore_flag, 0) = 0
               AND fr.embedding IS NOT NULL
-              AND (SELECT fl2.person_id 
-                   FROM face_labels fl2 
-                   JOIN face_cluster_members fcm2 ON fl2.face_rectangle_id = fcm2.face_rectangle_id
-WHERE fcm2.cluster_id = fc.id 
-                   LIMIT 1) = ?
+              AND fc.person_id = ?
             GROUP BY fc.id
             ORDER BY fc.id
         """
@@ -1918,20 +1857,18 @@ def merge_clusters(*, source_cluster_id: int, target_cluster_id: int) -> None:
     # Перемещаем только те лица, которых еще нет в target_cluster
     faces_to_move = [fid for fid in face_ids if fid not in existing_face_ids]
     
-    # ВАЖНО: Получаем все face_labels для source_cluster ДО перемещения лиц
-    # чтобы потом удалить их для всех перемещенных лиц
-    # Кластер определяется через JOIN с face_cluster_members
-    cur.execute(
-        """
-        SELECT fl.face_rectangle_id, fl.person_id
-        FROM face_labels fl
-        JOIN face_cluster_members fcm ON fl.face_rectangle_id = fcm.face_rectangle_id
-        WHERE fcm.cluster_id = ?
-        """,
-        (source_cluster_id,),
-    )
-    source_labels_to_cleanup = cur.fetchall()
-    source_labels_by_face = {(row["face_rectangle_id"], row["person_id"]) for row in source_labels_to_cleanup}
+    # Проверяем person_id для обоих кластеров
+    cur.execute("SELECT person_id FROM face_clusters WHERE id = ?", (source_cluster_id,))
+    source_person_id = cur.fetchone()["person_id"] if cur.fetchone() else None
+    cur.execute("SELECT person_id FROM face_clusters WHERE id = ?", (target_cluster_id,))
+    target_person_id = cur.fetchone()["person_id"] if cur.fetchone() else None
+    
+    # Если у source_cluster есть person_id, а у target_cluster нет - переносим person_id
+    if source_person_id and not target_person_id:
+        cur.execute(
+            "UPDATE face_clusters SET person_id = ? WHERE id = ?",
+            (source_person_id, target_cluster_id),
+        )
     
     # Если все лица уже в target_cluster, просто удаляем из source
     if len(faces_to_move) == 0:
@@ -1964,74 +1901,8 @@ def merge_clusters(*, source_cluster_id: int, target_cluster_id: int) -> None:
                 (target_cluster_id, face_id),
             )
     
-    # ВАЖНО: Удаляем face_labels для source_cluster для ВСЕХ лиц, которые были в source_cluster
-    # независимо от того, были ли они уже в target_cluster или нет
-    # Это предотвращает дубликаты записей face_labels
-    for face_id in face_ids:  # Все лица, которые были в source_cluster
-        # Находим person_id для этого лица из source_labels
-        person_ids_for_face = [pid for fid, pid in source_labels_by_face if fid == face_id]
-        
-        for person_id in person_ids_for_face:
-            # Удаляем face_label для этого лица и персоны
-            # ВАЖНО: cluster_id больше не храним, удаляем только по face_rectangle_id + person_id
-            cur.execute(
-                """
-                DELETE FROM face_labels
-                WHERE face_rectangle_id = ? AND person_id = ?
-                """,
-                (face_id, person_id),
-            )
-            
-            # Проверяем, есть ли уже face_label для этого лица и персоны
-            # (независимо от кластера, т.к. cluster_id больше не храним)
-            cur.execute(
-                """
-                SELECT id FROM face_labels
-                WHERE face_rectangle_id = ? AND person_id = ?
-                """,
-                (face_id, person_id),
-            )
-            
-            existing_label = cur.fetchone()
-            
-            if not existing_label:
-                # Получаем данные из старой записи для создания новой
-                # Ищем по face_rectangle_id + person_id (без cluster_id)
-                cur.execute(
-                    """
-                    SELECT source, confidence, created_at
-                    FROM face_labels
-                    WHERE face_rectangle_id = ? AND person_id = ?
-                    LIMIT 1
-                    """,
-                    (face_id, person_id),
-                )
-                old_label = cur.fetchone()
-                
-                if not old_label:
-                    # Если не нашли старую запись (уже удалили), используем значения по умолчанию
-                    from datetime import datetime, timezone
-                    now = datetime.now(timezone.utc).isoformat()
-                    # ВАЖНО: cluster_id больше не храним в face_labels
-                    # Используем INSERT OR REPLACE для предотвращения дубликатов
-                    cur.execute(
-                        """
-                        INSERT OR REPLACE INTO face_labels (face_rectangle_id, person_id, source, confidence, created_at)
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (face_id, person_id, "cluster", 0.8, now),
-                    )
-                else:
-                    # Создаем новую запись с данными из старой
-                    # ВАЖНО: cluster_id больше не храним в face_labels
-                    # Используем INSERT OR REPLACE для предотвращения дубликатов
-                    cur.execute(
-                        """
-                        INSERT OR REPLACE INTO face_labels (face_rectangle_id, person_id, source, confidence, created_at)
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (face_id, person_id, old_label["source"], old_label["confidence"], old_label["created_at"]),
-                    )
+    # Ручные привязки (face_person_manual_assignments) не трогаем - они остаются как есть
+    # Лица наследуют персону через face_clusters.person_id
     
     # Проверяем, что source_cluster стал пустым, и удаляем его
     cur.execute(
@@ -2045,21 +1916,6 @@ def merge_clusters(*, source_cluster_id: int, target_cluster_id: int) -> None:
     remaining_faces = cur.fetchone()["count"]
     
     if remaining_faces == 0:
-        # Удаляем оставшиеся face_labels для source_cluster (если они еще есть)
-        # Основная очистка уже была сделана выше при перемещении лиц
-        # Кластер определяется через JOIN с face_cluster_members
-        cur.execute(
-            """
-            DELETE FROM face_labels
-            WHERE face_rectangle_id IN (
-                SELECT face_rectangle_id
-                FROM face_cluster_members
-                WHERE cluster_id = ?
-            )
-            """,
-            (source_cluster_id,),
-        )
-        
         # Удаляем сам пустой кластер
         cur.execute("DELETE FROM face_clusters WHERE id = ?", (source_cluster_id,))
     

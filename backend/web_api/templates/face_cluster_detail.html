@@ -3,6 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.ico" />
     <meta name="referrer" content="no-referrer" />
     <title>PhotoSorter — Кластер лиц</title>
     <style>
@@ -98,7 +99,16 @@
       <div>
         <h3>Все лица в кластере (<span id="facesCount">-</span>)</h3>
         <div class="muted" style="margin-top:6px;">Двойной клик на лицо — открыть полную фотографию</div>
-        <div class="thumb-grid" id="facesGrid"></div>
+        <div id="facesGridContainer">
+          <div id="facesGridArchive" style="margin-bottom:24px;">
+            <h4 style="margin:0 0 12px 0; font-size:16px; font-weight:600; color:#1f2937;">Архив</h4>
+            <div class="thumb-grid" id="facesGridArchiveContent"></div>
+          </div>
+          <div id="facesGridRun">
+            <h4 style="margin:0 0 12px 0; font-size:16px; font-weight:600; color:#1f2937;">Текущий прогон</h4>
+            <div class="thumb-grid" id="facesGridRunContent"></div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -153,11 +163,16 @@
       </div>
     </div>
 
+    <script src="/static/face_rectangles_viewer.js"></script>
     <script>
       // Получаем cluster_id из URL: /face-clusters/123
       const pathParts = window.location.pathname.split('/').filter(p => p);
       const clusterId = parseInt(pathParts[pathParts.length - 1]) || 0;
       let persons = [];
+      
+      // Сохраняем ссылку на функцию из модуля ПЕРЕД любыми переопределениями
+      const drawAllFaceRectanglesFromModule = typeof drawAllFaceRectangles !== 'undefined' ? drawAllFaceRectangles : null;
+      const drawFaceRectangleFromModule = typeof drawFaceRectangle !== 'undefined' ? drawFaceRectangle : null;
       let clusterInfo = null;
       let undoStack = []; // История действий для undo
       let currentFaceBbox = null; // Bbox текущего отображаемого лица
@@ -389,19 +404,23 @@
           `;
           
           const faces = clusterInfo.faces || clusterInfo.example_faces || [];
-          const grid = document.getElementById('facesGrid');
           
-          if (!grid) {
-            console.error('Grid element not found');
+          // Разделяем лица на архивные и из текущего прогона
+          const archiveGrid = document.getElementById('facesGridArchiveContent');
+          const runGrid = document.getElementById('facesGridRunContent');
+          const archiveSection = document.getElementById('facesGridArchive');
+          const runSection = document.getElementById('facesGridRun');
+          
+          if (!archiveGrid || !runGrid || !archiveSection || !runSection) {
+            console.error('Grid elements not found');
             return;
           }
           
-          if (faces.length === 0) {
-            grid.innerHTML = '<div class="muted">Нет лиц в кластере</div>';
-            return;
-          }
+          const archiveFaces = faces.filter(f => f.is_archive);
+          const runFaces = faces.filter(f => f.is_run);
           
-          grid.innerHTML = faces.map(face => {
+          // Функция для рендеринга одного лица
+          const renderFace = (face) => {
             const thumbData = face.thumb_jpeg_base64 ? 
               `data:image/jpeg;base64,${face.thumb_jpeg_base64}` : 
               null;
@@ -420,7 +439,30 @@
                 </div>
               </div>
             `;
-          }).join('');
+          };
+          
+          // Рендерим архивные лица
+          if (archiveFaces.length === 0) {
+            archiveSection.style.display = 'none';
+          } else {
+            archiveSection.style.display = 'block';
+            archiveGrid.innerHTML = archiveFaces.map(renderFace).join('');
+          }
+          
+          // Рендерим лица из текущего прогона
+          if (runFaces.length === 0) {
+            runSection.style.display = 'none';
+          } else {
+            runSection.style.display = 'block';
+            runGrid.innerHTML = runFaces.map(renderFace).join('');
+          }
+          
+          // Если нет лиц вообще, показываем сообщение
+          if (faces.length === 0) {
+            archiveSection.style.display = 'block';
+            archiveGrid.innerHTML = '<div class="muted">Нет лиц в кластере</div>';
+            runSection.style.display = 'none';
+          }
           
           // Показываем кнопку "Зафиксировать в gold" если есть назначенная персона
           updateConfirmToGoldButton();
@@ -592,7 +634,14 @@
                   .then(res => res.json())
                   .then(data => {
                     allFacesOnImage = data.faces || [];
-                    drawAllFaceRectangles();
+                    // Получаем размеры исходного изображения из данных лица
+                    const face = clusterInfo.faces?.find(f => f.face_id === currentFaceId) || 
+                                 clusterInfo.example_faces?.find(f => f.face_id === currentFaceId);
+                    const originalImageSize = face?.image_size;
+                    if (drawAllFaceRectanglesFromModule) {
+                      drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+                    }
+                    drawFaceRectangleLocal();
                   })
                   .catch(err => {
                     console.error('Failed to reload faces:', err);
@@ -625,7 +674,14 @@
                 .then(data => {
                   console.log('Получены обновленные данные о лицах:', data.faces?.length);
                   allFacesOnImage = data.faces || [];
-                  drawAllFaceRectangles();
+                  // Получаем размеры исходного изображения из данных лица
+                  const face = clusterInfo.faces?.find(f => f.face_id === currentFaceId) || 
+                               clusterInfo.example_faces?.find(f => f.face_id === currentFaceId);
+                  const originalImageSize = face?.image_size;
+                  if (drawAllFaceRectanglesFromModule) {
+                    drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+                  }
+                  drawFaceRectangleLocal();
                 })
                 .catch(err => {
                   console.error('Failed to reload faces:', err);
@@ -835,7 +891,14 @@
                 }
                 // Перерисовываем rectangles с новыми размерами
                 if (lbImg && lbImg.complete) {
-                  drawAllFaceRectangles();
+                  // Получаем размеры исходного изображения из данных лица
+                  const face = clusterInfo.faces?.find(f => f.face_id === currentFaceId) || 
+                               clusterInfo.example_faces?.find(f => f.face_id === currentFaceId);
+                  const originalImageSize = face?.image_size;
+                  if (drawAllFaceRectanglesFromModule) {
+                    drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+                  }
+                  drawFaceRectangleLocal();
                 }
               }
             })
@@ -905,7 +968,14 @@
               facesLoaded: allFacesOnImage !== undefined,
               facesCount: allFacesOnImage?.length || 0
             });
-            drawAllFaceRectangles();
+            // Получаем размеры исходного изображения из данных лица
+            const face = clusterInfo.faces?.find(f => f.face_id === currentFaceId) || 
+                         clusterInfo.example_faces?.find(f => f.face_id === currentFaceId);
+            const originalImageSize = face?.image_size;
+            if (drawAllFaceRectanglesFromModule) {
+              drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+            }
+            drawFaceRectangleLocal();
           }
         }
         
@@ -936,14 +1006,28 @@
                     // Перерисовываем rectangle с новыми размерами
                     requestAnimationFrame(() => {
                       requestAnimationFrame(() => {
-                        drawAllFaceRectangles();
+                        // Получаем размеры исходного изображения из данных лица
+                    const face = clusterInfo.faces?.find(f => f.face_id === currentFaceId) || 
+                                 clusterInfo.example_faces?.find(f => f.face_id === currentFaceId);
+                    const originalImageSize = face?.image_size;
+                    if (drawAllFaceRectanglesFromModule) {
+                      drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+                    }
+                    drawFaceRectangleLocal();
                       });
                     });
                   } else {
                     // Если не удалось получить размеры, рисуем с эвристикой
                     requestAnimationFrame(() => {
                       requestAnimationFrame(() => {
-                        drawAllFaceRectangles();
+                        // Получаем размеры исходного изображения из данных лица
+                    const face = clusterInfo.faces?.find(f => f.face_id === currentFaceId) || 
+                                 clusterInfo.example_faces?.find(f => f.face_id === currentFaceId);
+                    const originalImageSize = face?.image_size;
+                    if (drawAllFaceRectanglesFromModule) {
+                      drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+                    }
+                    drawFaceRectangleLocal();
                       });
                     });
                   }
@@ -953,7 +1037,14 @@
                   // В случае ошибки рисуем с эвристикой
                   requestAnimationFrame(() => {
                     requestAnimationFrame(() => {
-                      drawAllFaceRectangles();
+                      // Получаем размеры исходного изображения из данных лица
+                    const face = clusterInfo.faces?.find(f => f.face_id === currentFaceId) || 
+                                 clusterInfo.example_faces?.find(f => f.face_id === currentFaceId);
+                    const originalImageSize = face?.image_size;
+                    if (drawAllFaceRectanglesFromModule) {
+                      drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+                    }
+                    drawFaceRectangleLocal();
                     });
                   });
                 });
@@ -961,7 +1052,14 @@
               // Размеры уже есть, просто рисуем
               requestAnimationFrame(() => {
                 requestAnimationFrame(() => {
-                  drawAllFaceRectangles();
+                  // Получаем размеры исходного изображения из данных лица
+                  const face = clusterInfo.faces?.find(f => f.face_id === currentFaceId) || 
+                               clusterInfo.example_faces?.find(f => f.face_id === currentFaceId);
+                  const originalImageSize = face?.image_size;
+                  if (drawAllFaceRectanglesFromModule) {
+                    drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+                  }
+                  drawFaceRectangleLocal();
                 });
               });
             }
@@ -993,14 +1091,28 @@
                     // Перерисовываем rectangle с новыми размерами
                     requestAnimationFrame(() => {
                       requestAnimationFrame(() => {
-                        drawAllFaceRectangles();
+                        // Получаем размеры исходного изображения из данных лица
+                    const face = clusterInfo.faces?.find(f => f.face_id === currentFaceId) || 
+                                 clusterInfo.example_faces?.find(f => f.face_id === currentFaceId);
+                    const originalImageSize = face?.image_size;
+                    if (drawAllFaceRectanglesFromModule) {
+                      drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+                    }
+                    drawFaceRectangleLocal();
                       });
                     });
                   } else {
                     // Если не удалось получить размеры, рисуем с эвристикой
                     requestAnimationFrame(() => {
                       requestAnimationFrame(() => {
-                        drawAllFaceRectangles();
+                        // Получаем размеры исходного изображения из данных лица
+                    const face = clusterInfo.faces?.find(f => f.face_id === currentFaceId) || 
+                                 clusterInfo.example_faces?.find(f => f.face_id === currentFaceId);
+                    const originalImageSize = face?.image_size;
+                    if (drawAllFaceRectanglesFromModule) {
+                      drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+                    }
+                    drawFaceRectangleLocal();
                       });
                     });
                   }
@@ -1010,7 +1122,14 @@
                   // В случае ошибки рисуем с эвристикой
                   requestAnimationFrame(() => {
                     requestAnimationFrame(() => {
-                      drawAllFaceRectangles();
+                      // Получаем размеры исходного изображения из данных лица
+                    const face = clusterInfo.faces?.find(f => f.face_id === currentFaceId) || 
+                                 clusterInfo.example_faces?.find(f => f.face_id === currentFaceId);
+                    const originalImageSize = face?.image_size;
+                    if (drawAllFaceRectanglesFromModule) {
+                      drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+                    }
+                    drawFaceRectangleLocal();
                     });
                   });
                 });
@@ -1018,7 +1137,14 @@
               // Размеры уже есть, просто рисуем
               requestAnimationFrame(() => {
                 requestAnimationFrame(() => {
-                  drawAllFaceRectangles();
+                  // Получаем размеры исходного изображения из данных лица
+                  const face = clusterInfo.faces?.find(f => f.face_id === currentFaceId) || 
+                               clusterInfo.example_faces?.find(f => f.face_id === currentFaceId);
+                  const originalImageSize = face?.image_size;
+                  if (drawAllFaceRectanglesFromModule) {
+                    drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+                  }
+                  drawFaceRectangleLocal();
                 });
               });
             }
@@ -1026,482 +1152,33 @@
         }
       }
       
-      function drawAllFaceRectangles() {
-        // Сначала рисуем остальные лица (желтые rectangles с подписями)
-        // Синий rectangle нарисуем в конце, чтобы он был поверх желтых
-        const lbImg = document.getElementById('lbImg');
-        const lbBody = document.getElementById('lbBody');
-        if (!lbImg || !lbBody || !lbImg.complete) {
-          console.log('drawAllFaceRectangles: элементы не готовы', {lbImg: !!lbImg, lbBody: !!lbBody, complete: lbImg?.complete});
-          return;
-        }
-        
-        // Удаляем старые желтые rectangles
-        const oldRects = lbBody.querySelectorAll('.lb-rectangle.other, .lb-rectangle-label');
-        oldRects.forEach(el => el.remove());
-        
-        if (!allFacesOnImage || allFacesOnImage.length === 0) {
-          console.log('drawAllFaceRectangles: нет других лиц на фото', {allFacesOnImage});
-          return;
-        }
-        
-        // Получаем размеры изображения
-        const imgRect = lbImg.getBoundingClientRect();
-        const imgNaturalWidth = lbImg.naturalWidth;
-        const imgNaturalHeight = lbImg.naturalHeight;
-        const imgDisplayWidth = imgRect.width;
-        const imgDisplayHeight = imgRect.height;
-        
-        if (imgNaturalWidth === 0 || imgNaturalHeight === 0) {
-          console.log('drawAllFaceRectangles: нулевые размеры изображения');
-          return;
-        }
-        
-        // Получаем размеры исходного изображения для масштабирования
-        const face = clusterInfo.faces?.find(f => f.face_id === currentFaceId) || 
-                     clusterInfo.example_faces?.find(f => f.face_id === currentFaceId);
-        const originalImageSize = face?.image_size;
-        
-        console.log('drawAllFaceRectangles: начинаем отрисовку', {
-          allFacesOnImageCount: allFacesOnImage.length,
-          currentFaceId,
-          originalImageSize,
-          imgNaturalWidth,
-          imgNaturalHeight,
-          imgDisplayWidth,
-          imgDisplayHeight
-        });
-        
-        // Рисуем каждое лицо (кроме текущего)
-        let drawnCount = 0;
-        for (const otherFace of allFacesOnImage) {
-          // Сравниваем как числа и как строки, так как face_id может быть числом или строкой
-          const otherFaceIdNum = Number(otherFace.face_id);
-          const currentFaceIdNum = Number(currentFaceId);
-          const otherFaceIdStr = String(otherFace.face_id);
-          const currentFaceIdStr = String(currentFaceId);
-          
-          const isCurrent = otherFaceIdNum === currentFaceIdNum || 
-                           otherFace.face_id === currentFaceId ||
-                           otherFaceIdStr === currentFaceIdStr;
-          
-          console.log('drawAllFaceRectangles: проверяем лицо', {
-            otherFaceId: otherFace.face_id,
-            otherFaceIdNum,
-            otherFaceIdStr,
-            currentFaceId,
-            currentFaceIdNum,
-            currentFaceIdStr,
-            isCurrent,
-            bbox: otherFace.bbox
-          });
-          
-          if (isCurrent) {
-            console.log('drawAllFaceRectangles: пропускаем текущее лицо (синий rectangle будет нарисован в конце)');
-            continue; // Пропускаем текущее лицо (оно будет нарисовано синим в конце)
-          }
-          
-          let bboxX = otherFace.bbox.x;
-          let bboxY = otherFace.bbox.y;
-          let bboxW = otherFace.bbox.w;
-          let bboxH = otherFace.bbox.h;
-          
-          // Масштабируем координаты (аналогично drawFaceRectangle)
-          if (originalImageSize && originalImageSize.width && originalImageSize.height) {
-            const originalWidth = originalImageSize.width;
-            const originalHeight = originalImageSize.height;
-            const exifOrientation = originalImageSize.exif_orientation;
-            const originalRatio = originalWidth / originalHeight;
-            const previewRatio = imgNaturalWidth / imgNaturalHeight;
-            const isRotated90 = Math.abs(originalRatio - 1/previewRatio) < 0.1;
-            
-            if (isRotated90 && exifOrientation) {
-              const scaleX = imgNaturalWidth / originalHeight;
-              const scaleY = imgNaturalHeight / originalWidth;
-              
-              if (exifOrientation === 6) {
-                const tempX = bboxX;
-                const tempW = bboxW;
-                bboxX = bboxY * scaleX;
-                bboxY = (originalWidth - tempX - tempW) * scaleY;
-                bboxW = bboxH * scaleX;
-                bboxH = tempW * scaleY;
-              } else if (exifOrientation === 8) {
-                const tempX = bboxX;
-                const tempW = bboxW;
-                bboxX = (originalHeight - bboxY - bboxH) * scaleX;
-                bboxY = tempX * scaleY;
-                bboxW = bboxH * scaleX;
-                bboxH = tempW * scaleY;
-              } else if (exifOrientation === 3) {
-                const scaleX2 = imgNaturalWidth / originalWidth;
-                const scaleY2 = imgNaturalHeight / originalHeight;
-                bboxX = (originalWidth - bboxX - bboxW) * scaleX2;
-                bboxY = (originalHeight - bboxY - bboxH) * scaleY2;
-                bboxW = bboxW * scaleX2;
-                bboxH = bboxH * scaleY2;
-              } else {
-                const scaleX2 = imgNaturalWidth / originalWidth;
-                const scaleY2 = imgNaturalHeight / originalHeight;
-                bboxX = bboxX * scaleX2;
-                bboxY = bboxY * scaleY2;
-                bboxW = bboxW * scaleX2;
-                bboxH = bboxH * scaleY2;
-              }
-            } else {
-              const scaleX = imgNaturalWidth / originalWidth;
-              const scaleY = imgNaturalHeight / originalHeight;
-              bboxX = bboxX * scaleX;
-              bboxY = bboxY * scaleY;
-              bboxW = bboxW * scaleX;
-              bboxH = bboxH * scaleY;
-            }
-          } else if (bboxX >= imgNaturalWidth || bboxY >= imgNaturalHeight || (bboxX + bboxW) > imgNaturalWidth || (bboxY + bboxH) > imgNaturalHeight) {
-            const originalWidth = Math.max(bboxX + bboxW, imgNaturalWidth);
-            const originalHeight = Math.max(bboxY + bboxH, imgNaturalHeight);
-            const scaleX = imgNaturalWidth / originalWidth;
-            const scaleY = imgNaturalHeight / originalHeight;
-            bboxX = bboxX * scaleX;
-            bboxY = bboxY * scaleY;
-            bboxW = bboxW * scaleX;
-            bboxH = bboxH * scaleY;
-          }
-          
-          // Ограничиваем границы
-          bboxX = Math.max(0, Math.min(bboxX, imgNaturalWidth));
-          bboxY = Math.max(0, Math.min(bboxY, imgNaturalHeight));
-          if (bboxX + bboxW > imgNaturalWidth) {
-            bboxW = Math.max(1, imgNaturalWidth - bboxX);
-          }
-          if (bboxY + bboxH > imgNaturalHeight) {
-            bboxH = Math.max(1, imgNaturalHeight - bboxY);
-          }
-          bboxW = Math.max(1, Math.min(bboxW, imgNaturalWidth - bboxX));
-          bboxH = Math.max(1, Math.min(bboxH, imgNaturalHeight - bboxY));
-          
-          // Масштабируем к отображаемому размеру
-          const scaleX = imgDisplayWidth / imgNaturalWidth;
-          const scaleY = imgDisplayHeight / imgNaturalHeight;
-          const rectX = bboxX * scaleX;
-          const rectY = bboxY * scaleY;
-          const rectW = bboxW * scaleX;
-          const rectH = bboxH * scaleY;
-          
-          // Позиционируем относительно body
-          const bodyRect = lbBody.getBoundingClientRect();
-          const left = (imgRect.left - bodyRect.left) + rectX;
-          const top = (imgRect.top - bodyRect.top) + rectY;
-          
-          console.log('drawAllFaceRectangles: координаты для rectangle', {
-            faceId: otherFace.face_id,
-            originalBbox: {x: otherFace.bbox.x, y: otherFace.bbox.y, w: otherFace.bbox.w, h: otherFace.bbox.h},
-            scaledBbox: {x: bboxX, y: bboxY, w: bboxW, h: bboxH},
-            displayBbox: {x: rectX, y: rectY, w: rectW, h: rectH},
-            imgRect: {left: imgRect.left, top: imgRect.top, width: imgRect.width, height: imgRect.height},
-            bodyRect: {left: bodyRect.left, top: bodyRect.top, width: bodyRect.width, height: bodyRect.height},
-            finalPosition: {left, top, width: rectW, height: rectH}
-          });
-          
-          // Создаем желтый rectangle
-          const rect = document.createElement('div');
-          rect.className = 'lb-rectangle other';
-          rect.style.left = `${left}px`;
-          rect.style.top = `${top}px`;
-          rect.style.width = `${rectW}px`;
-          rect.style.height = `${rectH}px`;
-          rect.style.display = 'block';
-          rect.style.position = 'absolute';
-          rect.style.zIndex = '1000';
-          rect.style.cursor = 'pointer';
-          rect.style.pointerEvents = 'auto'; // Важно: разрешаем клики на rectangle
-          
-          // Формируем текст для tooltip
-          let tooltipText = '';
-          if (otherFace.person_name) {
-            tooltipText = `${otherFace.person_name}${otherFace.is_me ? ' (я)' : ''}`;
-          }
-          if (otherFace.cluster_id) {
-            if (tooltipText) tooltipText += ' | ';
-            tooltipText += `Кластер #${otherFace.cluster_id}`;
-            tooltipText += ' (клик для открытия)';
-          } else {
-            if (tooltipText) tooltipText += ' | ';
-            tooltipText += 'Не назначен кластеру';
-          }
-          rect.title = tooltipText;
-          
-          // Добавляем клик для перехода к кластеру или назначения персоны
-          if (otherFace.cluster_id) {
-            rect.onclick = function(e) {
-              e.stopPropagation();
-              const clusterUrl = `/face-clusters/${otherFace.cluster_id}`;
-              window.open(clusterUrl, '_blank');
-            };
-          } else {
-            // Если нет кластера, открываем модал для назначения персоны
-            rect.onclick = function(e) {
-              e.stopPropagation();
-              console.log('Клик на желтый rectangle без кластера, face_id:', otherFace.face_id);
-              // Открываем модал для назначения персоны на это лицо
-              try {
-                openAssignPersonModalForFace(otherFace.face_id);
-              } catch (err) {
-                console.error('Ошибка при открытии модала:', err);
-              }
-            };
-            rect.title = tooltipText + ' (клик для назначения персоны)';
-            rect.style.cursor = 'pointer';
-          }
-          
-          lbBody.appendChild(rect);
-          drawnCount++;
-          
-          console.log('drawAllFaceRectangles: создан желтый rectangle', {
-            faceId: otherFace.face_id,
-            left,
-            top,
-            width: rectW,
-            height: rectH,
-            personName: otherFace.person_name,
-            clusterId: otherFace.cluster_id,
-            element: rect,
-            parent: lbBody
-          });
-          
-          // Добавляем подпись с именем персоны (если назначена)
-          const labelText = otherFace.person_name 
-            ? (otherFace.person_name + (otherFace.is_me ? ' (я)' : ''))
-            : (otherFace.cluster_id ? `Кластер #${otherFace.cluster_id}` : 'Не назначено');
-          
-          const label = document.createElement('div');
-          label.className = 'lb-rectangle-label';
-          label.textContent = labelText;
-          label.style.left = `${left}px`;
-          label.style.top = `${top - 20}px`; // Над rectangle
-          label.style.position = 'absolute';
-          label.style.zIndex = '10001';
-          if (otherFace.cluster_id) {
-            // Если есть cluster_id, подпись должна быть кликабельной
-            label.style.pointerEvents = 'auto';
-            label.style.cursor = 'pointer';
-            label.onclick = function(e) {
-              e.stopPropagation();
-              const clusterUrl = `/face-clusters/${otherFace.cluster_id}`;
-              window.open(clusterUrl, '_blank');
-            };
-          } else {
-            // Если нет cluster_id, подпись не кликабельна
-            label.style.pointerEvents = 'none';
-          }
-          lbBody.appendChild(label);
-        }
-        
-        console.log('drawAllFaceRectangles: завершено, нарисовано желтых rectangles:', drawnCount);
-        
-        // В конце рисуем текущее лицо (синий rectangle) поверх желтых
-        drawFaceRectangle();
-      }
 
-      function drawFaceRectangle() {
+      function drawFaceRectangleLocal() {
         if (!currentFaceBbox) {
-          console.log('drawFaceRectangle: нет currentFaceBbox');return;
+          return;
         }
         
         const lbImg = document.getElementById('lbImg');
-        const lbRectangle = document.getElementById('lbRectangle');
-        if (!lbImg || !lbRectangle) {
-          console.log('drawFaceRectangle: не найдены элементы', {lbImg: !!lbImg, lbRectangle: !!lbRectangle});return;
+        if (!lbImg || !lbImg.complete) {
+          return;
         }
-        
-        if (!lbImg.complete) {
-          console.log('drawFaceRectangle: изображение еще не загружено');return;
-        }
-        
-        // Получаем реальные размеры отображаемого изображения
-        const imgRect = lbImg.getBoundingClientRect();
-        const imgNaturalWidth = lbImg.naturalWidth;
-        const imgNaturalHeight = lbImg.naturalHeight;
-        const imgDisplayWidth = imgRect.width;
-        const imgDisplayHeight = imgRect.height;
-        
-        if (imgNaturalWidth === 0 || imgNaturalHeight === 0) {
-          console.log('drawFaceRectangle: нулевые размеры изображения');return;
-        }
-        
-        // Масштабируем bbox координаты от исходного изображения к preview
-        // Используем реальные размеры исходного изображения из БД, если они доступны
-        let bboxX = currentFaceBbox.x;
-        let bboxY = currentFaceBbox.y;
-        let bboxW = currentFaceBbox.w;
-        let bboxH = currentFaceBbox.h;
         
         // Получаем размеры исходного изображения из данных лица
         const face = clusterInfo.faces?.find(f => f.face_id === currentFaceId) || 
                      clusterInfo.example_faces?.find(f => f.face_id === currentFaceId);
         const originalImageSize = face?.image_size;
-        
-        // Если есть размеры исходного изображения и они отличаются от preview, масштабируем
-        if (originalImageSize && originalImageSize.width && originalImageSize.height) {
-          const originalWidth = originalImageSize.width;
-          const originalHeight = originalImageSize.height;
-          
-          // Используем EXIF orientation для правильного преобразования координат
-          // EXIF orientation: 1=normal, 3=180°, 6=90°CW, 8=90°CCW
-          const exifOrientation = originalImageSize.exif_orientation;
-          const originalRatio = originalWidth / originalHeight;
-          const previewRatio = imgNaturalWidth / imgNaturalHeight;
-          const isRotated90 = Math.abs(originalRatio - 1/previewRatio) < 0.1; // Поворот на 90/270 градусов
-          
-          if (isRotated90 && exifOrientation) {
-            // Изображение повернуто на 90/270 градусов, используем EXIF orientation для определения направления
-            const scaleX = imgNaturalWidth / originalHeight;
-            const scaleY = imgNaturalHeight / originalWidth;
-            
-            // EXIF orientation 6 = поворот на 90° по часовой стрелке
-            // EXIF orientation 8 = поворот на 90° против часовой стрелки
-            if (exifOrientation === 6) {
-              // Поворот на 90° по часовой: (x,y) -> (y, width-x-w)
-              const tempX = bboxX;
-              const tempW = bboxW;
-              bboxX = bboxY * scaleX;
-              bboxY = (originalWidth - tempX - tempW) * scaleY;
-              bboxW = bboxH * scaleX;
-              bboxH = tempW * scaleY;
-            } else if (exifOrientation === 8) {
-              // Поворот на 90° против часовой: (x,y) -> (height-y-h, x)
-              const tempX = bboxX;
-              const tempW = bboxW;
-              bboxX = (originalHeight - bboxY - bboxH) * scaleX;
-              bboxY = tempX * scaleY;
-              bboxW = bboxH * scaleX;
-              bboxH = tempW * scaleY;
-            } else if (exifOrientation === 3) {
-              // Поворот на 180°: (x,y) -> (width-x-w, height-y-h)
-              const scaleX2 = imgNaturalWidth / originalWidth;
-              const scaleY2 = imgNaturalHeight / originalHeight;
-              bboxX = (originalWidth - bboxX - bboxW) * scaleX2;
-              bboxY = (originalHeight - bboxY - bboxH) * scaleY2;
-              bboxW = bboxW * scaleX2;
-              bboxH = bboxH * scaleY2;
-            } else {
-              // EXIF orientation 1 или другой - обычное масштабирование
-              const scaleX2 = imgNaturalWidth / originalWidth;
-              const scaleY2 = imgNaturalHeight / originalHeight;
-              bboxX = bboxX * scaleX2;
-              bboxY = bboxY * scaleY2;
-              bboxW = bboxW * scaleX2;
-              bboxH = bboxH * scaleY2;
-            }
-          } else {
-            // Обычное масштабирование без поворота
-            const scaleX = imgNaturalWidth / originalWidth;
-            const scaleY = imgNaturalHeight / originalHeight;
-            bboxX = bboxX * scaleX;
-            bboxY = bboxY * scaleY;
-            bboxW = bboxW * scaleX;
-            bboxH = bboxH * scaleY;
-          }
-        } else if (bboxX >= imgNaturalWidth || bboxY >= imgNaturalHeight || (bboxX + bboxW) > imgNaturalWidth || (bboxY + bboxH) > imgNaturalHeight) {
-          // Fallback: эвристика, если размеры исходного изображения недоступны
-          const originalWidth = Math.max(bboxX + bboxW, imgNaturalWidth);
-          const originalHeight = Math.max(bboxY + bboxH, imgNaturalHeight);
-          const scaleX = imgNaturalWidth / originalWidth;
-          const scaleY = imgNaturalHeight / originalHeight;
-          bboxX = bboxX * scaleX;
-          bboxY = bboxY * scaleY;
-          bboxW = bboxW * scaleX;
-          bboxH = bboxH * scaleY;
-        }
-        
-        // Убеждаемся, что bbox координаты не выходят за границы preview
-        const bboxXBefore = bboxX;
-        const bboxYBefore = bboxY;
-        const bboxWBefore = bboxW;
-        const bboxHBefore = bboxH;
-        
-        // Более строгая проверка границ: убеждаемся, что bbox полностью внутри изображения
-        bboxX = Math.max(0, Math.min(bboxX, imgNaturalWidth));
-        bboxY = Math.max(0, Math.min(bboxY, imgNaturalHeight));
-        // Убеждаемся, что bbox не выходит за правую/нижнюю границу
-        if (bboxX + bboxW > imgNaturalWidth) {
-          bboxW = Math.max(1, imgNaturalWidth - bboxX);
-        }
-        if (bboxY + bboxH > imgNaturalHeight) {
-          bboxH = Math.max(1, imgNaturalHeight - bboxY);
-        }
-        // Убеждаемся, что размеры положительные
-        bboxW = Math.max(1, Math.min(bboxW, imgNaturalWidth - bboxX));
-        bboxH = Math.max(1, Math.min(bboxH, imgNaturalHeight - bboxY));
-        
-        // Вычисляем масштаб от preview к отображаемому размеру
-        const scaleX = imgDisplayWidth / imgNaturalWidth;
-        const scaleY = imgDisplayHeight / imgNaturalHeight;
-        
-        // Вычисляем позицию и размер rectangle на отображаемом изображении
-        const rectX = bboxX * scaleX;
-        const rectY = bboxY * scaleY;
-        const rectW = bboxW * scaleX;
-        const rectH = bboxH * scaleY;
-        
-        // Позиционируем rectangle относительно изображения
-        // rectX и rectY уже в координатах отображаемого изображения (imgDisplayWidth x imgDisplayHeight)
-        // lbRectangle позиционируется относительно lbBody (parent элемента)
-        const lbBody = lbImg.parentElement;
-        if (!lbBody) {
-          console.log('drawFaceRectangle: не найден parent элемент');
-          return;
-        }
-        
-        const bodyRect = lbBody.getBoundingClientRect();
-        
-        // Удаляем старую подпись для синего rectangle (если есть)
-        const oldLabel = lbBody.querySelector('.lb-rectangle-label.current');
-        if (oldLabel) oldLabel.remove();
-        
-        // rectX и rectY - это координаты относительно отображаемого изображения
-        // Нужно добавить смещение изображения относительно body
-        const left = (imgRect.left - bodyRect.left) + rectX;
-        const top = (imgRect.top - bodyRect.top) + rectY;
-        
-        console.log('drawFaceRectangle:', {
-          bbox: currentFaceBbox,
-          imgNatural: {w: imgNaturalWidth, h: imgNaturalHeight},
-          imgDisplay: {w: imgDisplayWidth, h: imgDisplayHeight},
-          scale: {x: scaleX, y: scaleY},
-          rect: {x: rectX, y: rectY, w: rectW, h: rectH},
-          position: {left, top}
-        });
-        
-        lbRectangle.style.left = left + 'px';
-        lbRectangle.style.top = top + 'px';
-        lbRectangle.style.width = rectW + 'px';
-        lbRectangle.style.height = rectH + 'px';
-        lbRectangle.style.display = 'block';
-        
-        // Добавляем подпись для синего rectangle
         const currentPerson = clusterInfo.persons?.[0];
-        const labelText = currentPerson?.name 
-          ? (currentPerson.name + (currentPerson.is_me ? ' (я)' : ''))
-          : (clusterInfo.cluster_id ? `Кластер #${clusterInfo.cluster_id}` : 'Не назначено');
         
-        const label = document.createElement('div');
-        label.className = 'lb-rectangle-label current';
-        label.textContent = labelText;
-        label.style.left = `${left}px`;
-        label.style.top = `${top - 20}px`;
-        label.style.position = 'absolute';
-        label.style.zIndex = '10002';
-        label.style.pointerEvents = 'none';
-        label.style.background = 'rgba(11, 87, 208, 0.95)';
-        label.style.color = '#fff';
-        label.style.padding = '3px 8px';
-        label.style.fontSize = '12px';
-        label.style.fontWeight = '700';
-        label.style.borderRadius = '4px';
-        label.style.boxShadow = '0 2px 4px rgba(0, 0, 0, 0.3)';
-        label.style.border = '1px solid rgba(11, 87, 208, 1)';
-        label.style.whiteSpace = 'nowrap';
-        lbBody.appendChild(label);
+        // Вызываем функцию из модуля
+        if (drawFaceRectangleFromModule) {
+          drawFaceRectangleFromModule(
+            currentFaceBbox,
+            originalImageSize,
+            currentPerson?.name,
+            currentPerson?.is_me,
+            clusterId // Используем clusterId из URL
+          );
+        }
       }
 
       async function createPersonAndAssign() {
@@ -1572,7 +1249,14 @@
                       .then(res => res.json())
                       .then(data => {
                         allFacesOnImage = data.faces || [];
-                        drawAllFaceRectangles();
+                        // Получаем размеры исходного изображения из данных лица
+                    const face = clusterInfo.faces?.find(f => f.face_id === currentFaceId) || 
+                                 clusterInfo.example_faces?.find(f => f.face_id === currentFaceId);
+                    const originalImageSize = face?.image_size;
+                    if (drawAllFaceRectanglesFromModule) {
+                      drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+                    }
+                    drawFaceRectangleLocal();
                       })
                       .catch(err => {
                         console.error('Failed to reload faces:', err);
@@ -1677,7 +1361,14 @@
       // Перерисовка rectangles при изменении размера окна
       window.addEventListener('resize', () => {
         if (document.getElementById('lightbox').classList.contains('open')) {
-          drawAllFaceRectangles();
+          // Получаем размеры исходного изображения из данных лица
+          const face = clusterInfo.faces?.find(f => f.face_id === currentFaceId) || 
+                       clusterInfo.example_faces?.find(f => f.face_id === currentFaceId);
+          const originalImageSize = face?.image_size;
+          if (drawAllFaceRectanglesFromModule) {
+            drawAllFaceRectanglesFromModule(allFacesOnImage || [], currentFaceId, originalImageSize, null);
+          }
+          drawFaceRectangleLocal();
         }
       });
       // Обработчик кнопки "Исправить клипинг"

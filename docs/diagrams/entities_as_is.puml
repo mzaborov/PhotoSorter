@@ -244,6 +244,7 @@ class face_clusters <<table>> {
   +id: INTEGER <<PK>>
   run_id: INTEGER <<FK>>         ' NULL для архива (archive_scope='archive')
   archive_scope: TEXT             ' NULL|'' для прогонов, 'archive' для архива
+  person_id: INTEGER <<FK>>        ' прямая привязка кластера к персоне
   method: TEXT                    ' DBSCAN|HDBSCAN|...
   params_json: TEXT
   created_at: TEXT
@@ -254,11 +255,11 @@ class face_cluster_members <<table>> {
   face_rectangle_id: INTEGER <<FK,PK>>
 }
 
-class face_labels <<table>> {
+class face_person_manual_assignments <<table>> {
   +id: INTEGER <<PK>>
   face_rectangle_id: INTEGER <<FK>>
   person_id: INTEGER <<FK>>
-  source: TEXT                  ' manual|cluster|ai
+  source: TEXT                  ' manual|restored_from_gold|ai
   confidence: REAL
   created_at: TEXT
 }
@@ -266,19 +267,30 @@ class face_labels <<table>> {
 face_rectangles "0..1" -- "0..1" persons : avatar (avatar_face_id)
 face_rectangles "1" -- "*" face_cluster_members : член кластера
 face_clusters "1" -- "*" face_cluster_members : кластер
-face_rectangles "1" -- "*" face_labels : метки лица
-persons "1" -- "*" face_labels : назначенная персона
+face_clusters "0..1" -- "0..1" persons : привязка кластера к персоне (person_id)
+face_rectangles "1" -- "0..*" face_person_manual_assignments : ручные привязки лица
+persons "1" -- "*" face_person_manual_assignments : ручная привязка к персоне
 face_runs "1" -- "*" face_clusters : прогон кластеризации
 
-note right of face_labels
-  ВАЖНО: cluster_id удалён из face_labels
-  (рефакторинг для устранения избыточности)
+note right of face_person_manual_assignments
+  ТОЛЬКО для ручных привязок отдельных лиц
+  (не через кластеры)
   
-  Кластер определяется через JOIN:
-  face_labels → face_cluster_members → face_clusters
+  Кластеры привязаны к персонам через
+  face_clusters.person_id напрямую
   
-  face_cluster_members — единственный источник истины
-  о том, в каком кластере находится лицо
+  Лица в кластере наследуют персону через:
+  face_rectangles → face_cluster_members → 
+  face_clusters.person_id
+end note
+
+note right of face_clusters
+  person_id: прямая привязка кластера к персоне
+  
+  Все лица в кластере наследуют персону
+  через JOIN с face_cluster_members
+  
+  Если person_id = NULL — кластер не назначен
 end note
 
 note right of face_cluster_members

@@ -564,19 +564,22 @@ class FaceStore:
             );
         """)
 
-        # Метки лиц (назначение персоны лицу)
-        # ВАЖНО: cluster_id удалён из face_labels (рефакторинг для устранения избыточности)
-        # Кластер определяется через JOIN с face_cluster_members
+        # Ручные привязки лиц к персонам (только для ручных привязок, не через кластеры)
+        # Кластеры привязаны к персонам через face_clusters.person_id
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS face_labels (
+            CREATE TABLE IF NOT EXISTS face_person_manual_assignments (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                 face_rectangle_id   INTEGER NOT NULL,
                 person_id           INTEGER NOT NULL,
-                source              TEXT NOT NULL,             -- 'manual'|'cluster'|'ai'
+                source              TEXT NOT NULL,             -- 'manual'|'ai'
                 confidence          REAL,
                 created_at          TEXT NOT NULL
             );
         """)
+        
+        # Старая таблица face_labels больше не создаётся
+        # Миграция завершена: используется face_person_manual_assignments для ручных привязок
+        # и face_clusters.person_id для привязки кластеров к персонам
 
         # Archive scope для кластеров (аналогично face_rectangles)
         _ensure_columns(
@@ -589,14 +592,21 @@ class FaceStore:
         
         # Индексы
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_clusters_run ON face_clusters(run_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_clusters_person ON face_clusters(person_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_rect_archive_scope ON face_rectangles(archive_scope);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_clusters_archive_scope ON face_clusters(archive_scope);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_cluster_members_cluster ON face_cluster_members(cluster_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_cluster_members_face ON face_cluster_members(face_rectangle_id);")
+        # Индексы для face_person_manual_assignments
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_person_manual_assignments_face ON face_person_manual_assignments(face_rectangle_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_person_manual_assignments_person ON face_person_manual_assignments(person_id);")
+        # UNIQUE индекс для предотвращения дубликатов: одно лицо может быть назначено персоне только один раз
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_face_person_manual_assignments_unique ON face_person_manual_assignments(face_rectangle_id, person_id);")
+        # Старые индексы для face_labels (для обратной совместимости, будут удалены после миграции)
+        # ВАЖНО: таблица face_labels больше не используется в рабочем коде, индексы оставлены только для совместимости
+        # После полного тестирования можно удалить таблицу через migrate_drop_face_labels_table.py
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_labels_face ON face_labels(face_rectangle_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_labels_person ON face_labels(person_id);")
-        # ВАЖНО: idx_face_labels_cluster удалён, т.к. cluster_id больше не хранится в face_labels
-        # UNIQUE индекс для предотвращения дубликатов: одно лицо может быть назначено персоне только один раз
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_face_labels_unique ON face_labels(face_rectangle_id, person_id);")
 
         # Прямоугольники без лица, но с человеком (для привязки к персоне)
@@ -1340,7 +1350,7 @@ class FaceStore:
     ) -> dict[str, Any]:
         """
         Возвращает все привязки файла к персонам (через все 3 способа):
-        - через лица (face_labels через face_rectangles)
+        - через лица (face_person_manual_assignments + face_clusters.person_id через face_cluster_members)
         - через прямоугольники без лица (person_rectangles)
         - прямая привязка (file_persons)
         
@@ -1363,30 +1373,58 @@ class FaceStore:
             except Exception:
                 pass
         
-        # Привязки через лица
+        # Привязки через лица (ручные привязки + через кластеры)
         if face_run_id is not None:
             # Фильтруем по face_run_id для локальных прогонов
             cur.execute(
                 """
-                SELECT DISTINCT fl.person_id, p.name AS person_name
-                FROM face_labels fl
-                JOIN face_rectangles fr ON fr.id = fl.face_rectangle_id
-                LEFT JOIN persons p ON p.id = fl.person_id
-                WHERE fr.file_path = ? AND fr.run_id = ?
+                SELECT DISTINCT person_id, person_name
+                FROM (
+                    -- Ручные привязки
+                    SELECT DISTINCT fpma.person_id, p.name AS person_name
+                    FROM face_person_manual_assignments fpma
+                    JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
+                    LEFT JOIN persons p ON p.id = fpma.person_id
+                    WHERE fr.file_path = ? AND fr.run_id = ?
+                    
+                    UNION
+                    
+                    -- Привязки через кластеры
+                    SELECT DISTINCT fc.person_id, p.name AS person_name
+                    FROM face_cluster_members fcm
+                    JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
+                    JOIN face_clusters fc ON fc.id = fcm.cluster_id
+                    LEFT JOIN persons p ON p.id = fc.person_id
+                    WHERE fr.file_path = ? AND fr.run_id = ? AND fc.person_id IS NOT NULL
+                )
                 """,
-                (str(file_path), int(face_run_id)),
+                (str(file_path), int(face_run_id), str(file_path), int(face_run_id)),
             )
         else:
             # Для архивных данных (archive_scope='archive') или без фильтрации
             cur.execute(
                 """
-                SELECT DISTINCT fl.person_id, p.name AS person_name
-                FROM face_labels fl
-                JOIN face_rectangles fr ON fr.id = fl.face_rectangle_id
-                LEFT JOIN persons p ON p.id = fl.person_id
-                WHERE fr.file_path = ?
+                SELECT DISTINCT person_id, person_name
+                FROM (
+                    -- Ручные привязки
+                    SELECT DISTINCT fpma.person_id, p.name AS person_name
+                    FROM face_person_manual_assignments fpma
+                    JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
+                    LEFT JOIN persons p ON p.id = fpma.person_id
+                    WHERE fr.file_path = ?
+                    
+                    UNION
+                    
+                    -- Привязки через кластеры
+                    SELECT DISTINCT fc.person_id, p.name AS person_name
+                    FROM face_cluster_members fcm
+                    JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
+                    JOIN face_clusters fc ON fc.id = fcm.cluster_id
+                    LEFT JOIN persons p ON p.id = fc.person_id
+                    WHERE fr.file_path = ? AND fc.person_id IS NOT NULL
+                )
                 """,
-                (str(file_path),),
+                (str(file_path), str(file_path)),
             )
         face_assignments = [dict(r) for r in cur.fetchall()]
         

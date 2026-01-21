@@ -8,6 +8,7 @@ import urllib.parse
 import subprocess
 import json
 import os
+import logging
 from fastapi import APIRouter, HTTPException, Request, Body
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
@@ -45,6 +46,84 @@ def _yd_call_retry(fn):
 def _repo_root() -> Path:
     """Возвращает корень репозитория."""
     return APP_DIR.parent.parent
+
+def _generate_face_thumbnail_on_fly(file_path: str, bbox: tuple[int, int, int, int], thumb_size: int = 200) -> str | None:
+    """
+    Генерирует превью лица на лету из оригинального файла, если thumb_jpeg отсутствует в БД.
+    
+    Args:
+        file_path: путь к файлу (disk:/... или local:...)
+        bbox: координаты лица (x, y, w, h)
+        thumb_size: размер превью (по умолчанию 200)
+    
+    Returns:
+        base64-encoded JPEG thumbnail или None в случае ошибки
+    """
+    from PIL import Image
+    from PIL import ImageOps
+    from io import BytesIO
+    import base64
+    import requests
+    
+    try:
+        x, y, w, h = bbox
+        if w <= 0 or h <= 0:
+            return None
+        
+        # Загружаем изображение
+        img = None
+        if file_path.startswith("disk:"):
+            disk = get_disk()
+            p = _normalize_yadisk_path(file_path)
+            md = _yd_call_retry(lambda: disk.get_meta(p, limit=0))
+            sizes = getattr(md, "sizes", None)
+            if sizes and "ORIGINAL" in sizes:
+                original_url = sizes["ORIGINAL"]
+                resp = requests.get(original_url, timeout=10, stream=True)
+                resp.raise_for_status()
+                img = Image.open(BytesIO(resp.content))
+            else:
+                return None
+        elif file_path.startswith("local:"):
+            local_path = file_path.replace("local:", "")
+            if not os.path.isfile(local_path):
+                return None
+            img = Image.open(local_path)
+        else:
+            return None
+        
+        if img is None:
+            return None
+        
+        # Применяем EXIF transpose для правильной ориентации
+        try:
+            img = ImageOps.exif_transpose(img)
+        except Exception:
+            pass
+        
+        # Генерируем кроп лица с padding
+        iw, ih = img.size
+        pad_ratio = 0.18
+        pad = int(round(max(w, h) * pad_ratio))
+        x0 = max(0, x - pad)
+        y0 = max(0, y - pad)
+        x1 = min(iw, x + w + pad)
+        y1 = min(ih, y + h + pad)
+        
+        crop = img.crop((x0, y0, x1, y1)).convert("RGB")
+        crop.thumbnail((thumb_size, thumb_size), Image.Resampling.LANCZOS)
+        
+        buf = BytesIO()
+        crop.save(buf, format="JPEG", quality=78, optimize=True)
+        thumb_bytes = buf.getvalue()
+        
+        img.close()
+        
+        return base64.b64encode(thumb_bytes).decode("utf-8")
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Error generating thumbnail on fly for {file_path}: {e}")
+        return None
 
 def _venv_face_python() -> Path:
     """Возвращает путь к Python из .venv-face."""
@@ -127,11 +206,11 @@ async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: st
     
     # Фильтр по person_id (для кластеров конкретной персоны)
     if person_id is not None:
-        where_parts.append("(SELECT p2.id FROM face_labels fl2 JOIN persons p2 ON fl2.person_id = p2.id JOIN face_cluster_members fcm_fl2 ON fl2.face_rectangle_id = fcm_fl2.face_rectangle_id WHERE fcm_fl2.cluster_id = fc.id LIMIT 1) = ?")
+        where_parts.append("fc.person_id = ?")
         where_params.append(person_id)
     elif unassigned_only:
         # Только неназначенные кластеры (person_id IS NULL)
-        where_parts.append("(SELECT p2.id FROM face_labels fl2 JOIN persons p2 ON fl2.person_id = p2.id JOIN face_cluster_members fcm_fl2 ON fl2.face_rectangle_id = fcm_fl2.face_rectangle_id WHERE fcm_fl2.cluster_id = fc.id LIMIT 1) IS NULL")
+        where_parts.append("fc.person_id IS NULL")
     
     # Формируем финальное WHERE условие
     if where_parts:
@@ -171,41 +250,35 @@ async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: st
     cur.execute(
         f"""
         SELECT 
-            fc.id, fc.run_id, fc.method, fc.params_json, fc.created_at,
+            fc.id, fc.run_id, fc.archive_scope, fc.method, fc.params_json, fc.created_at,
             (SELECT COUNT(DISTINCT fcm2.face_rectangle_id)
              FROM face_cluster_members fcm2
              JOIN face_rectangles fr2 ON fcm2.face_rectangle_id = fr2.id
              WHERE fcm2.cluster_id = fc.id AND COALESCE(fr2.ignore_flag, 0) = 0) as faces_count,
-            (SELECT GROUP_CONCAT(DISTINCT fl2.person_id)
-             FROM face_labels fl2
-             JOIN face_cluster_members fcm_fl2 ON fl2.face_rectangle_id = fcm_fl2.face_rectangle_id
-             WHERE fcm_fl2.cluster_id = fc.id) as person_ids,
-            (SELECT p2.id
-             FROM face_labels fl2
-             JOIN persons p2 ON fl2.person_id = p2.id
-             JOIN face_cluster_members fcm_fl2 ON fl2.face_rectangle_id = fcm_fl2.face_rectangle_id
-             WHERE fcm_fl2.cluster_id = fc.id
-             LIMIT 1) as person_id,
-            (SELECT p2.name
-             FROM face_labels fl2
-             JOIN persons p2 ON fl2.person_id = p2.id
-             JOIN face_cluster_members fcm_fl2 ON fl2.face_rectangle_id = fcm_fl2.face_rectangle_id
-             WHERE fcm_fl2.cluster_id = fc.id
-             LIMIT 1) as person_name,
-            (SELECT p2.avatar_face_id
-             FROM face_labels fl2
-             JOIN persons p2 ON fl2.person_id = p2.id
-             JOIN face_cluster_members fcm_fl2 ON fl2.face_rectangle_id = fcm_fl2.face_rectangle_id
-             WHERE fcm_fl2.cluster_id = fc.id
-             LIMIT 1) as avatar_face_id
+            COALESCE((SELECT COUNT(DISTINCT fcm2.face_rectangle_id)
+             FROM face_cluster_members fcm2
+             JOIN face_rectangles fr2 ON fcm2.face_rectangle_id = fr2.id
+             WHERE fcm2.cluster_id = fc.id AND COALESCE(fr2.ignore_flag, 0) = 0 
+               AND (fr2.archive_scope = 'archive' 
+                    OR (fr2.archive_scope IS NULL AND fc.archive_scope = 'archive'))), 0) as faces_count_archive,
+            COALESCE((SELECT COUNT(DISTINCT fcm2.face_rectangle_id)
+             FROM face_cluster_members fcm2
+             JOIN face_rectangles fr2 ON fcm2.face_rectangle_id = fr2.id
+             WHERE fcm2.cluster_id = fc.id AND COALESCE(fr2.ignore_flag, 0) = 0 
+               AND (fr2.archive_scope IS NULL OR fr2.archive_scope != 'archive') 
+               AND fr2.run_id IS NOT NULL), 0) as faces_count_run,
+            fc.person_id as person_id,
+            p.name as person_name,
+            p.avatar_face_id as avatar_face_id
         FROM face_clusters fc
+        LEFT JOIN persons p ON fc.person_id = p.id
         WHERE {where_clause}
         AND (SELECT COUNT(DISTINCT fcm2.face_rectangle_id)
              FROM face_cluster_members fcm2
              JOIN face_rectangles fr2 ON fcm2.face_rectangle_id = fr2.id
              WHERE fcm2.cluster_id = fc.id AND COALESCE(fr2.ignore_flag, 0) = 0) > 0
         ORDER BY 
-            CASE WHEN (SELECT p2.name FROM face_labels fl2 JOIN persons p2 ON fl2.person_id = p2.id JOIN face_cluster_members fcm_fl2 ON fl2.face_rectangle_id = fcm_fl2.face_rectangle_id WHERE fcm_fl2.cluster_id = fc.id LIMIT 1) = ? THEN 1 ELSE 0 END,
+            CASE WHEN p.name = ? THEN 1 ELSE 0 END,
             person_name ASC, 
             faces_count DESC, 
             fc.created_at DESC
@@ -216,10 +289,10 @@ async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: st
     
     clusters = []
     for row in cur.fetchall():
-        person_ids_str = row["person_ids"] or ""
-        person_ids = [int(p) for p in person_ids_str.split(",") if p.strip()] if person_ids_str else []
+        # person_ids теперь всегда один элемент (или пустой список) из face_clusters.person_id
+        person_ids = [row["person_id"]] if row["person_id"] else []
         
-        # Получаем preview-лицо (самое крупное) для кластера
+        # Получаем preview-лицо (самое крупное) для кластера - только из архива
         preview_face_id = None
         cur_preview = conn.cursor()
         cur_preview.execute(
@@ -227,7 +300,9 @@ async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: st
             SELECT fr.id
             FROM face_cluster_members fcm
             JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
-            WHERE fcm.cluster_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+            WHERE fcm.cluster_id = ? 
+              AND COALESCE(fr.ignore_flag, 0) = 0
+              AND fr.archive_scope = 'archive'
             ORDER BY (fr.bbox_w * fr.bbox_h) DESC, fr.confidence DESC
             LIMIT 1
             """,
@@ -237,13 +312,53 @@ async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: st
         if preview_row:
             preview_face_id = preview_row["id"]
         
+        # Определяем тип кластера: архив или текущий прогон
+        archive_scope = row["archive_scope"]
+        run_id = row["run_id"]
+        is_archive = archive_scope == 'archive' if archive_scope else False
+        is_run = not is_archive and run_id is not None
+        
+        # Явно получаем значения счетчиков из результата запроса
+        faces_count_val = row["faces_count"] if row["faces_count"] is not None else 0
+        
+        # Получаем значения для архив/прогон
+        # Используем прямое обращение, так как sqlite3.Row не поддерживает .get()
+        faces_count_archive_val = 0
+        faces_count_run_val = 0
+        
+        try:
+            if "faces_count_archive" in row.keys():
+                faces_count_archive_val = row["faces_count_archive"]
+                if faces_count_archive_val is None:
+                    faces_count_archive_val = 0
+                else:
+                    faces_count_archive_val = int(faces_count_archive_val)
+        except (KeyError, TypeError, ValueError):
+            faces_count_archive_val = 0
+        
+        try:
+            if "faces_count_run" in row.keys():
+                faces_count_run_val = row["faces_count_run"]
+                if faces_count_run_val is None:
+                    faces_count_run_val = 0
+                else:
+                    faces_count_run_val = int(faces_count_run_val)
+        except (KeyError, TypeError, ValueError):
+            faces_count_run_val = 0
+        
+        # Создаем словарь с ВСЕМИ полями сразу
         clusters.append({
             "id": row["id"],
-            "run_id": row["run_id"],
+            "run_id": run_id,
+            "archive_scope": archive_scope,
+            "is_archive": is_archive,
+            "is_run": is_run,
             "method": row["method"],
             "params_json": row["params_json"],
             "created_at": row["created_at"],
-            "faces_count": row["faces_count"],
+            "faces_count": faces_count_val,
+            "faces_count_archive": int(faces_count_archive_val) if faces_count_archive_val is not None else 0,
+            "faces_count_run": int(faces_count_run_val) if faces_count_run_val is not None else 0,
             "person_ids": person_ids,
             "person_id": row["person_id"],
             "person_name": row["person_name"],
@@ -314,12 +429,7 @@ async def api_face_clusters_suggestions_for_single(*, max_distance: float = 0.45
                FROM face_cluster_members fcm2
                JOIN face_rectangles fr2 ON fcm2.face_rectangle_id = fr2.id
                WHERE fcm2.cluster_id = fc.id AND COALESCE(fr2.ignore_flag, 0) = 0) = 1
-          AND (SELECT p2.id 
-               FROM face_labels fl2 
-               JOIN persons p2 ON fl2.person_id = p2.id 
-               JOIN face_cluster_members fcm_fl2 ON fl2.face_rectangle_id = fcm_fl2.face_rectangle_id
-               WHERE fcm_fl2.cluster_id = fc.id 
-               LIMIT 1) IS NULL
+          AND fc.person_id IS NULL
         """,
         tuple(where_params),
     )
@@ -742,13 +852,15 @@ async def page_face_cluster_detail(request: Request, cluster_id: int) -> Any:
 async def api_face_rectangle_thumbnail(*, face_rectangle_id: int) -> dict[str, Any]:
     """Получает thumbnail лица для отображения аватара."""
     import base64
+    import logging
+    logger = logging.getLogger(__name__)
     
     conn = get_connection()
     cur = conn.cursor()
     
     cur.execute(
         """
-        SELECT thumb_jpeg
+        SELECT thumb_jpeg, file_path, bbox_x, bbox_y, bbox_w, bbox_h
         FROM face_rectangles
         WHERE id = ?
         """,
@@ -756,10 +868,24 @@ async def api_face_rectangle_thumbnail(*, face_rectangle_id: int) -> dict[str, A
     )
     
     row = cur.fetchone()
-    if not row or not row["thumb_jpeg"]:
-        raise HTTPException(status_code=404, detail="Face rectangle not found or no thumbnail")
+    if not row:
+        raise HTTPException(status_code=404, detail="Face rectangle not found")
     
-    thumb_base64 = base64.b64encode(row["thumb_jpeg"]).decode("utf-8")
+    thumb_base64 = None
+    if row["thumb_jpeg"]:
+        thumb_base64 = base64.b64encode(row["thumb_jpeg"]).decode("utf-8")
+    elif row["file_path"] and row["bbox_x"] is not None and row["bbox_y"] is not None and row["bbox_w"] is not None and row["bbox_h"] is not None:
+        # Генерируем превью на лету, если thumb_jpeg отсутствует
+        try:
+            thumb_base64 = _generate_face_thumbnail_on_fly(
+                file_path=row["file_path"],
+                bbox=(row["bbox_x"], row["bbox_y"], row["bbox_w"], row["bbox_h"])
+            )
+        except Exception as e:
+            logger.warning(f"Failed to generate thumbnail on fly for face_id={face_rectangle_id}: {e}")
+    
+    if not thumb_base64:
+        raise HTTPException(status_code=404, detail="Face rectangle has no thumbnail and cannot generate one")
     
     return {"thumb_jpeg_base64": thumb_base64}
 
@@ -844,10 +970,16 @@ async def api_persons_stats() -> dict[str, Any]:
     """
     Возвращает список персон со статистикой: количество кластеров и лиц.
     """
+    import time
+    metrics = {}
+    total_start = time.time()
+    
     conn = get_connection()
     cur = conn.cursor()
     
-    # Получаем всех персон со статистикой по 3 способам привязки
+    # Оптимизированный запрос: используем JOIN и агрегацию вместо множественных подзапросов
+    # Сначала получаем базовую информацию о персонах
+    step_start = time.time()
     cur.execute(
         """
         SELECT 
@@ -855,22 +987,8 @@ async def api_persons_stats() -> dict[str, Any]:
             p.name,
             p.avatar_face_id,
             p."group",
-            p.group_order,
-            COUNT(DISTINCT CASE WHEN COALESCE(fr.ignore_flag, 0) = 0 THEN fcm.cluster_id ELSE NULL END) as clusters_count,
-            COUNT(DISTINCT CASE WHEN COALESCE(fr.ignore_flag, 0) = 0 THEN fl.face_rectangle_id ELSE NULL END) as faces_count,
-            -- Статистика через прямоугольники без лица (person_rectangles)
-            (SELECT COUNT(DISTINCT pr.file_path) 
-             FROM person_rectangles pr 
-             WHERE pr.person_id = p.id) as person_rectangles_files_count,
-            -- Статистика прямой привязки (file_persons)
-            (SELECT COUNT(DISTINCT fp.file_path) 
-             FROM file_persons fp 
-             WHERE fp.person_id = p.id) as file_persons_files_count
+            p.group_order
         FROM persons p
-        LEFT JOIN face_labels fl ON fl.person_id = p.id
-        LEFT JOIN face_cluster_members fcm ON fl.face_rectangle_id = fcm.face_rectangle_id
-        LEFT JOIN face_rectangles fr ON fl.face_rectangle_id = fr.id
-        GROUP BY p.id, p.name, p.avatar_face_id, p."group", p.group_order
         ORDER BY 
             CASE WHEN p.name = ? THEN 1 ELSE 0 END,
             COALESCE(p.group_order, 999) ASC,
@@ -879,12 +997,131 @@ async def api_persons_stats() -> dict[str, Any]:
         (IGNORED_PERSON_NAME,),
     )
     
-    persons = []
+    person_rows = cur.fetchall()
+    metrics["step1_get_persons"] = time.time() - step_start
+    
+    # Теперь для каждой персоны получаем статистику через отдельные оптимизированные запросы
+    # Это быстрее, чем множественные подзапросы в одном SELECT
+    persons_data = {}
+    for row in person_rows:
+        person_id = row["id"]
+        persons_data[person_id] = {
+            "id": person_id,
+            "name": row["name"],
+            "avatar_face_id": row["avatar_face_id"],
+            "group": row["group"],
+            "group_order": row["group_order"],
+            "clusters_count": 0,
+            "clusters_count_archive": 0,
+            "clusters_count_run": 0,
+            "faces_count": 0,
+            "faces_count_archive": 0,
+            "faces_count_run": 0,
+            "person_rectangles_files_count": 0,
+            "file_persons_files_count": 0,
+        }
+    
+    # Получаем статистику кластеров одним запросом
+    step_start = time.time()
+    cur.execute("""
+        SELECT 
+            fc.person_id,
+            COUNT(DISTINCT CASE WHEN fc.archive_scope = 'archive' THEN fc.id END) as clusters_archive,
+            COUNT(DISTINCT CASE WHEN (fc.archive_scope IS NULL OR fc.archive_scope = '') AND fc.run_id IS NOT NULL THEN fc.id END) as clusters_run,
+            COUNT(DISTINCT fc.id) as clusters_total
+        FROM face_clusters fc
+        WHERE fc.person_id IS NOT NULL
+        GROUP BY fc.person_id
+    """)
     for row in cur.fetchall():
+        if row["person_id"] in persons_data:
+            persons_data[row["person_id"]]["clusters_count"] = row["clusters_total"] or 0
+            persons_data[row["person_id"]]["clusters_count_archive"] = row["clusters_archive"] or 0
+            persons_data[row["person_id"]]["clusters_count_run"] = row["clusters_run"] or 0
+    metrics["step2_get_clusters_stats"] = time.time() - step_start
+    
+    # Получаем статистику лиц через кластеры одним запросом
+    # Оптимизация: начинаем с face_clusters (есть индекс по person_id), затем JOIN
+    step_start = time.time()
+    cur.execute("""
+        SELECT 
+            fc.person_id,
+            COUNT(DISTINCT CASE WHEN fr.archive_scope = 'archive' THEN fr.id END) as faces_archive,
+            COUNT(DISTINCT CASE WHEN (fr.archive_scope IS NULL OR fr.archive_scope = '') AND fr.run_id IS NOT NULL THEN fr.id END) as faces_run,
+            COUNT(DISTINCT fr.id) as faces_total
+        FROM face_clusters fc
+        JOIN face_cluster_members fcm ON fcm.cluster_id = fc.id
+        JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
+        WHERE fc.person_id IS NOT NULL AND COALESCE(fr.ignore_flag, 0) = 0
+        GROUP BY fc.person_id
+    """)
+    for row in cur.fetchall():
+        if row["person_id"] in persons_data:
+            persons_data[row["person_id"]]["faces_count"] = (persons_data[row["person_id"]]["faces_count"] or 0) + (row["faces_total"] or 0)
+            persons_data[row["person_id"]]["faces_count_archive"] = (persons_data[row["person_id"]]["faces_count_archive"] or 0) + (row["faces_archive"] or 0)
+            persons_data[row["person_id"]]["faces_count_run"] = (persons_data[row["person_id"]]["faces_count_run"] or 0) + (row["faces_run"] or 0)
+    metrics["step3_get_faces_via_clusters"] = time.time() - step_start
+    
+    # Получаем статистику лиц через ручные привязки (исключая те, что уже в кластерах этой персоны)
+    # Используем LEFT JOIN вместо NOT EXISTS для лучшей производительности
+    step_start = time.time()
+    cur.execute("""
+        SELECT 
+            fpma.person_id,
+            COUNT(DISTINCT CASE WHEN fr.archive_scope = 'archive' AND fc_check.person_id IS NULL THEN fr.id END) as faces_archive,
+            COUNT(DISTINCT CASE WHEN (fr.archive_scope IS NULL OR fr.archive_scope = '') AND fr.run_id IS NOT NULL AND fc_check.person_id IS NULL THEN fr.id END) as faces_run,
+            COUNT(DISTINCT CASE WHEN fc_check.person_id IS NULL THEN fr.id END) as faces_total
+        FROM face_person_manual_assignments fpma
+        JOIN face_rectangles fr ON fpma.face_rectangle_id = fr.id
+        LEFT JOIN face_cluster_members fcm_check ON fcm_check.face_rectangle_id = fr.id
+        LEFT JOIN face_clusters fc_check ON fcm_check.cluster_id = fc_check.id AND fc_check.person_id = fpma.person_id
+        WHERE COALESCE(fr.ignore_flag, 0) = 0
+        GROUP BY fpma.person_id
+    """)
+    for row in cur.fetchall():
+        if row["person_id"] in persons_data:
+            persons_data[row["person_id"]]["faces_count"] = (persons_data[row["person_id"]]["faces_count"] or 0) + (row["faces_total"] or 0)
+            persons_data[row["person_id"]]["faces_count_archive"] = (persons_data[row["person_id"]]["faces_count_archive"] or 0) + (row["faces_archive"] or 0)
+            persons_data[row["person_id"]]["faces_count_run"] = (persons_data[row["person_id"]]["faces_count_run"] or 0) + (row["faces_run"] or 0)
+    metrics["step4_get_faces_via_manual"] = time.time() - step_start
+    
+    # Получаем статистику через прямоугольники и прямую привязку
+    step_start = time.time()
+    cur.execute("""
+        SELECT 
+            pr.person_id,
+            COUNT(DISTINCT pr.file_path) as files_count
+        FROM person_rectangles pr
+        GROUP BY pr.person_id
+    """)
+    for row in cur.fetchall():
+        if row["person_id"] in persons_data:
+            persons_data[row["person_id"]]["person_rectangles_files_count"] = row["files_count"] or 0
+    metrics["step5_get_person_rectangles"] = time.time() - step_start
+    
+    step_start = time.time()
+    cur.execute("""
+        SELECT 
+            fp.person_id,
+            COUNT(DISTINCT fp.file_path) as files_count
+        FROM file_persons fp
+        GROUP BY fp.person_id
+    """)
+    for row in cur.fetchall():
+        if row["person_id"] in persons_data:
+            persons_data[row["person_id"]]["file_persons_files_count"] = row["files_count"] or 0
+    metrics["step6_get_file_persons"] = time.time() - step_start
+    
+    # Формируем финальный список персон с аватарами
+    step_start = time.time()
+    persons = []
+    avatar_queries_count = 0
+    for person_id, person_data in persons_data.items():
         # Получаем preview для аватара, если есть
-        avatar_face_id = row["avatar_face_id"]
+        avatar_face_id = person_data["avatar_face_id"]
         avatar_preview_url = None
         if avatar_face_id:
+            avatar_queries_count += 1
             cur.execute(
                 """
                 SELECT fr.file_path, fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
@@ -902,94 +1139,182 @@ async def api_persons_stats() -> dict[str, Any]:
                     avatar_preview_url = f"/api/local/preview?path={urllib.parse.quote(file_path)}"
         
         persons.append({
-            "id": row["id"],
-            "name": row["name"],
+            "id": person_data["id"],
+            "name": person_data["name"],
             "avatar_face_id": avatar_face_id,
             "avatar_preview_url": avatar_preview_url,
-            "clusters_count": row["clusters_count"] or 0,
-            "faces_count": row["faces_count"] or 0,
-            "person_rectangles_files_count": row["person_rectangles_files_count"] or 0,
-            "file_persons_files_count": row["file_persons_files_count"] or 0,
-            "group": row["group"],
-            "group_order": row["group_order"],
-            "is_ignored": row["name"] == IGNORED_PERSON_NAME,
+            "clusters_count": person_data["clusters_count"],
+            "clusters_count_archive": person_data["clusters_count_archive"],
+            "clusters_count_run": person_data["clusters_count_run"],
+            "faces_count": person_data["faces_count"],
+            "faces_count_archive": person_data["faces_count_archive"],
+            "faces_count_run": person_data["faces_count_run"],
+            "person_rectangles_files_count": person_data["person_rectangles_files_count"],
+            "file_persons_files_count": person_data["file_persons_files_count"],
+            "group": person_data["group"],
+            "group_order": person_data["group_order"],
+            "is_ignored": person_data["name"] == IGNORED_PERSON_NAME,
         })
+    metrics["step7_build_final_list"] = time.time() - step_start
+    metrics["avatar_queries_count"] = avatar_queries_count
     
-    return {"persons": persons}
+    total_time = time.time() - total_start
+    metrics["total_time"] = total_time
+    
+    # Логируем метрики для отладки
+    logger = logging.getLogger(__name__)
+    logger.info(f"[api_persons_stats] Metrics: total={total_time:.3f}s, steps={metrics}, persons_count={len(persons)}")
+    
+    result = {"persons": persons}
+    
+    # Добавляем метрики производительности под ключом debug (только если включен debug режим)
+    # Для простоты всегда добавляем, но можно проверять через env переменную
+    result["debug"] = {"metrics": metrics}
+    
+    return result
 
 
 @router.get("/api/persons/{person_id}")
 async def api_person_detail(*, person_id: int) -> dict[str, Any]:
     """Получает детальную информацию о персоне и все её лица."""
-    conn = get_connection()
-    cur = conn.cursor()
-    
-    # Получаем информацию о персоне
-    cur.execute(
-        """
-        SELECT id, name, mode, is_me, kinship, avatar_face_id, created_at, updated_at, "group", group_order
-        FROM persons
-        WHERE id = ?
-        """,
-        (person_id,),
-    )
-    
-    person_row = cur.fetchone()
-    if not person_row:
-        raise HTTPException(status_code=404, detail="Person not found")
-    
-    # Получаем все лица персоны через face_labels
-    # Используем DISTINCT, чтобы исключить дубликаты, если в face_labels есть несколько записей для одного face_rectangle_id
-    cur.execute(
-        """
-        SELECT DISTINCT
-            fr.id as face_id,
-            fr.run_id,
-            fr.file_path,
-            fr.face_index,
-            fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
-            fr.confidence, fr.presence_score,
-            fr.thumb_jpeg,
-            fr.embedding IS NOT NULL as has_embedding,
-            fcm.cluster_id,
-            fc.run_id as cluster_run_id
-        FROM face_labels fl
-        JOIN face_rectangles fr ON fl.face_rectangle_id = fr.id
-        LEFT JOIN face_cluster_members fcm ON fr.id = fcm.face_rectangle_id
-        LEFT JOIN face_clusters fc ON fcm.cluster_id = fc.id
-        WHERE fl.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
-        ORDER BY fr.file_path, fr.face_index
-        """,
-        (person_id,),
-    )
-    
-    faces = []
-    for row in cur.fetchall():
-        thumb_base64 = None
-        if row["thumb_jpeg"]:
-            import base64
-            thumb_base64 = base64.b64encode(row["thumb_jpeg"]).decode("utf-8")
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
         
-        faces.append({
-            "face_id": row["face_id"],
-            "run_id": row["run_id"],
-            "file_path": row["file_path"],
-            "face_index": row["face_index"],
-            "bbox": {
-                "x": row["bbox_x"],
-                "y": row["bbox_y"],
-                "w": row["bbox_w"],
-                "h": row["bbox_h"],
-            },
-            "confidence": row["confidence"],
-            "presence_score": row["presence_score"],
-            "thumb_jpeg_base64": thumb_base64,
-            "has_embedding": bool(row["has_embedding"]),
-            "cluster_id": row["cluster_id"],
-            "cluster_run_id": row["cluster_run_id"],
-        })
-    
-    return {
+        # Получаем информацию о персоне
+        cur.execute(
+            """
+            SELECT id, name, mode, is_me, kinship, avatar_face_id, created_at, updated_at, "group", group_order
+            FROM persons
+            WHERE id = ?
+            """,
+            (person_id,),
+        )
+        
+        person_row = cur.fetchone()
+        if not person_row:
+            raise HTTPException(status_code=404, detail="Person not found")
+        
+        # Получаем все лица персоны ТОЛЬКО через кластеры (ручные привязки временно игнорируются):
+        # Через кластеры: face_cluster_members -> face_clusters -> person_id
+        cur.execute(
+            """
+            SELECT DISTINCT
+                fr.id as face_id,
+                fr.run_id,
+                fr.archive_scope,
+                fr.file_path,
+                fr.face_index,
+                fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
+                fr.confidence, fr.presence_score,
+                fr.thumb_jpeg,
+                fr.embedding IS NOT NULL as has_embedding,
+                fcm.cluster_id,
+                fc.run_id as cluster_run_id,
+                fc.archive_scope as cluster_archive_scope
+            FROM face_cluster_members fcm
+            JOIN face_clusters fc ON fcm.cluster_id = fc.id
+            JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
+            WHERE fc.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+            ORDER BY 
+                CASE WHEN fr.archive_scope IS NULL OR fr.archive_scope != 'archive' THEN 1 ELSE 0 END,
+                fr.file_path, fr.face_index
+            """,
+            (person_id,),
+        )
+        
+        faces = []
+        for row in cur.fetchall():
+            try:
+                thumb_base64 = None
+                if row["thumb_jpeg"]:
+                    import base64
+                    thumb_base64 = base64.b64encode(row["thumb_jpeg"]).decode("utf-8")
+                elif row["file_path"] and row["bbox_x"] is not None and row["bbox_y"] is not None and row["bbox_w"] is not None and row["bbox_h"] is not None:
+                    # Генерируем превью на лету, если thumb_jpeg отсутствует
+                    try:
+                        thumb_base64 = _generate_face_thumbnail_on_fly(
+                            file_path=row["file_path"],
+                            bbox=(row["bbox_x"], row["bbox_y"], row["bbox_w"], row["bbox_h"])
+                        )
+                    except Exception as e:
+                        logger = logging.getLogger(__name__)
+                        logger.warning(f"Failed to generate thumbnail on fly for face_id={row['face_id']}: {e}")
+                        thumb_base64 = None
+                
+                # Определяем, относится ли лицо к архиву или текущему прогону
+                # ВАЖНО: archive_scope берется ТОЛЬКО из face_rectangles, НЕ из кластера!
+                # Кластер может быть архивным, но лицо в нем может быть из текущего прогона
+                try:
+                    archive_scope_val = row["archive_scope"]
+                except (KeyError, TypeError):
+                    archive_scope_val = None
+                
+                # Лицо архивное ТОЛЬКО если archive_scope == 'archive' в face_rectangles
+                is_archive = (archive_scope_val == 'archive') if archive_scope_val else False
+                
+                try:
+                    run_id_val = row["run_id"]
+                except (KeyError, TypeError):
+                    run_id_val = None
+                    
+                # Лицо из прогона, если оно не архивное и имеет run_id
+                is_run = not is_archive and (run_id_val is not None)
+            except Exception as e:
+                # Логируем ошибку для отладки
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.error(f"Error processing face row: {e}, row keys: {list(row.keys()) if hasattr(row, 'keys') else 'N/A'}")
+                continue
+            
+            try:
+                bbox_x = row["bbox_x"] if row["bbox_x"] is not None else 0
+                bbox_y = row["bbox_y"] if row["bbox_y"] is not None else 0
+                bbox_w = row["bbox_w"] if row["bbox_w"] is not None else 0
+                bbox_h = row["bbox_h"] if row["bbox_h"] is not None else 0
+                confidence = row["confidence"] if row["confidence"] is not None else 0.0
+                
+                # Обрабатываем presence_score: может быть None, inf, -inf
+                presence_score_val = row["presence_score"]
+                if presence_score_val is not None:
+                    import math
+                    if math.isinf(presence_score_val) or math.isnan(presence_score_val):
+                        presence_score = None
+                    else:
+                        presence_score = presence_score_val
+                else:
+                    presence_score = None
+                    
+                cluster_id = row["cluster_id"] if row["cluster_id"] is not None else None
+                cluster_run_id = row["cluster_run_id"] if row["cluster_run_id"] is not None else None
+            except (KeyError, TypeError) as e:
+                logger = logging.getLogger(__name__)
+                logger.error(f"Error extracting row values: {e}")
+                continue
+            
+            faces.append({
+                "face_id": row["face_id"],
+                "run_id": run_id_val,
+                "archive_scope": archive_scope_val,
+                "is_archive": is_archive,
+                "is_run": is_run,
+                "file_path": row["file_path"],
+                "face_index": row["face_index"],
+                "bbox": {
+                    "x": bbox_x,
+                    "y": bbox_y,
+                    "w": bbox_w,
+                    "h": bbox_h,
+                },
+                "confidence": confidence,
+                "presence_score": presence_score,
+                "thumb_jpeg_base64": thumb_base64,
+                "has_embedding": bool(row["has_embedding"]),
+                "cluster_id": cluster_id,
+                "cluster_run_id": cluster_run_id,
+            })
+        
+        return {
         "person": {
             "id": person_row["id"],
             "name": person_row["name"],
@@ -1002,8 +1327,14 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
             "created_at": person_row["created_at"],
             "updated_at": person_row["updated_at"],
         },
-        "faces": faces,
-    }
+            "faces": faces,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.error(f"Error in api_person_detail for person_id={person_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
 @router.put("/api/persons/{person_id}")
@@ -1061,14 +1392,22 @@ async def api_person_set_avatar(*, person_id: int, payload: dict[str, Any] = Bod
     if not cur.fetchone():
         raise HTTPException(status_code=404, detail="Person not found")
     
-    # Проверяем, что лицо принадлежит персоне
+    # Проверяем, что лицо принадлежит персоне (через кластеры или ручные привязки)
     cur.execute(
         """
-        SELECT fl.id
-        FROM face_labels fl
-        WHERE fl.person_id = ? AND fl.face_rectangle_id = ?
+        SELECT 1
+        FROM face_cluster_members fcm
+        JOIN face_clusters fc ON fcm.cluster_id = fc.id
+        WHERE fc.person_id = ? AND fcm.face_rectangle_id = ?
+        
+        UNION
+        
+        SELECT 1
+        FROM face_person_manual_assignments fpma
+        WHERE fpma.person_id = ? AND fpma.face_rectangle_id = ?
+        LIMIT 1
         """,
-        (person_id, face_id),
+        (person_id, face_id, person_id, face_id),
     )
     if not cur.fetchone():
         raise HTTPException(status_code=400, detail="Face does not belong to this person")
@@ -1095,14 +1434,22 @@ async def api_person_face_ignore(*, person_id: int, face_id: int) -> dict[str, A
     conn = get_connection()
     cur = conn.cursor()
     
-    # Проверяем, что лицо принадлежит персоне
+    # Проверяем, что лицо принадлежит персоне (через кластеры или ручные привязки)
     cur.execute(
         """
-        SELECT fl.id
-        FROM face_labels fl
-        WHERE fl.person_id = ? AND fl.face_rectangle_id = ?
+        SELECT 1
+        FROM face_cluster_members fcm
+        JOIN face_clusters fc ON fcm.cluster_id = fc.id
+        WHERE fc.person_id = ? AND fcm.face_rectangle_id = ?
+        
+        UNION
+        
+        SELECT 1
+        FROM face_person_manual_assignments fpma
+        WHERE fpma.person_id = ? AND fpma.face_rectangle_id = ?
+        LIMIT 1
         """,
-        (person_id, face_id),
+        (person_id, face_id, person_id, face_id),
     )
     if not cur.fetchone():
         raise HTTPException(status_code=400, detail="Face does not belong to this person")
@@ -1183,8 +1530,10 @@ async def api_person_face_similar(*, person_id: int, face_id: int, limit: int = 
             fl.person_id,
             p.name as person_name
         FROM face_rectangles fr
-        LEFT JOIN face_labels fl ON fr.id = fl.face_rectangle_id
-        LEFT JOIN persons p ON fl.person_id = p.id
+        LEFT JOIN face_person_manual_assignments fpma ON fr.id = fpma.face_rectangle_id
+        LEFT JOIN face_cluster_members fcm ON fr.id = fcm.face_rectangle_id
+        LEFT JOIN face_clusters fc ON fcm.cluster_id = fc.id
+        LEFT JOIN persons p ON COALESCE(fpma.person_id, fc.person_id) = p.id
         WHERE fr.embedding IS NOT NULL
           AND fr.id != ?
           AND COALESCE(fr.ignore_flag, 0) = 0
@@ -1233,56 +1582,61 @@ async def api_person_face_reassign(*, person_id: int, face_id: int, payload: dic
     
     target_person_id = payload.get("target_person_id")  # Может быть None для удаления
     
-    # Проверяем, что лицо принадлежит текущей персоне
+    # Проверяем, что лицо принадлежит текущей персоне (через кластеры или ручные привязки)
     cur.execute(
         """
-        SELECT fl.id
-        FROM face_labels fl
-        WHERE fl.person_id = ? AND fl.face_rectangle_id = ?
+        SELECT 'cluster' as source, fcm.cluster_id
+        FROM face_cluster_members fcm
+        JOIN face_clusters fc ON fcm.cluster_id = fc.id
+        WHERE fc.person_id = ? AND fcm.face_rectangle_id = ?
+        
+        UNION
+        
+        SELECT 'manual' as source, NULL as cluster_id
+        FROM face_person_manual_assignments fpma
+        WHERE fpma.person_id = ? AND fpma.face_rectangle_id = ?
+        LIMIT 1
         """,
-        (person_id, face_id),
+        (person_id, face_id, person_id, face_id),
     )
     label_row = cur.fetchone()
     if not label_row:
         raise HTTPException(status_code=400, detail="Face does not belong to this person")
     
-    # Получаем cluster_id через face_cluster_members (если нужно для логирования)
-    # Но НЕ сохраняем его в face_labels
-    cur.execute(
-        """
-        SELECT cluster_id
-        FROM face_cluster_members
-        WHERE face_rectangle_id = ?
-        LIMIT 1
-        """,
-        (face_id,),
-    )
-    cluster_row = cur.fetchone()
-    cluster_id = cluster_row["cluster_id"] if cluster_row else None
+    source_type = label_row["source"]
+    cluster_id = label_row["cluster_id"]
     
-    # Удаляем из текущей персоны
-    cur.execute(
-        """
-        DELETE FROM face_labels
-        WHERE person_id = ? AND face_rectangle_id = ?
-        """,
-        (person_id, face_id),
-    )
-    
-    # Если указана целевая персона - добавляем к ней
-    if target_person_id is not None:
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc).isoformat()
-        
-        # ВАЖНО: cluster_id больше не храним в face_labels
-        # Используем INSERT OR REPLACE для предотвращения дубликатов (UNIQUE индекс на face_rectangle_id, person_id)
+    # Если лицо привязано через кластер - изменяем person_id кластера
+    if source_type == "cluster" and cluster_id:
+        if target_person_id is None:
+            # Снимаем назначение кластера
+            cur.execute("UPDATE face_clusters SET person_id = NULL WHERE id = ?", (cluster_id,))
+        else:
+            # Изменяем назначение кластера
+            cur.execute("UPDATE face_clusters SET person_id = ? WHERE id = ?", (target_person_id, cluster_id))
+    else:
+        # Если лицо привязано вручную - работаем с face_person_manual_assignments
+        # Удаляем из текущей персоны
         cur.execute(
             """
-            INSERT OR REPLACE INTO face_labels (face_rectangle_id, person_id, source, confidence, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            DELETE FROM face_person_manual_assignments
+            WHERE person_id = ? AND face_rectangle_id = ?
             """,
-            (face_id, target_person_id, "manual", 1.0, now),
+            (person_id, face_id),
         )
+        
+        # Если указана целевая персона - добавляем к ней
+        if target_person_id is not None:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+            
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO face_person_manual_assignments (face_rectangle_id, person_id, source, confidence, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (face_id, target_person_id, "manual", 1.0, now),
+            )
     
     conn.commit()
     
@@ -1296,28 +1650,45 @@ async def api_person_face_clear(*, person_id: int, face_id: int) -> dict[str, An
     cur = conn.cursor()
     
     # Проверяем, что лицо принадлежит персоне
+    # Проверяем, принадлежит ли лицо персоне (через кластер или ручную привязку)
     cur.execute(
         """
-        SELECT fl.id
-        FROM face_labels fl
-        WHERE fl.person_id = ? AND fl.face_rectangle_id = ?
+        SELECT fc.id as cluster_id
+        FROM face_cluster_members fcm
+        JOIN face_clusters fc ON fcm.cluster_id = fc.id
+        WHERE fcm.face_rectangle_id = ? AND fc.person_id = ?
+        LIMIT 1
         """,
-        (person_id, face_id),
+        (face_id, person_id),
     )
-    label_row = cur.fetchone()
-    if not label_row:
+    cluster_row = cur.fetchone()
+    
+    # Проверяем ручную привязку
+    cur.execute(
+        """
+        SELECT id
+        FROM face_person_manual_assignments
+        WHERE face_rectangle_id = ? AND person_id = ?
+        LIMIT 1
+        """,
+        (face_id, person_id),
+    )
+    manual_row = cur.fetchone()
+    
+    if not cluster_row and not manual_row:
         raise HTTPException(status_code=400, detail="Face does not belong to this person")
     
-    old_cluster_id = label_row["cluster_id"]
+    old_cluster_id = cluster_row["cluster_id"] if cluster_row else None
     
-    # Удаляем из текущей персоны
-    cur.execute(
-        """
-        DELETE FROM face_labels
-        WHERE person_id = ? AND face_rectangle_id = ?
-        """,
-        (person_id, face_id),
-    )
+    # Удаляем ручную привязку, если есть
+    if manual_row:
+        cur.execute(
+            """
+            DELETE FROM face_person_manual_assignments
+            WHERE face_rectangle_id = ? AND person_id = ?
+            """,
+            (face_id, person_id),
+        )
     
     # Ищем ближайший кластер (исключая текущий)
     target_cluster_id = find_closest_cluster_for_face(
@@ -1369,17 +1740,32 @@ async def api_person_refresh_gold(*, person_id: int) -> dict[str, Any]:
     
     person_name = person_row["name"]
     
-    # Получаем все лица персоны через face_labels
+    # Получаем все лица персоны (ручные привязки + через кластеры)
     cur.execute(
         """
-        SELECT 
+        SELECT DISTINCT
             fr.id, fr.run_id, fr.file_path, fr.face_index,
             fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
-        FROM face_labels fl
-        JOIN face_rectangles fr ON fl.face_rectangle_id = fr.id
-        WHERE fl.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+        FROM (
+            -- Ручные привязки
+            SELECT fr.id, fr.run_id, fr.file_path, fr.face_index,
+                   fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
+            FROM face_person_manual_assignments fpma
+            JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
+            WHERE fpma.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+            
+            UNION
+            
+            -- Привязки через кластеры
+            SELECT fr.id, fr.run_id, fr.file_path, fr.face_index,
+                   fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
+            FROM face_cluster_members fcm
+            JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
+            JOIN face_clusters fc ON fc.id = fcm.cluster_id
+            WHERE fc.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+        ) fr
         """,
-        (person_id,),
+        (person_id, person_id),
     )
     
     faces = cur.fetchall()
@@ -1816,17 +2202,32 @@ async def api_save_all_persons_to_gold() -> dict[str, Any]:
     for person in persons:
         person_id = person["id"]
         
-        # Получаем все лица персоны через face_labels
+        # Получаем все лица персоны (ручные привязки + через кластеры)
         cur.execute(
             """
-            SELECT 
+            SELECT DISTINCT
                 fr.id, fr.run_id, fr.file_path, fr.face_index,
                 fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
-            FROM face_labels fl
-            JOIN face_rectangles fr ON fl.face_rectangle_id = fr.id
-            WHERE fl.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+            FROM (
+                -- Ручные привязки
+                SELECT fr.id, fr.run_id, fr.file_path, fr.face_index,
+                       fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
+                FROM face_person_manual_assignments fpma
+                JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
+                WHERE fpma.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+                
+                UNION
+                
+                -- Привязки через кластеры
+                SELECT fr.id, fr.run_id, fr.file_path, fr.face_index,
+                       fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
+                FROM face_cluster_members fcm
+                JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
+                JOIN face_clusters fc ON fc.id = fcm.cluster_id
+                WHERE fc.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+            ) fr
             """,
-            (person_id,),
+            (person_id, person_id),
         )
         
         faces = cur.fetchall()
@@ -1906,17 +2307,32 @@ async def api_save_person_to_gold(*, person_id: int) -> dict[str, Any]:
     if not person:
         raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
     
-    # Получаем все лица персоны через face_labels
+    # Получаем все лица персоны (ручные привязки + через кластеры)
     cur.execute(
         """
-        SELECT 
+        SELECT DISTINCT
             fr.id, fr.run_id, fr.file_path, fr.face_index,
             fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
-        FROM face_labels fl
-        JOIN face_rectangles fr ON fl.face_rectangle_id = fr.id
-        WHERE fl.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+        FROM (
+            -- Ручные привязки
+            SELECT fr.id, fr.run_id, fr.file_path, fr.face_index,
+                   fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
+            FROM face_person_manual_assignments fpma
+            JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
+            WHERE fpma.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+            
+            UNION
+            
+            -- Привязки через кластеры
+            SELECT fr.id, fr.run_id, fr.file_path, fr.face_index,
+                   fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
+            FROM face_cluster_members fcm
+            JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
+            JOIN face_clusters fc ON fc.id = fcm.cluster_id
+            WHERE fc.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+        ) fr
         """,
-        (person_id,),
+        (person_id, person_id),
     )
     
     faces = cur.fetchall()
@@ -2018,14 +2434,21 @@ async def api_face_runs_list() -> dict[str, Any]:
 @router.get("/api/file-faces")
 async def api_file_faces(file_path: str) -> dict[str, Any]:
     """Получает все лица на указанном файле с информацией о назначенных персонах."""
-    conn = get_connection()
-    cur = conn.cursor()
+    import logging
+    logger = logging.getLogger(__name__)
     
-    # Получаем все лица на этом файле
-    # Фильтруем дубликаты: для одинаковых позиций (face_index + bbox) выбираем:
-    # 1. Кластеризованное лицо (если есть)
-    # 2. Иначе - лицо с максимальным run_id (последний прогон)
-    cur.execute(
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        
+        # Получаем все лица на этом файле
+        # Фильтруем дубликаты: для одинаковых позиций (face_index + bbox) выбираем:
+        # 1. Кластеризованное лицо (если есть)
+        # 2. Иначе - лицо с максимальным run_id (последний прогон)
+        # Персона определяется:
+        # 1. Через ручные привязки: face_person_manual_assignments (приоритет)
+        # 2. Через кластеры: face_clusters.person_id
+        cur.execute(
         """
         WITH ranked_faces AS (
             SELECT 
@@ -2034,9 +2457,10 @@ async def api_file_faces(file_path: str) -> dict[str, Any]:
                 fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
                 fr.run_id,
                 fr.archive_scope,
-                fl.person_id,
-                p.name as person_name,
-                p.is_me,
+                -- Персона: сначала ручные привязки, потом через кластеры
+                COALESCE(fpma.person_id, fc.person_id) as person_id,
+                COALESCE(p_manual.name, p_cluster.name) as person_name,
+                COALESCE(p_manual.is_me, p_cluster.is_me, 0) as is_me,
                 fcm.cluster_id,
                 ROW_NUMBER() OVER (
                     PARTITION BY fr.file_path, fr.face_index, fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
@@ -2047,9 +2471,11 @@ async def api_file_faces(file_path: str) -> dict[str, Any]:
                         fr.run_id DESC  -- Потом по run_id (последний прогон)
                 ) as rn
             FROM face_rectangles fr
-            LEFT JOIN face_labels fl ON fr.id = fl.face_rectangle_id
-            LEFT JOIN persons p ON fl.person_id = p.id
             LEFT JOIN face_cluster_members fcm ON fr.id = fcm.face_rectangle_id
+            LEFT JOIN face_clusters fc ON fcm.cluster_id = fc.id
+            LEFT JOIN persons p_cluster ON fc.person_id = p_cluster.id
+            LEFT JOIN face_person_manual_assignments fpma ON fr.id = fpma.face_rectangle_id
+            LEFT JOIN persons p_manual ON fpma.person_id = p_manual.id
             WHERE fr.file_path = ? AND COALESCE(fr.ignore_flag, 0) = 0
         )
         SELECT 
@@ -2067,24 +2493,36 @@ async def api_file_faces(file_path: str) -> dict[str, Any]:
         (file_path,),
     )
     
-    faces = []
-    for row in cur.fetchall():
-        faces.append({
-            "face_id": row["face_id"],
-            "face_index": row["face_index"],
-            "bbox": {
-                "x": row["bbox_x"],
-                "y": row["bbox_y"],
-                "w": row["bbox_w"],
-                "h": row["bbox_h"],
-            },
-            "person_id": row["person_id"],
-            "person_name": row["person_name"],
-            "is_me": bool(row["is_me"]) if row["is_me"] else False,
-            "cluster_id": row["cluster_id"],
-        })
-    
-    return {"faces": faces}
+        faces = []
+        for row in cur.fetchall():
+            # Проверяем, что bbox данные есть
+            if row["bbox_x"] is None or row["bbox_y"] is None or row["bbox_w"] is None or row["bbox_h"] is None:
+                logger.warning(f"Face {row['face_id']} has NULL bbox data, skipping")
+                continue
+                
+            faces.append({
+                "face_id": row["face_id"],
+                "face_index": row["face_index"],
+                "bbox": {
+                    "x": row["bbox_x"],
+                    "y": row["bbox_y"],
+                    "w": row["bbox_w"],
+                    "h": row["bbox_h"],
+                },
+                "person_id": row["person_id"],
+                "person_name": row["person_name"],
+                "is_me": bool(row["is_me"]) if row["is_me"] else False,
+                "cluster_id": row["cluster_id"],
+            })
+        
+        logger.info(f"api_file_faces: file_path={file_path}, faces_count={len(faces)}")
+        return {"faces": faces}
+    except Exception as e:
+        logger.error(f"Error in api_file_faces for {file_path}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
 
 @router.post("/api/face-rectangles/{face_rectangle_id}/find-cluster")
@@ -2135,23 +2573,22 @@ async def api_assign_person_to_face(*, face_rectangle_id: int, payload: dict[str
     cluster_row = cur.fetchone()
     cluster_id = cluster_row["cluster_id"] if cluster_row else None
     
-    # Удаляем старые назначения для этого лица
+    # Удаляем старые ручные назначения для этого лица
     cur.execute(
         """
-        DELETE FROM face_labels WHERE face_rectangle_id = ?
+        DELETE FROM face_person_manual_assignments WHERE face_rectangle_id = ?
         """,
         (face_rectangle_id,),
     )
     
-    # Создаем новое назначение
-    # ВАЖНО: cluster_id больше не храним в face_labels, кластер определяется через face_cluster_members
-    # Используем INSERT OR REPLACE для предотвращения дубликатов (UNIQUE индекс на face_rectangle_id, person_id)
+    # Создаем новое ручное назначение
+    # Используем INSERT OR REPLACE для предотвращения дубликатов
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
     
     cur.execute(
         """
-        INSERT OR REPLACE INTO face_labels (face_rectangle_id, person_id, source, confidence, created_at)
+        INSERT OR REPLACE INTO face_person_manual_assignments (face_rectangle_id, person_id, source, confidence, created_at)
         VALUES (?, ?, ?, ?, ?)
         """,
         (face_rectangle_id, person_id, "manual", 1.0, now),
@@ -2495,13 +2932,13 @@ async def api_persons_remove_assignment(payload: dict[str, Any] = Body(...)) -> 
     conn = get_connection()
     try:
         if assignment_type == "face":
-            # Удаляем привязку через лицо (face_labels)
+            # Удаляем привязку через лицо (face_person_manual_assignments)
             if not isinstance(face_rectangle_id, int):
                 raise HTTPException(status_code=400, detail="face_rectangle_id is required for type='face'")
             cur = conn.cursor()
             cur.execute(
                 """
-                DELETE FROM face_labels
+                DELETE FROM face_person_manual_assignments
                 WHERE face_rectangle_id = ? AND person_id = ?
                 """,
                 (int(face_rectangle_id), int(person_id)),
@@ -2543,7 +2980,7 @@ async def api_persons_file_assignments(
 ) -> dict[str, Any]:
     """
     Возвращает все привязки файла к персонам (через все 3 способа):
-    - через лица (face_labels через face_rectangles)
+    - через лица (face_person_manual_assignments + face_clusters.person_id через face_cluster_members)
     - через прямоугольники без лица (person_rectangles)
     - прямая привязка (file_persons)
     """
