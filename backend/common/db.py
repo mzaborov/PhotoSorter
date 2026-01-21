@@ -376,6 +376,16 @@ def init_db():
         """
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_files_manual_labels_run ON files_manual_labels(pipeline_run_id);")
+    
+    # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
+    _ensure_columns(
+        conn,
+        "files_manual_labels",
+        {
+            "file_id": "file_id INTEGER",  # FOREIGN KEY на files.id, пока NULL (заполним миграцией)
+        },
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_files_manual_labels_file_id ON files_manual_labels(file_id);")
 
     # --- Run-scoped manual rectangles for VIDEO frames (3 frames per video) ---
     # ВАЖНО: для видео нам нужны прямоугольники с привязкой к кадру/таймкоду.
@@ -394,6 +404,16 @@ def init_db():
         """
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_video_manual_frames_path ON video_manual_frames(path);")
+    
+    # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
+    _ensure_columns(
+        conn,
+        "video_manual_frames",
+        {
+            "file_id": "file_id INTEGER",  # FOREIGN KEY на files.id, пока NULL (заполним миграцией)
+        },
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_video_manual_frames_file_id ON video_manual_frames(file_id);")
 
     # Индексы для быстрых группировок дублей.
     cur.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash_alg, hash_value);")
@@ -518,6 +538,16 @@ class FaceStore:
                 "archive_scope": "archive_scope TEXT",  # NULL|'' для прогонов, 'archive' для архива
             },
         )
+        
+        # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
+        _ensure_columns(
+            self.conn,
+            "face_rectangles",
+            {
+                "file_id": "file_id INTEGER",  # FOREIGN KEY на files.id, пока NULL (заполним миграцией)
+            },
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_rect_file_id ON face_rectangles(file_id);")
 
         # Справочник персон (людей)
         cur.execute("""
@@ -628,6 +658,16 @@ class FaceStore:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rect_run ON person_rectangles(pipeline_run_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rect_file ON person_rectangles(file_path);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rect_person ON person_rectangles(person_id);")
+        
+        # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
+        _ensure_columns(
+            self.conn,
+            "person_rectangles",
+            {
+                "file_id": "file_id INTEGER",  # FOREIGN KEY на files.id, пока NULL (заполним миграцией)
+            },
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rect_file_id ON person_rectangles(file_id);")
 
         # Простая привязка файла к персоне (без прямоугольника)
         cur.execute("""
@@ -643,6 +683,16 @@ class FaceStore:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_file_persons_run ON file_persons(pipeline_run_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_file_persons_file ON file_persons(file_path);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_file_persons_person ON file_persons(person_id);")
+        
+        # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
+        _ensure_columns(
+            self.conn,
+            "file_persons",
+            {
+                "file_id": "file_id INTEGER",  # FOREIGN KEY на files.id, пока NULL (заполним миграцией)
+            },
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_persons_file_id ON file_persons(file_id);")
 
         # Группы для файлов "Нет людей" (иерархические: Поездки/2023 Турция, Мемы и т.д.)
         cur.execute("""
@@ -658,6 +708,16 @@ class FaceStore:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_file_groups_run ON file_groups(pipeline_run_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_file_groups_file ON file_groups(file_path);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_file_groups_path ON file_groups(group_path);")
+        
+        # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
+        _ensure_columns(
+            self.conn,
+            "file_groups",
+            {
+                "file_id": "file_id INTEGER",  # FOREIGN KEY на files.id, пока NULL (заполним миграцией)
+            },
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_groups_file_id ON file_groups(file_id);")
 
         # Привязка персон к файлам в группах "Артефакты людей"
         cur.execute("""
@@ -674,6 +734,16 @@ class FaceStore:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_file_group_persons_run ON file_group_persons(pipeline_run_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_file_group_persons_file ON file_group_persons(file_path);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_file_group_persons_person ON file_group_persons(person_id);")
+        
+        # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
+        _ensure_columns(
+            self.conn,
+            "file_group_persons",
+            {
+                "file_id": "file_id INTEGER",  # FOREIGN KEY на files.id, пока NULL (заполним миграцией)
+            },
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_group_persons_file_id ON file_group_persons(file_id);")
 
         self.conn.commit()
 

@@ -1,0 +1,15 @@
+{
+  // Отключение Shell Integration для решения проблемы с терминалом при выполнении Python команд
+  // Проблема: выполнение Python команд вызывает Connection Error и ломает чаты Cursor
+  // Решение: отключение Shell Integration предотвращает конфликт с выводом Python
+  "terminal.integrated.shellIntegration.enabled": false,
+  
+  // Настройки терминала для Windows
+  "terminal.integrated.defaultProfile.windows": "PowerShell",
+  
+  // Отключение автоматического определения команд в терминале
+  "terminal.integrated.enablePersistentSessions": false,
+  
+  // Настройки буферизации терминала
+  "terminal.integrated.scrollback": 10000
+}

@@ -1,81 +1,87 @@
+"""Список последних прогонов pipeline.
+
+Использование:
+    python backend/scripts/debug/list_pipeline_runs.py
+    python backend/scripts/debug/list_pipeline_runs.py --limit 15
+    python backend/scripts/debug/list_pipeline_runs.py --limit 5 --include-face-runs
+"""
 from __future__ import annotations
 
 import argparse
-import sqlite3
+import sys
 from pathlib import Path
 
+# Добавляем корень проекта в путь
+repo_root = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(repo_root))
 
-def _connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    return conn
+from backend.common.db import get_connection
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="List recent pipeline runs from SQLite (helps pick pipeline_run_id).")
-    ap.add_argument("--db", default="data/photosorter.db", help="Path to photosorter.db")
-    ap.add_argument("--limit", type=int, default=15, help="How many rows to print")
+    ap = argparse.ArgumentParser(description="Список последних прогонов pipeline")
+    ap.add_argument("--limit", type=int, default=15, help="Количество прогонов для отображения (по умолчанию 15)")
+    ap.add_argument("--include-face-runs", action="store_true", help="Включить информацию о face_runs")
     args = ap.parse_args()
 
-    db = Path(args.db)
-    if not db.exists():
-        raise SystemExit(f"DB not found: {db}")
+    conn = get_connection()
+    cur = conn.cursor()
 
-    conn = _connect(db)
-    try:
-        cur = conn.cursor()
-        rows = cur.execute(
-            """
-            SELECT
-              id,
-              kind,
-              root_path,
-              status,
-              apply,
-              face_run_id,
-              dedup_run_id,
-              started_at,
-              updated_at,
-              finished_at
-            FROM pipeline_runs
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (int(args.limit),),
-        ).fetchall()
+    limit = max(1, min(100, args.limit))
 
-        if not rows:
-            print("No pipeline_runs rows.")
-            return 0
+    # Получаем последние прогоны
+    cur.execute(
+        """
+        SELECT id, kind, status, root_path, face_run_id, started_at, finished_at, step_num, step_total, step_title
+        FROM pipeline_runs
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
 
-        # Simple aligned table
-        headers = ["id", "kind", "status", "apply", "face_run_id", "root_path", "started_at", "finished_at"]
-        vals = []
-        for r in rows:
-            vals.append(
-                {
-                    "id": str(r["id"]),
-                    "kind": str(r["kind"] or ""),
-                    "status": str(r["status"] or ""),
-                    "apply": str(int(r["apply"] or 0)),
-                    "face_run_id": str(r["face_run_id"] or ""),
-                    "root_path": str(r["root_path"] or ""),
-                    "started_at": str(r["started_at"] or ""),
-                    "finished_at": str(r["finished_at"] or ""),
-                }
-            )
-
-        widths = {h: max(len(h), max(len(v[h]) for v in vals)) for h in headers}
-        print(" | ".join(h.ljust(widths[h]) for h in headers))
-        print("-+-".join("-" * widths[h] for h in headers))
-        for v in vals:
-            print(" | ".join(v[h].ljust(widths[h]) for h in headers))
-
+    runs = cur.fetchall()
+    if not runs:
+        print("Нет прогонов в БД")
         return 0
-    finally:
-        conn.close()
+
+    print("=" * 100)
+    print(f"Последние {len(runs)} прогонов pipeline:")
+    print("=" * 100)
+
+    for run in runs:
+        print(f"\nПрогон #{run['id']}:")
+        print(f"  Вид: {run['kind']}")
+        print(f"  Статус: {run['status']}")
+        print(f"  Путь: {run['root_path']}")
+        if run['face_run_id']:
+            print(f"  Face run ID: {run['face_run_id']}")
+        print(f"  Начало: {run['started_at']}")
+        if run['finished_at']:
+            print(f"  Завершение: {run['finished_at']}")
+        if run['step_num'] and run['step_total']:
+            print(f"  Прогресс: {run['step_num']}/{run['step_total']} - {run['step_title'] or 'N/A'}")
+
+        # Если нужно, получаем информацию о face_run
+        if args.include_face_runs and run['face_run_id']:
+            cur.execute(
+                """
+                SELECT id, scope, status, total_files, processed_files, faces_found, started_at, finished_at
+                FROM face_runs
+                WHERE id = ?
+                """,
+                (run['face_run_id'],),
+            )
+            face_run = cur.fetchone()
+            if face_run:
+                print(f"  Face Run #{face_run['id']}:")
+                print(f"    Статус: {face_run['status']}")
+                print(f"    Файлов: {face_run['processed_files']}/{face_run['total_files']}")
+                print(f"    Лиц найдено: {face_run['faces_found']}")
+
+    print("\n" + "=" * 100)
+    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
-
+    sys.exit(main())
