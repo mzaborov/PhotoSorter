@@ -270,10 +270,12 @@
       // Загружаем изображение
       await loadImage();
 
-      // Загружаем rectangles (только для sorting режима)
-      if (currentState.mode === 'sorting' && currentState.pipeline_run_id) {
+      // Загружаем rectangles (для всех режимов, если есть pipeline_run_id)
+      if (currentState.pipeline_run_id) {
         await loadRectangles();
         await checkDuplicates();
+      } else {
+        console.warn('[photo_card] No pipeline_run_id, skipping rectangles load');
       }
       
       // Показываем специальные действия для sorting режима
@@ -404,6 +406,12 @@
    */
   function drawRectangles() {
     if (!currentState.showRectangles) {
+      console.log('[photo_card] Rectangles hidden by showRectangles flag');
+      return;
+    }
+    
+    if (!currentState.rectangles || currentState.rectangles.length === 0) {
+      console.log('[photo_card] No rectangles to draw');
       return;
     }
 
@@ -412,6 +420,7 @@
     const imgWrap = document.getElementById('photoCardImgWrap');
     
     if (!imgElement || !canvas || !imgWrap) {
+      console.warn('[photo_card] Missing DOM elements for drawing rectangles');
       return;
     }
 
@@ -1139,7 +1148,7 @@
     if (toggleBtn) {
       toggleBtn.addEventListener('click', function() {
         currentState.showRectangles = !currentState.showRectangles;
-        toggleBtn.textContent = currentState.showRectangles ? 'Скрыть квадраты' : 'Показать квадраты';
+        toggleBtn.textContent = currentState.showRectangles ? 'Скрыть прямоугольники' : 'Показать прямоугольники';
         if (currentState.showRectangles) {
           drawRectangles();
         } else {
