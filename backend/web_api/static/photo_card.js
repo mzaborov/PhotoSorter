@@ -289,12 +289,10 @@
       // Загружаем изображение
       await loadImage();
 
-      // Загружаем rectangles (для всех режимов, если есть pipeline_run_id)
+      // Загружаем rectangles (для всех режимов, pipeline_run_id опционален для архивных фото)
+      await loadRectangles();
       if (currentState.pipeline_run_id) {
-        await loadRectangles();
         await checkDuplicates();
-      } else {
-        console.warn('[photo_card] No pipeline_run_id, skipping rectangles load');
       }
       
       // Показываем специальные действия для sorting режима
@@ -371,14 +369,17 @@
    * Загружает rectangles через API
    */
   async function loadRectangles() {
-    if (!currentState.pipeline_run_id) {
-      console.warn('[photo_card] pipeline_run_id is required for loading rectangles');
+    if (!currentState.file_id && !currentState.file_path) {
+      console.warn('[photo_card] file_id or file_path is required for loading rectangles');
       return;
     }
 
     try {
       const params = new URLSearchParams();
-      params.append('pipeline_run_id', currentState.pipeline_run_id);
+      // pipeline_run_id опционален (для архивных фотографий)
+      if (currentState.pipeline_run_id) {
+        params.append('pipeline_run_id', currentState.pipeline_run_id);
+      }
       if (currentState.file_id) {
         params.append('file_id', currentState.file_id);
       } else if (currentState.file_path) {
@@ -946,7 +947,10 @@
    * Проверяет дубликаты персоны на фото
    */
   async function checkDuplicates() {
-    if (!currentState.pipeline_run_id) return;
+    // Проверка дубликатов работает только для sorting режима (с pipeline_run_id)
+    if (!currentState.pipeline_run_id || currentState.mode !== 'sorting') {
+      return;
+    }
     
     try {
       const params = new URLSearchParams();

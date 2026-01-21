@@ -1624,31 +1624,65 @@ def api_faces_remove_group(payload: dict[str, Any] = Body(...)) -> dict[str, Any
 
 
 @router.get("/api/faces/rectangles")
-def api_faces_rectangles(pipeline_run_id: int, file_id: int | None = None, path: str | None = None) -> dict[str, Any]:
+def api_faces_rectangles(pipeline_run_id: int | None = None, file_id: int | None = None, path: str | None = None) -> dict[str, Any]:
     """
     Возвращает список rectangles для файла.
     Приоритет: file_id (если передан), иначе path (если передан).
+    
+    Если pipeline_run_id не передан, загружает все rectangles для файла (для архивных фотографий).
     """
     from backend.common.db import _get_file_id, get_connection
     
     if file_id is None and path is None:
         raise HTTPException(status_code=400, detail="Either file_id or path must be provided")
     
-    ps = PipelineStore()
-    try:
-        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
-    finally:
-        ps.close()
-    if not pr:
-        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
-    face_run_id = pr.get("face_run_id")
-    if not face_run_id:
-        raise HTTPException(status_code=400, detail="face_run_id is not set yet")
-    face_run_id_i = int(face_run_id)
+    face_run_id_i = None
+    
+    # Если pipeline_run_id передан, получаем face_run_id
+    if pipeline_run_id is not None:
+        ps = PipelineStore()
+        try:
+            pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+        finally:
+            ps.close()
+        if not pr:
+            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+        face_run_id = pr.get("face_run_id")
+        if not face_run_id:
+            raise HTTPException(status_code=400, detail="face_run_id is not set yet")
+        face_run_id_i = int(face_run_id)
     
     fs = FaceStore()
     try:
-        rects = fs.list_rectangles(run_id=face_run_id_i, file_id=file_id, file_path=path)
+        # Если pipeline_run_id не передан, загружаем все rectangles для файла (без фильтрации по run_id)
+        if face_run_id_i is None:
+            # Получаем file_id
+            resolved_file_id = _get_file_id(fs.conn, file_id=file_id, file_path=path)
+            if resolved_file_id is None:
+                raise HTTPException(status_code=404, detail="File not found")
+            
+            # Загружаем все rectangles для файла (для архивных фотографий)
+            cur = fs.conn.cursor()
+            cur.execute(
+                """
+                SELECT
+                  fr.id, fr.run_id, f.path AS file_path, fr.face_index,
+                  fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
+                  fr.confidence, fr.presence_score,
+                  fr.manual_person, fr.ignore_flag,
+                  fr.created_at,
+                  COALESCE(fr.is_manual, 0) AS is_manual,
+                  fr.manual_created_at
+                FROM face_rectangles fr
+                JOIN files f ON f.id = fr.file_id
+                WHERE fr.file_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+                ORDER BY COALESCE(fr.is_manual, 0) ASC, fr.face_index ASC, fr.id ASC
+                """,
+                (resolved_file_id,),
+            )
+            rects = [dict(r) for r in cur.fetchall()]
+        else:
+            rects = fs.list_rectangles(run_id=face_run_id_i, file_id=file_id, file_path=path)
         
         # Добавляем информацию о персонах для каждого прямоугольника
         # face_clusters, face_person_manual_assignments и persons находятся в FaceStore
@@ -1697,7 +1731,13 @@ def api_faces_rectangles(pipeline_run_id: int, file_id: int | None = None, path:
     finally:
         fs.close()
     
-    return {"ok": True, "pipeline_run_id": int(pipeline_run_id), "run_id": face_run_id_i, "path": path, "rectangles": rects}
+    return {
+        "ok": True,
+        "pipeline_run_id": int(pipeline_run_id) if pipeline_run_id is not None else None,
+        "run_id": face_run_id_i,
+        "path": path,
+        "rectangles": rects
+    }
 
 
 @router.post("/api/faces/assign-face-person")
