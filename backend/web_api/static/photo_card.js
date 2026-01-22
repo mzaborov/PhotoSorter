@@ -395,7 +395,7 @@
       console.log('[photo_card] Loaded rectangles:', data.ok, data.rectangles?.length || 0, 'rectangles');
       if (data.ok && data.rectangles) {
         currentState.rectangles = data.rectangles;
-        console.log('[photo_card] Rectangles data:', currentState.rectangles.map(r => ({
+        console.log('[photo_card] Rectangles data sample:', currentState.rectangles.slice(0, 2).map(r => ({
           id: r.id,
           bbox_x: r.bbox_x,
           bbox_y: r.bbox_y,
@@ -408,7 +408,8 @@
         const imgElement = document.getElementById('photoCardImg');
         if (imgElement && imgElement.complete && imgElement.naturalWidth > 0) {
           console.log('[photo_card] Image already loaded, drawing rectangles');
-          drawRectangles();
+          // Небольшая задержка для гарантии, что DOM обновлен
+          setTimeout(() => drawRectangles(), 10);
         } else {
           console.log('[photo_card] Image not ready yet, will draw on load');
         }
@@ -460,6 +461,7 @@
     const imgDisplayHeight = imgRect.height;
 
     if (imgNaturalWidth === 0 || imgNaturalHeight === 0) {
+      console.warn('[photo_card] Image not loaded yet:', { naturalWidth: imgNaturalWidth, naturalHeight: imgNaturalHeight });
       return;
     }
 
@@ -467,7 +469,11 @@
     const scaleX = imgDisplayWidth / imgNaturalWidth;
     const scaleY = imgDisplayHeight / imgNaturalHeight;
 
-    console.log('[photo_card] Drawing rectangles:', currentState.rectangles.length, 'scale:', scaleX, scaleY);
+    console.log('[photo_card] Drawing rectangles:', {
+      count: currentState.rectangles.length,
+      scale: { x: scaleX, y: scaleY },
+      imageSize: { natural: { w: imgNaturalWidth, h: imgNaturalHeight }, display: { w: imgDisplayWidth, h: imgDisplayHeight } }
+    });
     
     // Рисуем каждый rectangle
     currentState.rectangles.forEach((rect, index) => {
@@ -493,12 +499,30 @@
         return;
       }
       
-      const x = bbox_x * scaleX;
-      const y = bbox_y * scaleY;
-      const w = bbox_w * scaleX;
-      const h = bbox_h * scaleY;
+      // Проверяем, что координаты не слишком большие (возможно, уже в пикселях экрана)
+      // Если координаты больше натуральных размеров изображения, возможно они уже в пикселях экрана
+      let x, y, w, h;
+      if (bbox_x > imgNaturalWidth || bbox_y > imgNaturalHeight) {
+        // Координаты уже в пикселях экрана, используем их напрямую
+        console.warn('[photo_card] Coordinates seem to be in display pixels, using directly:', { bbox_x, bbox_y, imgNaturalWidth, imgNaturalHeight });
+        x = bbox_x;
+        y = bbox_y;
+        w = bbox_w;
+        h = bbox_h;
+      } else {
+        // Координаты в натуральных размерах, масштабируем
+        x = bbox_x * scaleX;
+        y = bbox_y * scaleY;
+        w = bbox_w * scaleX;
+        h = bbox_h * scaleY;
+      }
       
-      console.log('[photo_card] Drawing rectangle', rect.id, 'at', x, y, w, h);
+      console.log('[photo_card] Drawing rectangle', rect.id, {
+        bbox: { x: bbox_x, y: bbox_y, w: bbox_w, h: bbox_h },
+        display: { x, y, w, h },
+        scale: { x: scaleX, y: scaleY },
+        imageSize: { natural: { w: imgNaturalWidth, h: imgNaturalHeight }, display: { w: imgDisplayWidth, h: imgDisplayHeight } }
+      });
 
       // Определяем цвет rectangle
       let color = 'rgba(250, 204, 21, 0.3)'; // Желтый по умолчанию (кластеры)
@@ -564,6 +588,9 @@
         }
         rectElement.appendChild(label);
       }
+      
+      // Добавляем rectangle в контейнер изображения
+      imgWrap.appendChild(rectElement);
       
       // Добавляем обработчики событий для редактирования (только для sorting режима)
       if (currentState.mode === 'sorting') {

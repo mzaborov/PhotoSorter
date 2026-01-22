@@ -81,6 +81,32 @@
     flex-wrap:wrap; 
     align-items:center; 
   }
+  .imgwrap {
+    position: relative;
+    display: inline-block;
+  }
+  .imgwrap img {
+    max-width: 94vw;
+    max-height: calc(94vh - 200px);
+    width: auto;
+    height: auto;
+    display: block;
+    background: #111827;
+  }
+  .imgwrap video {
+    max-width: 94vw;
+    max-height: calc(94vh - 200px);
+    width: auto;
+    height: auto;
+    display: block;
+    background: #111827;
+  }
+  .imgwrap canvas {
+    position: absolute;
+    left: 0;
+    top: 0;
+    pointer-events: none;
+  }
   .photo-card-rectangle {
     position: absolute;
     pointer-events: auto;
