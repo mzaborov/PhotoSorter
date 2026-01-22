@@ -794,6 +794,7 @@ class FaceStore:
         
         cur = self.conn.cursor()
         # Используем file_id для запроса (приоритет над file_path)
+        # Фильтруем rectangles с ignore_flag = 1 (помеченные как "нет людей" или "игнорировать")
         cur.execute(
             """
             SELECT
@@ -806,7 +807,7 @@ class FaceStore:
               fr.manual_created_at
             FROM face_rectangles fr
             JOIN files f ON f.id = fr.file_id
-            WHERE fr.run_id = ? AND fr.file_id = ?
+            WHERE fr.run_id = ? AND fr.file_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
             ORDER BY COALESCE(fr.is_manual, 0) ASC, fr.face_index ASC, fr.id ASC
             """,
             (int(run_id), resolved_file_id),

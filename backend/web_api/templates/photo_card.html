@@ -103,6 +103,9 @@
     background: #f9fafb;
     position: relative;
   }
+  #photoCardSpecialActions {
+    display: flex !important;
+  }
   .photo-card-position {
     font-weight: 700;
     font-size: 14px;
@@ -363,18 +366,18 @@
         <span class="photo-card-position" id="photoCardPosition" style="display:none;">1 из 1</span>
         <button class="btn" id="photoCardNext" type="button" style="display:none;">→</button>
       </div>
+      <!-- Специальные действия (только для sorting режима) -->
+      <div id="photoCardSpecialActions" style="position: absolute; right: 12px; display: none; gap: 8px; align-items: center;">
+        <button class="btn" id="photoCardAssignOutsider" type="button">Все остальные - посторонние</button>
+        <button class="btn danger" id="photoCardMarkAsCat" type="button">Это кот</button>
+        <button class="btn danger" id="photoCardMarkAsNoPeople" type="button">Нет людей</button>
+      </div>
     </div>
     
     <!-- Плашки со списком rectangles -->
     <div class="photo-card-bottom">
       <div class="muted">Прямоугольники:</div>
       <div class="rectlist" id="photoCardRectList"></div>
-      <!-- Специальные действия (только для sorting режима) -->
-      <div id="photoCardSpecialActions" style="display:none; margin-top:12px; padding-top:12px; border-top:1px solid #e5e7eb;">
-        <button class="btn" id="photoCardAssignOutsider" type="button">Все остальные - посторонние</button>
-        <button class="btn danger" id="photoCardMarkAsCat" type="button">Это кот</button>
-        <button class="btn danger" id="photoCardMarkAsNoPeople" type="button">Нет людей</button>
-      </div>
     </div>
   </div>
 </div>

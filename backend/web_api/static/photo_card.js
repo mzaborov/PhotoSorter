@@ -577,7 +577,8 @@ console.error = function(...args) {
         // Всегда обновляем список плашек, даже если изображение еще не загружено
         updateRectanglesList();
         
-        // Проверяем, загружено ли изображение перед отрисовкой
+        // ВСЕГДА вызываем drawRectangles() для удаления старых rectangles с экрана
+        // Это важно, когда rectangles были помечены как ignore_flag = 1 (например, после "нет людей")
         const imgElement = document.getElementById('photoCardImg');
         if (imgElement && imgElement.complete && imgElement.naturalWidth > 0 && imgElement.naturalHeight > 0) {
           console.log('[photo_card] Image already loaded, drawing rectangles');
@@ -587,6 +588,14 @@ console.error = function(...args) {
           }, 50);
         } else {
           console.log('[photo_card] Image not ready yet, will draw on load');
+          // Даже если изображение не готово, нужно удалить старые rectangles
+          // (они могут остаться на экране после обновления данных)
+          const imgWrap = document.getElementById('photoCardImgWrap');
+          if (imgWrap) {
+            const oldRects = imgWrap.querySelectorAll('.photo-card-rectangle');
+            console.log('[photo_card] Removing old rectangles (image not ready):', oldRects.length);
+            oldRects.forEach(el => el.remove());
+          }
         }
       } else {
         console.warn('[photo_card] No rectangles in response:', data);
@@ -849,16 +858,6 @@ console.error = function(...args) {
    * Отрисовывает rectangles на изображении
    */
   function drawRectangles() {
-    if (!currentState.showRectangles) {
-      console.log('[photo_card] Rectangles hidden by showRectangles flag');
-      return;
-    }
-    
-    if (!currentState.rectangles || currentState.rectangles.length === 0) {
-      console.log('[photo_card] No rectangles to draw');
-      return;
-    }
-
     const imgElement = document.getElementById('photoCardImg');
     const canvas = document.getElementById('photoCardCanvas');
     const imgWrap = document.getElementById('photoCardImgWrap');
@@ -868,10 +867,22 @@ console.error = function(...args) {
       return;
     }
 
-    // Очищаем старые rectangles
+    // ВСЕГДА очищаем старые rectangles (даже если новых нет)
+    // Это важно, когда rectangles были удалены или помечены как ignore_flag = 1
     const oldRects = imgWrap.querySelectorAll('.photo-card-rectangle');
     console.log('[photo_card] Removing old rectangles:', oldRects.length);
     oldRects.forEach(el => el.remove());
+    
+    // Если rectangles скрыты или их нет, просто удаляем старые и выходим
+    if (!currentState.showRectangles) {
+      console.log('[photo_card] Rectangles hidden by showRectangles flag');
+      return;
+    }
+    
+    if (!currentState.rectangles || currentState.rectangles.length === 0) {
+      console.log('[photo_card] No rectangles to draw (all removed)');
+      return;
+    }
 
     if (!imgElement.complete || imgElement.naturalWidth === 0 || imgElement.naturalHeight === 0) {
       console.warn('[photo_card] Image not ready, skipping draw:', {
@@ -967,6 +978,9 @@ console.error = function(...args) {
         originalImageSize: currentState.originalImageSize
       });
 
+      // Проверяем дубликаты (красный восклицательный знак и красный текст)
+      const isDuplicate = rect.is_duplicate || false;
+      
       // Определяем цвет rectangle
       let color = 'rgba(250, 204, 21, 0.3)'; // Желтый по умолчанию (кластеры)
       let borderColor = 'rgba(250, 204, 21, 1)';
@@ -997,8 +1011,10 @@ console.error = function(...args) {
         labelColor = '#fff'; // Белый текст для зеленого фона
       }
       
-      // Проверяем дубликаты (красный восклицательный знак)
-      const isDuplicate = rect.is_duplicate || false;
+      // Для дубликатов - только красный текст, рамка остается как есть
+      if (isDuplicate) {
+        labelColor = '#dc2626'; // Красный текст для дубликатов
+      }
       
       // Проверяем тип привязки для стиля границы (пунктир для ручных привязок)
       const isManualFace = rect.assignment_type === 'manual_face';
@@ -1044,7 +1060,7 @@ console.error = function(...args) {
         label.style.zIndex = '10002';
         label.style.pointerEvents = 'none';
         if (isDuplicate) {
-          label.style.color = '#dc2626'; // Красный для дубликатов
+          label.style.color = '#dc2626'; // Красный текст для дубликатов
         }
         rectElement.appendChild(label);
       }
@@ -1143,7 +1159,7 @@ console.error = function(...args) {
       const text = document.createElement('span');
       text.textContent = (rect.is_duplicate ? '⚠ ' : '') + (rect.person_name || `Rectangle ${index + 1}`);
       if (rect.is_duplicate) {
-        text.style.color = '#dc2626';
+        text.style.color = '#dc2626'; // Красный текст для дубликатов в плашке
       }
       pill.appendChild(text);
       
@@ -1201,21 +1217,21 @@ console.error = function(...args) {
     
     const hasPerson = rect.person_id !== null && rect.person_id !== undefined;
     
-    // Кнопка "Посторонний" - отдельный пункт меню первого уровня (первым)
+    // Кнопка "Посторонние" - отдельный пункт меню первого уровня (первым)
     const outsiderBtn = document.createElement('button');
     outsiderBtn.textContent = 'Посторонний';
     outsiderBtn.addEventListener('click', async function(e) {
       e.stopPropagation();
       menu.classList.remove('open');
       
-      // Находим персону "Посторонние" (в БД хранится как "Посторонние")
+      // Находим персону "Посторонний" по флагу is_ignored
       if (!currentState.allPersons || currentState.allPersons.length === 0) {
         await loadPersons();
       }
       
-      const outsiderPerson = currentState.allPersons.find(p => p.name === 'Посторонние');
+      const outsiderPerson = currentState.allPersons.find(p => p.is_ignored === true);
       if (!outsiderPerson) {
-        alert('Персона "Посторонние" не найдена');
+        alert('Персона "Посторонний" не найдена');
         return;
       }
       
@@ -1277,11 +1293,6 @@ console.error = function(...args) {
           menu.classList.remove('open');
           
           const newType = rect.assignment_type === 'cluster' ? 'manual_face' : 'cluster';
-          const confirmText = newType === 'manual_face' 
-            ? 'Изменить привязку на ручную? (rectangle будет удален из кластера)'
-            : 'Изменить привязку на кластер? (ручная привязка будет удалена)';
-          
-          if (!confirm(confirmText)) return;
           
           try {
             // Сохраняем старое состояние для UNDO
@@ -1357,7 +1368,7 @@ console.error = function(...args) {
     
     currentState.allPersons.forEach(person => {
       // Исключаем "Посторонние" из списка
-      if (person.name === 'Посторонние') {
+      if (person.is_ignored === true) {
         return;
       }
       
@@ -2598,75 +2609,75 @@ console.error = function(...args) {
     
     if (assignOutsiderBtn) {
       assignOutsiderBtn.addEventListener('click', async function() {
-        if (confirm('Назначить все неназначенные rectangles персоне "Посторонний"?')) {
-          try {
-            const response = await fetch('/api/faces/rectangles/assign-outsider', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                pipeline_run_id: currentState.pipeline_run_id,
-                file_id: currentState.file_id,
-                path: currentState.file_path
-              })
-            });
-            if (response.ok) {
-              await loadRectangles();
-              await checkDuplicates();
-            }
-          } catch (error) {
-            console.error('[photo_card] Error assigning outsider:', error);
-            alert('Ошибка: ' + error.message);
+        try {
+          const payload = {
+            file_id: currentState.file_id,
+            path: currentState.file_path
+          };
+          // Для архивных файлов pipeline_run_id не нужен
+          if (currentState.pipeline_run_id) {
+            payload.pipeline_run_id = currentState.pipeline_run_id;
           }
+          
+          const response = await fetch('/api/faces/rectangles/assign-outsider', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          if (response.ok) {
+            await loadRectangles();
+            await checkDuplicates();
+          } else {
+            const errorData = await response.json().catch(() => ({ detail: response.statusText }));
+            alert('Ошибка: ' + (errorData.detail || response.statusText));
+          }
+        } catch (error) {
+          console.error('[photo_card] Error assigning outsider:', error);
+          alert('Ошибка: ' + error.message);
         }
       });
     }
     
     if (markAsCatBtn) {
       markAsCatBtn.addEventListener('click', async function() {
-        if (confirm('Пометить файл как "кот"? Все rectangles будут удалены.')) {
-          try {
-            const response = await fetch('/api/faces/file/mark-as-cat', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                pipeline_run_id: currentState.pipeline_run_id,
-                file_id: currentState.file_id,
-                path: currentState.file_path
-              })
-            });
-            if (response.ok) {
-              await loadRectangles();
-              alert('Файл помечен как "кот"');
-            }
-          } catch (error) {
-            console.error('[photo_card] Error marking as cat:', error);
-            alert('Ошибка: ' + error.message);
+        try {
+          const response = await fetch('/api/faces/file/mark-as-cat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              pipeline_run_id: currentState.pipeline_run_id,
+              file_id: currentState.file_id,
+              path: currentState.file_path
+            })
+          });
+          if (response.ok) {
+            await loadRectangles();
           }
+        } catch (error) {
+          console.error('[photo_card] Error marking as cat:', error);
+          alert('Ошибка: ' + error.message);
         }
       });
     }
     
     if (markAsNoPeopleBtn) {
       markAsNoPeopleBtn.addEventListener('click', async function() {
-        if (confirm('Пометить файл как "нет людей"? Все rectangles будут удалены.')) {
-          try {
-            const response = await fetch('/api/faces/file/mark-as-no-people', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                pipeline_run_id: currentState.pipeline_run_id,
-                file_id: currentState.file_id,
-                path: currentState.file_path
-              })
-            });
-            if (response.ok) {
-              await loadRectangles();
-              alert('Файл помечен как "нет людей"');
-            }
-          } catch (error) {
-            console.error('[photo_card] Error marking as no people:', error);
-            alert('Ошибка: ' + error.message);
+        try {
+          const response = await fetch('/api/faces/file/mark-as-no-people', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              pipeline_run_id: currentState.pipeline_run_id,
+              file_id: currentState.file_id,
+              path: currentState.file_path
+            })
+          });
+          if (response.ok) {
+            await loadRectangles();
           }
+        } catch (error) {
+          console.error('[photo_card] Error marking as no people:', error);
+          alert('Ошибка: ' + error.message);
         }
       });
     }
@@ -2709,14 +2720,21 @@ console.error = function(...args) {
     const assignPersonBtn = document.getElementById('photoCardAssignPerson');
     const assignPersonContainer = document.getElementById('photoCardAssignPersonContainer');
     if (assignPersonBtn && assignPersonContainer) {
-      assignPersonBtn.addEventListener('mouseenter', function() {
-        if (!currentState.isDrawing) {
-          showAssignPersonMenu(assignPersonContainer);
-        }
-      });
-      assignPersonBtn.addEventListener('click', function() {
+      assignPersonBtn.addEventListener('click', function(e) {
         if (currentState.isDrawing) {
           toggleDrawingMode();
+        } else {
+          // Проверяем, открыто ли меню
+          const existingMenu = assignPersonContainer.querySelector('.assign-person-menu');
+          if (existingMenu) {
+            // Если меню открыто - закрываем его
+            existingMenu.remove();
+            e.stopPropagation();
+          } else {
+            // Если меню закрыто - открываем его
+            showAssignPersonMenu(assignPersonContainer);
+            e.stopPropagation();
+          }
         }
       });
     }
@@ -3282,12 +3300,13 @@ console.error = function(...args) {
     personsList.style.maxHeight = '400px';
     personsList.style.overflowY = 'auto';
     
-    // Группируем персон по группам (исключая "Посторонние")
+    // Группируем персон по группам (исключая "Посторонний" по флагу is_ignored)
     const personsByGroup = {};
     const noGroupPersons = [];
     
     currentState.allPersons.forEach(person => {
-      if (person.name === 'Посторонние') return;
+      // Исключаем "Посторонний" по флагу is_ignored (будет добавлен отдельной кнопкой в конце)
+      if (person.is_ignored === true) return;
       
       const group = person.group || null;
       if (group) {
@@ -3375,7 +3394,7 @@ console.error = function(...args) {
       personsList.appendChild(personBtn);
     });
     
-    // Кнопка "Посторонний"
+    // Кнопка "Посторонние"
     const outsiderBtn = document.createElement('button');
     outsiderBtn.textContent = 'Посторонний';
     outsiderBtn.style.width = '100%';
@@ -3397,9 +3416,9 @@ console.error = function(...args) {
     });
     
     outsiderBtn.addEventListener('click', async () => {
-      const outsiderPerson = currentState.allPersons.find(p => p.name === 'Посторонние');
+      const outsiderPerson = currentState.allPersons.find(p => p.is_ignored === true);
       if (!outsiderPerson) {
-        alert('Персона "Посторонние" не найдена');
+        alert('Персона "Посторонний" не найдена');
         return;
       }
       modal.remove();
@@ -3449,12 +3468,20 @@ console.error = function(...args) {
         bbox: bbox
       };
       
-      // Для сортируемых фото требуется pipeline_run_id
+      // Для сортируемых фото требуется pipeline_run_id И file_id/path
       if (currentState.mode === 'sorting') {
         if (!currentState.pipeline_run_id) {
           throw new Error('pipeline_run_id is required for sorting mode');
         }
         payload.pipeline_run_id = currentState.pipeline_run_id;
+        // Для сортируемых фото тоже нужен file_id или path
+        if (currentState.file_id) {
+          payload.file_id = currentState.file_id;
+        } else if (currentState.file_path) {
+          payload.path = currentState.file_path;
+        } else {
+          throw new Error('file_id or file_path is required for sorting mode');
+        }
       } else {
         // Для архивных фото используем file_id или file_path
         if (currentState.file_id) {
@@ -3546,12 +3573,13 @@ console.error = function(...args) {
     personsList.style.maxHeight = '400px';
     personsList.style.overflowY = 'auto';
     
-    // Группируем персон по группам (исключая "Посторонние")
+    // Группируем персон по группам (исключая "Посторонний" по флагу is_ignored)
     const personsByGroup = {};
     const noGroupPersons = [];
     
     currentState.allPersons.forEach(person => {
-      if (person.name === 'Посторонние') return;
+      // Исключаем "Посторонний" по флагу is_ignored (будет добавлен отдельной кнопкой в конце)
+      if (person.is_ignored === true) return;
       
       const group = person.group || null;
       if (group) {
@@ -3637,7 +3665,7 @@ console.error = function(...args) {
       personsList.appendChild(personBtn);
     });
     
-    // Кнопка "Посторонний"
+    // Кнопка "Посторонние"
     const outsiderBtn = document.createElement('button');
     outsiderBtn.textContent = 'Посторонний';
     outsiderBtn.style.width = '100%';
@@ -3659,9 +3687,9 @@ console.error = function(...args) {
     });
     
     outsiderBtn.addEventListener('click', async () => {
-      const outsiderPerson = currentState.allPersons.find(p => p.name === 'Посторонние');
+      const outsiderPerson = currentState.allPersons.find(p => p.is_ignored === true);
       if (!outsiderPerson) {
-        alert('Персона "Посторонние" не найдена');
+        alert('Персона "Посторонний" не найдена');
         return;
       }
       modal.remove();

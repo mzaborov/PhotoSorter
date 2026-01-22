@@ -946,9 +946,16 @@ def find_closest_cluster_with_person_for_face(
     except Exception:
         return None
     
-    # Получаем все кластеры с персоной (исключая "Посторонние") с их средними embeddings
+    # Получаем ID персоны "Посторонний" для исключения
+    cur.execute("SELECT id FROM persons WHERE name LIKE '%Посторонн%' LIMIT 1")
+    outsider_person_row = cur.fetchone()
+    outsider_person_id = outsider_person_row["id"] if outsider_person_row else None
+    
+    # Получаем все кластеры с персоной (исключая "Посторонний") с их средними embeddings
     exclude_clause = ""
-    exclude_params = [ignored_person_name]
+    exclude_params = []
+    if outsider_person_id is not None:
+        exclude_params.append(outsider_person_id)
     if exclude_cluster_id is not None:
         exclude_clause = "AND fc.id != ?"
         exclude_params.append(exclude_cluster_id)
@@ -967,9 +974,9 @@ def find_closest_cluster_with_person_for_face(
         WHERE fr.embedding IS NOT NULL
           AND COALESCE(fr.ignore_flag, 0) = 0
           AND fc.person_id IS NOT NULL
-          AND (p.name IS NULL OR p.name != ?)
+          AND (fc.person_id IS NULL OR fc.person_id != ?)
           {exclude_clause}
-        GROUP BY fc.id, fl.person_id, p.name
+        GROUP BY fc.id, fc.person_id, p.name
         """,
         tuple(exclude_params),
     )
@@ -1090,9 +1097,16 @@ def find_closest_cluster_with_person_for_face_by_min_distance(
     except Exception:
         return None
     
-    # Получаем все кластеры с персоной (исключая "Посторонние") с их embeddings
+    # Получаем ID персоны "Посторонний" для исключения
+    cur.execute("SELECT id FROM persons WHERE name LIKE '%Посторонн%' LIMIT 1")
+    outsider_person_row = cur.fetchone()
+    outsider_person_id = outsider_person_row["id"] if outsider_person_row else None
+    
+    # Получаем все кластеры с персоной (исключая "Посторонний") с их embeddings
     exclude_clause = ""
-    exclude_params = [ignored_person_name]
+    exclude_params = []
+    if outsider_person_id is not None:
+        exclude_params.append(outsider_person_id)
     if exclude_cluster_id is not None:
         exclude_clause = "AND fc.id != ?"
         exclude_params.append(exclude_cluster_id)
@@ -1111,7 +1125,7 @@ def find_closest_cluster_with_person_for_face_by_min_distance(
         WHERE fr.embedding IS NOT NULL
           AND COALESCE(fr.ignore_flag, 0) = 0
           AND fc.person_id IS NOT NULL
-          AND p.name != ?
+          AND (fc.person_id IS NULL OR fc.person_id != ?)
           {exclude_clause}
         GROUP BY fc.id, fc.person_id, p.name
         """,

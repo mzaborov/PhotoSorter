@@ -2648,11 +2648,11 @@ def api_faces_rectangle_delete(payload: dict[str, Any] = Body(...)) -> dict[str,
 @router.post("/api/faces/rectangles/assign-outsider")
 def api_faces_rectangles_assign_outsider(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """
-    Назначает все неназначенные rectangles персоне "Посторонний".
+    Назначает все неназначенные rectangles персоне "Посторонние".
     Приоритет: file_id (если передан), иначе path (если передан).
     
     Параметры:
-    - pipeline_run_id: int (обязательно)
+    - pipeline_run_id: int (опционально, для файлов из прогона сортировки)
     - file_id: int (опционально)
     - path: str (опционально)
     """
@@ -2662,23 +2662,28 @@ def api_faces_rectangles_assign_outsider(payload: dict[str, Any] = Body(...)) ->
     file_id = payload.get("file_id")
     path = payload.get("path")
     
-    if not isinstance(pipeline_run_id, int):
-        raise HTTPException(status_code=400, detail="pipeline_run_id is required and must be int")
     if file_id is None and path is None:
         raise HTTPException(status_code=400, detail="Either file_id or path must be provided")
     
-    # Проверяем, что pipeline_run_id существует
-    ps = PipelineStore()
-    try:
-        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
-        if not pr:
-            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
-        face_run_id = pr.get("face_run_id")
-        if not face_run_id:
-            raise HTTPException(status_code=400, detail="face_run_id is not set yet")
-        face_run_id_i = int(face_run_id)
-    finally:
-        ps.close()
+    # Определяем, архивный ли это файл
+    is_archive = path and path.startswith("disk:")
+    
+    # Для файлов из прогона сортировки проверяем pipeline_run_id
+    face_run_id_i = None
+    if pipeline_run_id is not None:
+        if not isinstance(pipeline_run_id, int):
+            raise HTTPException(status_code=400, detail="pipeline_run_id must be int if provided")
+        ps = PipelineStore()
+        try:
+            pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+            if not pr:
+                raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+            face_run_id = pr.get("face_run_id")
+            if not face_run_id:
+                raise HTTPException(status_code=400, detail="face_run_id is not set yet")
+            face_run_id_i = int(face_run_id)
+        finally:
+            ps.close()
     
     # Получаем file_id
     conn = get_connection()
@@ -2689,44 +2694,54 @@ def api_faces_rectangles_assign_outsider(payload: dict[str, Any] = Body(...)) ->
     finally:
         conn.close()
     
-    # Находим или создаем персону "Посторонний"
+    # Находим или создаем персону "Посторонний" (или "Посторонние")
     fs = FaceStore()
     try:
         conn = fs.conn
         cur = conn.cursor()
         
-        # Ищем персону "Посторонний"
-        cur.execute("SELECT id FROM persons WHERE name = 'Посторонний' LIMIT 1")
-        person_row = cur.fetchone()
-        if person_row:
-            outsider_person_id = person_row["id"]
-        else:
-            # Создаем персону "Посторонний"
-            from datetime import datetime, timezone
-            now = datetime.now(timezone.utc).isoformat()
-            cur.execute("""
-                INSERT INTO persons (name, is_me, created_at)
-                VALUES ('Посторонний', 0, ?)
-            """, (now,))
-            outsider_person_id = cur.lastrowid
+        # Используем функцию для получения ID персоны "Посторонний"
+        from backend.web_api.routers.face_clusters import get_outsider_person_id
+        outsider_person_id = get_outsider_person_id(conn)
+        if not outsider_person_id:
+            raise HTTPException(status_code=500, detail="Персона 'Посторонний' не найдена. Требуется миграция.")
         
         # Находим все неназначенные rectangles для файла
-        cur.execute("""
-            SELECT fr.id
-            FROM face_rectangles fr
-            WHERE fr.file_id = ? 
-              AND fr.run_id = ?
-              AND COALESCE(fr.ignore_flag, 0) = 0
-              AND NOT EXISTS (
-                  SELECT 1 FROM face_person_manual_assignments fpma 
-                  WHERE fpma.face_rectangle_id = fr.id
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM face_cluster_members fcm
-                  JOIN face_clusters fc ON fc.id = fcm.cluster_id
-                  WHERE fcm.face_rectangle_id = fr.id AND fc.person_id IS NOT NULL
-              )
-        """, (resolved_file_id, face_run_id_i))
+        # Для архивных файлов используем archive_scope, для файлов из прогона - run_id
+        if is_archive or face_run_id_i is None:
+            cur.execute("""
+                SELECT fr.id
+                FROM face_rectangles fr
+                WHERE fr.file_id = ? 
+                  AND fr.archive_scope = 'archive'
+                  AND COALESCE(fr.ignore_flag, 0) = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM face_person_manual_assignments fpma 
+                      WHERE fpma.face_rectangle_id = fr.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM face_cluster_members fcm
+                      JOIN face_clusters fc ON fc.id = fcm.cluster_id
+                      WHERE fcm.face_rectangle_id = fr.id AND fc.person_id IS NOT NULL
+                  )
+            """, (resolved_file_id,))
+        else:
+            cur.execute("""
+                SELECT fr.id
+                FROM face_rectangles fr
+                WHERE fr.file_id = ? 
+                  AND fr.run_id = ?
+                  AND COALESCE(fr.ignore_flag, 0) = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM face_person_manual_assignments fpma 
+                      WHERE fpma.face_rectangle_id = fr.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM face_cluster_members fcm
+                      JOIN face_clusters fc ON fc.id = fcm.cluster_id
+                      WHERE fcm.face_rectangle_id = fr.id AND fc.person_id IS NOT NULL
+                  )
+            """, (resolved_file_id, face_run_id_i))
         
         unassigned_rects = cur.fetchall()
         assigned_count = 0
@@ -3027,10 +3042,17 @@ def api_faces_rectangles_duplicates_check(
                 person_rects[person_id].append(rect["face_rectangle_id"])
         
         # Находим дубликаты (персоны с более чем одним rectangle)
+        # ИСКЛЮЧЕНИЕ: "Посторонний" - это специальная персона, для нее дубликаты разрешены
+        # Получаем ID персоны "Посторонний" для исключения из проверки
+        from backend.web_api.routers.face_clusters import get_outsider_person_id
+        outsider_person_id = get_outsider_person_id(conn)
+        
         duplicates: dict[int, list[int]] = {}
         for person_id, rect_ids in person_rects.items():
             if len(rect_ids) > 1:
-                duplicates[person_id] = rect_ids
+                # Исключаем "Посторонний" из проверки дубликатов по ID
+                if person_id != outsider_person_id:
+                    duplicates[person_id] = rect_ids
         
         # Формируем результат
         result_rectangles = []

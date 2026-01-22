@@ -157,8 +157,46 @@ router = APIRouter()
 APP_DIR = Path(__file__).resolve().parents[1]
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
-# Константа для специальной персоны "Посторонние"
-IGNORED_PERSON_NAME = "Посторонние"
+# Константа для специальной персоны "Посторонний" (или "Посторонние")
+IGNORED_PERSON_NAME = "Посторонние"  # Для обратной совместимости, но используем ID
+
+def get_outsider_person_id(conn) -> int | None:
+    """
+    Получает ID персоны "Посторонний" (ID = 6).
+    Всегда использует фиксированный ID 6.
+    Если персона с ID 6 не существует - создает её с именем "Посторонний".
+    НЕ ищет по имени и НЕ создает дубликатов - всегда использует только ID 6.
+    """
+    cur = conn.cursor()
+    # Проверяем существование персоны с ID 6
+    cur.execute("SELECT id FROM persons WHERE id = 6")
+    person_row = cur.fetchone()
+    if person_row:
+        return 6
+    
+    # Персона с ID 6 не найдена - создаем её
+    # ВАЖНО: SQLite не позволяет явно указать ID в INSERT,
+    # но если ID 6 свободен (был удален), автоинкремент может его использовать
+    # Если нет - создастся персона с другим ID, что нежелательно
+    # В этом случае нужно будет запустить миграцию для исправления
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    cur.execute("""
+        INSERT INTO persons (name, mode, is_me, created_at, updated_at)
+        VALUES ('Посторонний', 'active', 0, ?, ?)
+    """, (now, now))
+    conn.commit()
+    created_id = cur.lastrowid
+    
+    # Если созданная персона получила ID 6 - отлично
+    if created_id == 6:
+        return 6
+    
+    # Если получила другой ID - это проблема, но возвращаем его для работоспособности
+    # В логе можно будет увидеть, что нужна миграция
+    import logging
+    logging.warning(f"Персона 'Посторонний' создана с ID {created_id} вместо ожидаемого ID 6. Требуется миграция.")
+    return created_id
 
 # Группы персон с порядком сортировки
 PERSON_GROUPS = {
@@ -241,11 +279,14 @@ async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: st
     else:
         where_clause = "1=1"
     
-    # Параметры для ORDER BY (IGNORED_PERSON_NAME)
-    params = tuple(where_params) + (IGNORED_PERSON_NAME,)
+    # Получаем ID персоны "Посторонний" для ORDER BY
+    outsider_person_id = get_outsider_person_id(conn)
+    
+    # Параметры для ORDER BY (используем ID вместо имени)
+    params = tuple(where_params) + (outsider_person_id,)
     
     # Подсчет общего количества кластеров для пагинации
-    # Для COUNT нужны только параметры WHERE (без IGNORED_PERSON_NAME, который используется только в ORDER BY)
+    # Для COUNT нужны только параметры WHERE (без outsider_person_id, который используется только в ORDER BY)
     count_params = tuple(where_params)
     
     cur_count = conn.cursor()
@@ -301,7 +342,7 @@ async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: st
              JOIN face_rectangles fr2 ON fcm2.face_rectangle_id = fr2.id
              WHERE fcm2.cluster_id = fc.id AND COALESCE(fr2.ignore_flag, 0) = 0) > 0
         ORDER BY 
-            CASE WHEN p.name = ? THEN 1 ELSE 0 END,
+            CASE WHEN p.id = ? THEN 1 ELSE 0 END,
             person_name ASC, 
             faces_count DESC, 
             fc.created_at DESC
@@ -970,33 +1011,14 @@ async def api_face_cluster_info(*, cluster_id: int, limit: int | None = None) ->
 
 @router.get("/api/persons/list")
 async def api_persons_list() -> dict[str, Any]:
-    """Получает список персон из справочника. Автоматически создаёт персону "Посторонние" если её нет."""
-    from datetime import datetime, timezone
-    
+    """Получает список персон из справочника. Автоматически создаёт персону "Посторонний" если её нет."""
     conn = get_connection()
     cur = conn.cursor()
     
-    # Проверяем, есть ли персона "Посторонние"
-    cur.execute(
-        """
-        SELECT id FROM persons WHERE name = ?
-        """,
-        (IGNORED_PERSON_NAME,),
-    )
-    ignored_person_row = cur.fetchone()
-    
-    # Если нет - создаём автоматически
-    if not ignored_person_row:
-        now = datetime.now(timezone.utc).isoformat()
-        cur.execute(
-            """
-            INSERT INTO persons (name, mode, is_me, kinship, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (IGNORED_PERSON_NAME, "active", 0, None, now, now),
-        )
-        conn.commit()
-        print(f"Автоматически создана персона '{IGNORED_PERSON_NAME}'")
+    # Получаем или создаем персону "Посторонний" один раз
+    outsider_person_id = get_outsider_person_id(conn)
+    if outsider_person_id:
+        print(f"Персона 'Посторонний' найдена (ID: {outsider_person_id})")
     
     cur.execute(
         """
@@ -1019,7 +1041,7 @@ async def api_persons_list() -> dict[str, Any]:
             "updated_at": row["updated_at"],
             "group": row["group"],
             "group_order": row["group_order"],
-            "is_ignored": row["name"] == IGNORED_PERSON_NAME,  # Флаг для персоны "Посторонние"
+            "is_ignored": row["id"] == outsider_person_id,  # Флаг для персоны "Посторонний"
         })
     
     return {"persons": persons}
@@ -1031,16 +1053,21 @@ async def api_persons_stats() -> dict[str, Any]:
     Возвращает список персон со статистикой: количество кластеров и лиц.
     """
     import time
+    import traceback
     metrics = {}
     total_start = time.time()
     
-    conn = get_connection()
-    cur = conn.cursor()
-    
-    # Оптимизированный запрос: используем JOIN и агрегацию вместо множественных подзапросов
-    # Сначала получаем базовую информацию о персонах
-    step_start = time.time()
-    cur.execute(
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        
+        # Получаем ID персоны "Посторонний" один раз
+        outsider_person_id = get_outsider_person_id(conn)
+        
+        # Оптимизированный запрос: используем JOIN и агрегацию вместо множественных подзапросов
+        # Сначала получаем базовую информацию о персонах
+        step_start = time.time()
+        cur.execute(
         """
         SELECT 
             p.id,
@@ -1050,40 +1077,40 @@ async def api_persons_stats() -> dict[str, Any]:
             p.group_order
         FROM persons p
         ORDER BY 
-            CASE WHEN p.name = ? THEN 1 ELSE 0 END,
+            CASE WHEN p.id = ? THEN 1 ELSE 0 END,
             COALESCE(p.group_order, 999) ASC,
             p.name ASC
         """,
-        (IGNORED_PERSON_NAME,),
+        (outsider_person_id,),
     )
     
-    person_rows = cur.fetchall()
-    metrics["step1_get_persons"] = time.time() - step_start
+        person_rows = cur.fetchall()
+        metrics["step1_get_persons"] = time.time() - step_start
+        
+        # Теперь для каждой персоны получаем статистику через отдельные оптимизированные запросы
+        # Это быстрее, чем множественные подзапросы в одном SELECT
+        persons_data = {}
+        for row in person_rows:
+            person_id = row["id"]
+            persons_data[person_id] = {
+                "id": person_id,
+                "name": row["name"],
+                "avatar_face_id": row["avatar_face_id"],
+                "group": row["group"],
+                "group_order": row["group_order"],
+                "clusters_count": 0,
+                "clusters_count_archive": 0,
+                "clusters_count_run": 0,
+                "faces_count": 0,
+                "faces_count_archive": 0,
+                "faces_count_run": 0,
+                "person_rectangles_files_count": 0,
+                "file_persons_files_count": 0,
+            }
     
-    # Теперь для каждой персоны получаем статистику через отдельные оптимизированные запросы
-    # Это быстрее, чем множественные подзапросы в одном SELECT
-    persons_data = {}
-    for row in person_rows:
-        person_id = row["id"]
-        persons_data[person_id] = {
-            "id": person_id,
-            "name": row["name"],
-            "avatar_face_id": row["avatar_face_id"],
-            "group": row["group"],
-            "group_order": row["group_order"],
-            "clusters_count": 0,
-            "clusters_count_archive": 0,
-            "clusters_count_run": 0,
-            "faces_count": 0,
-            "faces_count_archive": 0,
-            "faces_count_run": 0,
-            "person_rectangles_files_count": 0,
-            "file_persons_files_count": 0,
-        }
-    
-    # Получаем статистику кластеров одним запросом
-    step_start = time.time()
-    cur.execute("""
+        # Получаем статистику кластеров одним запросом
+        step_start = time.time()
+        cur.execute("""
         SELECT 
             fc.person_id,
             COUNT(DISTINCT CASE WHEN fc.archive_scope = 'archive' THEN fc.id END) as clusters_archive,
@@ -1093,17 +1120,17 @@ async def api_persons_stats() -> dict[str, Any]:
         WHERE fc.person_id IS NOT NULL
         GROUP BY fc.person_id
     """)
-    for row in cur.fetchall():
-        if row["person_id"] in persons_data:
-            persons_data[row["person_id"]]["clusters_count"] = row["clusters_total"] or 0
-            persons_data[row["person_id"]]["clusters_count_archive"] = row["clusters_archive"] or 0
-            persons_data[row["person_id"]]["clusters_count_run"] = row["clusters_run"] or 0
-    metrics["step2_get_clusters_stats"] = time.time() - step_start
-    
-    # Получаем статистику лиц через кластеры одним запросом
-    # Оптимизация: начинаем с face_clusters (есть индекс по person_id), затем JOIN
-    step_start = time.time()
-    cur.execute("""
+        for row in cur.fetchall():
+            if row["person_id"] in persons_data:
+                persons_data[row["person_id"]]["clusters_count"] = row["clusters_total"] or 0
+                persons_data[row["person_id"]]["clusters_count_archive"] = row["clusters_archive"] or 0
+                persons_data[row["person_id"]]["clusters_count_run"] = row["clusters_run"] or 0
+        metrics["step2_get_clusters_stats"] = time.time() - step_start
+        
+        # Получаем статистику лиц через кластеры одним запросом
+        # Оптимизация: начинаем с face_clusters (есть индекс по person_id), затем JOIN
+        step_start = time.time()
+        cur.execute("""
         SELECT 
             fc.person_id,
             COUNT(DISTINCT CASE WHEN fr.archive_scope = 'archive' THEN fr.id END) as faces_archive,
@@ -1115,17 +1142,17 @@ async def api_persons_stats() -> dict[str, Any]:
         WHERE fc.person_id IS NOT NULL AND COALESCE(fr.ignore_flag, 0) = 0
         GROUP BY fc.person_id
     """)
-    for row in cur.fetchall():
-        if row["person_id"] in persons_data:
-            persons_data[row["person_id"]]["faces_count"] = (persons_data[row["person_id"]]["faces_count"] or 0) + (row["faces_total"] or 0)
-            persons_data[row["person_id"]]["faces_count_archive"] = (persons_data[row["person_id"]]["faces_count_archive"] or 0) + (row["faces_archive"] or 0)
-            persons_data[row["person_id"]]["faces_count_run"] = (persons_data[row["person_id"]]["faces_count_run"] or 0) + (row["faces_run"] or 0)
-    metrics["step3_get_faces_via_clusters"] = time.time() - step_start
-    
-    # Получаем статистику лиц через ручные привязки (исключая те, что уже в кластерах этой персоны)
-    # Используем LEFT JOIN вместо NOT EXISTS для лучшей производительности
-    step_start = time.time()
-    cur.execute("""
+        for row in cur.fetchall():
+            if row["person_id"] in persons_data:
+                persons_data[row["person_id"]]["faces_count"] = (persons_data[row["person_id"]]["faces_count"] or 0) + (row["faces_total"] or 0)
+                persons_data[row["person_id"]]["faces_count_archive"] = (persons_data[row["person_id"]]["faces_count_archive"] or 0) + (row["faces_archive"] or 0)
+                persons_data[row["person_id"]]["faces_count_run"] = (persons_data[row["person_id"]]["faces_count_run"] or 0) + (row["faces_run"] or 0)
+        metrics["step3_get_faces_via_clusters"] = time.time() - step_start
+        
+        # Получаем статистику лиц через ручные привязки (исключая те, что уже в кластерах этой персоны)
+        # Используем LEFT JOIN вместо NOT EXISTS для лучшей производительности
+        step_start = time.time()
+        cur.execute("""
         SELECT 
             fpma.person_id,
             COUNT(DISTINCT CASE WHEN fr.archive_scope = 'archive' AND fc_check.person_id IS NULL THEN fr.id END) as faces_archive,
@@ -1138,67 +1165,74 @@ async def api_persons_stats() -> dict[str, Any]:
         WHERE COALESCE(fr.ignore_flag, 0) = 0
         GROUP BY fpma.person_id
     """)
-    for row in cur.fetchall():
-        if row["person_id"] in persons_data:
-            persons_data[row["person_id"]]["faces_count"] = (persons_data[row["person_id"]]["faces_count"] or 0) + (row["faces_total"] or 0)
-            persons_data[row["person_id"]]["faces_count_archive"] = (persons_data[row["person_id"]]["faces_count_archive"] or 0) + (row["faces_archive"] or 0)
-            persons_data[row["person_id"]]["faces_count_run"] = (persons_data[row["person_id"]]["faces_count_run"] or 0) + (row["faces_run"] or 0)
-    metrics["step4_get_faces_via_manual"] = time.time() - step_start
+        for row in cur.fetchall():
+            if row["person_id"] in persons_data:
+                persons_data[row["person_id"]]["faces_count"] = (persons_data[row["person_id"]]["faces_count"] or 0) + (row["faces_total"] or 0)
+                persons_data[row["person_id"]]["faces_count_archive"] = (persons_data[row["person_id"]]["faces_count_archive"] or 0) + (row["faces_archive"] or 0)
+                persons_data[row["person_id"]]["faces_count_run"] = (persons_data[row["person_id"]]["faces_count_run"] or 0) + (row["faces_run"] or 0)
+        metrics["step4_get_faces_via_manual"] = time.time() - step_start
     
-    # Получаем статистику через прямоугольники и прямую привязку
-    step_start = time.time()
-    cur.execute("""
-        SELECT 
-            pr.person_id,
-            COUNT(DISTINCT pr.file_path) as files_count
-        FROM person_rectangles pr
-        GROUP BY pr.person_id
-    """)
-    for row in cur.fetchall():
-        if row["person_id"] in persons_data:
-            persons_data[row["person_id"]]["person_rectangles_files_count"] = row["files_count"] or 0
-    metrics["step5_get_person_rectangles"] = time.time() - step_start
+        # Получаем статистику через прямоугольники и прямую привязку
+        step_start = time.time()
+        # Проверяем существование таблицы person_rectangles
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='person_rectangles'")
+        if cur.fetchone():
+            cur.execute("""
+            SELECT 
+                pr.person_id,
+                COUNT(DISTINCT pr.file_id) as files_count
+            FROM person_rectangles pr
+            GROUP BY pr.person_id
+        """)
+            for row in cur.fetchall():
+                if row["person_id"] in persons_data:
+                    persons_data[row["person_id"]]["person_rectangles_files_count"] = row["files_count"] or 0
+        metrics["step5_get_person_rectangles"] = time.time() - step_start
     
-    step_start = time.time()
-    cur.execute("""
-        SELECT 
-            fp.person_id,
-            COUNT(DISTINCT fp.file_path) as files_count
-        FROM file_persons fp
-        GROUP BY fp.person_id
-    """)
-    for row in cur.fetchall():
-        if row["person_id"] in persons_data:
-            persons_data[row["person_id"]]["file_persons_files_count"] = row["files_count"] or 0
-    metrics["step6_get_file_persons"] = time.time() - step_start
+        step_start = time.time()
+        # Проверяем существование таблицы file_persons
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='file_persons'")
+        if cur.fetchone():
+            cur.execute("""
+            SELECT 
+                fp.person_id,
+                COUNT(DISTINCT fp.file_id) as files_count
+            FROM file_persons fp
+            GROUP BY fp.person_id
+        """)
+            for row in cur.fetchall():
+                if row["person_id"] in persons_data:
+                    persons_data[row["person_id"]]["file_persons_files_count"] = row["files_count"] or 0
+        metrics["step6_get_file_persons"] = time.time() - step_start
     
-    # Формируем финальный список персон с аватарами
-    step_start = time.time()
-    persons = []
-    avatar_queries_count = 0
-    for person_id, person_data in persons_data.items():
-        # Получаем preview для аватара, если есть
-        avatar_face_id = person_data["avatar_face_id"]
-        avatar_preview_url = None
-        if avatar_face_id:
-            avatar_queries_count += 1
-            cur.execute(
-                """
-                SELECT fr.file_path, fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
-                FROM face_rectangles fr
-                WHERE fr.id = ?
-                """,
-                (avatar_face_id,),
-            )
-            avatar_row = cur.fetchone()
-            if avatar_row:
-                file_path = avatar_row["file_path"]
-                if file_path and file_path.startswith("disk:"):
-                    avatar_preview_url = f"/api/yadisk/preview-image?size=M&path={urllib.parse.quote(file_path)}"
-                elif file_path and file_path.startswith("local:"):
-                    avatar_preview_url = f"/api/local/preview?path={urllib.parse.quote(file_path)}"
-        
-        persons.append({
+        # Формируем финальный список персон с аватарами
+        step_start = time.time()
+        persons = []
+        avatar_queries_count = 0
+        for person_id, person_data in persons_data.items():
+            # Получаем preview для аватара, если есть
+            avatar_face_id = person_data["avatar_face_id"]
+            avatar_preview_url = None
+            if avatar_face_id:
+                avatar_queries_count += 1
+                cur.execute(
+                    """
+                    SELECT f.path as file_path, fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
+                    FROM face_rectangles fr
+                    LEFT JOIN files f ON fr.file_id = f.id
+                    WHERE fr.id = ?
+                    """,
+                    (avatar_face_id,),
+                )
+                avatar_row = cur.fetchone()
+                if avatar_row:
+                    file_path = avatar_row["file_path"]
+                    if file_path and file_path.startswith("disk:"):
+                        avatar_preview_url = f"/api/yadisk/preview-image?size=M&path={urllib.parse.quote(file_path)}"
+                    elif file_path and file_path.startswith("local:"):
+                        avatar_preview_url = f"/api/local/preview?path={urllib.parse.quote(file_path)}"
+            
+            persons.append({
             "id": person_data["id"],
             "name": person_data["name"],
             "avatar_face_id": avatar_face_id,
@@ -1213,25 +1247,30 @@ async def api_persons_stats() -> dict[str, Any]:
             "file_persons_files_count": person_data["file_persons_files_count"],
             "group": person_data["group"],
             "group_order": person_data["group_order"],
-            "is_ignored": person_data["name"] == IGNORED_PERSON_NAME,
-        })
-    metrics["step7_build_final_list"] = time.time() - step_start
-    metrics["avatar_queries_count"] = avatar_queries_count
+                "is_ignored": person_data["id"] == outsider_person_id,
+            })
+        metrics["step7_build_final_list"] = time.time() - step_start
+        metrics["avatar_queries_count"] = avatar_queries_count
     
-    total_time = time.time() - total_start
-    metrics["total_time"] = total_time
-    
-    # Логируем метрики для отладки
-    logger = logging.getLogger(__name__)
-    logger.info(f"[api_persons_stats] Metrics: total={total_time:.3f}s, steps={metrics}, persons_count={len(persons)}")
-    
-    result = {"persons": persons}
-    
-    # Добавляем метрики производительности под ключом debug (только если включен debug режим)
-    # Для простоты всегда добавляем, но можно проверять через env переменную
-    result["debug"] = {"metrics": metrics}
-    
-    return result
+        total_time = time.time() - total_start
+        metrics["total_time"] = total_time
+        
+        # Логируем метрики для отладки
+        logger = logging.getLogger(__name__)
+        logger.info(f"[api_persons_stats] Metrics: total={total_time:.3f}s, steps={metrics}, persons_count={len(persons)}")
+        
+        result = {"persons": persons}
+        
+        # Добавляем метрики производительности под ключом debug (только если включен debug режим)
+        # Для простоты всегда добавляем, но можно проверять через env переменную
+        result["debug"] = {"metrics": metrics}
+        
+        return result
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        error_msg = f"Error in api_persons_stats: {str(e)}\n{traceback.format_exc()}"
+        logger.error(error_msg)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/api/persons/{person_id}")
@@ -1282,7 +1321,9 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
             JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
             LEFT JOIN files f ON fr.file_id = f.id
             LEFT JOIN pipeline_runs pr ON pr.face_run_id = fr.run_id
-            WHERE fc.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+            WHERE fc.person_id = ? 
+              AND COALESCE(fr.ignore_flag, 0) = 0
+              AND (f.status IS NULL OR f.status != 'deleted')
             ORDER BY 
                 CASE WHEN fr.archive_scope IS NULL OR fr.archive_scope != 'archive' THEN 1 ELSE 0 END,
                 COALESCE(f.path, ''), fr.face_index
@@ -1646,12 +1687,13 @@ async def api_person_face_similar(*, person_id: int, face_id: int, limit: int = 
         """
         SELECT 
             fr.id,
-            fr.file_path,
+            f.path as file_path,
             fr.face_index,
             fr.embedding,
-            fl.person_id,
+            COALESCE(fpma.person_id, fc.person_id) as person_id,
             p.name as person_name
         FROM face_rectangles fr
+        LEFT JOIN files f ON fr.file_id = f.id
         LEFT JOIN face_person_manual_assignments fpma ON fr.id = fpma.face_rectangle_id
         LEFT JOIN face_cluster_members fcm ON fr.id = fcm.face_rectangle_id
         LEFT JOIN face_clusters fc ON fcm.cluster_id = fc.id
@@ -1866,24 +1908,26 @@ async def api_person_refresh_gold(*, person_id: int) -> dict[str, Any]:
     cur.execute(
         """
         SELECT DISTINCT
-            fr.id, fr.run_id, fr.file_path, fr.face_index,
+            fr.id, fr.run_id, f.path as file_path, fr.face_index,
             fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
         FROM (
             -- Ручные привязки
-            SELECT fr.id, fr.run_id, fr.file_path, fr.face_index,
+            SELECT fr.id, fr.run_id, f.path as file_path, fr.face_index,
                    fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
             FROM face_person_manual_assignments fpma
             JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
+            LEFT JOIN files f ON fr.file_id = f.id
             WHERE fpma.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
             
             UNION
             
             -- Привязки через кластеры
-            SELECT fr.id, fr.run_id, fr.file_path, fr.face_index,
+            SELECT fr.id, fr.run_id, f.path as file_path, fr.face_index,
                    fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
             FROM face_cluster_members fcm
             JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
             JOIN face_clusters fc ON fc.id = fcm.cluster_id
+            LEFT JOIN files f ON fr.file_id = f.id
             WHERE fc.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
         ) fr
         """,
@@ -2238,10 +2282,11 @@ async def api_confirm_cluster_to_gold(*, cluster_id: int, payload: dict[str, Any
     cur.execute(
         """
         SELECT 
-            fr.id, fr.run_id, fr.file_path, fr.face_index,
+            fr.id, fr.run_id, f.path as file_path, fr.face_index,
             fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
         FROM face_cluster_members fcm
         JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
+        LEFT JOIN files f ON fr.file_id = f.id
         WHERE fcm.cluster_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
         """,
         (cluster_id,),
@@ -2306,7 +2351,7 @@ async def api_save_all_persons_to_gold() -> dict[str, Any]:
     conn = get_connection()
     cur = conn.cursor()
     
-    # Получаем все персоны (кроме "Посторонние", если нужно)
+    # Получаем все персоны (кроме "Посторонний", если нужно)
     cur.execute(
         """
         SELECT id, name FROM persons
@@ -2433,24 +2478,26 @@ async def api_save_person_to_gold(*, person_id: int) -> dict[str, Any]:
     cur.execute(
         """
         SELECT DISTINCT
-            fr.id, fr.run_id, fr.file_path, fr.face_index,
+            fr.id, fr.run_id, f.path as file_path, fr.face_index,
             fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
         FROM (
             -- Ручные привязки
-            SELECT fr.id, fr.run_id, fr.file_path, fr.face_index,
+            SELECT fr.id, fr.run_id, f.path as file_path, fr.face_index,
                    fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
             FROM face_person_manual_assignments fpma
             JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
+            LEFT JOIN files f ON fr.file_id = f.id
             WHERE fpma.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
             
             UNION
             
             -- Привязки через кластеры
-            SELECT fr.id, fr.run_id, fr.file_path, fr.face_index,
+            SELECT fr.id, fr.run_id, f.path as file_path, fr.face_index,
                    fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
             FROM face_cluster_members fcm
             JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
             JOIN face_clusters fc ON fc.id = fcm.cluster_id
+            LEFT JOIN files f ON fr.file_id = f.id
             WHERE fc.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
         ) fr
         """,
