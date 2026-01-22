@@ -47,6 +47,29 @@ def _repo_root() -> Path:
     """Возвращает корень репозитория."""
     return APP_DIR.parent.parent
 
+def _agent_dbg(*, hypothesis_id: str, location: str, message: str, data: dict[str, Any] | None = None, run_id: str = "pre-fix") -> None:
+    """
+    Tiny NDJSON logger for debug-mode evidence. Writes to .cursor/debug.log.
+    Never log secrets/PII.
+    """
+    import time
+    try:
+        p = _repo_root() / ".cursor" / "debug.log"
+        payload = {
+            "sessionId": "debug-session",
+            "runId": str(run_id),
+            "hypothesisId": str(hypothesis_id),
+            "location": str(location),
+            "message": str(message),
+            "data": data or {},
+            "timestamp": int(time.time() * 1000),
+        }
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
 def _generate_face_thumbnail_on_fly(file_path: str, bbox: tuple[int, int, int, int], thumb_size: int = 200) -> str | None:
     """
     Генерирует превью лица на лету из оригинального файла, если thumb_jpeg отсутствует в БД.
@@ -842,6 +865,9 @@ async def api_persons_apply_all_pending_merges(person_id: int) -> dict[str, Any]
 @router.get("/face-clusters/{cluster_id}", response_class=HTMLResponse)
 async def page_face_cluster_detail(request: Request, cluster_id: int) -> Any:
     """Страница для детального просмотра кластера."""
+    # #region agent log
+    _agent_dbg(hypothesis_id="A", location="face_clusters.py:843", message="page_face_cluster_detail called", data={"cluster_id": cluster_id})
+    # #endregion
     return templates.TemplateResponse("face_cluster_detail.html", {
         "request": request,
         "cluster_id": cluster_id,
@@ -891,6 +917,20 @@ async def api_face_rectangle_thumbnail(*, face_rectangle_id: int) -> dict[str, A
     return {"thumb_jpeg_base64": thumb_base64}
 
 
+@router.post("/api/debug/log")
+async def api_debug_log(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Endpoint для приёма логов с клиента (JavaScript)."""
+    # #region agent log
+    _agent_dbg(
+        hypothesis_id=payload.get("hypothesisId", "D"),
+        location=payload.get("location", "unknown"),
+        message=payload.get("message", "client log"),
+        data=payload.get("data", {}),
+        run_id=payload.get("runId", "pre-fix")
+    )
+    # #endregion
+    return {"ok": True}
+
 @router.get("/api/face-clusters/{cluster_id}")
 async def api_face_cluster_info(*, cluster_id: int, limit: int | None = None) -> dict[str, Any]:
     """
@@ -900,12 +940,31 @@ async def api_face_cluster_info(*, cluster_id: int, limit: int | None = None) ->
         cluster_id: ID кластера
         limit: максимальное количество лиц (None = все лица)
     """
+    # #region agent log
+    _agent_dbg(hypothesis_id="B", location="face_clusters.py:895", message="api_face_cluster_info called", data={"cluster_id": cluster_id, "limit": limit})
+    # #endregion
     import base64
     try:
         info = get_cluster_info(cluster_id=cluster_id, limit=limit)
+        # #region agent log
+        _agent_dbg(
+            hypothesis_id="B",
+            location="face_clusters.py:907",
+            message="get_cluster_info returned",
+            data={
+                "cluster_id": info.get("cluster_id"),
+                "total_faces": info.get("total_faces"),
+                "faces_count": len(info.get("faces", [])),
+                "persons_count": len(info.get("persons", []))
+            }
+        )
+        # #endregion
         # thumb_jpeg уже конвертирован в base64 в get_cluster_info, дополнительная обработка не нужна
         return info
     except Exception as e:
+        # #region agent log
+        _agent_dbg(hypothesis_id="B", location="face_clusters.py:909", message="api_face_cluster_info exception", data={"error": str(e), "error_type": type(e).__name__})
+        # #endregion
         raise HTTPException(status_code=404, detail=f"Cluster not found: {e}")
 
 
@@ -1200,6 +1259,7 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
         
         # Получаем все лица персоны ТОЛЬКО через кластеры (ручные привязки временно игнорируются):
         # Через кластеры: face_cluster_members -> face_clusters -> person_id
+        # Также получаем pipeline_run_id через JOIN с pipeline_runs по face_run_id
         cur.execute(
             """
             SELECT DISTINCT
@@ -1207,6 +1267,7 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 fr.run_id,
                 fr.archive_scope,
                 f.path as file_path,
+                f.id as file_id,
                 fr.face_index,
                 fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
                 fr.confidence, fr.presence_score,
@@ -1214,11 +1275,13 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 fr.embedding IS NOT NULL as has_embedding,
                 fcm.cluster_id,
                 fc.run_id as cluster_run_id,
-                fc.archive_scope as cluster_archive_scope
+                fc.archive_scope as cluster_archive_scope,
+                pr.id as pipeline_run_id
             FROM face_cluster_members fcm
             JOIN face_clusters fc ON fcm.cluster_id = fc.id
             JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
             LEFT JOIN files f ON fr.file_id = f.id
+            LEFT JOIN pipeline_runs pr ON pr.face_run_id = fr.run_id
             WHERE fc.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
             ORDER BY 
                 CASE WHEN fr.archive_scope IS NULL OR fr.archive_scope != 'archive' THEN 1 ELSE 0 END,
@@ -1329,6 +1392,11 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 file_path_val = None
             
             try:
+                file_id_val = row["file_id"] if row["file_id"] is not None else None
+            except (KeyError, TypeError):
+                file_id_val = None
+            
+            try:
                 face_index_val = row["face_index"]
             except (KeyError, TypeError):
                 face_index_val = 0
@@ -1338,6 +1406,11 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
             except (KeyError, TypeError):
                 has_embedding_val = False
             
+            try:
+                pipeline_run_id_val = row["pipeline_run_id"] if row["pipeline_run_id"] is not None else None
+            except (KeyError, TypeError):
+                pipeline_run_id_val = None
+            
             faces.append({
                 "face_id": face_id_val,
                 "run_id": run_id_val,
@@ -1345,6 +1418,7 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 "is_archive": is_archive,
                 "is_run": is_run,
                 "file_path": file_path_val,
+                "file_id": file_id_val,
                 "face_index": face_index_val,
                 "bbox": {
                     "x": bbox_x,
@@ -1358,6 +1432,7 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 "has_embedding": has_embedding_val,
                 "cluster_id": cluster_id,
                 "cluster_run_id": cluster_run_id,
+                "pipeline_run_id": pipeline_run_id_val,
             })
         
         return {
@@ -2967,6 +3042,92 @@ async def api_persons_assign_file(payload: dict[str, Any] = Body(...)) -> dict[s
         "pipeline_run_id": int(pipeline_run_id),
         "file_id": file_id,
         "file_path": str(file_path) if file_path else None,
+        "person_id": int(person_id),
+        "person_name": person_row["name"],
+    }
+
+
+@router.post("/api/faces/file/assign-person")
+async def api_faces_file_assign_person(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Назначает персону файлу напрямую (без прямоугольника) - file_persons.
+    Поддерживает архивные файлы (без pipeline_run_id).
+    
+    Параметры:
+    - pipeline_run_id: int (опционально, для сортируемых фото)
+    - file_id: int (опционально, для архивных фото)
+    - path: str (опционально, для архивных фото)
+    - person_id: int (обязательно)
+    """
+    from backend.common.db import _get_file_id, get_connection
+    
+    pipeline_run_id = payload.get("pipeline_run_id")
+    file_id = payload.get("file_id")
+    path = payload.get("path")
+    person_id = payload.get("person_id")
+    
+    if not isinstance(person_id, int):
+        raise HTTPException(status_code=400, detail="person_id is required and must be int")
+    if file_id is None and path is None:
+        raise HTTPException(status_code=400, detail="Either file_id or path must be provided")
+    
+    # Для сортируемых фото требуется pipeline_run_id
+    if pipeline_run_id is not None:
+        if not isinstance(pipeline_run_id, int):
+            raise HTTPException(status_code=400, detail="pipeline_run_id must be int if provided")
+        
+        # Проверяем, что pipeline_run_id существует
+        ps = PipelineStore()
+        try:
+            pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+            if not pr:
+                raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+        finally:
+            ps.close()
+    
+    # Проверяем, что персона существует
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM persons WHERE id = ?", (int(person_id),))
+    person_row = cur.fetchone()
+    if not person_row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="person_id not found")
+    
+    # Получаем file_id
+    resolved_file_id = _get_file_id(conn, file_id=file_id, file_path=path)
+    if resolved_file_id is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    # Вставляем привязку
+    fs = FaceStore()
+    try:
+        if pipeline_run_id is not None:
+            # Для сортируемых фото
+            fs.insert_file_person(
+                pipeline_run_id=int(pipeline_run_id),
+                file_id=resolved_file_id,
+                file_path=path,
+                person_id=int(person_id),
+            )
+        else:
+            # Для архивных фото - вставляем напрямую в БД
+            from datetime import datetime, timezone
+            cur.execute("""
+                INSERT OR REPLACE INTO file_persons (file_id, person_id, created_at)
+                VALUES (?, ?, ?)
+            """, (resolved_file_id, int(person_id), datetime.now(timezone.utc).isoformat()))
+            conn.commit()
+    finally:
+        fs.close()
+        conn.close()
+    
+    return {
+        "ok": True,
+        "pipeline_run_id": pipeline_run_id,
+        "file_id": resolved_file_id,
+        "path": path,
         "person_id": int(person_id),
         "person_name": person_row["name"],
     }

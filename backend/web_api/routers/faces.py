@@ -1705,6 +1705,7 @@ def api_faces_rectangles(pipeline_run_id: int | None = None, file_id: int | None
                 """, (rect_id,))
                 cluster_row = fs_cur.fetchone()
                 person_id = cluster_row["person_id"] if cluster_row else None
+                assignment_type = "cluster" if person_id else None
                 
                 # Если не нашли через кластер, ищем через ручные привязки (FaceStore)
                 if not person_id:
@@ -1716,6 +1717,7 @@ def api_faces_rectangles(pipeline_run_id: int | None = None, file_id: int | None
                     """, (rect_id,))
                     manual_row = fs_cur.fetchone()
                     person_id = manual_row["person_id"] if manual_row else None
+                    assignment_type = "manual_face" if person_id else None
                 
                 # Если нашли person_id, получаем имя из FaceStore (persons находится там же)
                 if person_id:
@@ -1728,15 +1730,43 @@ def api_faces_rectangles(pipeline_run_id: int | None = None, file_id: int | None
                     rect["person_id"] = None
                     rect["person_name"] = None
                     rect["is_me"] = False
+                
+                # Добавляем тип привязки
+                rect["assignment_type"] = assignment_type
     finally:
         fs.close()
+    
+    # Получаем размеры изображения и EXIF orientation из таблицы files
+    image_width = None
+    image_height = None
+    exif_orientation = None
+    if file_id or path:
+        conn = get_connection()
+        try:
+            resolved_file_id = _get_file_id(conn, file_id=file_id, file_path=path)
+            if resolved_file_id:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT image_width, image_height, exif_orientation FROM files WHERE id = ?",
+                    (resolved_file_id,)
+                )
+                file_row = cur.fetchone()
+                if file_row:
+                    image_width = file_row["image_width"]
+                    image_height = file_row["image_height"]
+                    exif_orientation = file_row["exif_orientation"]
+        finally:
+            conn.close()
     
     return {
         "ok": True,
         "pipeline_run_id": int(pipeline_run_id) if pipeline_run_id is not None else None,
         "run_id": face_run_id_i,
         "path": path,
-        "rectangles": rects
+        "rectangles": rects,
+        "image_width": image_width,
+        "image_height": image_height,
+        "exif_orientation": exif_orientation
     }
 
 
@@ -2115,8 +2145,10 @@ def api_faces_rectangle_update(payload: dict[str, Any] = Body(...)) -> dict[str,
     Приоритет: file_id (если передан), иначе path (если передан).
     
     Параметры:
-    - pipeline_run_id: int (обязательно)
+    - pipeline_run_id: int (опционально, для сортируемых фото)
     - face_rectangle_id: int (обязательно)
+    - file_id: int (опционально, для архивных фото)
+    - path: str (опционально, для архивных фото)
     - bbox: dict (опционально) - {"x": int, "y": int, "w": int, "h": int}
     - person_id: int | None (опционально) - если None, удаляет привязку к персоне
     - assignment_type: str (опционально) - "cluster" | "manual_face" | None
@@ -2125,27 +2157,33 @@ def api_faces_rectangle_update(payload: dict[str, Any] = Body(...)) -> dict[str,
     
     pipeline_run_id = payload.get("pipeline_run_id")
     face_rectangle_id = payload.get("face_rectangle_id")
+    file_id = payload.get("file_id")
+    path = payload.get("path")
     bbox = payload.get("bbox")
     person_id = payload.get("person_id")
     assignment_type = payload.get("assignment_type")
     
-    if not isinstance(pipeline_run_id, int):
-        raise HTTPException(status_code=400, detail="pipeline_run_id is required and must be int")
     if not isinstance(face_rectangle_id, int):
         raise HTTPException(status_code=400, detail="face_rectangle_id is required and must be int")
     
-    # Проверяем, что pipeline_run_id существует
-    ps = PipelineStore()
-    try:
-        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
-        if not pr:
-            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
-        face_run_id = pr.get("face_run_id")
-        if not face_run_id:
-            raise HTTPException(status_code=400, detail="face_run_id is not set yet")
-        face_run_id_i = int(face_run_id)
-    finally:
-        ps.close()
+    face_run_id_i = None
+    
+    # Если pipeline_run_id передан, получаем face_run_id (для сортируемых фото)
+    if pipeline_run_id is not None:
+        if not isinstance(pipeline_run_id, int):
+            raise HTTPException(status_code=400, detail="pipeline_run_id must be int if provided")
+        
+        ps = PipelineStore()
+        try:
+            pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+            if not pr:
+                raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+            face_run_id = pr.get("face_run_id")
+            if not face_run_id:
+                raise HTTPException(status_code=400, detail="face_run_id is not set yet")
+            face_run_id_i = int(face_run_id)
+        finally:
+            ps.close()
     
     fs = FaceStore()
     try:
@@ -2153,8 +2191,22 @@ def api_faces_rectangle_update(payload: dict[str, Any] = Body(...)) -> dict[str,
         cur = conn.cursor()
         
         # Проверяем, что rectangle существует
-        cur.execute("SELECT id, file_id, bbox_x, bbox_y, bbox_w, bbox_h FROM face_rectangles WHERE id = ? AND run_id = ?", 
-                   (int(face_rectangle_id), face_run_id_i))
+        if face_run_id_i is not None:
+            # Для сортируемых фото проверяем по run_id
+            cur.execute("SELECT id, file_id, bbox_x, bbox_y, bbox_w, bbox_h FROM face_rectangles WHERE id = ? AND run_id = ?", 
+                       (int(face_rectangle_id), face_run_id_i))
+        else:
+            # Для архивных фото проверяем по file_id или path
+            if file_id is None and path is None:
+                raise HTTPException(status_code=400, detail="For archive photos, either file_id or path must be provided")
+            
+            resolved_file_id = _get_file_id(conn, file_id=file_id, file_path=path)
+            if resolved_file_id is None:
+                raise HTTPException(status_code=404, detail="File not found")
+            
+            cur.execute("SELECT id, file_id, bbox_x, bbox_y, bbox_w, bbox_h FROM face_rectangles WHERE id = ? AND file_id = ?", 
+                       (int(face_rectangle_id), resolved_file_id))
+        
         rect_row = cur.fetchone()
         if not rect_row:
             raise HTTPException(status_code=404, detail="face_rectangle_id not found")
@@ -2203,38 +2255,53 @@ def api_faces_rectangle_update(payload: dict[str, Any] = Body(...)) -> dict[str,
                     """, (int(face_rectangle_id), int(person_id), now))
                     
                 elif assignment_type == "cluster":
-                    # Добавляем в кластер (нужно найти или создать кластер для персоны)
-                    # Сначала удаляем ручную привязку (если была)
-                    cur.execute("""
-                        DELETE FROM face_person_manual_assignments 
-                        WHERE face_rectangle_id = ?
-                    """, (int(face_rectangle_id),))
-                    
-                    # Ищем существующий кластер для персоны в этом run_id
-                    cur.execute("""
-                        SELECT id FROM face_clusters 
-                        WHERE person_id = ? AND run_id = ? 
-                        LIMIT 1
-                    """, (int(person_id), face_run_id_i))
-                    cluster_row = cur.fetchone()
-                    
-                    if cluster_row:
-                        cluster_id = cluster_row["id"]
-                    else:
-                        # Создаем новый кластер для персоны
+                    # Добавляем в кластер (только для сортируемых фото с run_id)
+                    if face_run_id_i is None:
+                        # Для архивных фото кластеры не поддерживаются, используем manual_face
                         from datetime import datetime, timezone
                         now = datetime.now(timezone.utc).isoformat()
                         cur.execute("""
-                            INSERT INTO face_clusters (run_id, person_id, created_at)
-                            VALUES (?, ?, ?)
-                        """, (face_run_id_i, int(person_id), now))
-                        cluster_id = cur.lastrowid
-                    
-                    # Добавляем rectangle в кластер
-                    cur.execute("""
-                        INSERT OR IGNORE INTO face_cluster_members (cluster_id, face_rectangle_id)
-                        VALUES (?, ?)
-                    """, (cluster_id, int(face_rectangle_id)))
+                            DELETE FROM face_cluster_members 
+                            WHERE face_rectangle_id = ?
+                        """, (int(face_rectangle_id),))
+                        cur.execute("""
+                            INSERT OR REPLACE INTO face_person_manual_assignments 
+                            (face_rectangle_id, person_id, source, created_at)
+                            VALUES (?, ?, 'manual', ?)
+                        """, (int(face_rectangle_id), int(person_id), now))
+                    else:
+                        # Добавляем в кластер (нужно найти или создать кластер для персоны)
+                        # Сначала удаляем ручную привязку (если была)
+                        cur.execute("""
+                            DELETE FROM face_person_manual_assignments 
+                            WHERE face_rectangle_id = ?
+                        """, (int(face_rectangle_id),))
+                        
+                        # Ищем существующий кластер для персоны в этом run_id
+                        cur.execute("""
+                            SELECT id FROM face_clusters 
+                            WHERE person_id = ? AND run_id = ? 
+                            LIMIT 1
+                        """, (int(person_id), face_run_id_i))
+                        cluster_row = cur.fetchone()
+                        
+                        if cluster_row:
+                            cluster_id = cluster_row["id"]
+                        else:
+                            # Создаем новый кластер для персоны
+                            from datetime import datetime, timezone
+                            now = datetime.now(timezone.utc).isoformat()
+                            cur.execute("""
+                                INSERT INTO face_clusters (run_id, person_id, created_at)
+                                VALUES (?, ?, ?)
+                            """, (face_run_id_i, int(person_id), now))
+                            cluster_id = cur.lastrowid
+                        
+                        # Добавляем rectangle в кластер
+                        cur.execute("""
+                            INSERT OR IGNORE INTO face_cluster_members (cluster_id, face_rectangle_id)
+                            VALUES (?, ?)
+                        """, (cluster_id, int(face_rectangle_id)))
             else:
                 # person_id = None или 0 - удаляем все привязки
                 cur.execute("""
@@ -2284,6 +2351,209 @@ def api_faces_rectangle_update(payload: dict[str, Any] = Body(...)) -> dict[str,
     return result
 
 
+@router.post("/api/faces/rectangle/create")
+def api_faces_rectangle_create(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Создает новый rectangle (координаты, тип, персона).
+    Приоритет: file_id (если передан), иначе path (если передан).
+    
+    Параметры:
+    - pipeline_run_id: int (опционально, для сортируемых фото)
+    - file_id: int (опционально, для архивных фото)
+    - path: str (опционально, для архивных фото)
+    - bbox: dict (обязательно) - {"x": int, "y": int, "w": int, "h": int}
+    - person_id: int | None (опционально) - если передан, назначает персону
+    - assignment_type: str (опционально) - "cluster" | "manual_face" | None
+    """
+    from backend.common.db import _get_file_id, get_connection
+    from datetime import datetime, timezone
+    
+    pipeline_run_id = payload.get("pipeline_run_id")
+    file_id = payload.get("file_id")
+    path = payload.get("path")
+    bbox = payload.get("bbox")
+    person_id = payload.get("person_id")
+    assignment_type = payload.get("assignment_type", "manual_face")
+    
+    if not isinstance(bbox, dict):
+        raise HTTPException(status_code=400, detail="bbox is required and must be dict")
+    
+    bbox_x = int(bbox.get("x", 0))
+    bbox_y = int(bbox.get("y", 0))
+    bbox_w = int(bbox.get("w", 0))
+    bbox_h = int(bbox.get("h", 0))
+    
+    if bbox_w <= 0 or bbox_h <= 0:
+        raise HTTPException(status_code=400, detail="bbox width and height must be positive")
+    
+    face_run_id_i = None
+    
+    # Если pipeline_run_id передан, получаем face_run_id (для сортируемых фото)
+    if pipeline_run_id is not None:
+        if not isinstance(pipeline_run_id, int):
+            raise HTTPException(status_code=400, detail="pipeline_run_id must be int if provided")
+        
+        ps = PipelineStore()
+        try:
+            pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+            if not pr:
+                raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+            face_run_id = pr.get("face_run_id")
+            if not face_run_id:
+                raise HTTPException(status_code=400, detail="face_run_id is not set yet")
+            face_run_id_i = int(face_run_id)
+        finally:
+            ps.close()
+    
+    fs = FaceStore()
+    try:
+        conn = fs.conn
+        cur = conn.cursor()
+        
+        # Получаем file_id
+        if face_run_id_i is not None:
+            # Для сортируемых фото file_id должен быть передан или получен из path
+            if file_id is None and path is None:
+                raise HTTPException(status_code=400, detail="Either file_id or path must be provided")
+            resolved_file_id = _get_file_id(conn, file_id=file_id, file_path=path)
+            if resolved_file_id is None:
+                raise HTTPException(status_code=404, detail="File not found")
+        else:
+            # Для архивных фото используем file_id или path
+            if file_id is None and path is None:
+                raise HTTPException(status_code=400, detail="For archive photos, either file_id or path must be provided")
+            resolved_file_id = _get_file_id(conn, file_id=file_id, file_path=path)
+            if resolved_file_id is None:
+                raise HTTPException(status_code=404, detail="File not found")
+        
+        # Определяем face_index (максимальный + 1)
+        if face_run_id_i is not None:
+            cur.execute("""
+                SELECT COALESCE(MAX(face_index), -1) + 1 as next_index
+                FROM face_rectangles
+                WHERE run_id = ? AND file_id = ?
+            """, (face_run_id_i, resolved_file_id))
+        else:
+            cur.execute("""
+                SELECT COALESCE(MAX(face_index), -1) + 1 as next_index
+                FROM face_rectangles
+                WHERE file_id = ? AND (run_id IS NULL OR run_id = 0)
+            """, (resolved_file_id,))
+        
+        row = cur.fetchone()
+        face_index = int(row["next_index"]) if row else 0
+        
+        # Создаем rectangle
+        now = datetime.now(timezone.utc).isoformat()
+        
+        if face_run_id_i is not None:
+            cur.execute("""
+                INSERT INTO face_rectangles(
+                    run_id, file_id, face_index,
+                    bbox_x, bbox_y, bbox_w, bbox_h,
+                    confidence, presence_score,
+                    thumb_jpeg, manual_person, ignore_flag,
+                    created_at,
+                    is_manual, manual_created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, ?, 1, ?)
+            """, (face_run_id_i, resolved_file_id, face_index, bbox_x, bbox_y, bbox_w, bbox_h, now, now))
+        else:
+            # Для архивных фото run_id = NULL
+            cur.execute("""
+                INSERT INTO face_rectangles(
+                    run_id, file_id, face_index,
+                    bbox_x, bbox_y, bbox_w, bbox_h,
+                    confidence, presence_score,
+                    thumb_jpeg, manual_person, ignore_flag,
+                    created_at,
+                    is_manual, manual_created_at
+                )
+                VALUES (NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, ?, 1, ?)
+            """, (resolved_file_id, face_index, bbox_x, bbox_y, bbox_w, bbox_h, now, now))
+        
+        face_rectangle_id = cur.lastrowid
+        
+        # Если персона назначена, создаем привязку
+        if person_id is not None and isinstance(person_id, int) and person_id > 0:
+            # Проверяем, что персона существует
+            cur.execute("SELECT id, name FROM persons WHERE id = ?", (int(person_id),))
+            person_row = cur.fetchone()
+            if not person_row:
+                raise HTTPException(status_code=404, detail="person_id not found")
+            
+            # Определяем тип привязки
+            if assignment_type == "manual_face":
+                # Создаем ручную привязку
+                cur.execute("""
+                    INSERT INTO face_person_manual_assignments 
+                    (face_rectangle_id, person_id, source, created_at)
+                    VALUES (?, ?, 'manual', ?)
+                """, (face_rectangle_id, int(person_id), now))
+            elif assignment_type == "cluster" and face_run_id_i is not None:
+                # Добавляем в кластер (только для сортируемых фото)
+                # Ищем существующий кластер для персоны в этом run_id
+                cur.execute("""
+                    SELECT id FROM face_clusters 
+                    WHERE person_id = ? AND run_id = ? 
+                    LIMIT 1
+                """, (int(person_id), face_run_id_i))
+                cluster_row = cur.fetchone()
+                
+                if cluster_row:
+                    cluster_id = cluster_row["id"]
+                else:
+                    # Создаем новый кластер для персоны
+                    cur.execute("""
+                        INSERT INTO face_clusters (run_id, person_id, created_at)
+                        VALUES (?, ?, ?)
+                    """, (face_run_id_i, int(person_id), now))
+                    cluster_id = cur.lastrowid
+                
+                # Добавляем rectangle в кластер
+                cur.execute("""
+                    INSERT OR IGNORE INTO face_cluster_members (cluster_id, face_rectangle_id)
+                    VALUES (?, ?)
+                """, (cluster_id, face_rectangle_id))
+        
+        conn.commit()
+        
+        # Возвращаем созданный rectangle
+        cur.execute("""
+            SELECT 
+                fr.id,
+                fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
+                fpma.person_id,
+                p.name AS person_name,
+                p.is_me
+            FROM face_rectangles fr
+            LEFT JOIN face_person_manual_assignments fpma ON fpma.face_rectangle_id = fr.id
+            LEFT JOIN persons p ON p.id = fpma.person_id
+            WHERE fr.id = ?
+            LIMIT 1
+        """, (face_rectangle_id,))
+        created_row = cur.fetchone()
+        
+        result = {
+            "ok": True,
+            "face_rectangle_id": int(face_rectangle_id),
+            "bbox": {
+                "x": created_row["bbox_x"] if created_row else None,
+                "y": created_row["bbox_y"] if created_row else None,
+                "w": created_row["bbox_w"] if created_row else None,
+                "h": created_row["bbox_h"] if created_row else None,
+            } if created_row else None,
+            "person_id": created_row["person_id"] if created_row else None,
+            "person_name": created_row["person_name"] if created_row else None,
+            "is_me": bool(created_row["is_me"]) if created_row and created_row["is_me"] else False,
+        }
+        
+    finally:
+        fs.close()
+    
+    return result
+
+
 @router.post("/api/faces/rectangle/delete")
 def api_faces_rectangle_delete(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """
@@ -2291,29 +2561,39 @@ def api_faces_rectangle_delete(payload: dict[str, Any] = Body(...)) -> dict[str,
     Приоритет: file_id (если передан), иначе path (если передан).
     
     Параметры:
-    - pipeline_run_id: int (обязательно)
+    - pipeline_run_id: int (опционально, для сортируемых фото)
     - face_rectangle_id: int (обязательно)
+    - file_id: int (опционально, для архивных фото)
+    - path: str (опционально, для архивных фото)
     """
+    from backend.common.db import _get_file_id
+    
     pipeline_run_id = payload.get("pipeline_run_id")
     face_rectangle_id = payload.get("face_rectangle_id")
+    file_id = payload.get("file_id")
+    path = payload.get("path")
     
-    if not isinstance(pipeline_run_id, int):
-        raise HTTPException(status_code=400, detail="pipeline_run_id is required and must be int")
     if not isinstance(face_rectangle_id, int):
         raise HTTPException(status_code=400, detail="face_rectangle_id is required and must be int")
     
-    # Проверяем, что pipeline_run_id существует
-    ps = PipelineStore()
-    try:
-        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
-        if not pr:
-            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
-        face_run_id = pr.get("face_run_id")
-        if not face_run_id:
-            raise HTTPException(status_code=400, detail="face_run_id is not set yet")
-        face_run_id_i = int(face_run_id)
-    finally:
-        ps.close()
+    face_run_id_i = None
+    
+    # Если pipeline_run_id передан, получаем face_run_id (для сортируемых фото)
+    if pipeline_run_id is not None:
+        if not isinstance(pipeline_run_id, int):
+            raise HTTPException(status_code=400, detail="pipeline_run_id must be int if provided")
+        
+        ps = PipelineStore()
+        try:
+            pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+            if not pr:
+                raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+            face_run_id = pr.get("face_run_id")
+            if not face_run_id:
+                raise HTTPException(status_code=400, detail="face_run_id is not set yet")
+            face_run_id_i = int(face_run_id)
+        finally:
+            ps.close()
     
     fs = FaceStore()
     try:
@@ -2321,8 +2601,22 @@ def api_faces_rectangle_delete(payload: dict[str, Any] = Body(...)) -> dict[str,
         cur = conn.cursor()
         
         # Проверяем, что rectangle существует
-        cur.execute("SELECT id FROM face_rectangles WHERE id = ? AND run_id = ?", 
-                   (int(face_rectangle_id), face_run_id_i))
+        if face_run_id_i is not None:
+            # Для сортируемых фото проверяем по run_id
+            cur.execute("SELECT id, file_id FROM face_rectangles WHERE id = ? AND run_id = ?", 
+                       (int(face_rectangle_id), face_run_id_i))
+        else:
+            # Для архивных фото проверяем по file_id или path
+            if file_id is None and path is None:
+                raise HTTPException(status_code=400, detail="For archive photos, either file_id or path must be provided")
+            
+            resolved_file_id = _get_file_id(conn, file_id=file_id, file_path=path)
+            if resolved_file_id is None:
+                raise HTTPException(status_code=404, detail="File not found")
+            
+            cur.execute("SELECT id, file_id FROM face_rectangles WHERE id = ? AND file_id = ?", 
+                       (int(face_rectangle_id), resolved_file_id))
+        
         rect_row = cur.fetchone()
         if not rect_row:
             raise HTTPException(status_code=404, detail="face_rectangle_id not found")
@@ -3815,3 +4109,38 @@ def api_faces_fix_clipping(payload: dict[str, Any] = Body(...)) -> dict[str, Any
             os.unlink(paths_file)
         except Exception:
             pass
+
+
+@router.post("/api/debug/client-log")
+def api_debug_client_log(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Записывает логи от клиента в файл для отладки.
+    Параметры:
+    - level: str (log, warn, error)
+    - message: str
+    - data: dict (опционально)
+    """
+    try:
+        log_dir = _repo_root() / "backend" / "scripts" / "debug" / "_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        log_file = log_dir / "photo_card_client.log"
+        
+        level = payload.get("level", "log")
+        message = payload.get("message", "")
+        data = payload.get("data", {})
+        
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        
+        log_line = f"[{timestamp}] [{level.upper()}] {message}"
+        if data:
+            log_line += f" | {json.dumps(data, ensure_ascii=False)}"
+        log_line += "\n"
+        
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(log_line)
+        
+        return {"ok": True, "logged": True}
+    except Exception as e:
+        logger.error(f"Error writing client log: {e}", exc_info=True)
+        return {"ok": False, "error": str(e)}

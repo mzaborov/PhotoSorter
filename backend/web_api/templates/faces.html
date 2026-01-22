@@ -7,6 +7,12 @@
     <!-- YaDisk preview hotlink защита: просим браузер не слать Referer при загрузке картинок -->
     <meta name="referrer" content="no-referrer" />
     <title>PhotoSorter — Результаты лиц</title>
+    <svg style="display: none;" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+      <symbol id="icon-line-copy-right" viewBox="0 0 16 16" fill="none">
+        <rect x="5.5" y="5.5" width="9" height="9" stroke="currentColor" stroke-width="1.2" fill="none" rx="1.5" stroke-linejoin="round"/>
+        <rect x="1.5" y="1.5" width="9" height="9" stroke="currentColor" stroke-width="1.2" fill="none" rx="1.5" stroke-linejoin="round"/>
+      </symbol>
+    </svg>
     <style>
       :root { color-scheme: light; }
       body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
@@ -3275,85 +3281,8 @@
     </script>
     
     <!-- Подключение единой карточки фотографий -->
-    <!-- Включаем photo_card.html напрямую -->
-    <div class="photo-card-modal" id="photoCardModal" aria-hidden="true" style="display: none;">
-      <div class="photo-card-panel" role="dialog" aria-modal="true">
-        <div class="photo-card-top">
-          <code class="photo-card-path" id="photoCardPath">—</code>
-          <div class="photo-card-actions">
-            <span class="pill" id="photoCardMode">просмотр</span>
-            <button class="btn" id="photoCardToggleRectangles" type="button">Скрыть прямоугольники</button>
-            <button class="btn" id="photoCardUndo" type="button" style="display:none;" title="Отменить последнее действие">Undo</button>
-            <button class="btn" id="photoCardClose" type="button">Закрыть</button>
-          </div>
-        </div>
-        <div class="photo-card-tabs" id="photoCardTabs" style="display:none;">
-          <button class="lb-tab" id="photoCardTabVideo" type="button">Видео</button>
-          <button class="lb-tab" id="photoCardTabF1" type="button">Кадр 1</button>
-          <button class="lb-tab" id="photoCardTabF2" type="button">Кадр 2</button>
-          <button class="lb-tab" id="photoCardTabF3" type="button">Кадр 3</button>
-        </div>
-        <div class="photo-card-body">
-          <div class="imgwrap" id="photoCardImgWrap">
-            <img id="photoCardImg" alt="preview" />
-            <video id="photoCardVideo" controls preload="metadata" style="display:none;"></video>
-            <canvas id="photoCardCanvas"></canvas>
-          </div>
-        </div>
-        <div class="photo-card-navigation" id="photoCardNavigation" style="display:none;">
-          <button class="btn" id="photoCardPrev" type="button">←</button>
-          <span class="photo-card-position" id="photoCardPosition">1 из 1</span>
-          <button class="btn" id="photoCardNext" type="button">→</button>
-        </div>
-        <div class="photo-card-bottom">
-          <div class="muted">Прямоугольники:</div>
-          <div class="rectlist" id="photoCardRectList"></div>
-          <div id="photoCardSpecialActions" style="display:none; margin-top:12px; padding-top:12px; border-top:1px solid #e5e7eb;">
-            <button class="btn" id="photoCardAssignOutsider" type="button">Все остальные - посторонние</button>
-            <button class="btn danger" id="photoCardMarkAsCat" type="button">Это кот</button>
-            <button class="btn danger" id="photoCardMarkAsNoPeople" type="button">Нет людей</button>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div class="photo-card-modal" id="photoCardPersonModal" aria-hidden="true" style="display: none;">
-      <div class="photo-card-panel" role="dialog" aria-modal="true" style="max-width: 500px;">
-        <div class="photo-card-top">
-          <div style="font-weight:700;">Назначить персону</div>
-          <button class="btn" id="photoCardPersonModalClose" type="button" style="padding:4px 8px;">✕</button>
-        </div>
-        <div style="padding: 16px;">
-          <div style="margin-bottom:12px; font-weight:700;">Выберите персону:</div>
-          <select id="photoCardSelectPerson" style="width:100%; border:1px solid #d1d5db; border-radius:10px; padding:8px 10px; font-size:14px; margin-bottom:16px;">
-            <option value="">Выберите персону...</option>
-          </select>
-          <div style="margin-top:16px; padding-top:16px; border-top:1px solid #e5e7eb;">
-            <div style="margin-bottom:8px; font-weight:700;">Или создайте новую:</div>
-            <input type="text" id="photoCardInputNewPersonName" placeholder="Имя персоны" style="width:100%; border:1px solid #d1d5db; border-radius:10px; padding:8px 10px; font-size:14px; margin-bottom:8px;" />
-          </div>
-          <button class="btn" id="photoCardAssignPerson" type="button" style="width:100%; margin-top:16px;">Назначить</button>
-        </div>
-        <div class="photo-card-bottom" style="justify-content:flex-end;">
-          <button class="btn" id="photoCardPersonModalCancel" type="button">Отмена</button>
-        </div>
-      </div>
-    </div>
-    <style>
-      .photo-card-modal { position: fixed; inset: 0; background: rgba(17,24,39,0.82); display: none; align-items: center; justify-content: center; padding: 18px; z-index: 9999; }
-      .photo-card-modal[aria-hidden="false"] { display: flex; }
-      .photo-card-panel { background: #fff; border-radius: 14px; max-width: 94vw; max-height: 94vh; width: min(1200px, 94vw); overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,0.35); display: flex; flex-direction: column; }
-      .photo-card-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #e5e7eb; }
-      .photo-card-top code { font-size: 11px; }
-      .photo-card-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-      .photo-card-tabs { display:flex; gap:8px; padding: 10px 12px; border-bottom: 1px solid #e5e7eb; background:#f9fafb; flex-wrap:wrap; }
-      .photo-card-body { background: #111827; display: flex; align-items: center; justify-content: center; padding: 10px; flex: 1; overflow: auto; }
-      .photo-card-navigation { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 10px 12px; border-top: 1px solid #e5e7eb; border-bottom: 1px solid #e5e7eb; background: #f9fafb; }
-      .photo-card-position { font-weight: 700; font-size: 14px; }
-      .photo-card-bottom { padding: 10px 12px; border-top: 1px solid #e5e7eb; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-      .photo-card-rectangle { position: absolute; pointer-events: auto; cursor: pointer; z-index: 1000; }
-      .photo-card-rectangle-label { position: absolute; pointer-events: none; white-space: nowrap; max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
-    </style>
-    <script src="/static/photo_card.js?v=2"></script>
+    {% include "photo_card.html" %}
+    <script src="/static/photo_card.js?v=38"></script>
   </body>
 </html>
 

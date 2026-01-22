@@ -21,6 +21,30 @@ except ImportError:
 
 from backend.common.db import get_connection
 
+def _agent_dbg(*, hypothesis_id: str, location: str, message: str, data: dict[str, Any] | None = None, run_id: str = "pre-fix") -> None:
+    """
+    Tiny NDJSON logger for debug-mode evidence. Writes to .cursor/debug.log.
+    Never log secrets/PII.
+    """
+    import time
+    try:
+        root = Path(__file__).resolve().parents[2]
+        p = root / ".cursor" / "debug.log"
+        payload = {
+            "sessionId": "debug-session",
+            "runId": str(run_id),
+            "hypothesisId": str(hypothesis_id),
+            "location": str(location),
+            "message": str(message),
+            "data": data or {},
+            "timestamp": int(time.time() * 1000),
+        }
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
 
 def extract_folder_name_from_path(file_path: str) -> str | None:
     """
@@ -614,6 +638,9 @@ def get_cluster_info(*, cluster_id: int, limit: int | None = None) -> dict[str, 
         cluster_id: ID кластера
         limit: максимальное количество лиц для возврата (None = все лица)
     """
+    # #region agent log
+    _agent_dbg(hypothesis_id="C", location="face_recognition.py:609", message="get_cluster_info entry", data={"cluster_id": cluster_id, "limit": limit})
+    # #endregion
     conn = get_connection()
     cur = conn.cursor()
     
@@ -622,7 +649,7 @@ def get_cluster_info(*, cluster_id: int, limit: int | None = None) -> dict[str, 
     query = """
         SELECT 
             fc.id, fc.run_id, fc.method, fc.params_json, fc.created_at,
-            fr.id as face_rectangle_id, fr.file_path, fr.face_index, 
+            fr.id as face_rectangle_id, f.path as file_path, fr.face_index, 
             fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
             fr.archive_scope, fr.run_id as face_run_id,
             f.image_width, f.image_height, f.exif_orientation,
@@ -631,7 +658,7 @@ def get_cluster_info(*, cluster_id: int, limit: int | None = None) -> dict[str, 
         FROM face_clusters fc
         JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
         JOIN face_rectangles fr ON fcm.face_rectangle_id = fr.id
-        LEFT JOIN files f ON fr.file_path = f.path
+        LEFT JOIN files f ON f.id = fr.file_id
         WHERE fc.id = ? AND COALESCE(fr.ignore_flag, 0) = 0
         ORDER BY 
             CASE WHEN fr.archive_scope = 'archive' THEN 0 ELSE 1 END,
@@ -643,7 +670,17 @@ def get_cluster_info(*, cluster_id: int, limit: int | None = None) -> dict[str, 
         query += " LIMIT ?"
         params.append(limit)
     
-    cur.execute(query, tuple(params))
+    # #region agent log
+    _agent_dbg(hypothesis_id="C", location="face_recognition.py:646", message="before SQL execute", data={"query": query[:200] + "..." if len(query) > 200 else query, "params": params})
+    # #endregion
+    
+    try:
+        cur.execute(query, tuple(params))
+    except Exception as e:
+        # #region agent log
+        _agent_dbg(hypothesis_id="C", location="face_recognition.py:648", message="SQL execute exception", data={"error": str(e), "error_type": type(e).__name__})
+        # #endregion
+        raise
     
     faces = []
     for row in cur.fetchall():
