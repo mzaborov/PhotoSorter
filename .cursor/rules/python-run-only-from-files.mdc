@@ -10,17 +10,34 @@ Python запускать только из файлов (PhotoSorter)
 
 **Известная проблема:** Выполнение команд Python в терминале Cursor может вызывать Connection Error и ломать текущий чат и все новые чаты. Старые чаты продолжают работать.
 
-**Причина:** Конфликт Shell Integration Cursor с выводом Python команд.
+**Причина:** Конфликт Shell Integration Cursor с выводом Python команд. Точная причина не выяснена, проблема возникает в произвольный момент, воспроизведения нет.
 
 **Решение:**
 - Shell Integration отключена в `.vscode/settings.json` (`terminal.integrated.shellIntegration.enabled: false`)
-- Если проблема повторяется, можно очистить битые настройки терминала:
-  - `python backend/scripts/debug/clean_terminal_settings.py --dry-run` (проверка)
-  - `python backend/scripts/debug/clean_terminal_settings.py` (очистка)
-- Диагностика проблемы:
-  - `python backend/scripts/debug/diagnose_terminal_issue.py`
+- Это уменьшает частоту проблем, но не устраняет полностью
 
-**Временное решение при поломке:** Удаление `%APPDATA%\Cursor\User\workspaceStorage\` решает проблему, но только до следующего запуска Python.
+**Workaround при поломке терминала:**
+1. Закрыть Cursor полностью
+2. Удалить `%APPDATA%\Cursor\User\workspaceStorage\` (очистка битых настроек)
+3. Запустить Cursor на чистую
+4. Если работали над планом:
+   - Стартовать нового агента
+   - Попросить прочитать:
+     - `.cursor/plans/` (все планы)
+     - `docs/README.md`
+     - Конкретный план (если был активен)
+     - Правила из `.cursor/rules/`
+   - Попросить продолжить план с отметкой прогресса
+
+**Профилактика:**
+- Все крупные изменения агентов выполняются только через планы (`.cursor/plans/`)
+- Агент при выполнении отмечает прогресс в плане
+- Python команды выполняются только из файлов (не inline)
+
+**Утилиты для диагностики:**
+- `python backend/scripts/debug/diagnose_terminal_issue.py` — диагностика проблемы
+- `python backend/scripts/debug/clean_terminal_settings.py --dry-run` — проверка битых настроек
+- `python backend/scripts/debug/clean_terminal_settings.py` — очистка битых настроек терминала
 
 ## ЖЁСТКИЕ запреты
 - НЕЛЬЗЯ использовать `python -c "..."`.

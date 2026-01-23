@@ -511,6 +511,46 @@ C:\\Users\\mzaborov\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe -m u
 - `/folders` — таблица папок
 - В колонке "Путь" есть ссылка **↗** на просмотр вложенных папок (`/browse?path=...`)
 
+## Известные проблемы и решения
+
+### Проблема с терминалом Cursor при выполнении Python
+
+**Симптомы:**
+- Выполнение команд Python в терминале Cursor может вызывать Connection Error
+- Ломается текущий чат и все новые чаты (старые чаты продолжают работать)
+- Проблема возникает в произвольный момент, воспроизведения нет
+
+**Причина:**
+- Конфликт Shell Integration Cursor с выводом Python команд
+- Точная причина не выяснена, проблема нестабильна
+
+**Решение:**
+- Shell Integration отключена в `.vscode/settings.json` (`terminal.integrated.shellIntegration.enabled: false`)
+- Это уменьшает частоту проблем, но не устраняет полностью
+
+**Workaround при поломке терминала:**
+1. Закрыть Cursor полностью
+2. Удалить `%APPDATA%\Cursor\User\workspaceStorage\` (очистка битых настроек)
+3. Запустить Cursor на чистую
+4. Если работали над планом:
+   - Стартовать нового агента
+   - Попросить прочитать:
+     - `.cursor/plans/` (все планы)
+     - `docs/README.md`
+     - Конкретный план (если был активен)
+     - Правила из `.cursor/rules/`
+   - Попросить продолжить план с отметкой прогресса
+
+**Профилактика:**
+- Все крупные изменения агентов выполняются только через планы (`.cursor/plans/`)
+- Агент при выполнении отмечает прогресс в плане
+- Python команды выполняются только из файлов (не inline), см. правило `.cursor/rules/python-run-only-from-files.mdc`
+
+**Утилиты для диагностики:**
+- `python backend/scripts/debug/diagnose_terminal_issue.py` — диагностика проблемы
+- `python backend/scripts/debug/clean_terminal_settings.py --dry-run` — проверка битых настроек
+- `python backend/scripts/debug/clean_terminal_settings.py` — очистка битых настроек терминала
+
 
 
 
