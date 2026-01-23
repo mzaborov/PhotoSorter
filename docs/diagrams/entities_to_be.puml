@@ -113,7 +113,7 @@ class face_runs <<table>> {
   last_error: TEXT
 }
 
-class face_rectangles <<table>> {
+class photo_rectangles <<table>> {
   +id: INTEGER <<PK>>
   run_id: INTEGER <<FK>>
   file_id: INTEGER <<FK>>
@@ -126,49 +126,52 @@ class face_rectangles <<table>> {
   presence_score: REAL          ' photo: доля среди лиц в кадре
   thumb_jpeg: BLOB
   ignore_flag: INTEGER
+  is_face: INTEGER <<NOT NULL>> <<DEFAULT 1>>  ' 1=лицо, 0=персона
   created_at: TEXT
 }
 
-face_runs "1" -- "*" face_rectangles : прямоугольники лиц
-media_files "1" -- "*" face_rectangles : лица на файле
-persons "0..1" -- "0..1" face_rectangles : аватар (лицо)
+face_runs "1" -- "*" photo_rectangles : прямоугольники лиц
+media_files "1" -- "*" photo_rectangles : лица на файле
+persons "0..1" -- "0..1" photo_rectangles : аватар (лицо)
 folders "0..1" -- "*" media_files : файлы в папке (parent_path)
 pipeline_runs "0..1" -- "0..1" face_runs : шаг (лица)
 
-class face_person_manual_assignments <<table>> {
+class person_rectangle_manual_assignments <<table>> {
   +id: INTEGER <<PK>>
-  face_rectangle_id: INTEGER <<FK>>
+  rectangle_id: INTEGER <<FK>>  ' может быть лицо (is_face=1) или персона (is_face=0)
   person_id: INTEGER <<FK>>
   source: TEXT                  ' manual|restored_from_gold|ai
   confidence: REAL
   created_at: TEXT
 }
 
-face_rectangles "1" -- "0..*" face_person_manual_assignments : ручные привязки лица
-persons "1" -- "*" face_person_manual_assignments : ручная привязка к персоне
+photo_rectangles "1" -- "0..*" person_rectangle_manual_assignments : ручные привязки (лица или персоны)
+persons "1" -- "*" person_rectangle_manual_assignments : ручная привязка к персоне
 
-note right of face_person_manual_assignments
-  ТОЛЬКО для ручных привязок отдельных лиц
+note right of person_rectangle_manual_assignments
+  ТОЛЬКО для ручных привязок отдельных rectangles
   (не через кластеры)
   
   Кластеры привязаны к персонам через
   face_clusters.person_id напрямую
   
   Лица в кластере наследуют персону через:
-  face_rectangles → face_cluster_members → 
+  photo_rectangles → face_cluster_members → 
   face_clusters.person_id
+  
+  rectangle_id может быть лицом (is_face=1) или персоной (is_face=0)
 end note
 
 class face_identity_candidates <<table>> {
   +id: INTEGER <<PK>>
-  face_rectangle_id: INTEGER <<FK>>
+  rectangle_id: INTEGER <<FK>>
   person_id: INTEGER <<FK>>
   score: REAL
   model_version: TEXT
   created_at: TEXT
 }
 
-face_rectangles "1" -- "*" face_identity_candidates : AI-кандидаты
+photo_rectangles "1" -- "*" face_identity_candidates : AI-кандидаты
 persons "1" -- "*" face_identity_candidates : кандидат для лица
 
 class file_anchors <<table>> {
@@ -203,7 +206,7 @@ media_files "1" -- "*" video_face_tracks : треки на файле
 
 class face_embeddings <<table>> {
   +id: INTEGER <<PK>>
-  face_rectangle_id: INTEGER <<FK>>
+  rectangle_id: INTEGER <<FK>>
   model: TEXT
   model_version: TEXT
   dims: INTEGER
@@ -211,7 +214,7 @@ class face_embeddings <<table>> {
   created_at: TEXT
 }
 
-face_rectangles "1" -- "0..*" face_embeddings : эмбеддинги (модели/версии)
+photo_rectangles "1" -- "0..*" face_embeddings : эмбеддинги (модели/версии)
 
 class face_clusters <<table>> {
   +id: INTEGER <<PK>>
@@ -224,13 +227,13 @@ class face_clusters <<table>> {
 
 class face_cluster_members <<table>> {
   +cluster_id: INTEGER <<FK>>
-  +face_rectangle_id: INTEGER <<FK>>
+  +rectangle_id: INTEGER <<FK>>  ' только is_face=1
 }
 
 face_runs "1" -- "*" face_clusters : кластеры
 face_clusters "1" -- "*" face_cluster_members : элементы кластера
 face_clusters "0..1" -- "0..1" persons : привязка кластера к персоне (person_id)
-face_rectangles "1" -- "*" face_cluster_members : участие в кластере
+photo_rectangles "1" -- "*" face_cluster_members : участие в кластере (только is_face=1)
 
 note right of face_clusters
   person_id: прямая привязка кластера к персоне

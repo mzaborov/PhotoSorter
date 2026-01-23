@@ -418,7 +418,7 @@ def init_db():
 
     # --- Run-scoped manual rectangles for VIDEO frames (3 frames per video) ---
     # ВАЖНО: для видео нам нужны прямоугольники с привязкой к кадру/таймкоду.
-    # Храним отдельной таблицей, чтобы не смешивать с face_rectangles (она про фото/одно изображение).
+    # Храним отдельной таблицей, чтобы не смешивать с photo_rectangles (она про фото/одно изображение).
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS video_manual_frames (
@@ -485,11 +485,11 @@ class FaceStore:
     def _ensure_face_schema(self) -> None:
         cur = self.conn.cursor()
 
-        # Миграция: раньше таблица называлась face_detections, теперь face_rectangles.
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('face_detections','face_rectangles')")
+        # Миграция: раньше таблица называлась face_detections, теперь photo_rectangles.
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('face_detections','face_rectangles','photo_rectangles')")
         existing = {r[0] for r in cur.fetchall()}
-        if "face_detections" in existing and "face_rectangles" not in existing:
-            cur.execute("ALTER TABLE face_detections RENAME TO face_rectangles;")
+        if "face_detections" in existing and "photo_rectangles" not in existing and "face_rectangles" not in existing:
+            cur.execute("ALTER TABLE face_detections RENAME TO photo_rectangles;")
             # Старые индексы могли называться idx_face_det_*. Их можно оставить,
             # но создаём новые с актуальными именами для читаемости.
             try:
@@ -497,6 +497,16 @@ class FaceStore:
                 cur.execute("DROP INDEX IF EXISTS idx_face_det_file;")
             except Exception:
                 pass
+        elif "face_rectangles" in existing and "photo_rectangles" not in existing:
+            # Миграция: face_rectangles → photo_rectangles
+            # Добавляем is_face если его нет
+            cur.execute("PRAGMA table_info(face_rectangles)")
+            columns = {row[1] for row in cur.fetchall()}
+            if "is_face" not in columns:
+                cur.execute("ALTER TABLE face_rectangles ADD COLUMN is_face INTEGER DEFAULT 1")
+                cur.execute("UPDATE face_rectangles SET is_face = 1 WHERE is_face IS NULL")
+            # Переименовываем таблицу
+            cur.execute("ALTER TABLE face_rectangles RENAME TO photo_rectangles;")
 
         cur.execute(
             """
@@ -518,9 +528,9 @@ class FaceStore:
 
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS face_rectangles (
+            CREATE TABLE IF NOT EXISTS photo_rectangles (
               id             INTEGER PRIMARY KEY AUTOINCREMENT,
-              run_id         INTEGER NOT NULL,
+              run_id         INTEGER,
               file_id        INTEGER NOT NULL,    -- FOREIGN KEY на files.id
               face_index     INTEGER NOT NULL, -- индекс лица внутри файла в рамках текущего прогона
               bbox_x         INTEGER NOT NULL,
@@ -533,18 +543,21 @@ class FaceStore:
               manual_person  TEXT,             -- имя/код персоны (пока строка; схему персон сделаем позже)
               ignore_flag    INTEGER NOT NULL DEFAULT 0,
               created_at     TEXT NOT NULL,
+              is_face        INTEGER NOT NULL DEFAULT 1,  -- 1=лицо, 0=персона
               FOREIGN KEY (file_id) REFERENCES files(id)
             );
             """
         )
 
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_rect_run ON face_rectangles(run_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_rect_file ON face_rectangles(file_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_photo_rect_run ON photo_rectangles(run_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_photo_rect_file ON photo_rectangles(file_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_photo_rect_file_id ON photo_rectangles(file_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_photo_rect_is_face ON photo_rectangles(is_face);")
 
         # Ручная разметка (UI шага 2: корректировка лиц/нет лиц)
         _ensure_columns(
             self.conn,
-            "face_rectangles",
+            "photo_rectangles",
             {
                 "is_manual": "is_manual INTEGER NOT NULL DEFAULT 0",
                 "manual_created_at": "manual_created_at TEXT",
@@ -554,7 +567,7 @@ class FaceStore:
         # Face recognition embeddings (векторное представление лица для распознавания)
         _ensure_columns(
             self.conn,
-            "face_rectangles",
+            "photo_rectangles",
             {
                 "embedding": "embedding BLOB",  # JSON массив float32 (обычно 512 или 1024 элементов)
             },
@@ -564,21 +577,14 @@ class FaceStore:
         # NULL или '' = для прогонов (сортируемые папки), 'archive' = для архива (текущий статус)
         _ensure_columns(
             self.conn,
-            "face_rectangles",
+            "photo_rectangles",
             {
                 "archive_scope": "archive_scope TEXT",  # NULL|'' для прогонов, 'archive' для архива
             },
         )
         
-        # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
-        _ensure_columns(
-            self.conn,
-            "face_rectangles",
-            {
-                "file_id": "file_id INTEGER",  # FOREIGN KEY на files.id, пока NULL (заполним миграцией)
-            },
-        )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_rect_file_id ON face_rectangles(file_id);")
+        # Убеждаемся, что is_face имеет значение для всех записей
+        cur.execute("UPDATE photo_rectangles SET is_face = 1 WHERE is_face IS NULL")
 
         # Справочник персон (людей)
         cur.execute("""
@@ -588,7 +594,7 @@ class FaceStore:
                 mode            TEXT NOT NULL DEFAULT 'active',  -- 'active'|'deferred'|'never'
                 is_me           INTEGER NOT NULL DEFAULT 0,
                 kinship         TEXT,                          -- степень родства/близости
-                avatar_face_id  INTEGER,                       -- FK к face_rectangles.id
+                avatar_face_id  INTEGER,                       -- FK к photo_rectangles.id
                 created_at       TEXT NOT NULL,
                 updated_at       TEXT
             );
@@ -616,21 +622,76 @@ class FaceStore:
             );
         """)
 
+        # Миграция: переименование face_person_manual_assignments → person_rectangle_manual_assignments
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('face_person_manual_assignments','person_rectangle_manual_assignments')")
+        existing_assignments = {r[0] for r in cur.fetchall()}
+        if "face_person_manual_assignments" in existing_assignments and "person_rectangle_manual_assignments" not in existing_assignments:
+            # Проверяем, есть ли колонка rectangle_id
+            cur.execute("PRAGMA table_info(face_person_manual_assignments)")
+            columns = {row[1] for row in cur.fetchall()}
+            if "rectangle_id" not in columns:
+                # Пересоздаем таблицу с новым именем колонки
+                cur.execute("""
+                    CREATE TABLE person_rectangle_manual_assignments_new (
+                        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                        rectangle_id        INTEGER NOT NULL,
+                        person_id           INTEGER NOT NULL,
+                        source              TEXT NOT NULL,
+                        confidence          REAL,
+                        created_at          TEXT NOT NULL
+                    )
+                """)
+                cur.execute("""
+                    INSERT INTO person_rectangle_manual_assignments_new (
+                        id, rectangle_id, person_id, source, confidence, created_at
+                    )
+                    SELECT 
+                        id, face_rectangle_id, person_id, source, confidence, created_at
+                    FROM face_person_manual_assignments
+                """)
+                cur.execute("DROP TABLE face_person_manual_assignments")
+                cur.execute("ALTER TABLE person_rectangle_manual_assignments_new RENAME TO person_rectangle_manual_assignments")
+            else:
+                # Просто переименовываем таблицу
+                cur.execute("ALTER TABLE face_person_manual_assignments RENAME TO person_rectangle_manual_assignments")
+
         # Связь лиц с кластерами
+        # Миграция: переименование face_rectangle_id → rectangle_id
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='face_cluster_members'")
+        if cur.fetchone():
+            cur.execute("PRAGMA table_info(face_cluster_members)")
+            columns = {row[1] for row in cur.fetchall()}
+            if "rectangle_id" not in columns and "face_rectangle_id" in columns:
+                # Пересоздаем таблицу с новым именем колонки
+                cur.execute("""
+                    CREATE TABLE face_cluster_members_new (
+                        cluster_id          INTEGER NOT NULL,
+                        rectangle_id        INTEGER NOT NULL,
+                        PRIMARY KEY (cluster_id, rectangle_id)
+                    )
+                """)
+                cur.execute("""
+                    INSERT INTO face_cluster_members_new (cluster_id, rectangle_id)
+                    SELECT cluster_id, face_rectangle_id
+                    FROM face_cluster_members
+                """)
+                cur.execute("DROP TABLE face_cluster_members")
+                cur.execute("ALTER TABLE face_cluster_members_new RENAME TO face_cluster_members")
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS face_cluster_members (
                 cluster_id          INTEGER NOT NULL,
-                face_rectangle_id   INTEGER NOT NULL,
-                PRIMARY KEY (cluster_id, face_rectangle_id)
+                rectangle_id        INTEGER NOT NULL,
+                PRIMARY KEY (cluster_id, rectangle_id)
             );
         """)
 
         # Ручные привязки лиц к персонам (только для ручных привязок, не через кластеры)
         # Кластеры привязаны к персонам через face_clusters.person_id
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS face_person_manual_assignments (
+            CREATE TABLE IF NOT EXISTS person_rectangle_manual_assignments (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                face_rectangle_id   INTEGER NOT NULL,
+                rectangle_id        INTEGER NOT NULL,
                 person_id           INTEGER NOT NULL,
                 source              TEXT NOT NULL,             -- 'manual'|'ai'
                 confidence          REAL,
@@ -639,10 +700,10 @@ class FaceStore:
         """)
         
         # Старая таблица face_labels больше не создаётся
-        # Миграция завершена: используется face_person_manual_assignments для ручных привязок
+        # Миграция завершена: используется person_rectangle_manual_assignments для ручных привязок
         # и face_clusters.person_id для привязки кластеров к персонам
 
-        # Archive scope для кластеров (аналогично face_rectangles)
+        # Archive scope для кластеров (аналогично photo_rectangles)
         _ensure_columns(
             self.conn,
             "face_clusters",
@@ -654,15 +715,15 @@ class FaceStore:
         # Индексы
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_clusters_run ON face_clusters(run_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_clusters_person ON face_clusters(person_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_rect_archive_scope ON face_rectangles(archive_scope);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_photo_rect_archive_scope ON photo_rectangles(archive_scope);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_clusters_archive_scope ON face_clusters(archive_scope);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_cluster_members_cluster ON face_cluster_members(cluster_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_cluster_members_face ON face_cluster_members(face_rectangle_id);")
-        # Индексы для face_person_manual_assignments
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_person_manual_assignments_face ON face_person_manual_assignments(face_rectangle_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_person_manual_assignments_person ON face_person_manual_assignments(person_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_cluster_members_rect ON face_cluster_members(rectangle_id);")
+        # Индексы для person_rectangle_manual_assignments
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rectangle_manual_assignments_rect ON person_rectangle_manual_assignments(rectangle_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rectangle_manual_assignments_person ON person_rectangle_manual_assignments(person_id);")
         # UNIQUE индекс для предотвращения дубликатов: одно лицо может быть назначено персоне только один раз
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_face_person_manual_assignments_unique ON face_person_manual_assignments(face_rectangle_id, person_id);")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_person_rectangle_manual_assignments_unique ON person_rectangle_manual_assignments(rectangle_id, person_id);")
         # Старые индексы для face_labels (для обратной совместимости, будут удалены после миграции)
         # ВАЖНО: таблица face_labels больше не используется в рабочем коде, индексы оставлены только для совместимости
         # После полного тестирования можно удалить таблицу через migrate_drop_face_labels_table.py
@@ -805,7 +866,7 @@ class FaceStore:
               fr.created_at,
               COALESCE(fr.is_manual, 0) AS is_manual,
               fr.manual_created_at
-            FROM face_rectangles fr
+            FROM photo_rectangles fr
             JOIN files f ON f.id = fr.file_id
             WHERE fr.run_id = ? AND fr.file_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
             ORDER BY COALESCE(fr.is_manual, 0) ASC, fr.face_index ASC, fr.id ASC
@@ -837,7 +898,7 @@ class FaceStore:
         now = _now_utc_iso()
         cur = self.conn.cursor()
         cur.execute(
-            "DELETE FROM face_rectangles WHERE run_id = ? AND file_id = ? AND COALESCE(is_manual, 0) = 1",
+            "DELETE FROM photo_rectangles WHERE run_id = ? AND file_id = ? AND COALESCE(is_manual, 0) = 1",
             (int(run_id), resolved_file_id),
         )
         for i, r in enumerate(rects or []):
@@ -849,10 +910,11 @@ class FaceStore:
                 continue
             cur.execute(
                 """
-                INSERT INTO face_rectangles(
+                INSERT INTO photo_rectangles(
                   run_id, file_id, face_index,
                   bbox_x, bbox_y, bbox_w, bbox_h,
                   confidence, presence_score,
+                  is_face,
                   thumb_jpeg, manual_person, ignore_flag,
                   created_at,
                   is_manual, manual_created_at
@@ -930,7 +992,7 @@ class FaceStore:
         if resolved_file_id is None:
             raise ValueError("Either file_id or file_path must be provided")
         cur = self.conn.cursor()
-        cur.execute("DELETE FROM face_rectangles WHERE run_id = ? AND file_id = ?", (run_id, resolved_file_id))
+        cur.execute("DELETE FROM photo_rectangles WHERE run_id = ? AND file_id = ?", (run_id, resolved_file_id))
         self.conn.commit()
 
     def clear_run_auto_rectangles_for_file(self, *, run_id: int, file_id: int | None = None, file_path: str | None = None) -> None:
@@ -944,7 +1006,7 @@ class FaceStore:
             raise ValueError("Either file_id or file_path must be provided")
         cur = self.conn.cursor()
         cur.execute(
-            "DELETE FROM face_rectangles WHERE run_id = ? AND file_id = ? AND COALESCE(is_manual, 0) = 0",
+            "DELETE FROM photo_rectangles WHERE run_id = ? AND file_id = ? AND COALESCE(is_manual, 0) = 0",
             (int(run_id), resolved_file_id),
         )
         self.conn.commit()
@@ -986,7 +1048,7 @@ class FaceStore:
             # Проверяем существование по file_id + bbox
             cur.execute(
                 """
-                SELECT id FROM face_rectangles
+                SELECT id FROM photo_rectangles
                 WHERE archive_scope = 'archive'
                   AND file_id = ?
                   AND bbox_x = ?
@@ -1007,14 +1069,15 @@ class FaceStore:
             # Для архива run_id может быть NULL
             cur.execute(
                 """
-                INSERT INTO face_rectangles(
+                INSERT INTO photo_rectangles(
                   run_id, archive_scope, file_id, face_index,
                   bbox_x, bbox_y, bbox_w, bbox_h,
                   confidence, presence_score, thumb_jpeg,
                   embedding, manual_person, ignore_flag, created_at,
-                  is_manual, manual_created_at
+                  is_manual, manual_created_at,
+                  is_face
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, 0, NULL)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, 0, NULL, 1)
                 """,
                 (
                     run_id,  # может быть NULL для архива
@@ -1038,14 +1101,15 @@ class FaceStore:
                 raise ValueError("run_id обязателен для неархивных записей")
             cur.execute(
                 """
-                INSERT INTO face_rectangles(
+                INSERT INTO photo_rectangles(
                   run_id, archive_scope, file_id, face_index,
                   bbox_x, bbox_y, bbox_w, bbox_h,
                   confidence, presence_score, thumb_jpeg,
                   embedding, manual_person, ignore_flag, created_at,
-                  is_manual, manual_created_at
+                  is_manual, manual_created_at,
+                  is_face
                 )
-                VALUES(?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, 0, NULL)
+                VALUES(?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, 0, NULL, 1)
                 """,
                 (
                     run_id,
@@ -1114,9 +1178,9 @@ class FaceStore:
                     """
                     SELECT fr.id, fr.run_id, f.path AS file_path, fr.face_index, fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
                            fr.confidence, fr.embedding
-                    FROM face_rectangles fr
+                    FROM photo_rectangles fr
                     JOIN files f ON f.id = fr.file_id
-                    WHERE fr.run_id = ? AND fr.embedding IS NOT NULL AND COALESCE(fr.ignore_flag, 0) = 0
+                    WHERE fr.run_id = ? AND fr.embedding IS NOT NULL AND COALESCE(fr.ignore_flag, 0) = 0 AND fr.is_face = 1
                     """,
                     (int(run_id),),
                 )
@@ -1125,9 +1189,9 @@ class FaceStore:
                     """
                     SELECT fr.id, fr.run_id, f.path AS file_path, fr.face_index, fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
                            fr.confidence, fr.embedding
-                    FROM face_rectangles fr
+                    FROM photo_rectangles fr
                     JOIN files f ON f.id = fr.file_id
-                    WHERE fr.embedding IS NOT NULL AND COALESCE(fr.ignore_flag, 0) = 0
+                    WHERE fr.embedding IS NOT NULL AND COALESCE(fr.ignore_flag, 0) = 0 AND fr.is_face = 1
                     """,
                 )
             
@@ -1178,14 +1242,14 @@ class FaceStore:
 
     def update_file_path(self, *, old_file_path: str, new_file_path: str) -> None:
         """
-        Обновляет file_path для face_rectangles (когда файл физически перенесли на диске/в YaDisk).
+        Обновляет file_path для photo_rectangles (когда файл физически перенесли на диске/в YaDisk).
 
         Важно: это чисто "техническая" миграция ссылок. Семантика детекта не меняется.
         """
         cur = self.conn.cursor()
         cur.execute(
             """
-            UPDATE face_rectangles
+            UPDATE photo_rectangles
             SET file_path = ?
             WHERE file_path = ?
             """,
@@ -1578,11 +1642,11 @@ class FaceStore:
     ) -> dict[str, Any]:
         """
         Возвращает все привязки файла к персонам (через все 3 способа):
-        - через лица (face_person_manual_assignments + face_clusters.person_id через face_cluster_members)
+        - через лица (person_rectangle_manual_assignments + face_clusters.person_id через face_cluster_members)
         - через прямоугольники без лица (person_rectangles)
         - прямая привязка (file_persons)
         
-        Если указан pipeline_run_id, получает face_run_id из pipeline_runs для фильтрации face_rectangles.
+        Если указан pipeline_run_id, получает face_run_id из pipeline_runs для фильтрации photo_rectangles.
         Приоритет: file_id (если передан), иначе file_path (если передан).
         """
         # Получаем file_id
@@ -1616,8 +1680,8 @@ class FaceStore:
                 FROM (
                     -- Ручные привязки
                     SELECT DISTINCT fpma.person_id, p.name AS person_name
-                    FROM face_person_manual_assignments fpma
-                    JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
+                    FROM person_rectangle_manual_assignments fpma
+                    JOIN photo_rectangles fr ON fr.id = fpma.rectangle_id
                     LEFT JOIN persons p ON p.id = fpma.person_id
                     WHERE fr.file_id = ? AND fr.run_id = ?
                     
@@ -1626,7 +1690,8 @@ class FaceStore:
                     -- Привязки через кластеры
                     SELECT DISTINCT fc.person_id, p.name AS person_name
                     FROM face_cluster_members fcm
-                    JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
+                    JOIN photo_rectangles fr ON fr.id = fcm.rectangle_id
+                    WHERE fr.is_face = 1
                     JOIN face_clusters fc ON fc.id = fcm.cluster_id
                     LEFT JOIN persons p ON p.id = fc.person_id
                     WHERE fr.file_id = ? AND fr.run_id = ? AND fc.person_id IS NOT NULL
@@ -1642,8 +1707,8 @@ class FaceStore:
                 FROM (
                     -- Ручные привязки
                     SELECT DISTINCT fpma.person_id, p.name AS person_name
-                    FROM face_person_manual_assignments fpma
-                    JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
+                    FROM person_rectangle_manual_assignments fpma
+                    JOIN photo_rectangles fr ON fr.id = fpma.rectangle_id
                     LEFT JOIN persons p ON p.id = fpma.person_id
                     WHERE fr.file_id = ?
                     
@@ -1652,7 +1717,8 @@ class FaceStore:
                     -- Привязки через кластеры
                     SELECT DISTINCT fc.person_id, p.name AS person_name
                     FROM face_cluster_members fcm
-                    JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
+                    JOIN photo_rectangles fr ON fr.id = fcm.rectangle_id
+                    WHERE fr.is_face = 1
                     JOIN face_clusters fc ON fc.id = fcm.cluster_id
                     LEFT JOIN persons p ON p.id = fc.person_id
                     WHERE fr.file_id = ? AND fc.person_id IS NOT NULL

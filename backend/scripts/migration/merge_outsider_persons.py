@@ -50,10 +50,10 @@ def main():
     # Подсчитываем привязки
     print("\n📊 Подсчет привязок:")
     
-    # Ручные привязки (face_person_manual_assignments)
-    cur.execute("SELECT COUNT(*) as cnt FROM face_person_manual_assignments WHERE person_id = ?", (SOURCE_PERSON_ID,))
+    # Ручные привязки (person_rectangle_manual_assignments)
+    cur.execute("SELECT COUNT(*) as cnt FROM person_rectangle_manual_assignments WHERE person_id = ?", (SOURCE_PERSON_ID,))
     manual_count = cur.fetchone()['cnt']
-    print(f"  Ручные привязки (face_person_manual_assignments): {manual_count}")
+    print(f"  Ручные привязки (person_rectangle_manual_assignments): {manual_count}")
     
     # Привязки через кластеры (face_clusters)
     cur.execute("SELECT COUNT(*) as cnt FROM face_clusters WHERE person_id = ?", (SOURCE_PERSON_ID,))
@@ -112,7 +112,7 @@ def main():
         if manual_count > 0:
             print(f"  Переносим {manual_count} ручных привязок...")
             cur.execute("""
-                UPDATE face_person_manual_assignments 
+                UPDATE person_rectangle_manual_assignments 
                 SET person_id = ? 
                 WHERE person_id = ?
             """, (TARGET_PERSON_ID, SOURCE_PERSON_ID))
@@ -159,7 +159,7 @@ def main():
         
         # Проверяем результат
         print("\n📊 Проверка результата:")
-        cur.execute("SELECT COUNT(*) as cnt FROM face_person_manual_assignments WHERE person_id = ?", (TARGET_PERSON_ID,))
+        cur.execute("SELECT COUNT(*) as cnt FROM person_rectangle_manual_assignments WHERE person_id = ?", (TARGET_PERSON_ID,))
         final_manual = cur.fetchone()['cnt']
         cur.execute("SELECT COUNT(*) as cnt FROM face_clusters WHERE person_id = ?", (TARGET_PERSON_ID,))
         final_cluster = cur.fetchone()['cnt']

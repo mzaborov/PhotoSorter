@@ -1245,7 +1245,7 @@ console.error = function(...args) {
         
         pushUndoAction({
           type: 'assign_person',
-          face_rectangle_id: rect.id,
+          rectangle_id: rect.id,
           oldPersonId: oldPersonId,
           newPersonId: outsiderPerson.id,
           oldAssignmentType: rect.assignment_type || null,
@@ -1305,7 +1305,7 @@ console.error = function(...args) {
             // Сохраняем действие в стек UNDO
             pushUndoAction({
               type: 'change_assignment_type',
-              face_rectangle_id: rect.id,
+              rectangle_id: rect.id,
               oldAssignmentType: oldAssignmentType,
               newAssignmentType: newType,
               person_id: rect.person_id
@@ -1445,7 +1445,7 @@ console.error = function(...args) {
             
             pushUndoAction({
               type: 'assign_person',
-              face_rectangle_id: rect.id,
+              rectangle_id: rect.id,
               oldPersonId: oldPersonId,
               newPersonId: person.id,
               oldAssignmentType: rect.assignment_type || null,
@@ -1511,7 +1511,7 @@ console.error = function(...args) {
             
             pushUndoAction({
               type: 'assign_person',
-              face_rectangle_id: rect.id,
+              rectangle_id: rect.id,
               oldPersonId: oldPersonId,
               newPersonId: person.id,
               oldAssignmentType: rect.assignment_type || null,
@@ -1984,7 +1984,7 @@ console.error = function(...args) {
       // Сохраняем действие в стек UNDO
       pushUndoAction({
         type: 'move_resize',
-        face_rectangle_id: rect.id,
+        rectangle_id: rect.id,
         oldBbox: oldBbox,
         newBbox: { x: naturalX, y: naturalY, w: naturalW, h: naturalH }
       });
@@ -2165,7 +2165,7 @@ console.error = function(...args) {
         // Сохраняем действие в стек UNDO
         pushUndoAction({
           type: 'update_rectangle',
-          face_rectangle_id: rect.id,
+          rectangle_id: rect.id,
           oldBbox: oldBbox,
           newBbox: { x: naturalX, y: naturalY, w: naturalW, h: naturalH },
           oldPersonId: rect.person_id || null,
@@ -2190,9 +2190,18 @@ console.error = function(...args) {
    * Обновляет rectangle через API
    */
   async function updateRectangle(faceRectangleId, bbox, personId, assignmentType) {
+    // Преобразуем rectangle_id в число, если это возможно
+    const rectangleIdInt = faceRectangleId !== null && faceRectangleId !== undefined 
+      ? parseInt(faceRectangleId, 10) 
+      : null;
+    
+    if (rectangleIdInt === null || isNaN(rectangleIdInt)) {
+      throw new Error('rectangle_id is required and must be a valid number');
+    }
+    
     // Формируем payload в зависимости от режима
     const payload = {
-      face_rectangle_id: faceRectangleId
+      rectangle_id: rectangleIdInt
     };
     
     // Для сортируемых фото требуется pipeline_run_id
@@ -2248,7 +2257,7 @@ console.error = function(...args) {
     if (rect) {
       pushUndoAction({
         type: 'delete_rectangle',
-        face_rectangle_id: faceRectangleId,
+        rectangle_id: faceRectangleId,
         oldBbox: rect.bbox || {},
         oldPersonId: rect.person_id || null,
         oldAssignmentType: null
@@ -2257,7 +2266,7 @@ console.error = function(...args) {
     
     // Формируем payload в зависимости от режима
     const payload = {
-      face_rectangle_id: faceRectangleId
+      rectangle_id: faceRectangleId
     };
     
     // Для сортируемых фото требуется pipeline_run_id
@@ -2323,7 +2332,7 @@ console.error = function(...args) {
         const duplicateMap = {};
         data.rectangles.forEach(rect => {
           if (rect.is_duplicate) {
-            duplicateMap[rect.face_rectangle_id] = true;
+            duplicateMap[rect.rectangle_id] = true;
           }
         });
         
@@ -2463,7 +2472,7 @@ console.error = function(...args) {
       // Сохраняем действие в стек UNDO
       pushUndoAction({
         type: 'assign_person',
-        face_rectangle_id: rect.id,
+        rectangle_id: rect.id,
         oldPersonId: oldPersonId,
         newPersonId: personId,
         oldAssignmentType: null,
@@ -2804,7 +2813,7 @@ console.error = function(...args) {
       switch (action.type) {
         case 'update_rectangle':
           // Восстанавливаем предыдущее состояние rectangle
-          await updateRectangle(action.face_rectangle_id, action.oldBbox, action.oldPersonId, action.oldAssignmentType);
+          await updateRectangle(action.rectangle_id, action.oldBbox, action.oldPersonId, action.oldAssignmentType);
           await loadRectangles();
           await checkDuplicates();
           break;
@@ -2814,19 +2823,19 @@ console.error = function(...args) {
           break;
         case 'assign_person':
           // Удаляем привязку персоны
-          await updateRectangle(action.face_rectangle_id, null, null, null);
+          await updateRectangle(action.rectangle_id, null, null, null);
           await loadRectangles();
           await checkDuplicates();
           break;
         case 'change_assignment_type':
           // Восстанавливаем предыдущий тип привязки
-          await updateRectangle(action.face_rectangle_id, null, action.person_id, action.oldAssignmentType);
+          await updateRectangle(action.rectangle_id, null, action.person_id, action.oldAssignmentType);
           await loadRectangles();
           await checkDuplicates();
           break;
         case 'move_resize':
           // Восстанавливаем предыдущие координаты и размеры
-          await updateRectangle(action.face_rectangle_id, action.oldBbox, null, null);
+          await updateRectangle(action.rectangle_id, action.oldBbox, null, null);
           await loadRectangles();
           await checkDuplicates();
           break;

@@ -63,7 +63,7 @@
             <th>Аватар</th>
             <th>Имя</th>
             <th style="text-align: right;">Кластеры</th>
-            <th style="text-align: right;">Через лица<br/><span style="font-weight: normal; font-size: 11px; color: #6b7280;">Архив / Прогон</span></th>
+            <th style="text-align: right;">Через лица</th>
             <th style="text-align: right;">Через прямоугольники</th>
             <th style="text-align: right;">Прямая привязка</th>
           </tr>
@@ -258,6 +258,14 @@
         const facesCountArchive = p.faces_count_archive || 0;
         const facesCountRun = p.faces_count_run || 0;
         
+        // Разбивка по способам привязки
+        const facesViaClusters = p.faces_via_clusters || 0;
+        const facesViaClustersArchive = p.faces_via_clusters_archive || 0;
+        const facesViaClustersRun = p.faces_via_clusters_run || 0;
+        const facesViaManual = p.faces_via_manual || 0;
+        const facesViaManualArchive = p.faces_via_manual_archive || 0;
+        const facesViaManualRun = p.faces_via_manual_run || 0;
+        
         const personRectanglesCount = p.person_rectangles_files_count || 0;
         const filePersonsCount = p.file_persons_files_count || 0;
         
@@ -266,10 +274,24 @@
           ? `<a href="/persons/${p.id}/clusters" class="pill-link" title="Перейти к кластерам">${clustersCount}</a>`
           : `<span class="pill">${clustersCount}</span>`;
         
-        // Форматируем лица: всего (архив / прогон)
-        const facesHtml = facesCount > 0
-          ? `<a href="/persons/${p.id}" class="pill-link" title="Перейти к карточке персоны">${facesCount}</a><br/><span style="font-size: 11px; color: #6b7280;">${facesCountArchive} / ${facesCountRun}</span>`
-          : `<span class="pill">${facesCount}</span><br/><span style="font-size: 11px; color: #6b7280;">${facesCountArchive} / ${facesCountRun}</span>`;
+        // Форматируем лица: всего с разбивкой по способам привязки
+        let facesHtml = '';
+        if (facesCount > 0) {
+          facesHtml = `<a href="/persons/${p.id}" class="pill-link" title="Перейти к карточке персоны">${facesCount}</a>`;
+          // Добавляем разбивку по способам привязки
+          const details = [];
+          if (facesViaClusters > 0) {
+            details.push(`Кластеры: ${facesViaClusters} (${facesViaClustersArchive} архив / ${facesViaClustersRun} прогон)`);
+          }
+          if (facesViaManual > 0) {
+            details.push(`Ручные: ${facesViaManual} (${facesViaManualArchive} архив / ${facesViaManualRun} прогон)`);
+          }
+          if (details.length > 0) {
+            facesHtml += '<br/><span style="font-size: 11px; color: #6b7280;">' + details.join('<br/>') + '</span>';
+          }
+        } else {
+          facesHtml = `<span class="pill">${facesCount}</span>`;
+        }
         
         const personRectanglesHtml = personRectanglesCount > 0
           ? `<span class="pill" title="Файлов с прямоугольниками без лица">${personRectanglesCount}</span>`

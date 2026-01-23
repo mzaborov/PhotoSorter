@@ -201,7 +201,7 @@ class face_runs <<table>> {
   last_error: TEXT
 }
 
-class face_rectangles <<table>> {
+class photo_rectangles <<table>> {
   +id: INTEGER <<PK>>
   run_id: INTEGER <<FK>>         ' NULL для архива (archive_scope='archive')
   archive_scope: TEXT             ' NULL|'' для прогонов, 'archive' для архива
@@ -219,11 +219,12 @@ class face_rectangles <<table>> {
   ignore_flag: INTEGER
   is_manual: INTEGER
   manual_created_at: TEXT
+  is_face: INTEGER <<NOT NULL>> <<DEFAULT 1>>  ' 1=лицо, 0=персона
   created_at: TEXT
 }
 
-files "1" -- "*" face_rectangles : файл (file_id)
-face_runs "1" -- "*" face_rectangles : прямоугольники лиц
+files "1" -- "*" photo_rectangles : файл (file_id)
+face_runs "1" -- "*" photo_rectangles : прямоугольники лиц
 pipeline_runs "0..1" -- "0..1" face_runs : шаг 2 (лица)
 
 class persons <<table>> {
@@ -249,25 +250,25 @@ class face_clusters <<table>> {
 
 class face_cluster_members <<table>> {
   cluster_id: INTEGER <<FK,PK>>
-  face_rectangle_id: INTEGER <<FK,PK>>
+  rectangle_id: INTEGER <<FK,PK>>  ' только is_face=1
 }
 
-class face_person_manual_assignments <<table>> {
+class person_rectangle_manual_assignments <<table>> {
   +id: INTEGER <<PK>>
-  face_rectangle_id: INTEGER <<FK>>
+  rectangle_id: INTEGER <<FK>>  ' может быть лицо (is_face=1) или персона (is_face=0)
   person_id: INTEGER <<FK>>
   source: TEXT                  ' manual|restored_from_gold|ai
   confidence: REAL
   created_at: TEXT
 }
 
-files "1" -- "*" face_rectangles : файл (file_id)
-face_rectangles "0..1" -- "0..1" persons : avatar (avatar_face_id)
-face_rectangles "1" -- "*" face_cluster_members : член кластера
+files "1" -- "*" photo_rectangles : файл (file_id)
+photo_rectangles "0..1" -- "0..1" persons : avatar (avatar_face_id)
+photo_rectangles "1" -- "*" face_cluster_members : член кластера (только is_face=1)
 face_clusters "1" -- "*" face_cluster_members : кластер
 face_clusters "0..1" -- "0..1" persons : привязка кластера к персоне (person_id)
-face_rectangles "1" -- "0..*" face_person_manual_assignments : ручные привязки лица
-persons "1" -- "*" face_person_manual_assignments : ручная привязка к персоне
+photo_rectangles "1" -- "0..*" person_rectangle_manual_assignments : ручные привязки (лица или персоны)
+persons "1" -- "*" person_rectangle_manual_assignments : ручная привязка к персоне
 face_runs "1" -- "*" face_clusters : прогон кластеризации
 
 class person_rectangles <<table>> {
@@ -322,7 +323,7 @@ pipeline_runs "1" -- "*" file_persons : прогон
 pipeline_runs "1" -- "*" file_groups : прогон
 pipeline_runs "1" -- "*" file_group_persons : прогон
 
-note right of face_person_manual_assignments
+note right of person_rectangle_manual_assignments
   ТОЛЬКО для ручных привязок отдельных лиц
   (не через кластеры)
   
@@ -347,19 +348,24 @@ note right of face_cluster_members
   Единственный источник истины:
   какое лицо в каком кластере
   
-  PRIMARY KEY (cluster_id, face_rectangle_id)
+  PRIMARY KEY (cluster_id, rectangle_id)
   Одно лицо → один кластер
   
   Если лицо не в кластере (noise) —
   записи нет
+  
+  ТОЛЬКО rectangles с is_face=1 могут быть в кластерах
 end note
 
-note right of face_rectangles
+note right of photo_rectangles
   presence_score (photo) =
   area(face_bbox) / sum(area(all_face_bbox))
   
   embedding: BLOB (JSON float32[])
   для распознавания лиц
+  
+  is_face: 1=лицо, 0=персона
+  Только лица (is_face=1) могут быть в кластерах
 end note
 
 @enduml

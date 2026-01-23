@@ -176,7 +176,7 @@ def remove_column_from_table(conn, table_name: str, column_name: str, dry_run: b
 def remove_file_path_columns(conn, dry_run: bool = False):
     """Удаляет колонки file_path/path из всех таблиц."""
     tables_to_process = [
-        ("face_rectangles", "file_path"),
+        ("photo_rectangles", "file_path"),
         ("person_rectangles", "file_path"),
         ("file_persons", "file_path"),
         ("file_groups", "file_path"),

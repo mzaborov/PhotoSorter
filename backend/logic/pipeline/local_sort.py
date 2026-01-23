@@ -1586,7 +1586,7 @@ def scan_faces_local(
         def _rectangles_count_db() -> int:
             try:
                 cur0 = store.conn.cursor()
-                cur0.execute("SELECT COUNT(*) FROM face_rectangles WHERE run_id = ?", (int(run_id_i),))
+                cur0.execute("SELECT COUNT(*) FROM photo_rectangles WHERE run_id = ? AND is_face = 1", (int(run_id_i),))
                 v = cur0.fetchone()
                 return int(v[0] or 0) if v else 0
             except Exception:
@@ -1736,8 +1736,8 @@ def scan_faces_local(
                 pass
 
             # Resume-friendly: если уже есть сводка лиц для этого файла под этим run_id — пропускаем.
-            # ВАЖНО: проверяем не только faces_scanned_at, но и наличие face_rectangles,
-            # чтобы не пропускать файлы, где faces_scanned_at установлен, но face_rectangles не сохранены.
+            # ВАЖНО: проверяем не только faces_scanned_at, но и наличие photo_rectangles,
+            # чтобы не пропускать файлы, где faces_scanned_at установлен, но photo_rectangles не сохранены.
             stage = "dedup_get_row"
             row = dedup.get_row_by_path(path=db_path)
             if stats.images_scanned <= 3:
@@ -1748,20 +1748,24 @@ def scan_faces_local(
                     data={"i": int(stats.images_scanned), "has_row": bool(row), "row_keys": sorted(list(row.keys())) if row else None},
                 )
             if row and row.get("faces_run_id") is not None and int(row.get("faces_run_id")) == run_id_i and row.get("faces_scanned_at"):
-                # Проверяем, есть ли face_rectangles для этого файла
+                # Проверяем, есть ли photo_rectangles для этого файла
                 cur_check = store.conn.cursor()
                 cur_check.execute(
-                    "SELECT COUNT(*) FROM face_rectangles WHERE run_id = ? AND file_path = ? AND COALESCE(ignore_flag, 0) = 0",
+                    """
+                    SELECT COUNT(*) FROM photo_rectangles pr
+                    JOIN files f ON f.id = pr.file_id
+                    WHERE pr.run_id = ? AND f.path = ? AND pr.is_face = 1 AND COALESCE(pr.ignore_flag, 0) = 0
+                    """,
                     (run_id_i, db_path)
                 )
                 has_rectangles = int(cur_check.fetchone()[0] or 0) > 0
                 if has_rectangles:
                     continue  # Файл уже обработан корректно
-                # Если faces_scanned_at есть, но face_rectangles нет — пересканируем
+                # Если faces_scanned_at есть, но photo_rectangles нет — пересканируем
                 _pipe_log(
                     pipeline,
                     pipeline_run_id,
-                    f"⚠️  Resume: файл {db_path} имеет faces_scanned_at, но нет face_rectangles. Пересканируем.\n",
+                    f"⚠️  Resume: файл {db_path} имеет faces_scanned_at, но нет photo_rectangles. Пересканируем.\n",
                 )
             try:
                 # --- VIDEO: sample 1–3 frames and aggregate ---
@@ -2247,14 +2251,15 @@ def scan_faces_local(
                     stats.faces_found += 1
 
                 # Пишем сводку "лица/не лица" в files так, чтобы faces_count совпадал
-                # с количеством прямоугольников (auto+manual) в face_rectangles.
+                # с количеством прямоугольников (auto+manual) в photo_rectangles.
                 stage = "db_faces_count_recompute"
                 try:
                     cur1 = store.conn.cursor()
                     cur1.execute(
                         """
-                        SELECT COUNT(*) FROM face_rectangles
-                        WHERE run_id = ? AND file_path = ? AND COALESCE(ignore_flag, 0) = 0
+                        SELECT COUNT(*) FROM photo_rectangles pr
+                        JOIN files f ON f.id = pr.file_id
+                        WHERE pr.run_id = ? AND f.path = ? AND pr.is_face = 1 AND COALESCE(pr.ignore_flag, 0) = 0
                         """,
                         (int(run_id_i), db_path),
                     )
@@ -2448,7 +2453,7 @@ def sort_by_faces(
                 pipeline.update_run(run_id=int(pipeline_run_id), last_src_path=src_abs, last_dst_path=dst_abs)
             _move_file(src=src_abs, dst=dst_abs, dry_run=dry_run)
 
-            # update DB paths (files + face_rectangles) ONLY when не dry-run
+            # update DB paths (files + photo_rectangles) ONLY when не dry-run
             if not dry_run:
                 new_db_path = _as_local_path(dst_abs)
                 dedup.update_path(
@@ -2644,7 +2649,7 @@ def sort_faces_into_named_folders(
     """
     Шаг 3: внутри faces раскладываем по папкам с именами.
 
-    MVP-логика: используем ручные метки `manual_person` в face_rectangles.
+    MVP-логика: используем ручные метки `manual_person` в photo_rectangles.
     Если меток нет -> _unassigned.
     """
     stats = Stats()
@@ -2661,9 +2666,10 @@ def sort_faces_into_named_folders(
             cur = store.conn.cursor()
             cur.execute(
                 """
-                SELECT DISTINCT manual_person
-                FROM face_rectangles
-                WHERE run_id = ? AND file_path = ? AND manual_person IS NOT NULL AND TRIM(manual_person) != ''
+                SELECT DISTINCT pr.manual_person
+                FROM photo_rectangles pr
+                JOIN files f ON f.id = pr.file_id
+                WHERE pr.run_id = ? AND f.path = ? AND pr.is_face = 1 AND pr.manual_person IS NOT NULL AND TRIM(pr.manual_person) != ''
                 """,
                 (int(run_id), str(db_path)),
             )

@@ -625,13 +625,15 @@ def api_gold_faces_by_persons() -> dict[str, Any]:
             SELECT DISTINCT
                 p.id as person_id,
                 p.name as person_name
-            FROM face_rectangles fr
-            LEFT JOIN face_person_manual_assignments fpma ON fr.id = fpma.face_rectangle_id
-            LEFT JOIN face_cluster_members fcm ON fr.id = fcm.face_rectangle_id
+            FROM photo_rectangles pr
+            JOIN files f ON f.id = pr.file_id
+            LEFT JOIN person_rectangle_manual_assignments prma ON pr.id = prma.rectangle_id
+            LEFT JOIN face_cluster_members fcm ON pr.id = fcm.rectangle_id
             LEFT JOIN face_clusters fc ON fcm.cluster_id = fc.id
-            LEFT JOIN persons p ON COALESCE(fpma.person_id, fc.person_id) = p.id
-            WHERE fr.file_path IN ({placeholders})
-              AND COALESCE(fr.ignore_flag, 0) = 0
+            LEFT JOIN persons p ON COALESCE(prma.person_id, fc.person_id) = p.id
+            WHERE f.path IN ({placeholders})
+              AND pr.is_face = 1
+              AND COALESCE(pr.ignore_flag, 0) = 0
               AND p.id IS NOT NULL
             ORDER BY 
               CASE WHEN p.name = ? THEN 1 ELSE 0 END,
@@ -675,29 +677,31 @@ def api_gold_faces_by_persons() -> dict[str, Any]:
             cur.execute(
                 """
                 SELECT 
-                    fr.id as face_id,
-                    fr.file_path,
-                    fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
-                    fl.person_id,
+                    pr.id as face_id,
+                    f.path as file_path,
+                    pr.bbox_x, pr.bbox_y, pr.bbox_w, pr.bbox_h,
+                    COALESCE(prma.person_id, fc.person_id) as person_id,
                     p.name as person_name
-                FROM face_rectangles fr
-                LEFT JOIN face_person_manual_assignments fpma ON fr.id = fpma.face_rectangle_id
-                LEFT JOIN face_cluster_members fcm ON fr.id = fcm.face_rectangle_id
+                FROM photo_rectangles pr
+                JOIN files f ON f.id = pr.file_id
+                LEFT JOIN person_rectangle_manual_assignments prma ON pr.id = prma.rectangle_id
+                LEFT JOIN face_cluster_members fcm ON pr.id = fcm.rectangle_id
                 LEFT JOIN face_clusters fc ON fcm.cluster_id = fc.id
-                LEFT JOIN persons p ON COALESCE(fpma.person_id, fc.person_id) = p.id
-                WHERE fr.file_path = ? 
-                  AND ABS(fr.bbox_x - ?) <= 10
-                  AND ABS(fr.bbox_y - ?) <= 10
-                  AND ABS(fr.bbox_w - ?) <= 10
-                  AND ABS(fr.bbox_h - ?) <= 10
-                  AND COALESCE(fr.ignore_flag, 0) = 0
+                LEFT JOIN persons p ON COALESCE(prma.person_id, fc.person_id) = p.id
+                WHERE f.path = ? 
+                  AND pr.is_face = 1
+                  AND ABS(pr.bbox_x - ?) <= 10
+                  AND ABS(pr.bbox_y - ?) <= 10
+                  AND ABS(pr.bbox_w - ?) <= 10
+                  AND ABS(pr.bbox_h - ?) <= 10
+                  AND COALESCE(pr.ignore_flag, 0) = 0
                 ORDER BY 
                   -- Сначала берем лица с назначенной персоной
-                  CASE WHEN COALESCE(fpma.person_id, fc.person_id) IS NOT NULL THEN 0 ELSE 1 END,
+                  CASE WHEN COALESCE(prma.person_id, fc.person_id) IS NOT NULL THEN 0 ELSE 1 END,
                   -- Затем по точности совпадения координат
-                  (ABS(fr.bbox_x - ?) + ABS(fr.bbox_y - ?) + ABS(fr.bbox_w - ?) + ABS(fr.bbox_h - ?)) ASC,
+                  (ABS(pr.bbox_x - ?) + ABS(pr.bbox_y - ?) + ABS(pr.bbox_w - ?) + ABS(pr.bbox_h - ?)) ASC,
                   -- И наконец по ID для стабильности
-                  fr.id ASC
+                  pr.id ASC
                 LIMIT 1
                 """,
                 (file_path, x, y, w, h, x, y, w, h),
@@ -710,15 +714,17 @@ def api_gold_faces_by_persons() -> dict[str, Any]:
                 cur.execute(
                     """
                     SELECT DISTINCT
-                        COALESCE(fpma.person_id, fc.person_id) as person_id,
+                        COALESCE(prma.person_id, fc.person_id) as person_id,
                         p.name as person_name
-                    FROM face_rectangles fr
-                    LEFT JOIN face_person_manual_assignments fpma ON fr.id = fpma.face_rectangle_id
-                    LEFT JOIN face_cluster_members fcm ON fr.id = fcm.face_rectangle_id
+                    FROM photo_rectangles pr
+                    JOIN files f ON f.id = pr.file_id
+                    LEFT JOIN person_rectangle_manual_assignments prma ON pr.id = prma.rectangle_id
+                    LEFT JOIN face_cluster_members fcm ON pr.id = fcm.rectangle_id
                     LEFT JOIN face_clusters fc ON fcm.cluster_id = fc.id
-                    LEFT JOIN persons p ON COALESCE(fpma.person_id, fc.person_id) = p.id
-                    WHERE fr.file_path = ?
-                      AND COALESCE(fr.ignore_flag, 0) = 0
+                    LEFT JOIN persons p ON COALESCE(prma.person_id, fc.person_id) = p.id
+                    WHERE f.path = ?
+                      AND pr.is_face = 1
+                      AND COALESCE(pr.ignore_flag, 0) = 0
                       AND p.id IS NOT NULL
                     LIMIT 1
                     """,
@@ -1050,18 +1056,19 @@ def api_gold_update_from_db(payload: dict[str, Any] = Body(...)) -> dict[str, An
             f"""
             SELECT
               f.path AS path,
-              fr.run_id AS run_id,
-              fr.bbox_x AS x,
-              fr.bbox_y AS y,
-              fr.bbox_w AS w,
-              fr.bbox_h AS h
-            FROM face_rectangles fr
-            JOIN files f ON f.id = fr.file_id
+              pr.run_id AS run_id,
+              pr.bbox_x AS x,
+              pr.bbox_y AS y,
+              pr.bbox_w AS w,
+              pr.bbox_h AS h
+            FROM photo_rectangles pr
+            JOIN files f ON f.id = pr.file_id
             WHERE {base_where_sql_f}
-              AND COALESCE(fr.is_manual, 0) = 1
+              AND pr.is_face = 1
+              AND COALESCE(pr.is_manual, 0) = 1
               AND f.faces_run_id IS NOT NULL
-              AND fr.run_id = f.faces_run_id
-            ORDER BY f.path ASC, fr.face_index ASC, fr.id ASC
+              AND pr.run_id = f.faces_run_id
+            ORDER BY f.path ASC, pr.face_index ASC, pr.id ASC
             """,
             list(base_params),
         )

@@ -3,10 +3,10 @@
 Миграция архивных лиц из прогонов в архивный режим (без привязки к run_id).
 
 Находит все face_runs с scope='yadisk' и root_path начинающимся с 'disk:/Фото',
-и перемещает связанные face_rectangles и face_clusters в архивный режим
+и перемещает связанные photo_rectangles и face_clusters в архивный режим
 (archive_scope='archive', run_id=NULL для кластеров).
 
-Сохраняет все связи: face_cluster_members, face_labels.
+Сохраняет все связи: face_cluster_members, person_rectangle_manual_assignments.
 
 TODO: При переезде файлов в архив нужно копировать people_no_face_person
 из files_manual_labels в files.people_no_face_person, чтобы привязка сохранилась.
@@ -65,7 +65,7 @@ def main() -> int:
     cur.execute(
         """
         SELECT COUNT(*) as cnt
-        FROM face_rectangles
+        FROM photo_rectangles
         WHERE archive_scope = 'archive'
         """
     )
@@ -90,7 +90,7 @@ def main() -> int:
         
         # Подсчитываем лица
         cur.execute(
-            "SELECT COUNT(*) as cnt FROM face_rectangles WHERE run_id = ?",
+            "SELECT COUNT(*) as cnt FROM photo_rectangles WHERE run_id = ? AND is_face = 1",
             (run_id,)
         )
         faces_count = cur.fetchone()["cnt"]
@@ -109,8 +109,9 @@ def main() -> int:
             cur.execute(
                 """
                 SELECT COUNT(*) as cnt
-                FROM face_labels fl
-                JOIN face_clusters fc ON fl.cluster_id = fc.id
+                FROM person_rectangle_manual_assignments prma
+                JOIN face_cluster_members fcm ON fcm.rectangle_id = prma.rectangle_id
+                JOIN face_clusters fc ON fc.id = fcm.cluster_id
                 WHERE fc.run_id = ?
                 """,
                 (run_id,)
@@ -138,21 +139,23 @@ def main() -> int:
         
         print(f"Обработка run_id={run_id} ({root_path})...")
         
-        # 1. Мигрируем face_rectangles
-        # Проверяем дубликаты перед миграцией (по file_path + bbox)
+        # 1. Мигрируем photo_rectangles
+        # Проверяем дубликаты перед миграцией (по file_id + bbox)
         cur.execute(
             """
-            UPDATE face_rectangles
+            UPDATE photo_rectangles
             SET archive_scope = 'archive'
             WHERE run_id = ?
+              AND is_face = 1
               AND NOT EXISTS (
-                  SELECT 1 FROM face_rectangles fr2
-                  WHERE fr2.archive_scope = 'archive'
-                    AND fr2.file_id = face_rectangles.file_id
-                    AND fr2.bbox_x = face_rectangles.bbox_x
-                    AND fr2.bbox_y = face_rectangles.bbox_y
-                    AND fr2.bbox_w = face_rectangles.bbox_w
-                    AND fr2.bbox_h = face_rectangles.bbox_h
+                  SELECT 1 FROM photo_rectangles pr2
+                  WHERE pr2.archive_scope = 'archive'
+                    AND pr2.is_face = 1
+                    AND pr2.file_id = photo_rectangles.file_id
+                    AND pr2.bbox_x = photo_rectangles.bbox_x
+                    AND pr2.bbox_y = photo_rectangles.bbox_y
+                    AND pr2.bbox_w = photo_rectangles.bbox_w
+                    AND pr2.bbox_h = photo_rectangles.bbox_h
               )
             """,
             (run_id,),
@@ -164,17 +167,19 @@ def main() -> int:
         cur.execute(
             """
             SELECT COUNT(*) as cnt
-            FROM face_rectangles
+            FROM photo_rectangles
             WHERE run_id = ?
+              AND is_face = 1
               AND archive_scope IS NULL
               AND EXISTS (
-                  SELECT 1 FROM face_rectangles fr2
-                  WHERE fr2.archive_scope = 'archive'
-                    AND fr2.file_id = face_rectangles.file_id
-                    AND fr2.bbox_x = face_rectangles.bbox_x
-                    AND fr2.bbox_y = face_rectangles.bbox_y
-                    AND fr2.bbox_w = face_rectangles.bbox_w
-                    AND fr2.bbox_h = face_rectangles.bbox_h
+                  SELECT 1 FROM photo_rectangles pr2
+                  WHERE pr2.archive_scope = 'archive'
+                    AND pr2.is_face = 1
+                    AND pr2.file_id = photo_rectangles.file_id
+                    AND pr2.bbox_x = photo_rectangles.bbox_x
+                    AND pr2.bbox_y = photo_rectangles.bbox_y
+                    AND pr2.bbox_w = photo_rectangles.bbox_w
+                    AND pr2.bbox_h = photo_rectangles.bbox_h
               )
             """,
             (run_id,),
@@ -190,90 +195,90 @@ def main() -> int:
             cur.execute(
                 """
                 UPDATE face_cluster_members
-                SET face_rectangle_id = (
-                    SELECT fr2.id
-                    FROM face_rectangles fr2
-                    WHERE fr2.archive_scope = 'archive'
-                      AND fr2.file_path = (
-                          SELECT file_path FROM face_rectangles WHERE id = face_cluster_members.face_rectangle_id
+                SET rectangle_id = (
+                    SELECT pr2.id
+                    FROM photo_rectangles pr2
+                    WHERE pr2.archive_scope = 'archive'
+                      AND pr2.file_id = (
+                          SELECT file_id FROM photo_rectangles WHERE id = face_cluster_members.rectangle_id
                       )
-                      AND fr2.bbox_x = (
-                          SELECT bbox_x FROM face_rectangles WHERE id = face_cluster_members.face_rectangle_id
+                      AND pr2.bbox_x = (
+                          SELECT bbox_x FROM photo_rectangles WHERE id = face_cluster_members.rectangle_id
                       )
-                      AND fr2.bbox_y = (
-                          SELECT bbox_y FROM face_rectangles WHERE id = face_cluster_members.face_rectangle_id
+                      AND pr2.bbox_y = (
+                          SELECT bbox_y FROM photo_rectangles WHERE id = face_cluster_members.rectangle_id
                       )
-                      AND fr2.bbox_w = (
-                          SELECT bbox_w FROM face_rectangles WHERE id = face_cluster_members.face_rectangle_id
+                      AND pr2.bbox_w = (
+                          SELECT bbox_w FROM photo_rectangles WHERE id = face_cluster_members.rectangle_id
                       )
-                      AND fr2.bbox_h = (
-                          SELECT bbox_h FROM face_rectangles WHERE id = face_cluster_members.face_rectangle_id
+                      AND pr2.bbox_h = (
+                          SELECT bbox_h FROM photo_rectangles WHERE id = face_cluster_members.rectangle_id
                       )
                     LIMIT 1
                 )
-                WHERE face_rectangle_id IN (
-                    SELECT id FROM face_rectangles
+                WHERE rectangle_id IN (
+                    SELECT id FROM photo_rectangles
                     WHERE run_id = ? AND archive_scope IS NULL
                 )
                 AND EXISTS (
-                    SELECT 1 FROM face_rectangles fr3
-                    WHERE fr3.id = face_cluster_members.face_rectangle_id
-                      AND fr3.archive_scope IS NULL
+                    SELECT 1 FROM photo_rectangles pr3
+                    WHERE pr3.id = face_cluster_members.rectangle_id
+                      AND pr3.archive_scope IS NULL
                       AND EXISTS (
-                          SELECT 1 FROM face_rectangles fr4
-                          WHERE fr4.archive_scope = 'archive'
-                            AND fr4.file_path = fr3.file_path
-                            AND fr4.bbox_x = fr3.bbox_x
-                            AND fr4.bbox_y = fr3.bbox_y
-                            AND fr4.bbox_w = fr3.bbox_w
-                            AND fr4.bbox_h = fr3.bbox_h
+                          SELECT 1 FROM photo_rectangles pr4
+                          WHERE pr4.archive_scope = 'archive'
+                            AND pr4.file_id = pr3.file_id
+                            AND pr4.bbox_x = pr3.bbox_x
+                            AND pr4.bbox_y = pr3.bbox_y
+                            AND pr4.bbox_w = pr3.bbox_w
+                            AND pr4.bbox_h = pr3.bbox_h
                       )
                 )
                 """,
                 (run_id,)
             )
             
-            # Аналогично для face_labels
+            # Аналогично для person_rectangle_manual_assignments
             cur.execute(
                 """
-                UPDATE face_labels
-                SET face_rectangle_id = (
-                    SELECT fr2.id
-                    FROM face_rectangles fr2
-                    WHERE fr2.archive_scope = 'archive'
-                      AND fr2.file_path = (
-                          SELECT file_path FROM face_rectangles WHERE id = face_labels.face_rectangle_id
+                UPDATE person_rectangle_manual_assignments
+                SET rectangle_id = (
+                    SELECT pr2.id
+                    FROM photo_rectangles pr2
+                    WHERE pr2.archive_scope = 'archive'
+                      AND pr2.file_id = (
+                          SELECT file_id FROM photo_rectangles WHERE id = person_rectangle_manual_assignments.rectangle_id
                       )
-                      AND fr2.bbox_x = (
-                          SELECT bbox_x FROM face_rectangles WHERE id = face_labels.face_rectangle_id
+                      AND pr2.bbox_x = (
+                          SELECT bbox_x FROM photo_rectangles WHERE id = person_rectangle_manual_assignments.rectangle_id
                       )
-                      AND fr2.bbox_y = (
-                          SELECT bbox_y FROM face_rectangles WHERE id = face_labels.face_rectangle_id
+                      AND pr2.bbox_y = (
+                          SELECT bbox_y FROM photo_rectangles WHERE id = person_rectangle_manual_assignments.rectangle_id
                       )
-                      AND fr2.bbox_w = (
-                          SELECT bbox_w FROM face_rectangles WHERE id = face_labels.face_rectangle_id
+                      AND pr2.bbox_w = (
+                          SELECT bbox_w FROM photo_rectangles WHERE id = person_rectangle_manual_assignments.rectangle_id
                       )
-                      AND fr2.bbox_h = (
-                          SELECT bbox_h FROM face_rectangles WHERE id = face_labels.face_rectangle_id
+                      AND pr2.bbox_h = (
+                          SELECT bbox_h FROM photo_rectangles WHERE id = person_rectangle_manual_assignments.rectangle_id
                       )
                     LIMIT 1
                 )
-                WHERE face_rectangle_id IN (
-                    SELECT id FROM face_rectangles
+                WHERE rectangle_id IN (
+                    SELECT id FROM photo_rectangles
                     WHERE run_id = ? AND archive_scope IS NULL
                 )
                 AND EXISTS (
-                    SELECT 1 FROM face_rectangles fr3
-                    WHERE fr3.id = face_labels.face_rectangle_id
-                      AND fr3.archive_scope IS NULL
+                    SELECT 1 FROM photo_rectangles pr3
+                    WHERE pr3.id = person_rectangle_manual_assignments.rectangle_id
+                      AND pr3.archive_scope IS NULL
                       AND EXISTS (
-                          SELECT 1 FROM face_rectangles fr4
-                          WHERE fr4.archive_scope = 'archive'
-                            AND fr4.file_path = fr3.file_path
-                            AND fr4.bbox_x = fr3.bbox_x
-                            AND fr4.bbox_y = fr3.bbox_y
-                            AND fr4.bbox_w = fr3.bbox_w
-                            AND fr4.bbox_h = fr3.bbox_h
+                          SELECT 1 FROM photo_rectangles pr4
+                          WHERE pr4.archive_scope = 'archive'
+                            AND pr4.file_id = pr3.file_id
+                            AND pr4.bbox_x = pr3.bbox_x
+                            AND pr4.bbox_y = pr3.bbox_y
+                            AND pr4.bbox_w = pr3.bbox_w
+                            AND pr4.bbox_h = pr3.bbox_h
                       )
                 )
                 """,
@@ -302,8 +307,8 @@ def main() -> int:
     cur.execute(
         """
         SELECT COUNT(*) as cnt
-        FROM face_rectangles
-        WHERE archive_scope = 'archive'
+        FROM photo_rectangles
+        WHERE archive_scope = 'archive' AND is_face = 1
         """
     )
     final_faces = cur.fetchone()["cnt"]

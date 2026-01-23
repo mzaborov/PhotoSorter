@@ -38,19 +38,21 @@ def find_face_in_db(cur, file_path: str, x: int, y: int, w: int, h: int) -> dict
     cur.execute(
         """
         SELECT 
-            fr.id as face_id,
-            fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
-            fr.ignore_flag
-        FROM face_rectangles fr
-        WHERE fr.file_path = ? 
-          AND ABS(fr.bbox_x - ?) <= 10
-          AND ABS(fr.bbox_y - ?) <= 10
-          AND ABS(fr.bbox_w - ?) <= 10
-          AND ABS(fr.bbox_h - ?) <= 10
-          AND COALESCE(fr.ignore_flag, 0) = 0
+            pr.id as face_id,
+            pr.bbox_x, pr.bbox_y, pr.bbox_w, pr.bbox_h,
+            pr.ignore_flag
+        FROM photo_rectangles pr
+        JOIN files f ON f.id = pr.file_id
+        WHERE f.path = ? 
+          AND pr.is_face = 1
+          AND ABS(pr.bbox_x - ?) <= 10
+          AND ABS(pr.bbox_y - ?) <= 10
+          AND ABS(pr.bbox_w - ?) <= 10
+          AND ABS(pr.bbox_h - ?) <= 10
+          AND COALESCE(pr.ignore_flag, 0) = 0
         ORDER BY 
-          (ABS(fr.bbox_x - ?) + ABS(fr.bbox_y - ?) + ABS(fr.bbox_w - ?) + ABS(fr.bbox_h - ?)) ASC,
-          fr.id ASC
+          (ABS(pr.bbox_x - ?) + ABS(pr.bbox_y - ?) + ABS(pr.bbox_w - ?) + ABS(pr.bbox_h - ?)) ASC,
+          pr.id ASC
         LIMIT 1
         """,
         (file_path, x, y, w, h, x, y, w, h),
@@ -80,7 +82,7 @@ def get_face_cluster_and_person(cur, face_id: int) -> dict | None:
         SELECT 
             fcm.cluster_id
         FROM face_cluster_members fcm
-        WHERE fcm.face_rectangle_id = ?
+        WHERE fcm.rectangle_id = ?
         LIMIT 1
         """,
         (face_id,),
@@ -137,24 +139,28 @@ def restore_lost_faces(person_id: int | None = None, dry_run: bool = False) -> N
             p.id as person_id,
             p.name as person_name
         FROM (
-            -- Ручные привязки
-            SELECT fpma.person_id
-            FROM face_person_manual_assignments fpma
-            JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
-            WHERE fr.file_path IN ({placeholders})
+            -- Ручные привязки (только лица)
+            SELECT prma.person_id
+            FROM person_rectangle_manual_assignments prma
+            JOIN photo_rectangles pr ON pr.id = prma.rectangle_id
+            JOIN files f ON f.id = pr.file_id
+            WHERE f.path IN ({placeholders})
+              AND pr.is_face = 1
             
             UNION
             
-            -- Привязки через кластеры
+            -- Привязки через кластеры (только лица)
             SELECT fc.person_id
             FROM face_cluster_members fcm
-            JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
+            JOIN photo_rectangles pr ON pr.id = fcm.rectangle_id
+            JOIN files f ON f.id = pr.file_id
             JOIN face_clusters fc ON fc.id = fcm.cluster_id
-            WHERE fr.file_path IN ({placeholders})
+            WHERE f.path IN ({placeholders})
+              AND pr.is_face = 1
               AND fc.person_id IS NOT NULL
         ) person_ids
         JOIN persons p ON p.id = person_ids.person_id
-        WHERE COALESCE((SELECT ignore_flag FROM face_rectangles fr WHERE fr.file_path IN ({placeholders}) LIMIT 1), 0) = 0
+        WHERE COALESCE((SELECT ignore_flag FROM photo_rectangles pr JOIN files f ON f.id = pr.file_id WHERE f.path IN ({placeholders}) AND pr.is_face = 1 LIMIT 1), 0) = 0
         ORDER BY 
           CASE WHEN p.name = ? THEN 1 ELSE 0 END,
           p.name
@@ -204,27 +210,29 @@ def restore_lost_faces(person_id: int | None = None, dry_run: bool = False) -> N
             cur.execute(
                 """
                 SELECT 
-                    fr.id as face_id,
-                    fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
-                    COALESCE(fpma.person_id, fc.person_id) as person_id,
+                    pr.id as face_id,
+                    pr.bbox_x, pr.bbox_y, pr.bbox_w, pr.bbox_h,
+                    COALESCE(prma.person_id, fc.person_id) as person_id,
                     COALESCE(p_manual.name, p_cluster.name) as person_name,
                     fcm.cluster_id
-                FROM face_rectangles fr
-                LEFT JOIN face_person_manual_assignments fpma ON fpma.face_rectangle_id = fr.id
-                LEFT JOIN persons p_manual ON p_manual.id = fpma.person_id
-                LEFT JOIN face_cluster_members fcm ON fcm.face_rectangle_id = fr.id
+                FROM photo_rectangles pr
+                JOIN files f ON f.id = pr.file_id
+                LEFT JOIN person_rectangle_manual_assignments prma ON prma.rectangle_id = pr.id
+                LEFT JOIN persons p_manual ON p_manual.id = prma.person_id
+                LEFT JOIN face_cluster_members fcm ON fcm.rectangle_id = pr.id
                 LEFT JOIN face_clusters fc ON fc.id = fcm.cluster_id
                 LEFT JOIN persons p_cluster ON p_cluster.id = fc.person_id
-                WHERE fr.file_path = ? 
-                  AND ABS(fr.bbox_x - ?) <= 10
-                  AND ABS(fr.bbox_y - ?) <= 10
-                  AND ABS(fr.bbox_w - ?) <= 10
-                  AND ABS(fr.bbox_h - ?) <= 10
-                  AND COALESCE(fr.ignore_flag, 0) = 0
+                WHERE f.path = ? 
+                  AND pr.is_face = 1
+                  AND ABS(pr.bbox_x - ?) <= 10
+                  AND ABS(pr.bbox_y - ?) <= 10
+                  AND ABS(pr.bbox_w - ?) <= 10
+                  AND ABS(pr.bbox_h - ?) <= 10
+                  AND COALESCE(pr.ignore_flag, 0) = 0
                 ORDER BY 
-                  CASE WHEN COALESCE(fpma.person_id, fc.person_id) IS NOT NULL THEN 0 ELSE 1 END,
-                  (ABS(fr.bbox_x - ?) + ABS(fr.bbox_y - ?) + ABS(fr.bbox_w - ?) + ABS(fr.bbox_h - ?)) ASC,
-                  fr.id ASC
+                  CASE WHEN COALESCE(prma.person_id, fc.person_id) IS NOT NULL THEN 0 ELSE 1 END,
+                  (ABS(pr.bbox_x - ?) + ABS(pr.bbox_y - ?) + ABS(pr.bbox_w - ?) + ABS(pr.bbox_h - ?)) ASC,
+                  pr.id ASC
                 LIMIT 1
                 """,
                 (file_path, x, y, w, h, x, y, w, h),
@@ -237,13 +245,15 @@ def restore_lost_faces(person_id: int | None = None, dry_run: bool = False) -> N
                 cur.execute(
                     """
                     SELECT 
-                        fl.person_id,
+                        prma.person_id,
                         p.name as person_name
-                    FROM face_labels fl
-                    JOIN persons p ON fl.person_id = p.id
-                    JOIN face_rectangles fr ON fl.face_rectangle_id = fr.id
-                    WHERE fr.file_path = ?
-                      AND COALESCE(fr.ignore_flag, 0) = 0
+                    FROM person_rectangle_manual_assignments prma
+                    JOIN persons p ON prma.person_id = p.id
+                    JOIN photo_rectangles pr ON pr.id = prma.rectangle_id
+                    JOIN files f ON f.id = pr.file_id
+                    WHERE f.path = ?
+                      AND pr.is_face = 1
+                      AND COALESCE(pr.ignore_flag, 0) = 0
                     LIMIT 1
                     """,
                     (file_path,),
@@ -325,18 +335,18 @@ def restore_lost_faces(person_id: int | None = None, dry_run: bool = False) -> N
             """
             SELECT COUNT(DISTINCT face_id) as faces_count
             FROM (
-                SELECT fr.id as face_id
-                FROM face_person_manual_assignments fpma
-                JOIN face_rectangles fr ON fr.id = fpma.face_rectangle_id
-                WHERE fpma.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+                SELECT pr.id as face_id
+                FROM person_rectangle_manual_assignments prma
+                JOIN photo_rectangles pr ON pr.id = prma.rectangle_id
+                WHERE prma.person_id = ? AND pr.is_face = 1 AND COALESCE(pr.ignore_flag, 0) = 0
                 
                 UNION
                 
-                SELECT fr.id as face_id
+                SELECT pr.id as face_id
                 FROM face_cluster_members fcm
-                JOIN face_rectangles fr ON fr.id = fcm.face_rectangle_id
+                JOIN photo_rectangles pr ON pr.id = fcm.rectangle_id
                 JOIN face_clusters fc ON fc.id = fcm.cluster_id
-                WHERE fc.person_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+                WHERE fc.person_id = ? AND pr.is_face = 1 AND COALESCE(pr.ignore_flag, 0) = 0
             )
             """,
             (person_id_val, person_id_val),
@@ -361,13 +371,13 @@ def restore_lost_faces(person_id: int | None = None, dry_run: bool = False) -> N
             cur.execute(
                 """
                 SELECT 
-                    COALESCE(fpma.id, 1) as id,
+                    COALESCE(prma.id, 1) as id,
                     fcm.cluster_id
-                FROM face_rectangles fr
-                LEFT JOIN face_person_manual_assignments fpma ON fpma.face_rectangle_id = fr.id AND fpma.person_id = ?
-                LEFT JOIN face_cluster_members fcm ON fcm.face_rectangle_id = fr.id
+                FROM photo_rectangles pr
+                LEFT JOIN person_rectangle_manual_assignments prma ON prma.rectangle_id = pr.id AND prma.person_id = ?
+                LEFT JOIN face_cluster_members fcm ON fcm.rectangle_id = pr.id
                 LEFT JOIN face_clusters fc ON fc.id = fcm.cluster_id AND fc.person_id = ?
-                WHERE fr.id = ?
+                WHERE pr.id = ? AND pr.is_face = 1
                 LIMIT 1
                 """,
                 (person_id_val, person_id_val, face_id),
@@ -421,7 +431,7 @@ def restore_lost_faces(person_id: int | None = None, dry_run: bool = False) -> N
                         SELECT fc.person_id
                         FROM face_cluster_members fcm
                         JOIN face_clusters fc ON fc.id = fcm.cluster_id
-                        WHERE fcm.face_rectangle_id = ? AND fc.person_id = ?
+                        WHERE fcm.rectangle_id = ? AND fc.person_id = ?
                         """,
                         (face_id, person_id_val),
                     )
@@ -434,8 +444,8 @@ def restore_lost_faces(person_id: int | None = None, dry_run: bool = False) -> N
                     # Проверяем, нет ли уже ручной привязки
                     cur.execute(
                         """
-                        SELECT id FROM face_person_manual_assignments
-                        WHERE face_rectangle_id = ? AND person_id = ?
+                        SELECT id FROM person_rectangle_manual_assignments
+                        WHERE rectangle_id = ? AND person_id = ?
                         """,
                         (face_id, person_id_val),
                     )
@@ -449,7 +459,7 @@ def restore_lost_faces(person_id: int | None = None, dry_run: bool = False) -> N
                     try:
                         cur.execute(
                             """
-                            INSERT INTO face_person_manual_assignments (face_rectangle_id, person_id, source, confidence, created_at)
+                            INSERT INTO person_rectangle_manual_assignments (rectangle_id, person_id, source, confidence, created_at)
                             VALUES (?, ?, ?, ?, ?)
                             """,
                             (face_id, person_id_val, "restored_from_gold", 0.9, now),

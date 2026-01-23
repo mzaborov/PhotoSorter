@@ -51,7 +51,7 @@ def main():
     
     # Подсчитываем данные для переноса
     tables_to_check = [
-        ("face_person_manual_assignments", "person_id"),
+        ("person_rectangle_manual_assignments", "person_id"),
         ("face_clusters", "person_id"),
         ("person_rectangles", "person_id"),
         ("file_persons", "person_id"),
