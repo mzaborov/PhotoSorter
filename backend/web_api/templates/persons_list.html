@@ -84,6 +84,29 @@
           .replaceAll("'", "&#039;");
       }
 
+      function formatArchiveRunLinks(archiveCount, runCount, totalCount, archiveLink, runLink, archiveTitle, runTitle) {
+        // Если runLink не передан или равен archiveLink, используем одну ссылку для обоих
+        if (!runLink || (typeof runLink === 'string' && runLink === archiveLink)) {
+          // Одинаковая ссылка для обоих (например, для кластеров)
+          if (totalCount > 0) {
+            return `<a href="${archiveLink}" class="pill-link" title="${archiveTitle || 'Перейти'}">${archiveCount} / ${runCount}</a>`;
+          } else {
+            return `<span class="pill">${archiveCount} / ${runCount}</span>`;
+          }
+        }
+        
+        // Разные ссылки для архива и прогона
+        const archiveHtml = archiveCount > 0
+          ? `<a href="${archiveLink}" class="pill-link" title="${archiveTitle || 'Фотоархив'}">${archiveCount}</a>`
+          : `<span class="pill" style="opacity: 0.5;">${archiveCount}</span>`;
+        
+        const runHtml = runCount > 0
+          ? `<a href="${runLink}" class="pill-link" title="${runTitle || 'Сортируется'}">${runCount}</a>`
+          : `<span class="pill" style="opacity: 0.5;">${runCount}</span>`;
+        
+        return `${archiveHtml} / ${runHtml}`;
+      }
+
       async function getFaceThumbnail(faceId) {
         if (!faceId) return null;
         try {
@@ -267,18 +290,22 @@
         const facesViaManualRun = p.faces_via_manual_run || 0;
         
         const personRectanglesCount = p.person_rectangles_files_count || 0;
+        const personRectanglesCountArchive = p.person_rectangles_files_count_archive || 0;
+        const personRectanglesCountRun = p.person_rectangles_files_count_run || 0;
         const filePersonsCount = p.file_persons_files_count || 0;
+        const filePersonsCountArchive = p.file_persons_files_count_archive || 0;
+        const filePersonsCountRun = p.file_persons_files_count_run || 0;
         
-        // Форматируем кластеры: только общее количество
+        // Форматируем кластеры: только общее количество (как в этапе 2)
         const clustersHtml = clustersCount > 0 
           ? `<a href="/persons/${p.id}/clusters" class="pill-link" title="Перейти к кластерам">${clustersCount}</a>`
           : `<span class="pill">${clustersCount}</span>`;
         
-        // Форматируем лица: всего с разбивкой по способам привязки
+        // Форматируем лица: 4 разреза (Архив/Прогон × Кластеры/Ручные) как в этапе 2
         let facesHtml = '';
         if (facesCount > 0) {
           facesHtml = `<a href="/persons/${p.id}" class="pill-link" title="Перейти к карточке персоны">${facesCount}</a>`;
-          // Добавляем разбивку по способам привязки
+          // Добавляем разбивку по способам привязки (как в этапе 2)
           const details = [];
           if (facesViaClusters > 0) {
             details.push(`Кластеры: ${facesViaClusters} (${facesViaClustersArchive} архив / ${facesViaClustersRun} прогон)`);
@@ -293,12 +320,37 @@
           facesHtml = `<span class="pill">${facesCount}</span>`;
         }
         
-        const personRectanglesHtml = personRectanglesCount > 0
-          ? `<span class="pill" title="Файлов с прямоугольниками без лица">${personRectanglesCount}</span>`
-          : `<span class="pill">${personRectanglesCount}</span>`;
-        const filePersonsHtml = filePersonsCount > 0
-          ? `<span class="pill" title="Файлов с прямой привязкой">${filePersonsCount}</span>`
-          : `<span class="pill">${filePersonsCount}</span>`;
+        // Форматируем прямоугольники: с разбивкой Архив/Прогон
+        let personRectanglesHtml = '';
+        if (personRectanglesCount > 0) {
+          personRectanglesHtml = `<span class="pill" title="Файлов с прямоугольниками без лица">${personRectanglesCount}</span>`;
+          // Добавляем разбивку по архиву/прогону
+          const details = [];
+          if (personRectanglesCountArchive > 0 || personRectanglesCountRun > 0) {
+            details.push(`${personRectanglesCountArchive} архив / ${personRectanglesCountRun} прогон`);
+          }
+          if (details.length > 0) {
+            personRectanglesHtml += '<br/><span style="font-size: 11px; color: #6b7280;">' + details.join('<br/>') + '</span>';
+          }
+        } else {
+          personRectanglesHtml = `<span class="pill">${personRectanglesCount}</span>`;
+        }
+        
+        // Форматируем прямую привязку: с разбивкой Архив/Прогон
+        let filePersonsHtml = '';
+        if (filePersonsCount > 0) {
+          filePersonsHtml = `<span class="pill" title="Файлов с прямой привязкой">${filePersonsCount}</span>`;
+          // Добавляем разбивку по архиву/прогону
+          const details = [];
+          if (filePersonsCountArchive > 0 || filePersonsCountRun > 0) {
+            details.push(`${filePersonsCountArchive} архив / ${filePersonsCountRun} прогон`);
+          }
+          if (details.length > 0) {
+            filePersonsHtml += '<br/><span style="font-size: 11px; color: #6b7280;">' + details.join('<br/>') + '</span>';
+          }
+        } else {
+          filePersonsHtml = `<span class="pill">${filePersonsCount}</span>`;
+        }
         
         return `
           <tr ${isIgnored ? 'style="opacity: 0.7;"' : ""} data-person-id="${p.id}">

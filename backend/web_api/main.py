@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from common.db import DedupStore, FaceStore, PipelineStore, list_folders
+from common.db import DedupStore, FaceStore, PipelineStore, list_folders, init_db
 from common.yadisk_client import get_disk
 from web_api.routers.gold import router as gold_router
 from web_api.routers.preclean import router as preclean_router

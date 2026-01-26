@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import json
+import threading
 from pathlib import Path
 from typing import Any
 from datetime import datetime, timezone
@@ -84,75 +85,115 @@ def _get_file_id(conn: sqlite3.Connection, *, file_id: int | None = None, file_p
     return None
 
 
+# Глобальный флаг для отслеживания инициализации БД
+_db_initialized = False
+_db_init_lock = threading.Lock()
+
 def init_db():
-    # на всякий случай создаём папку data
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    """
+    Инициализирует БД (создает таблицы, если их нет).
+    Идемпотентная функция - безопасно вызывать многократно.
+    """
+    global _db_initialized
+    
+    # Быстрая проверка без блокировки (double-checked locking pattern)
+    if _db_initialized:
+        return
+    
+    with _db_init_lock:
+        # Повторная проверка после получения блокировки
+        if _db_initialized:
+            return
+        
+        # на всякий случай создаём папку data
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = get_connection()
-    cur = conn.cursor()
+        conn = get_connection()
+        cur = conn.cursor()
+        
+        # Быстрая проверка: существует ли уже таблица files (основная таблица)?
+        # Если да, значит БД уже инициализирована, пропускаем создание таблиц
+        try:
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='files'")
+            if cur.fetchone():
+                # БД уже инициализирована, только проверяем миграции (если нужно)
+                # Миграции выполняются ниже, но без создания всех таблиц
+                conn.close()
+                _db_initialized = True
+                return
+        except Exception:
+            # Если ошибка при проверке, продолжаем инициализацию
+            pass
 
-    # --- Миграция имени таблицы: yd_files -> files ---
-    # Исторически таблица называлась yd_files, но давно хранит и local: пути.
-    # Переименовываем безопасно при старте, чтобы старые базы не ломались после рефакторинга.
-    try:
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('yd_files','files')")
-        existing_tables = {str(r[0]) for r in cur.fetchall()}
-        if "files" not in existing_tables and "yd_files" in existing_tables:
-            cur.execute("ALTER TABLE yd_files RENAME TO files;")
-            conn.commit()
-        elif "files" in existing_tables and "yd_files" in existing_tables:
-            # Возможна промежуточная ситуация, если код уже успел создать пустую `files`,
-            # а реальные данные остались в `yd_files`.
-            try:
-                cur.execute("SELECT COUNT(*) FROM files")
-                files_cnt = int(cur.fetchone()[0] or 0)
-            except Exception:
-                files_cnt = -1
-            try:
-                cur.execute("SELECT COUNT(*) FROM yd_files")
-                yd_cnt = int(cur.fetchone()[0] or 0)
-            except Exception:
-                yd_cnt = -1
-
-            if files_cnt == 0 and yd_cnt > 0:
-                # Считаем `files` мусорной/пустой, восстанавливаем данные.
-                cur.execute("DROP TABLE files;")
+        # --- Миграция имени таблицы: yd_files -> files ---
+        # Исторически таблица называлась yd_files, но давно хранит и local: пути.
+        # Переименовываем безопасно при старте, чтобы старые базы не ломались после рефакторинга.
+        try:
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('yd_files','files')")
+            existing_tables = {str(r[0]) for r in cur.fetchall()}
+            if "files" not in existing_tables and "yd_files" in existing_tables:
                 cur.execute("ALTER TABLE yd_files RENAME TO files;")
                 conn.commit()
-            elif yd_cnt == 0 and files_cnt > 0:
-                # Старую таблицу можно убрать (best-effort).
-                cur.execute("DROP TABLE yd_files;")
-                conn.commit()
-    except Exception:
-        # best-effort: не валим приложение из-за миграции имени;
-        # если rename не прошёл, дальнейшие запросы покажут проблему явно.
-        pass
+            elif "files" in existing_tables and "yd_files" in existing_tables:
+                # Возможна промежуточная ситуация, если код уже успел создать пустую `files`,
+                # а реальные данные остались в `yd_files`.
+                try:
+                    cur.execute("SELECT COUNT(*) FROM files")
+                    files_cnt = int(cur.fetchone()[0] or 0)
+                except Exception:
+                    files_cnt = -1
+                try:
+                    cur.execute("SELECT COUNT(*) FROM yd_files")
+                    yd_cnt = int(cur.fetchone()[0] or 0)
+                except Exception:
+                    yd_cnt = -1
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS folders (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            code                TEXT UNIQUE NOT NULL,  -- 'inbox', 'children_agata' ...
-            path                TEXT NOT NULL,         -- 'disk:/...'
-            name                TEXT,                  -- имя папки (последний сегмент)
-            location            TEXT NOT NULL,         -- 'yadisk' / 'local'
-            role                TEXT NOT NULL,         -- 'source' / 'target'
-            priority_after_code TEXT,                  -- код папки-предшественника или NULL
-            sort_order          INTEGER,               -- порядок этапа сортировки (меньше = раньше)
-            content_rule        TEXT                   -- строка с правилом
-        );
-    """)
+                if files_cnt == 0 and yd_cnt > 0:
+                    # Считаем `files` мусорной/пустой, восстанавливаем данные.
+                    cur.execute("DROP TABLE files;")
+                    cur.execute("ALTER TABLE yd_files RENAME TO files;")
+                    conn.commit()
+                elif yd_cnt == 0 and files_cnt > 0:
+                    # Старую таблицу можно убрать (best-effort).
+                    cur.execute("DROP TABLE yd_files;")
+                    conn.commit()
+        except Exception:
+            # best-effort: не валим приложение из-за миграции имени;
+            # если rename не прошёл, дальнейшие запросы покажут проблему явно.
+            pass
 
-    _ensure_columns(
-        conn,
-        "folders",
-        {
-            "name": "name TEXT",
-            "sort_order": "sort_order INTEGER",
-        },
-    )
+        # Создаем таблицу folders с обработкой возможных блокировок при параллельных запросах
+        try:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS folders (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                code                TEXT UNIQUE NOT NULL,  -- 'inbox', 'children_agata' ...
+                path                TEXT NOT NULL,         -- 'disk:/...'
+                name                TEXT,                  -- имя папки (последний сегмент)
+                location            TEXT NOT NULL,         -- 'yadisk' / 'local'
+                role                TEXT NOT NULL,         -- 'source' / 'target'
+                priority_after_code TEXT,                  -- код папки-предшественника или NULL
+                sort_order          INTEGER,               -- порядок этапа сортировки (меньше = раньше)
+                content_rule        TEXT                   -- строка с правилом
+            );
+        """)
+        except sqlite3.OperationalError as e:
+            # Игнорируем ошибки "table already exists" и блокировки при параллельных запросах
+            # CREATE TABLE IF NOT EXISTS должен быть безопасным, но на всякий случай обрабатываем
+            if "already exists" not in str(e).lower() and "locked" not in str(e).lower():
+                raise
 
-    # --- Dedup: инвентарь файлов и прогоны скана архива (disk:/Фото) ---
-    cur.execute("""
+        _ensure_columns(
+            conn,
+            "folders",
+            {
+                "name": "name TEXT",
+                "sort_order": "sort_order INTEGER",
+            },
+        )
+
+        # --- Dedup: инвентарь файлов и прогоны скана архива (disk:/Фото) ---
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS dedup_runs (
             id                      INTEGER PRIMARY KEY AUTOINCREMENT,
             scope                   TEXT,            -- 'archive'|'source' (храним только последний на scope)
@@ -174,17 +215,17 @@ def init_db():
         );
     """)
 
-    _ensure_columns(
-        conn,
-        "dedup_runs",
-        {
-            "scope": "scope TEXT",
-            "total_files": "total_files INTEGER",
-        },
-    )
+        _ensure_columns(
+            conn,
+            "dedup_runs",
+            {
+                "scope": "scope TEXT",
+                "total_files": "total_files INTEGER",
+            },
+        )
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS files (
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS files (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             path            TEXT UNIQUE NOT NULL,    -- 'disk:/...'
             resource_id     TEXT,                   -- устойчивый ID ресурса Я.Диска (не зависит от пути)
@@ -211,9 +252,9 @@ def init_db():
         );
     """)
 
-    _ensure_columns(
-        conn,
-        "files",
+        _ensure_columns(
+            conn,
+            "files",
         {
             "resource_id": "resource_id TEXT",
             "inventory_scope": "inventory_scope TEXT",
@@ -263,11 +304,11 @@ def init_db():
             # Размеры исходного изображения (для правильного масштабирования bbox координат)
             "image_width": "image_width INTEGER",  # ширина исходного изображения (после EXIF transpose)
             "image_height": "image_height INTEGER",  # высота исходного изображения (после EXIF transpose)
-        },
-    )
+            },
+        )
 
-    # --- Geocode cache (lat/lon -> country/city) ---
-    cur.execute(
+        # --- Geocode cache (lat/lon -> country/city) ---
+        cur.execute(
         """
         CREATE TABLE IF NOT EXISTS geocode_cache (
             key          TEXT PRIMARY KEY,   -- e.g. "55.7558,37.6173" (rounded)
@@ -282,8 +323,8 @@ def init_db():
         """
     )
 
-    # --- Pipeline: единый конвейер сортировки локальной папки с resume ---
-    cur.execute(
+        # --- Pipeline: единый конвейер сортировки локальной папки с resume ---
+        cur.execute(
         """
         CREATE TABLE IF NOT EXISTS pipeline_runs (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -309,9 +350,9 @@ def init_db():
         """
     )
 
-    _ensure_columns(
-        conn,
-        "pipeline_runs",
+        _ensure_columns(
+            conn,
+            "pipeline_runs",
         {
             "kind": "kind TEXT NOT NULL DEFAULT 'local_sort'",
             "pid": "pid INTEGER",
@@ -322,10 +363,10 @@ def init_db():
         },
     )
 
-    # --- Pipeline run metrics snapshots (gold-based) ---
-    # Храним агрегаты "мимо gold" по каждому pipeline_run_id, чтобы они не "плыли" после следующего прогона
-    # (так как авто-результаты в files.* перезаписываются).
-    cur.execute(
+        # --- Pipeline run metrics snapshots (gold-based) ---
+        # Храним агрегаты "мимо gold" по каждому pipeline_run_id, чтобы они не "плыли" после следующего прогона
+        # (так как авто-результаты в files.* перезаписываются).
+        cur.execute(
         """
         CREATE TABLE IF NOT EXISTS pipeline_run_metrics (
             pipeline_run_id        INTEGER PRIMARY KEY,
@@ -346,10 +387,10 @@ def init_db():
         """
     )
 
-    # --- Preclean (шаг 1: предочистка): results + resume state ---
-    # ВАЖНО: в DRY_RUN ничего не перемещаем, поэтому "результат" шага 1 — это список планируемых перемещений.
-    # Для resume шага 1 сохраняем last_path и счётчики, чтобы после перезапуска продолжить.
-    cur.execute(
+        # --- Preclean (шаг 1: предочистка): results + resume state ---
+        # ВАЖНО: в DRY_RUN ничего не перемещаем, поэтому "результат" шага 1 — это список планируемых перемещений.
+        # Для resume шага 1 сохраняем last_path и счётчики, чтобы после перезапуска продолжить.
+        cur.execute(
         """
         CREATE TABLE IF NOT EXISTS preclean_state (
             pipeline_run_id      INTEGER PRIMARY KEY,
@@ -363,9 +404,9 @@ def init_db():
         );
         """
     )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_preclean_state_root ON preclean_state(root_path);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_preclean_state_root ON preclean_state(root_path);")
 
-    cur.execute(
+        cur.execute(
         """
         CREATE TABLE IF NOT EXISTS preclean_moves (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -378,14 +419,14 @@ def init_db():
         );
         """
     )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_preclean_moves_run_kind ON preclean_moves(pipeline_run_id, kind);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_preclean_moves_run_src ON preclean_moves(pipeline_run_id, src_path);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_preclean_moves_run_kind ON preclean_moves(pipeline_run_id, kind);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_preclean_moves_run_src ON preclean_moves(pipeline_run_id, src_path);")
 
-    # --- Run-scoped manual labels (pipeline_run_id + path) ---
+        # --- Run-scoped manual labels (pipeline_run_id + path) ---
     #
-    # ВАЖНО: ручные метки должны быть привязаны к прогону, иначе они "утекают" между разными папками/прогонами
-    # и портят отладку. Перенос ручных решений между прогонами делаем только через gold.
-    cur.execute(
+        # ВАЖНО: ручные метки должны быть привязаны к прогону, иначе они "утекают" между разными папками/прогонами
+        # и портят отладку. Перенос ручных решений между прогонами делаем только через gold.
+        cur.execute(
         """
         CREATE TABLE IF NOT EXISTS files_manual_labels (
             pipeline_run_id       INTEGER NOT NULL,
@@ -404,22 +445,22 @@ def init_db():
         );
         """
     )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_files_manual_labels_run ON files_manual_labels(pipeline_run_id);")
-    
-    # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
-    _ensure_columns(
-        conn,
-        "files_manual_labels",
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_files_manual_labels_run ON files_manual_labels(pipeline_run_id);")
+        
+        # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
+        _ensure_columns(
+            conn,
+            "files_manual_labels",
         {
             "file_id": "file_id INTEGER",  # FOREIGN KEY на files.id, пока NULL (заполним миграцией)
         },
     )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_files_manual_labels_file_id ON files_manual_labels(file_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_files_manual_labels_file_id ON files_manual_labels(file_id);")
 
-    # --- Run-scoped manual rectangles for VIDEO frames (3 frames per video) ---
-    # ВАЖНО: для видео нам нужны прямоугольники с привязкой к кадру/таймкоду.
-    # Храним отдельной таблицей, чтобы не смешивать с photo_rectangles (она про фото/одно изображение).
-    cur.execute(
+        # --- Run-scoped manual rectangles for VIDEO frames (3 frames per video) ---
+        # ВАЖНО: для видео нам нужны прямоугольники с привязкой к кадру/таймкоду.
+        # Храним отдельной таблицей, чтобы не смешивать с photo_rectangles (она про фото/одно изображение).
+        cur.execute(
         """
         CREATE TABLE IF NOT EXISTS video_manual_frames (
             pipeline_run_id   INTEGER NOT NULL,
@@ -433,28 +474,31 @@ def init_db():
         );
         """
     )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_video_manual_frames_file_id ON video_manual_frames(file_id);")
-    
-    # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
-    _ensure_columns(
-        conn,
-        "video_manual_frames",
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_video_manual_frames_file_id ON video_manual_frames(file_id);")
+        
+        # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
+        _ensure_columns(
+            conn,
+            "video_manual_frames",
         {
             "file_id": "file_id INTEGER",  # FOREIGN KEY на files.id, пока NULL (заполним миграцией)
         },
     )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_video_manual_frames_file_id ON video_manual_frames(file_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_video_manual_frames_file_id ON video_manual_frames(file_id);")
 
-    # Индексы для быстрых группировок дублей.
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash_alg, hash_value);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent_path);")
-    # Устойчивый идентификатор: уникален, если известен (partial unique index).
-    cur.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_files_resource_id ON files(resource_id) WHERE resource_id IS NOT NULL;"
-    )
+        # Индексы для быстрых группировок дублей.
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash_alg, hash_value);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent_path);")
+        # Устойчивый идентификатор: уникален, если известен (partial unique index).
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_files_resource_id ON files(resource_id) WHERE resource_id IS NOT NULL;"
+        )
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+        conn.close()
+        
+        # Помечаем БД как инициализированную
+        _db_initialized = True
 
 
 def _as_int(v: Any) -> int | None:
@@ -475,9 +519,7 @@ class FaceStore:
     """
 
     def __init__(self) -> None:
-        init_db()
         self.conn = get_connection()
-        self._ensure_face_schema()
 
     def close(self) -> None:
         self.conn.close()
@@ -1774,7 +1816,6 @@ def list_folders(*, location: str | None = None, role: str | None = None) -> lis
 
     Фильтры `location` и `role` опциональны.
     """
-    init_db()
     conn = get_connection()
     try:
         where: list[str] = []
@@ -1816,7 +1857,6 @@ class DedupStore:
     """
 
     def __init__(self) -> None:
-        init_db()
         self.conn = get_connection()
 
     def close(self) -> None:
@@ -2973,7 +3013,6 @@ class PipelineStore:
     """
 
     def __init__(self) -> None:
-        init_db()
         self.conn = get_connection()
 
     def close(self) -> None:

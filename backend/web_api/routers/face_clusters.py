@@ -240,7 +240,7 @@ async def page_person_clusters(request: Request, person_id: int) -> Any:
 
 
 @router.get("/api/face-clusters/list")
-async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: str | None = None, person_id: int | None = None, unassigned_only: bool = False, page: int = 1, page_size: int = 50) -> dict[str, Any]:
+async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: str | None = None, person_id: int | None = None, unassigned_only: bool = False, show_run_only: bool = False, page: int = 1, page_size: int = 50) -> dict[str, Any]:
     """
     Получает список кластеров лиц, сгруппированных по персоне.
     
@@ -249,6 +249,7 @@ async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: st
         archive_scope: опционально, фильтр по archive_scope (для архива, обычно 'archive')
         person_id: опционально, фильтр по person_id (для кластеров конкретной персоны)
         unassigned_only: если True, возвращает только неназначенные кластеры (person_id IS NULL)
+        show_run_only: если True, возвращает только сортируемые кластеры (исключает архивные)
         page: номер страницы (начинается с 1, по умолчанию 1)
         page_size: размер страницы (по умолчанию 50)
     """
@@ -261,6 +262,12 @@ async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: st
     
     if archive_scope == 'archive':
         where_parts.append("fc.archive_scope = 'archive'")
+    elif show_run_only:
+        # Только сортируемые (исключаем архивные)
+        where_parts.append("(fc.archive_scope IS NULL OR fc.archive_scope != 'archive')")
+        if run_id is not None:
+            where_parts.append("fc.run_id = ?")
+            where_params.append(run_id)
     elif run_id is not None:
         where_parts.append("fc.run_id = ?")
         where_params.append(run_id)
@@ -1113,7 +1120,11 @@ async def api_persons_stats() -> dict[str, Any]:
                 "faces_via_manual_archive": 0,
                 "faces_via_manual_run": 0,
                 "person_rectangles_files_count": 0,
+                "person_rectangles_files_count_archive": 0,
+                "person_rectangles_files_count_run": 0,
                 "file_persons_files_count": 0,
+                "file_persons_files_count_archive": 0,
+                "file_persons_files_count_run": 0,
             }
     
         # Получаем статистику кластеров одним запросом
@@ -1198,35 +1209,69 @@ async def api_persons_stats() -> dict[str, Any]:
     
         # Получаем статистику через прямоугольники и прямую привязку
         step_start = time.time()
-        # Проверяем существование таблицы person_rectangles
+        # 1. Через таблицу person_rectangles (для сортируемых файлов)
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='person_rectangles'")
         if cur.fetchone():
+            # Определяем архив/прогон через JOIN с files по file_id
             cur.execute("""
             SELECT 
                 pr.person_id,
-                COUNT(DISTINCT pr.file_id) as files_count
+                COUNT(DISTINCT CASE WHEN f.path LIKE 'disk:/Фото%' THEN pr.file_id END) as files_archive,
+                COUNT(DISTINCT CASE WHEN f.path NOT LIKE 'disk:/Фото%' AND pr.pipeline_run_id IS NOT NULL THEN pr.file_id END) as files_run,
+                COUNT(DISTINCT pr.file_id) as files_total
             FROM person_rectangles pr
+            LEFT JOIN files f ON pr.file_id = f.id
             GROUP BY pr.person_id
         """)
             for row in cur.fetchall():
                 if row["person_id"] in persons_data:
-                    persons_data[row["person_id"]]["person_rectangles_files_count"] = row["files_count"] or 0
+                    persons_data[row["person_id"]]["person_rectangles_files_count"] = row["files_total"] or 0
+                    persons_data[row["person_id"]]["person_rectangles_files_count_archive"] = row["files_archive"] or 0
+                    persons_data[row["person_id"]]["person_rectangles_files_count_run"] = row["files_run"] or 0
+        
+        # 2. Через person_rectangle_manual_assignments с is_face=0 (прямоугольники "без лица" для архивных файлов)
+        cur.execute("""
+            SELECT 
+                fpma.person_id,
+                COUNT(DISTINCT CASE WHEN fr.archive_scope = 'archive' THEN fr.file_id END) as files_archive,
+                COUNT(DISTINCT CASE WHEN (fr.archive_scope IS NULL OR fr.archive_scope = '') AND fr.run_id IS NOT NULL THEN fr.file_id END) as files_run,
+                COUNT(DISTINCT fr.file_id) as files_total
+            FROM person_rectangle_manual_assignments fpma
+            JOIN photo_rectangles fr ON fpma.rectangle_id = fr.id
+            WHERE fr.is_face = 0
+              AND COALESCE(fr.ignore_flag, 0) = 0
+            GROUP BY fpma.person_id
+        """)
+        for row in cur.fetchall():
+            person_id = row["person_id"]
+            if person_id in persons_data:
+                # Добавляем к существующим значениям (могут быть из person_rectangles)
+                persons_data[person_id]["person_rectangles_files_count"] = (persons_data[person_id].get("person_rectangles_files_count", 0) or 0) + (row["files_total"] or 0)
+                persons_data[person_id]["person_rectangles_files_count_archive"] = (persons_data[person_id].get("person_rectangles_files_count_archive", 0) or 0) + (row["files_archive"] or 0)
+                persons_data[person_id]["person_rectangles_files_count_run"] = (persons_data[person_id].get("person_rectangles_files_count_run", 0) or 0) + (row["files_run"] or 0)
+        
         metrics["step5_get_person_rectangles"] = time.time() - step_start
     
         step_start = time.time()
         # Проверяем существование таблицы file_persons
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='file_persons'")
         if cur.fetchone():
+            # Определяем архив/прогон через JOIN с files по file_id
             cur.execute("""
             SELECT 
                 fp.person_id,
-                COUNT(DISTINCT fp.file_id) as files_count
+                COUNT(DISTINCT CASE WHEN f.path LIKE 'disk:/Фото%' THEN fp.file_id END) as files_archive,
+                COUNT(DISTINCT CASE WHEN f.path NOT LIKE 'disk:/Фото%' AND fp.pipeline_run_id IS NOT NULL THEN fp.file_id END) as files_run,
+                COUNT(DISTINCT fp.file_id) as files_total
             FROM file_persons fp
+            LEFT JOIN files f ON fp.file_id = f.id
             GROUP BY fp.person_id
         """)
             for row in cur.fetchall():
                 if row["person_id"] in persons_data:
-                    persons_data[row["person_id"]]["file_persons_files_count"] = row["files_count"] or 0
+                    persons_data[row["person_id"]]["file_persons_files_count"] = row["files_total"] or 0
+                    persons_data[row["person_id"]]["file_persons_files_count_archive"] = row["files_archive"] or 0
+                    persons_data[row["person_id"]]["file_persons_files_count_run"] = row["files_run"] or 0
         metrics["step6_get_file_persons"] = time.time() - step_start
     
         # Формируем финальный список персон с аватарами
@@ -1275,7 +1320,11 @@ async def api_persons_stats() -> dict[str, Any]:
             "faces_via_manual_archive": person_data["faces_via_manual_archive"],
             "faces_via_manual_run": person_data["faces_via_manual_run"],
             "person_rectangles_files_count": person_data["person_rectangles_files_count"],
+            "person_rectangles_files_count_archive": person_data["person_rectangles_files_count_archive"],
+            "person_rectangles_files_count_run": person_data["person_rectangles_files_count_run"],
             "file_persons_files_count": person_data["file_persons_files_count"],
+            "file_persons_files_count_archive": person_data["file_persons_files_count_archive"],
+            "file_persons_files_count_run": person_data["file_persons_files_count_run"],
             "group": person_data["group"],
             "group_order": person_data["group_order"],
                 "is_ignored": person_data["id"] == outsider_person_id,
@@ -1306,6 +1355,9 @@ async def api_persons_stats() -> dict[str, Any]:
 
 @router.get("/api/persons/{person_id}")
 async def api_person_detail(*, person_id: int) -> dict[str, Any]:
+    # #region agent log
+    log_path = r"c:\Projects\PhotoSorter\.cursor\debug.log"
+    # #endregion
     """Получает детальную информацию о персоне и все её лица."""
     import logging
     logger = logging.getLogger(__name__)
@@ -1327,9 +1379,10 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
         if not person_row:
             raise HTTPException(status_code=404, detail="Person not found")
         
-        # Получаем все лица персоны ТОЛЬКО через кластеры (ручные привязки временно игнорируются):
-        # Через кластеры: face_cluster_members -> face_clusters -> person_id
-        # Также получаем pipeline_run_id через JOIN с pipeline_runs по face_run_id
+        # Собираем все типы привязки персоны
+        all_items = []
+        
+        # 1. Через кластеры: face_cluster_members -> face_clusters -> person_id
         cur.execute(
             """
             SELECT DISTINCT
@@ -1353,18 +1406,251 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
             LEFT JOIN files f ON fr.file_id = f.id
             LEFT JOIN pipeline_runs pr ON pr.face_run_id = fr.run_id
             WHERE fc.person_id = ? 
+              AND fr.is_face = 1
               AND COALESCE(fr.ignore_flag, 0) = 0
               AND (f.status IS NULL OR f.status != 'deleted')
-            ORDER BY 
-                CASE WHEN fr.archive_scope IS NULL OR fr.archive_scope != 'archive' THEN 1 ELSE 0 END,
-                COALESCE(f.path, ''), fr.face_index
             """,
             (person_id,),
         )
         
+        for row in cur.fetchall():
+            all_items.append({
+                "row": dict(row),
+                "assignment_type": "cluster",
+            })
+        
+        # 2. Через ручные привязки (person_rectangle_manual_assignments) - только лица (is_face=1)
+        cur.execute(
+            """
+            SELECT DISTINCT
+                fr.id as face_id,
+                fr.run_id,
+                fr.archive_scope,
+                f.path as file_path,
+                f.id as file_id,
+                fr.face_index,
+                fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
+                fr.confidence, fr.presence_score,
+                fr.thumb_jpeg,
+                fr.embedding IS NOT NULL as has_embedding,
+                NULL as cluster_id,
+                NULL as cluster_run_id,
+                NULL as cluster_archive_scope,
+                pr.id as pipeline_run_id
+            FROM person_rectangle_manual_assignments fpma
+            JOIN photo_rectangles fr ON fpma.rectangle_id = fr.id
+            LEFT JOIN files f ON fr.file_id = f.id
+            LEFT JOIN pipeline_runs pr ON pr.face_run_id = fr.run_id
+            WHERE fpma.person_id = ?
+              AND fr.is_face = 1
+              AND COALESCE(fr.ignore_flag, 0) = 0
+              AND (f.status IS NULL OR f.status != 'deleted')
+              -- Исключаем те, что уже в кластерах этой персоны
+              AND NOT EXISTS (
+                  SELECT 1 FROM face_cluster_members fcm2
+                  JOIN face_clusters fc2 ON fcm2.cluster_id = fc2.id
+                  WHERE fcm2.rectangle_id = fr.id AND fc2.person_id = ?
+              )
+            """,
+            (person_id, person_id),
+        )
+        
+        for row in cur.fetchall():
+            all_items.append({
+                "row": dict(row),
+                "assignment_type": "manual_face",
+            })
+        
+        # 3. Через person_rectangles (прямоугольники без лица, но с персоной)
+        # ВАЖНО: person_rectangles находится в FaceStore, а не в основной БД!
+        fs = FaceStore()
+        try:
+            fs_cur = fs.conn.cursor()
+            # #region agent log
+            try:
+                # Проверяем, сколько записей БЕЗ фильтра по статусу
+                fs_cur.execute("SELECT COUNT(*) as cnt FROM person_rectangles WHERE person_id = ?", (person_id,))
+                total_count_row = fs_cur.fetchone()
+                total_count = total_count_row["cnt"] if total_count_row else 0
+                # Проверяем детали первых 5 записей
+                fs_cur.execute("""
+                    SELECT pr.id, pr.file_id, pr.pipeline_run_id
+                    FROM person_rectangles pr
+                    WHERE pr.person_id = ?
+                    LIMIT 5
+                """, (person_id,))
+                sample_rows = fs_cur.fetchall()
+                sample_data = [{"id": r["id"], "file_id": r["file_id"], "pipeline_run_id": r["pipeline_run_id"]} for r in sample_rows]
+                # Проверяем person_rectangle_manual_assignments с is_face=0
+                fs_cur.execute("""
+                    SELECT COUNT(*) as cnt 
+                    FROM person_rectangle_manual_assignments fpma
+                    JOIN photo_rectangles fr ON fpma.rectangle_id = fr.id
+                    WHERE fpma.person_id = ? AND fr.is_face = 0
+                """, (person_id,))
+                manual_non_face_count_row = fs_cur.fetchone()
+                manual_non_face_count = manual_non_face_count_row["cnt"] if manual_non_face_count_row else 0
+                # Проверяем ВСЕ записи person_rectangle_manual_assignments для персоны (независимо от is_face)
+                fs_cur.execute("""
+                    SELECT COUNT(*) as cnt, 
+                           SUM(CASE WHEN fr.is_face = 0 THEN 1 ELSE 0 END) as non_face_count,
+                           SUM(CASE WHEN fr.is_face = 1 THEN 1 ELSE 0 END) as face_count
+                    FROM person_rectangle_manual_assignments fpma
+                    LEFT JOIN photo_rectangles fr ON fpma.rectangle_id = fr.id
+                    WHERE fpma.person_id = ?
+                """, (person_id,))
+                manual_all_count_row = fs_cur.fetchone()
+                manual_all_count = manual_all_count_row["cnt"] if manual_all_count_row else 0
+                manual_face_count = manual_all_count_row["face_count"] if manual_all_count_row and manual_all_count_row["face_count"] else 0
+                with open(log_path, "a", encoding="utf-8") as log_file:
+                    log_file.write(json.dumps({"location":"face_clusters.py:1443","message":"Before person_rectangles query (FaceStore)","data":{"person_id":person_id,"total_in_db":total_count,"manual_non_face_count":manual_non_face_count,"manual_all_count":manual_all_count,"manual_face_count":manual_face_count,"sample_rows":sample_data},"timestamp":__import__("time").time()*1000,"sessionId":"debug-session","runId":"run6","hypothesisId":"A"}) + "\n")
+            except Exception as e:
+                try:
+                    with open(log_path, "a", encoding="utf-8") as log_file:
+                        log_file.write(json.dumps({"location":"face_clusters.py:1443","message":"Error checking person_rectangles count","data":{"person_id":person_id,"error":str(e)},"timestamp":__import__("time").time()*1000,"sessionId":"debug-session","runId":"run6","hypothesisId":"A"}) + "\n")
+                except: pass
+            # #endregion
+            # 3a. Через таблицу person_rectangles (специальная таблица для прямоугольников без лица)
+            fs_cur.execute(
+                """
+                SELECT DISTINCT
+                    pr.id as person_rectangle_id,
+                    NULL as face_id,
+                    NULL as run_id,
+                    CASE WHEN f.path LIKE 'disk:/Фото%' THEN 'archive' ELSE NULL END as archive_scope,
+                    f.path as file_path,
+                    pr.file_id,
+                    pr.frame_idx as face_index,
+                    pr.bbox_x, pr.bbox_y, pr.bbox_w, pr.bbox_h,
+                    NULL as confidence,
+                    NULL as presence_score,
+                    NULL as thumb_jpeg,
+                    0 as has_embedding,
+                    NULL as cluster_id,
+                    NULL as cluster_run_id,
+                    NULL as cluster_archive_scope,
+                    pr.pipeline_run_id
+                FROM person_rectangles pr
+                LEFT JOIN files f ON pr.file_id = f.id
+                WHERE pr.person_id = ?
+                  AND (f.status IS NULL OR f.status != 'deleted')
+                """,
+                (person_id,),
+            )
+            rows = fs_cur.fetchall()
+            # 3b. Через person_rectangle_manual_assignments с is_face=0 (прямоугольники без лица, привязанные вручную)
+            fs_cur.execute(
+                """
+                SELECT DISTINCT
+                    NULL as person_rectangle_id,
+                    fr.id as face_id,
+                    fr.run_id,
+                    fr.archive_scope,
+                    f.path as file_path,
+                    f.id as file_id,
+                    fr.face_index,
+                    fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
+                    fr.confidence, fr.presence_score,
+                    fr.thumb_jpeg,
+                    fr.embedding IS NOT NULL as has_embedding,
+                    NULL as cluster_id,
+                    NULL as cluster_run_id,
+                    NULL as cluster_archive_scope,
+                    pr.id as pipeline_run_id
+                FROM person_rectangle_manual_assignments fpma
+                JOIN photo_rectangles fr ON fpma.rectangle_id = fr.id
+                LEFT JOIN files f ON fr.file_id = f.id
+                LEFT JOIN pipeline_runs pr ON pr.face_run_id = fr.run_id
+                WHERE fpma.person_id = ?
+                  AND fr.is_face = 0
+                  AND COALESCE(fr.ignore_flag, 0) = 0
+                  AND (f.status IS NULL OR f.status != 'deleted')
+                """,
+                (person_id,),
+            )
+            rows_manual = fs_cur.fetchall()
+            rows.extend(rows_manual)
+            # #region agent log
+            try:
+                with open(log_path, "a", encoding="utf-8") as log_file:
+                    log_file.write(json.dumps({"location":"face_clusters.py:1520","message":"After person_rectangles query (FaceStore)","data":{"person_id":person_id,"rows_count_person_rectangles":len(rows)-len(rows_manual),"rows_count_manual_non_face":len(rows_manual),"total_rows_count":len(rows)},"timestamp":__import__("time").time()*1000,"sessionId":"debug-session","runId":"run5","hypothesisId":"A"}) + "\n")
+            except: pass
+            # #endregion
+        finally:
+            fs.close()
+        
+        processed_count = 0
+        for row in rows:
+            # #region agent log
+            try:
+                row_dict = dict(row)
+                with open(log_path, "a", encoding="utf-8") as log_file:
+                    log_file.write(json.dumps({"location":"face_clusters.py:1470","message":"Processing person_rectangle row","data":{"person_id":person_id,"person_rectangle_id":row_dict.get("person_rectangle_id"),"file_path":row_dict.get("file_path"),"pipeline_run_id":row_dict.get("pipeline_run_id"),"file_id":row_dict.get("file_id")},"timestamp":__import__("time").time()*1000,"sessionId":"debug-session","runId":"run1","hypothesisId":"B"}) + "\n")
+            except: pass
+            # #endregion
+            all_items.append({
+                "row": dict(row),
+                "assignment_type": "person_rectangle",
+            })
+            processed_count += 1
+        # #region agent log
+        try:
+            with open(log_path, "a", encoding="utf-8") as log_file:
+                log_file.write(json.dumps({"location":"face_clusters.py:1475","message":"After processing person_rectangles","data":{"person_id":person_id,"processed_count":processed_count,"all_items_count":len(all_items)},"timestamp":__import__("time").time()*1000,"sessionId":"debug-session","runId":"run1","hypothesisId":"C"}) + "\n")
+        except: pass
+        # #endregion
+        
+        # 4. Через file_persons (прямая привязка файла к персоне)
+        cur.execute(
+            """
+            SELECT DISTINCT
+                NULL as face_id,
+                NULL as run_id,
+                CASE WHEN f.path LIKE 'disk:/Фото%' THEN 'archive' ELSE NULL END as archive_scope,
+                f.path as file_path,
+                fp.file_id,
+                0 as face_index,
+                NULL as bbox_x,
+                NULL as bbox_y,
+                NULL as bbox_w,
+                NULL as bbox_h,
+                NULL as confidence,
+                NULL as presence_score,
+                NULL as thumb_jpeg,
+                0 as has_embedding,
+                NULL as cluster_id,
+                NULL as cluster_run_id,
+                NULL as cluster_archive_scope,
+                fp.pipeline_run_id
+            FROM file_persons fp
+            LEFT JOIN files f ON fp.file_id = f.id
+            WHERE fp.person_id = ?
+              AND (f.status IS NULL OR f.status != 'deleted')
+            """,
+            (person_id,),
+        )
+        
+        for row in cur.fetchall():
+            all_items.append({
+                "row": dict(row),
+                "assignment_type": "file_person",
+            })
+        
+        # Сортируем все элементы
+        all_items.sort(key=lambda x: (
+            # Сначала архивные, потом прогоны
+            0 if (x["row"].get("archive_scope") == 'archive' or 
+                  (x["row"].get("file_path") and x["row"]["file_path"].startswith("disk:/Фото"))) else 1,
+            # Затем по пути
+            x["row"].get("file_path") or "",
+            # Затем по индексу лица
+            x["row"].get("face_index") or 0,
+        ))
         faces = []
         row_count = 0
-        for row in cur.fetchall():
+        for item in all_items:
+            row = item["row"]
+            assignment_type = item["assignment_type"]
             row_count += 1
             try:
                 thumb_base64 = None
@@ -1400,24 +1686,36 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                     except (KeyError, TypeError):
                         thumb_base64 = None
                 
-                # Определяем, относится ли лицо к архиву или текущему прогону
-                # ВАЖНО: archive_scope берется ТОЛЬКО из photo_rectangles, НЕ из кластера!
-                # Кластер может быть архивным, но лицо в нем может быть из текущего прогона
+                # Определяем, относится ли элемент к архиву или текущему прогону
                 try:
                     archive_scope_val = row["archive_scope"]
                 except (KeyError, TypeError):
                     archive_scope_val = None
                 
-                # Лицо архивное ТОЛЬКО если archive_scope == 'archive' в photo_rectangles
-                is_archive = (archive_scope_val == 'archive') if archive_scope_val else False
+                try:
+                    file_path_val = row["file_path"]
+                except (KeyError, TypeError):
+                    file_path_val = None
                 
                 try:
                     run_id_val = row["run_id"]
                 except (KeyError, TypeError):
                     run_id_val = None
-                    
-                # Лицо из прогона, если оно не архивное и имеет run_id
-                is_run = not is_archive and (run_id_val is not None)
+                
+                try:
+                    pipeline_run_id_val = row["pipeline_run_id"]
+                except (KeyError, TypeError):
+                    pipeline_run_id_val = None
+                
+                # Определяем is_archive и is_run в зависимости от типа привязки
+                if assignment_type in ("cluster", "manual_face"):
+                    # Для лиц определяем через archive_scope
+                    is_archive = (archive_scope_val == 'archive') if archive_scope_val else False
+                    is_run = not is_archive and (run_id_val is not None)
+                else:
+                    # Для person_rectangles и file_persons определяем через file_path
+                    is_archive = (file_path_val and file_path_val.startswith("disk:/Фото")) if file_path_val else False
+                    is_run = not is_archive and (pipeline_run_id_val is not None)
             except Exception as e:
                 # Логируем ошибку для отладки
                 import traceback
@@ -1453,15 +1751,11 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
             
             # Безопасное извлечение значений из row
             try:
-                face_id_val = row["face_id"]
+                face_id_val = row.get("face_id")
+                person_rectangle_id_val = row.get("person_rectangle_id")
             except (KeyError, TypeError):
-                logger.error(f"Missing face_id in row {row_count}, skipping")
-                continue
-            
-            try:
-                file_path_val = row["file_path"] if row["file_path"] is not None else None
-            except (KeyError, TypeError):
-                file_path_val = None
+                face_id_val = None
+                person_rectangle_id_val = None
             
             try:
                 file_id_val = row["file_id"] if row["file_id"] is not None else None
@@ -1483,8 +1777,38 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
             except (KeyError, TypeError):
                 pipeline_run_id_val = None
             
+            # Определяем source (archive или run)
+            if assignment_type in ("cluster", "manual_face"):
+                # Для лиц определяем через archive_scope
+                source = "archive" if is_archive else ("run" if is_run else "unknown")
+            else:
+                # Для person_rectangles и file_persons определяем через file_path и pipeline_run_id
+                # Используем уже вычисленные is_archive и is_run для консистентности
+                if is_archive:
+                    source = "archive"
+                elif is_run:
+                    source = "run"
+                else:
+                    # Fallback: проверяем напрямую, если is_archive/is_run не установлены
+                    if file_path_val and file_path_val.startswith("disk:/Фото"):
+                        source = "archive"
+                    elif pipeline_run_id_val is not None:
+                        source = "run"
+                    else:
+                        source = "unknown"
+            # #region agent log
+            if assignment_type == "person_rectangle":
+                try:
+                    with open(log_path, "a", encoding="utf-8") as log_file:
+                        log_file.write(json.dumps({"location":"face_clusters.py:1665","message":"Determined source for person_rectangle","data":{"assignment_type":assignment_type,"source":source,"is_archive":is_archive,"is_run":is_run,"file_path":file_path_val,"pipeline_run_id":pipeline_run_id_val},"timestamp":__import__("time").time()*1000,"sessionId":"debug-session","runId":"run1","hypothesisId":"D"}) + "\n")
+                except: pass
+            # #endregion
+            
             faces.append({
                 "face_id": face_id_val,
+                "person_rectangle_id": person_rectangle_id_val,
+                "assignment_type": assignment_type,
+                "source": source,
                 "run_id": run_id_val,
                 "archive_scope": archive_scope_val,
                 "is_archive": is_archive,
@@ -1497,7 +1821,7 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                     "y": bbox_y,
                     "w": bbox_w,
                     "h": bbox_h,
-                },
+                } if bbox_x is not None and bbox_y is not None and bbox_w is not None and bbox_h is not None else None,
                 "confidence": confidence,
                 "presence_score": presence_score,
                 "thumb_jpeg_base64": thumb_base64,

@@ -215,7 +215,7 @@ PhotoSorter/
 - **`photosorter/`**: основной код сортера. `scripts/` остаётся для запускалок/дебага/экспорта.
 - **`app/main.py`**: FastAPI `app`, HTML-страницы (`/`, `/folders`, `/browse`, `/duplicates`) и JSON API (`/api/...`), плюс вспомогательная логика (ретраи/таймауты YaDisk, превью-redirect, дедуп-сканы).
 - **`app/templates/*.html`**: UI-страницы на Jinja2; стили и JS (fetch/рендер/прогресс) — инлайном.
-- **`DB/db.py`**: инициализация схемы SQLite, чтение справочника папок (`list_folders`), и слой для дедупа (`DedupStore`: прогоны, инвентарь файлов, хэши, пометки deleted/ignore, reconcile).
+- **`DB/db.py`**: доступ к данным SQLite (чтение справочника папок `list_folders`, слой для дедупа `DedupStore`: прогоны, инвентарь файлов, хэши, пометки deleted/ignore, reconcile). **Важно:** DDL операции (создание/изменение схемы) выполняются только явно через скрипты, не в runtime, чтобы исключить риск порчи данных.
 - **`yadisk_client.py`**: загрузка `YADISK_ACCESS_TOKEN` из `secrets.env/.env` и создание `yadisk.YaDisk`.
 - **`scripts/tools/*`**: разовые утилиты, например скан первых уровней `/Фото` в таблицу `folders`.
 - **`scripts/debug/*`**: отладка проблемных путей/метаданных на Я.Диске.

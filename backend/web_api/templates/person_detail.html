@@ -36,8 +36,17 @@
       .thumb:hover { border-color:#0b57d0; }
       .thumb .face-actions { position:absolute; bottom:4px; left:4px; right:4px; display:none; gap:4px; flex-wrap:wrap; }
       .thumb:hover .face-actions { display:flex; }
-      .thumb .face-btn { background:rgba(0,0,0,0.8); color:#fff; border:none; border-radius:4px; padding:4px 6px; font-size:10px; cursor:pointer; flex:1; min-width:0; }
+      .thumb .face-btn { background:rgba(0,0,0,0.8); color:#fff; border:none; border-radius:4px; padding:4px 6px; font-size:10px; cursor:pointer; flex:1; min-width:0; position:relative; }
       .thumb .face-btn:hover { background:rgba(0,0,0,0.95); }
+      .thumb .face-btn.dropdown { position:relative; }
+      .reassign-dropdown-menu { position:absolute; background:#fff; border:1px solid #e5e7eb; border-radius:6px; box-shadow:0 4px 12px rgba(0,0,0,0.15); min-width:200px; max-width:300px; max-height:400px; overflow-y:auto; z-index:10001; display:none; }
+      .reassign-dropdown-menu.open { display:block; }
+      .reassign-dropdown-menu .menu-section { padding:4px 0; border-bottom:1px solid #f3f4f6; }
+      .reassign-dropdown-menu .menu-section:last-child { border-bottom:none; }
+      .reassign-dropdown-menu .menu-section-title { padding:6px 12px; font-size:11px; font-weight:700; color:#6b7280; text-transform:uppercase; }
+      .reassign-dropdown-menu .menu-item { display:block; width:100%; padding:8px 12px; text-align:left; background:none; border:none; color:#111827; cursor:pointer; font-size:12px; transition:background 0.15s; }
+      .reassign-dropdown-menu .menu-item:hover { background:#f9fafb; }
+      .reassign-dropdown-menu .menu-item:last-child { border-bottom:none; }
       .thumb.avatar { border:3px solid #0b57d0; }
       .info-section { background:#f9fafb; border:1px solid #e5e7eb; border-radius:12px; padding:16px; margin-bottom:20px; }
       .info-section h3 { margin:0 0 12px 0; }
@@ -82,6 +91,44 @@
       .modal-header { padding: 12px 16px; border-bottom: 1px solid #e5e7eb; display:flex; justify-content:space-between; align-items:center; }
       .modal-body { padding: 16px; max-height: calc(94vh - 120px); overflow-y: auto; }
       .modal-footer { padding: 12px 16px; border-top: 1px solid #e5e7eb; display:flex; gap:10px; justify-content:flex-end; }
+      /* Tabs */
+      .tabs { display: flex; gap: 8px; border-bottom: 2px solid #e5e7eb; margin-bottom: 12px; }
+      .tab { appearance: none; border: none; background: transparent; padding: 10px 16px; cursor: pointer; font-weight: 600; font-size: 14px; color: #6b7280; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.2s; }
+      .tab:hover { color: #111827; }
+      .tab.active { color: #0b57d0; border-bottom-color: #0b57d0; }
+      .subtabs { display: flex; gap: 6px; margin-bottom: 12px; align-items: center; }
+      .subtab { appearance: none; border: 1px solid #e5e7eb; background: #fff; padding: 6px 12px; cursor: pointer; font-weight: 500; font-size: 13px; color: #6b7280; border-radius: 6px; transition: all 0.2s; }
+      .subtab:hover { background: #f9fafb; border-color: #d1d5db; }
+      .subtab.active { background: #0b57d0; color: #fff; border-color: #0b57d0; }
+      #manualFilterSelect { min-width: 140px; padding: 6px 12px; border: 1px solid #d1d5db; border-radius: 6px; background: #fff; font-size: 13px; color: #374151; cursor: pointer; }
+      #manualFilterSelect:hover { border-color: #9ca3af; }
+      /* Бейджи типов привязки */
+      .assignment-type-badge {
+        position: absolute;
+        top: 4px;
+        left: 4px;
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-size: 10px;
+        font-weight: 700;
+        color: #fff;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+        z-index: 10;
+      }
+      .assignment-type-badge.badge-cluster {
+        background: #0b57d0; /* Синий - кластеры */
+      }
+      .assignment-type-badge.badge-manual {
+        background: #f59e0b; /* Оранжевый - ручные привязки */
+      }
+      .assignment-type-badge.badge-rectangle {
+        background: #6b7280; /* Серый - прямоугольники */
+      }
+      .assignment-type-badge.badge-file {
+        background: #10b981; /* Зеленый - прямая привязка файла */
+      }
     </style>
   </head>
   <body>
@@ -129,16 +176,77 @@
       </div>
 
       <div>
-        <h3>Все лица персоны (<span id="facesCount">-</span>)</h3>
-        <div class="muted" style="margin-top:6px;">Двойной клик на лицо — открыть полную фотографию</div>
-        <div id="facesGridContainer">
-          <div id="facesGridArchive" style="margin-bottom:24px;">
-            <h4 style="margin:0 0 12px 0; font-size:16px; font-weight:600; color:#1f2937;">Архив</h4>
-            <div class="thumb-grid" id="facesGridArchiveContent"></div>
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;">
+          <h3 style="margin:0;">Все элементы персоны (<span id="facesCount">-</span>)</h3>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <button class="btn" id="btnViewModeGeneral" type="button" style="padding:6px 12px; font-size:13px;">Общий</button>
+            <button class="btn primary" id="btnViewModeDetailed" type="button" style="padding:6px 12px; font-size:13px;">Детальный</button>
           </div>
-          <div id="facesGridRun">
-            <h4 style="margin:0 0 12px 0; font-size:16px; font-weight:600; color:#1f2937;">Текущий прогон</h4>
-            <div class="thumb-grid" id="facesGridRunContent"></div>
+        </div>
+        <div class="muted" style="margin-top:6px; margin-bottom:12px;">Двойной клик на элемент — открыть полную фотографию</div>
+        
+        <!-- Общий режим просмотра -->
+        <div id="viewModeGeneral" style="display:none;">
+          <div class="thumb-grid" id="facesGridGeneralContent"></div>
+        </div>
+        
+        <!-- Детальный режим просмотра -->
+        <div id="viewModeDetailed" style="display:block;">
+          <!-- Основные вкладки: Фотоархив / Сортируется -->
+          <div class="tabs" style="margin-bottom:12px;">
+            <button class="tab active" id="tabArchive" type="button" data-tab="archive">Фотоархив <span id="tabArchiveCount" class="pill" style="margin-left:6px; font-size:11px;">0</span></button>
+            <button class="tab" id="tabRun" type="button" data-tab="run">Сортируется <span id="tabRunCount" class="pill" style="margin-left:6px; font-size:11px;">0</span></button>
+          </div>
+          
+          <!-- Подвкладки для Фотоархив -->
+          <div class="subtabs" id="subtabsArchive" style="display:flex; margin-bottom:12px;">
+            <button class="subtab active" id="subArchiveFaces" type="button" data-subtab="faces">Через лица <span id="subArchiveFacesCount" class="pill" style="margin-left:4px; font-size:10px; padding:2px 6px;">0</span></button>
+            <button class="subtab" id="subArchiveRectangles" type="button" data-subtab="rectangles">Через прямоугольники <span id="subArchiveRectanglesCount" class="pill" style="margin-left:4px; font-size:10px; padding:2px 6px;">0</span></button>
+            <button class="subtab" id="subArchiveDirect" type="button" data-subtab="direct">Прямая привязка <span id="subArchiveDirectCount" class="pill" style="margin-left:4px; font-size:10px; padding:2px 6px;">0</span></button>
+          </div>
+          
+          <!-- Подвкладки для Сортируется -->
+          <div class="subtabs" id="subtabsRun" style="display:none; margin-bottom:12px;">
+            <button class="subtab active" id="subRunFaces" type="button" data-subtab="faces">Через лица <span id="subRunFacesCount" class="pill" style="margin-left:4px; font-size:10px; padding:2px 6px;">0</span></button>
+            <button class="subtab" id="subRunRectangles" type="button" data-subtab="rectangles">Через прямоугольники <span id="subRunRectanglesCount" class="pill" style="margin-left:4px; font-size:10px; padding:2px 6px;">0</span></button>
+            <button class="subtab" id="subRunDirect" type="button" data-subtab="direct">Прямая привязка <span id="subRunDirectCount" class="pill" style="margin-left:4px; font-size:10px; padding:2px 6px;">0</span></button>
+            <select id="manualFilterSelect" style="display:none; margin-left:auto; padding:6px 12px; border:1px solid #d1d5db; border-radius:6px; background:#fff; font-size:13px; color:#374151; cursor:pointer;">
+              <option value="all">Все</option>
+              <option value="manual_only">Только ручные</option>
+              <option value="no_manual">Кроме ручных</option>
+            </select>
+          </div>
+          
+          <!-- Контент для Фотоархив -->
+          <div id="contentArchive" style="display:block;">
+            <!-- Через лица -->
+            <div id="contentArchiveFaces" style="display:block;">
+              <div class="thumb-grid" id="facesGridArchiveFacesContent"></div>
+            </div>
+            <!-- Через прямоугольники -->
+            <div id="contentArchiveRectangles" style="display:none;">
+              <div class="thumb-grid" id="facesGridArchiveRectanglesContent"></div>
+            </div>
+            <!-- Прямая привязка -->
+            <div id="contentArchiveDirect" style="display:none;">
+              <div class="thumb-grid" id="facesGridArchiveDirectContent"></div>
+            </div>
+          </div>
+          
+          <!-- Контент для Сортируется -->
+          <div id="contentRun" style="display:none;">
+            <!-- Через лица -->
+            <div id="contentRunFaces" style="display:block;">
+              <div class="thumb-grid" id="facesGridRunFacesContent"></div>
+            </div>
+            <!-- Через прямоугольники -->
+            <div id="contentRunRectangles" style="display:none;">
+              <div class="thumb-grid" id="facesGridRunRectanglesContent"></div>
+            </div>
+            <!-- Прямая привязка -->
+            <div id="contentRunDirect" style="display:none;">
+              <div class="thumb-grid" id="facesGridRunDirectContent"></div>
+            </div>
           </div>
         </div>
       </div>
@@ -199,6 +307,12 @@
       let allFacesOnImage = []; // Все лица на текущем изображении
       let isDrawingFaces = false; // Флаг для предотвращения множественных вызовов drawAllFaceRectangles
       
+      // Режимы просмотра и вкладки
+      let viewMode = 'detailed'; // 'general' или 'detailed'
+      let mainTab = 'archive'; // 'archive' или 'run'
+      let subtab = 'faces'; // 'faces', 'rectangles', 'direct'
+      let manualFilterMode = 'all'; // Фильтр для вкладки "Сортируется - через лица": 'all' | 'manual_only' | 'no_manual'
+      
       // Сохраняем ссылку на функцию из модуля ПЕРЕД любыми переопределениями
       // Проверяем сразу после загрузки скрипта
       let drawAllFaceRectanglesFromModule = null;
@@ -228,7 +342,10 @@
       }
 
       function showToast(msg, isError = false) {
-        alert(msg);
+        // Тихий toast - только в консоль, без модальных окон
+        if (msg) {
+          console.log(isError ? '[ERROR]' : '[INFO]', msg);
+        }
       }
 
       async function loadPerson() {
@@ -261,12 +378,18 @@
           
           // Обновляем информацию с разделением на архив и текущий прогон
           const facesCount = personData.faces.length;
-          const facesArchive = personData.faces.filter(f => f.is_archive).length;
-          const facesRun = personData.faces.filter(f => f.is_run).length;
+          const facesArchive = personData.faces.filter(f => f.is_archive || f.source === 'archive').length;
+          const facesRun = personData.faces.filter(f => f.is_run || f.source === 'run').length;
           document.getElementById('facesCount').textContent = facesCount;
-          document.getElementById('personInfo').textContent = `${facesCount} лиц (Архив: ${facesArchive}, Прогон: ${facesRun})`;
+          document.getElementById('personInfo').textContent = `${facesCount} элементов (Фотоархив: ${facesArchive}, Сортируется: ${facesRun})`;
           
-          // Рендерим лица
+          // Обновляем счетчики на вкладках
+          updateTabCounts();
+          
+          // Обрабатываем якоря URL для перехода на нужную закладку
+          handleUrlAnchors();
+          
+          // Рендерим элементы
           renderFaces();
         } catch (e) {
           console.error('Ошибка загрузки персоны:', e);
@@ -288,64 +411,362 @@
         return null;
       }
 
-      async function renderFaces() {
-        const archiveGrid = document.getElementById('facesGridArchiveContent');
-        const runGrid = document.getElementById('facesGridRunContent');
-        const archiveSection = document.getElementById('facesGridArchive');
-        const runSection = document.getElementById('facesGridRun');
+      // Обработка якорей URL для перехода на нужную закладку
+      function handleUrlAnchors() {
+        const hash = window.location.hash;
+        if (!hash) return;
         
+        // Формат: #faces-archive, #rectangles-run, #direct-archive и т.д.
+        const match = hash.match(/^#(faces|rectangles|direct)-(archive|run)$/);
+        if (match) {
+          const [, subtabName, mainTabName] = match;
+          mainTab = mainTabName;
+          subtab = subtabName;
+          viewMode = 'detailed';
+          updateViewMode();
+          updateTabs();
+        }
+      }
+      
+      // Переключение режима просмотра
+      function setViewMode(mode) {
+        viewMode = mode;
+        updateViewMode();
+        renderFaces();
+      }
+      
+      function updateViewMode() {
+        const generalView = document.getElementById('viewModeGeneral');
+        const detailedView = document.getElementById('viewModeDetailed');
+        const btnGeneral = document.getElementById('btnViewModeGeneral');
+        const btnDetailed = document.getElementById('btnViewModeDetailed');
+        
+        if (viewMode === 'general') {
+          generalView.style.display = 'block';
+          detailedView.style.display = 'none';
+          btnGeneral.classList.add('primary');
+          btnDetailed.classList.remove('primary');
+        } else {
+          generalView.style.display = 'none';
+          detailedView.style.display = 'block';
+          btnGeneral.classList.remove('primary');
+          btnDetailed.classList.add('primary');
+        }
+      }
+      
+      // Переключение основных вкладок
+      function setMainTab(tab) {
+        mainTab = tab;
+        updateTabs();
+        renderFaces();
+      }
+      
+      // Переключение подвкладок
+      function setSubtab(sub) {
+        subtab = sub;
+        updateTabs();
+        renderFaces();
+      }
+      
+      // Функция для обновления счетчиков на вкладках
+      function updateTabCounts() {
+        if (!personData || !personData.faces) return;
+        
+        const faces = personData.faces;
+        
+        // Подсчет для основных вкладок
+        const archiveFaces = faces.filter(f => f.is_archive || f.source === 'archive');
+        const runFaces = faces.filter(f => f.is_run || f.source === 'run');
+        
+        const archiveCountEl = document.getElementById('tabArchiveCount');
+        const runCountEl = document.getElementById('tabRunCount');
+        if (archiveCountEl) archiveCountEl.textContent = archiveFaces.length;
+        if (runCountEl) runCountEl.textContent = runFaces.length;
+        
+        // Подсчет для подвкладок архива
+        const archiveFacesItems = archiveFaces.filter(f => f.assignment_type === 'cluster' || f.assignment_type === 'manual_face');
+        const archiveRectanglesItems = archiveFaces.filter(f => f.assignment_type === 'person_rectangle');
+        const archiveDirectItems = archiveFaces.filter(f => f.assignment_type === 'file_person');
+        
+        const subArchiveFacesCountEl = document.getElementById('subArchiveFacesCount');
+        const subArchiveRectanglesCountEl = document.getElementById('subArchiveRectanglesCount');
+        const subArchiveDirectCountEl = document.getElementById('subArchiveDirectCount');
+        if (subArchiveFacesCountEl) subArchiveFacesCountEl.textContent = archiveFacesItems.length;
+        if (subArchiveRectanglesCountEl) subArchiveRectanglesCountEl.textContent = archiveRectanglesItems.length;
+        if (subArchiveDirectCountEl) subArchiveDirectCountEl.textContent = archiveDirectItems.length;
+        
+        // Подсчет для подвкладок прогона
+        const runFacesItems = runFaces.filter(f => f.assignment_type === 'cluster' || f.assignment_type === 'manual_face');
+        const runRectanglesItems = runFaces.filter(f => f.assignment_type === 'person_rectangle');
+        const runDirectItems = runFaces.filter(f => f.assignment_type === 'file_person');
+        
+        const subRunFacesCountEl = document.getElementById('subRunFacesCount');
+        const subRunRectanglesCountEl = document.getElementById('subRunRectanglesCount');
+        const subRunDirectCountEl = document.getElementById('subRunDirectCount');
+        if (subRunFacesCountEl) subRunFacesCountEl.textContent = runFacesItems.length;
+        if (subRunRectanglesCountEl) subRunRectanglesCountEl.textContent = runRectanglesItems.length;
+        if (subRunDirectCountEl) subRunDirectCountEl.textContent = runDirectItems.length;
+      }
+      
+      function updateTabs() {
+        // Основные вкладки
+        document.querySelectorAll('.tabs .tab').forEach(btn => {
+          btn.classList.toggle('active', btn.getAttribute('data-tab') === mainTab);
+        });
+        
+        // Подвкладки
+        const subtabsContainer = mainTab === 'archive' ? 
+          document.getElementById('subtabsArchive') : 
+          document.getElementById('subtabsRun');
+        const otherSubtabsContainer = mainTab === 'archive' ? 
+          document.getElementById('subtabsRun') : 
+          document.getElementById('subtabsArchive');
+        
+        if (subtabsContainer) subtabsContainer.style.display = 'flex';
+        if (otherSubtabsContainer) otherSubtabsContainer.style.display = 'none';
+        
+        document.querySelectorAll('.subtabs .subtab').forEach(btn => {
+          const container = btn.closest('.subtabs');
+          if (container && container.style.display !== 'none') {
+            btn.classList.toggle('active', btn.getAttribute('data-subtab') === subtab);
+          }
+        });
+        
+        // Контент основных вкладок
+        document.getElementById('contentArchive').style.display = mainTab === 'archive' ? 'block' : 'none';
+        document.getElementById('contentRun').style.display = mainTab === 'run' ? 'block' : 'none';
+        
+        // Контент подвкладок для архива
+        document.getElementById('contentArchiveFaces').style.display = 
+          (mainTab === 'archive' && subtab === 'faces') ? 'block' : 'none';
+        document.getElementById('contentArchiveRectangles').style.display = 
+          (mainTab === 'archive' && subtab === 'rectangles') ? 'block' : 'none';
+        document.getElementById('contentArchiveDirect').style.display = 
+          (mainTab === 'archive' && subtab === 'direct') ? 'block' : 'none';
+        
+        // Контент подвкладок для прогона
+        document.getElementById('contentRunFaces').style.display = 
+          (mainTab === 'run' && subtab === 'faces') ? 'block' : 'none';
+        document.getElementById('contentRunRectangles').style.display = 
+          (mainTab === 'run' && subtab === 'rectangles') ? 'block' : 'none';
+        document.getElementById('contentRunDirect').style.display = 
+          (mainTab === 'run' && subtab === 'direct') ? 'block' : 'none';
+        
+        // Показываем/скрываем переключатель фильтра только для "Сортируется - через лица"
+        const manualFilterSelect = document.getElementById('manualFilterSelect');
+        if (manualFilterSelect) {
+          manualFilterSelect.style.display = (mainTab === 'run' && subtab === 'faces') ? 'block' : 'none';
+          // Синхронизируем состояние переключателя с переменной
+          manualFilterSelect.value = manualFilterMode;
+        }
+      }
+      
+      async function renderFaces() {
         if (!personData || !personData.faces) {
-          archiveGrid.innerHTML = '<div class="muted">Нет лиц</div>';
-          runGrid.innerHTML = '<div class="muted">Нет лиц</div>';
+          clearAllGrids();
           return;
         }
         
         const faces = personData.faces;
         if (faces.length === 0) {
-          archiveGrid.innerHTML = '<div class="muted">Нет лиц</div>';
-          runGrid.innerHTML = '<div class="muted">Нет лиц</div>';
+          clearAllGrids();
           return;
         }
         
-        // Разделяем лица на архивные и из текущего прогона
-        const archiveFaces = faces.filter(f => f.is_archive);
-        const runFaces = faces.filter(f => f.is_run);
-        
-        // Скрываем секцию, если нет лиц
-        if (archiveFaces.length === 0) {
-          archiveSection.style.display = 'none';
+        if (viewMode === 'general') {
+          // Общий режим: единый список всех элементов
+          await renderGeneralView(faces);
         } else {
-          archiveSection.style.display = 'block';
-          archiveGrid.innerHTML = await Promise.all(archiveFaces.map(async (face) => renderFaceThumb(face))).then(h => h.join(''));
-        }
-        
-        if (runFaces.length === 0) {
-          runSection.style.display = 'none';
-        } else {
-          runSection.style.display = 'block';
-          runGrid.innerHTML = await Promise.all(runFaces.map(async (face) => renderFaceThumb(face))).then(h => h.join(''));
+          // Детальный режим: разделение по вкладкам и подвкладкам
+          await renderDetailedView(faces);
         }
       }
       
-      async function renderFaceThumb(face) {
-        const thumbUrl = face.thumb_jpeg_base64 ? 
-          `data:image/jpeg;base64,${face.thumb_jpeg_base64}` : null;
+      function clearAllGrids() {
+        const grids = [
+          'facesGridGeneralContent',
+          'facesGridArchiveFacesContent', 'facesGridArchiveRectanglesContent', 'facesGridArchiveDirectContent',
+          'facesGridRunFacesContent', 'facesGridRunRectanglesContent', 'facesGridRunDirectContent'
+        ];
+        grids.forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.innerHTML = '<div class="muted">Нет элементов</div>';
+        });
+      }
+      
+      async function renderGeneralView(faces) {
+        const grid = document.getElementById('facesGridGeneralContent');
+        if (!grid) return;
         
-        const isAvatar = personData.person.avatar_face_id === face.face_id;
+        const html = await Promise.all(faces.map(async (face) => renderItemThumb(face))).then(h => h.join(''));
+        grid.innerHTML = html || '<div class="muted">Нет элементов</div>';
+      }
+      
+      async function renderDetailedView(faces) {
+        // Фильтруем элементы по основной вкладке (archive/run)
+        const filteredFaces = faces.filter(f => {
+          const source = f.source || (f.is_archive ? 'archive' : (f.is_run ? 'run' : 'unknown'));
+          return source === mainTab;
+        });
+        
+        // Фильтруем по подвкладке (faces/rectangles/direct)
+        const assignmentTypeMap = {
+          'faces': ['cluster', 'manual_face'],
+          'rectangles': ['person_rectangle'],
+          'direct': ['file_person']
+        };
+        
+        const allowedTypes = assignmentTypeMap[subtab] || [];
+        let subtabFaces = filteredFaces.filter(f => allowedTypes.includes(f.assignment_type));
+        
+        // Временная отладка для проверки person_rectangle элементов
+        if (subtab === 'rectangles') {
+          const allPersonRectangles = faces.filter(f => f.assignment_type === 'person_rectangle');
+          const filteredPersonRectangles = filteredFaces.filter(f => f.assignment_type === 'person_rectangle');
+          console.log('[DEBUG] person_rectangle elements:', {
+            total: allPersonRectangles.length,
+            filtered_by_source: filteredPersonRectangles.length,
+            after_subtab_filter: subtabFaces.length,
+            mainTab,
+            allPersonRectangles: allPersonRectangles.map(f => ({
+              assignment_type: f.assignment_type,
+              source: f.source,
+              is_archive: f.is_archive,
+              is_run: f.is_run,
+              person_rectangle_id: f.person_rectangle_id,
+              file_path: f.file_path
+            }))
+          });
+        }
+        
+        // Применяем фильтр для вкладки "Сортируется - через лица"
+        if (mainTab === 'run' && subtab === 'faces') {
+          if (manualFilterMode === 'manual_only') {
+            // Только ручные привязки
+            subtabFaces = subtabFaces.filter(f => f.assignment_type === 'manual_face');
+          } else if (manualFilterMode === 'no_manual') {
+            // Все кроме ручных (только кластеры)
+            subtabFaces = subtabFaces.filter(f => f.assignment_type !== 'manual_face');
+          }
+          // Если manualFilterMode === 'all', показываем все (не фильтруем)
+        }
+        
+        // Определяем ID контейнера для текущей подвкладки
+        const gridId = `facesGrid${mainTab.charAt(0).toUpperCase() + mainTab.slice(1)}${subtab.charAt(0).toUpperCase() + subtab.slice(1)}Content`;
+        const grid = document.getElementById(gridId);
+        
+        if (grid) {
+          const html = await Promise.all(subtabFaces.map(async (face) => renderItemThumb(face))).then(h => h.join(''));
+          grid.innerHTML = html || '<div class="muted">Нет элементов</div>';
+        }
+      }
+      
+      async function renderItemThumb(item) {
+        // Определяем тип элемента и соответствующие данные
+        const itemId = item.face_id || item.person_rectangle_id || item.file_id;
+        const thumbUrl = item.thumb_jpeg_base64 ? 
+          `data:image/jpeg;base64,${item.thumb_jpeg_base64}` : null;
+        
+        const isAvatar = personData.person.avatar_face_id === item.face_id;
         const avatarClass = isAvatar ? ' avatar' : '';
         
-        const escapedPath = (face.file_path || '').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
-        const bboxJson = face.bbox ? JSON.stringify(face.bbox).replace(/"/g, '&quot;') : '';
-        return `
-          <div class="thumb${avatarClass}" data-face-id="${face.face_id}" data-file-path="${escapedPath}" data-bbox="${bboxJson}" ondblclick="handleFaceDoubleClick(this)">
-            ${thumbUrl ? `<img src="${thumbUrl}" alt="Face ${face.face_id}" />` : '<div class="noimg">Нет превью</div>'}
+        const escapedPath = (item.file_path || '').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+        const bboxJson = item.bbox ? JSON.stringify(item.bbox).replace(/"/g, '&quot;') : '';
+        
+        // Иконка/подпись типа привязки с цветовым кодированием
+        let typeLabel = '';
+        let typeBadgeClass = '';
+        if (item.assignment_type === 'cluster') {
+          typeLabel = 'Кластер';
+          typeBadgeClass = 'badge-cluster'; // Синий цвет для кластеров
+        } else if (item.assignment_type === 'manual_face') {
+          typeLabel = 'Ручное';
+          typeBadgeClass = 'badge-manual'; // Оранжевый цвет для ручных привязок
+        } else if (item.assignment_type === 'person_rectangle') {
+          typeLabel = 'Прямоугольник';
+          typeBadgeClass = 'badge-rectangle'; // Серый цвет
+        } else if (item.assignment_type === 'file_person') {
+          typeLabel = 'Файл';
+          typeBadgeClass = 'badge-file'; // Зеленый цвет
+        }
+        
+        // Для прямой привязки (file_person) показываем файл целиком, без кропа
+        const hasBbox = item.bbox && item.bbox.x !== null && item.bbox.y !== null;
+        const canDoubleClick = item.face_id || (item.person_rectangle_id && hasBbox);
+        
+        let actionsHtml = '';
+        if (item.face_id) {
+          // Действия только для лиц. Аватар — только для карточек из архива (не сортируется).
+          const showAvatar = item.is_archive;
+          const avatarBtn = showAvatar
+            ? `<button class="face-btn" onclick="event.stopPropagation(); setAvatar(${item.face_id})" title="Назначить аватаром" ${isAvatar ? 'disabled' : ''}>Аватар</button>`
+            : '';
+          
+          // Кнопка "Посторонний" - показываем всегда для лиц
+          const escapedFilePathForOutsider = escapedPath || '';
+          const fileIdForOutsider = item.file_id || null;
+          const outsiderBtn = `<button class="face-btn" onclick="event.stopPropagation(); assignOutsider(${item.face_id}, '${escapedFilePathForOutsider}', ${fileIdForOutsider || 'null'})" title="Назначить персоне 'Посторонний'">Посторонний</button>`;
+          
+          actionsHtml = `
             <div class="face-actions">
-              <button class="face-btn" onclick="event.stopPropagation(); ignoreFace(${face.face_id})" title="Это не лицо">Не лицо</button>
-              <button class="face-btn" onclick="event.stopPropagation(); reassignFace(${face.face_id})" title="Это другой человек">Другой</button>
-              <button class="face-btn" onclick="event.stopPropagation(); setAvatar(${face.face_id})" title="Назначить аватаром" ${isAvatar ? 'disabled' : ''}>Аватар</button>
+              <button class="face-btn" onclick="event.stopPropagation(); ignoreFace(${item.face_id})" title="Это не лицо">Не лицо</button>
+              <button class="face-btn dropdown" onclick="event.stopPropagation(); showReassignDropdown(${item.face_id}, this)" title="Это другой человек">Другой</button>
+              ${outsiderBtn}
+              ${avatarBtn}
             </div>
+          `;
+        }
+        
+        const dataAttrs = [
+          item.face_id ? `data-face-id="${item.face_id}"` : '',
+          item.person_rectangle_id ? `data-person-rectangle-id="${item.person_rectangle_id}"` : '',
+          item.file_id ? `data-file-id="${item.file_id}"` : '',
+          `data-file-path="${escapedPath}"`,
+          bboxJson ? `data-bbox="${bboxJson}"` : '',
+          `data-assignment-type="${item.assignment_type || ''}"`
+        ].filter(Boolean).join(' ');
+        
+        const doubleClickHandler = canDoubleClick ? 'ondblclick="handleItemDoubleClick(this)"' : '';
+        
+        const typeBadgeHtml = typeLabel ? `
+          <div class="assignment-type-badge ${typeBadgeClass}" title="Тип привязки: ${typeLabel}">
+            ${typeLabel}
+          </div>
+        ` : '';
+        
+        return `
+          <div class="thumb${avatarClass}" ${dataAttrs} ${doubleClickHandler}>
+            ${thumbUrl ? `<img src="${thumbUrl}" alt="Item ${itemId}" />` : '<div class="noimg">Нет превью</div>'}
+            ${typeBadgeHtml}
+            ${actionsHtml}
           </div>
         `;
+      }
+      
+      function handleItemDoubleClick(element) {
+        const faceId = element.getAttribute('data-face-id');
+        const personRectId = element.getAttribute('data-person-rectangle-id');
+        const filePath = element.getAttribute('data-file-path');
+        const bboxStr = element.getAttribute('data-bbox');
+        
+        if (faceId) {
+          // Для лиц используем существующую функцию
+          handleFaceDoubleClick(element);
+        } else if (personRectId && bboxStr) {
+          // Для прямоугольников открываем фото с выделением области
+          let bboxData = null;
+          if (bboxStr) {
+            try {
+              bboxData = JSON.parse(bboxStr.replace(/&quot;/g, '"'));
+            } catch (e) {
+              console.error('Ошибка парсинга bbox:', e);
+            }
+          }
+          openFaceImage(null, filePath, bboxData, personRectId);
+        } else if (filePath) {
+          // Для прямой привязки открываем файл целиком
+          openFaceImage(null, filePath, null, null);
+        }
       }
 
       function handleFaceDoubleClick(element) {
@@ -364,15 +785,24 @@
         openFaceImage(faceId, filePath, bboxData);
       }
 
-      function openFaceImage(faceId, filePath, bboxData) {
-        // Находим информацию о лице
+      function openFaceImage(faceId, filePath, bboxData, personRectangleId = null) {
+        // Находим информацию об элементе
         const faces = personData?.faces || [];
-        const face = faces.find(f => f.face_id === faceId);
-        if (!face) {
-          return;
+        let face = null;
+        if (faceId) {
+          face = faces.find(f => f.face_id === faceId);
+        } else if (personRectangleId) {
+          face = faces.find(f => f.person_rectangle_id === personRectangleId);
+        } else if (filePath) {
+          // Для прямой привязки ищем по file_path
+          face = faces.find(f => f.file_path === filePath && f.assignment_type === 'file_person');
         }
         
-        const path = face.file_path || filePath;
+        const path = face?.file_path || filePath;
+        if (!path) {
+          console.error('openFaceImage: нет пути к файлу');
+          return;
+        }
         currentFilePath = path; // Сохраняем путь для исправления клиппинга
         const lb = document.getElementById('lightbox');
         const lbPath = document.getElementById('lbPath');
@@ -389,7 +819,7 @@
         if (lbPath) lbPath.textContent = path;
         
         // Сохраняем faceId и bbox для отрисовки
-        currentFaceId = faceId;
+        currentFaceId = faceId || personRectangleId;
         if (bboxData && typeof bboxData === 'object') {
           currentFaceBbox = bboxData;
         } else if (face && face.bbox) {
@@ -488,7 +918,9 @@
             items: items,
             current_index: currentIndex >= 0 ? currentIndex : 0,
             total_count: items.length,
-            api_fallback: null
+            api_fallback: null,
+            tab: mainTab,
+            person_id: personId
           };
           
           // Определяем pipeline_run_id из данных текущего лица (если есть)
@@ -886,10 +1318,7 @@
 
 
       async function ignoreFace(faceId) {
-        if (!confirm('Пометить это лицо как "не лицо"?')) {
-          return;
-        }
-        
+        // Убрано подтверждение - выполняем действие сразу
         try {
           const resp = await fetch(`/api/persons/${personId}/faces/${faceId}/ignore`, {
             method: 'POST',
@@ -908,7 +1337,418 @@
         }
       }
 
+      async function assignOutsider(faceId, filePath = null, fileId = null) {
+        // Назначаем лицо персоне "Посторонний"
+        // faceId может быть как face_id, так и rectangle_id (в контексте photo_rectangles это одно и то же)
+        console.log('[assignOutsider] Начинаем назначение на "Посторонний", faceId:', faceId, 'filePath:', filePath, 'fileId:', fileId);
+        
+        if (!faceId) {
+          console.error('[assignOutsider] faceId не передан');
+          showToast('Ошибка: не указан ID лица', true);
+          return;
+        }
+        
+        try {
+          // Получаем список всех персон для поиска "Посторонний"
+          if (!allPersons || allPersons.length === 0) {
+            console.log('[assignOutsider] Загружаем список персон...');
+            const resp = await fetch('/api/persons/list');
+            if (!resp.ok) {
+              throw new Error(`Не удалось загрузить список персон: HTTP ${resp.status}`);
+            }
+            const data = await resp.json();
+            allPersons = data.persons || [];
+            console.log('[assignOutsider] Загружено персон:', allPersons.length);
+          }
+          
+          const outsiderPerson = allPersons.find(p => p.is_ignored === true);
+          if (!outsiderPerson) {
+            console.error('[assignOutsider] Персона "Посторонний" не найдена в списке');
+            showToast('Персона "Посторонний" не найдена', true);
+            return;
+          }
+          
+          console.log('[assignOutsider] Найдена персона "Посторонний", ID:', outsiderPerson.id);
+          
+          // Назначаем лицо персоне "Посторонний" через API обновления rectangle
+          // rectangle_id в photo_rectangles это и есть id (face_id)
+          const rectangleId = parseInt(faceId);
+          if (isNaN(rectangleId)) {
+            throw new Error(`Некорректный ID лица: ${faceId}`);
+          }
+          
+          console.log('[assignOutsider] Отправляем запрос на назначение, rectangle_id:', rectangleId, 'person_id:', outsiderPerson.id);
+          
+          const requestBody = {
+            rectangle_id: rectangleId,
+            person_id: outsiderPerson.id,
+            assignment_type: 'manual_face'
+          };
+          
+          // Для архивных фото добавляем file_id или path
+          if (fileId && fileId !== 'null' && fileId !== null) {
+            requestBody.file_id = parseInt(fileId);
+          } else if (filePath && filePath !== '' && filePath !== 'null') {
+            // Убираем экранирование из filePath
+            requestBody.path = filePath.replace(/&quot;/g, '"').replace(/&#039;/g, "'");
+          }
+          
+          const resp = await fetch('/api/faces/rectangle/update', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestBody)
+          });
+          
+          console.log('[assignOutsider] Ответ от API, status:', resp.status, 'ok:', resp.ok);
+          
+          if (!resp.ok) {
+            let errorMsg = 'Ошибка назначения';
+            try {
+              const errorData = await resp.json();
+              errorMsg = errorData.detail || errorData.error || errorMsg;
+              console.error('[assignOutsider] Ошибка API:', errorData);
+            } catch (parseErr) {
+              const text = await resp.text();
+              errorMsg = `HTTP ${resp.status}: ${text || resp.statusText}`;
+              console.error('[assignOutsider] Ошибка парсинга ответа:', parseErr, 'Текст ответа:', text);
+            }
+            throw new Error(errorMsg);
+          }
+          
+          const result = await resp.json();
+          console.log('[assignOutsider] Успешно назначено, результат:', result);
+          
+          showToast('Лицо назначено персоне "Посторонний"');
+          
+          // Оптимистичное обновление: сразу удаляем элемент из таблицы кластеров
+          // (лицо больше не принадлежит этой персоне)
+          const thumbElement = document.querySelector(`.thumb[data-face-id="${faceId}"]`);
+          if (thumbElement) {
+            thumbElement.style.opacity = '0.5';
+            thumbElement.style.transition = 'opacity 0.3s';
+            setTimeout(() => {
+              thumbElement.remove();
+              // Обновляем счетчик лиц в заголовке таблицы
+              const container = thumbElement.closest('.thumb-grid')?.parentElement;
+              if (container) {
+                const header = container.querySelector('h3');
+                if (header) {
+                  const remainingThumbs = container.querySelectorAll('.thumb-grid .thumb').length;
+                  const clustersCount = container.querySelectorAll('.thumb-grid .thumb').length > 0 ? 
+                    new Set(Array.from(container.querySelectorAll('.thumb-grid .thumb')).map(t => t.getAttribute('data-cluster-id'))).size : 0;
+                  if (remainingThumbs === 0) {
+                    container.innerHTML = '<div class="muted">В кластерах нет лиц</div>';
+                  } else {
+                    header.textContent = `Кластеры (${clustersCount} кластеров, ${remainingThumbs} лиц)`;
+                  }
+                }
+              }
+            }, 300);
+          }
+          
+          // Обновляем счетчики на вкладках в фоне (без блокировки UI)
+          loadPerson().then(() => {
+            updateTabCounts();
+          }).catch(err => {
+            console.error('[assignOutsider] Ошибка обновления данных персоны:', err);
+          });
+        } catch (e) {
+          console.error('[assignOutsider] Ошибка назначения на "Посторонний":', e);
+          showToast(`Ошибка: ${e.message}`, true);
+        }
+      }
+      
+      async function showReassignDropdown(faceId, buttonElement) {
+        // Закрываем все открытые меню
+        document.querySelectorAll('.reassign-dropdown-menu.open').forEach(menu => {
+          menu.remove();
+        });
+        
+        // Проверяем, не открыто ли уже меню для этого лица
+        const existingMenu = document.querySelector(`.reassign-dropdown-menu[data-face-id="${faceId}"]`);
+        if (existingMenu) {
+          existingMenu.remove();
+          return; // Закрываем меню, если оно уже было открыто
+        }
+        
+        currentReassignFaceId = faceId;
+        
+        // Загружаем список персон
+        try {
+          const resp = await fetch('/api/persons/list');
+          if (!resp.ok) throw new Error('Не удалось загрузить список персон');
+          const data = await resp.json();
+          allPersons = data.persons || [];
+          
+          // Загружаем похожие лица
+          const similarResp = await fetch(`/api/persons/${personId}/faces/${faceId}/similar?limit=3`);
+          let similarFaces = [];
+          if (similarResp.ok) {
+            const similarData = await similarResp.json();
+            similarFaces = similarData.similar_faces || [];
+          }
+          
+          // Создаем меню
+          const menu = document.createElement('div');
+          menu.className = 'reassign-dropdown-menu open';
+          menu.dataset.faceId = faceId;
+          
+          // Добавляем 3 ближайших по embeddings
+          if (similarFaces.length > 0) {
+            const section = document.createElement('div');
+            section.className = 'menu-section';
+            const title = document.createElement('div');
+            title.className = 'menu-section-title';
+            title.textContent = 'Ближайшие по embeddings:';
+            section.appendChild(title);
+            
+            for (const sf of similarFaces) {
+              if (sf.person_id && sf.person_id !== personId) {
+                const person = allPersons.find(p => p.id === sf.person_id);
+                if (person && !person.is_ignored) {
+                  const item = document.createElement('button');
+                  item.className = 'menu-item';
+                  item.textContent = `${person.name} (${sf.distance.toFixed(3)})`;
+                  item.onclick = (e) => {
+                    e.stopPropagation();
+                    menu.remove();
+                    doReassign(faceId, sf.person_id);
+                  };
+                  section.appendChild(item);
+                }
+              }
+            }
+            
+            if (section.children.length > 1) { // Больше чем только title
+              menu.appendChild(section);
+            }
+          }
+          
+          // Группируем остальных персон по группам
+          const groupedPersons = {};
+          const noGroupPersons = [];
+          
+          for (const p of allPersons) {
+            if (p.id === personId || p.is_ignored) continue;
+            const groupName = p.group || null;
+            if (groupName) {
+              if (!groupedPersons[groupName]) {
+                groupedPersons[groupName] = {
+                  order: p.group_order || 999,
+                  persons: []
+                };
+              }
+              groupedPersons[groupName].persons.push(p);
+            } else {
+              noGroupPersons.push(p);
+            }
+          }
+          
+          // Сортируем группы по order
+          const sortedGroups = Object.entries(groupedPersons).sort((a, b) => {
+            return a[1].order - b[1].order;
+          });
+          
+          // Сортируем персон внутри каждой группы по имени
+          for (const [groupName, groupData] of sortedGroups) {
+            groupData.persons.sort((a, b) => {
+              const nameA = (a.name || '').toLowerCase();
+              const nameB = (b.name || '').toLowerCase();
+              return nameA.localeCompare(nameB);
+            });
+          }
+          
+          // Сортируем персон без группы по имени
+          noGroupPersons.sort((a, b) => {
+            const nameA = (a.name || '').toLowerCase();
+            const nameB = (b.name || '').toLowerCase();
+            return nameA.localeCompare(nameB);
+          });
+          
+          // Рендерим группы
+          for (const [groupName, groupData] of sortedGroups) {
+            const section = document.createElement('div');
+            section.className = 'menu-section';
+            const title = document.createElement('div');
+            title.className = 'menu-section-title';
+            title.textContent = groupName;
+            section.appendChild(title);
+            
+            for (const p of groupData.persons) {
+              const item = document.createElement('button');
+              item.className = 'menu-item';
+              item.textContent = p.name + (p.is_me ? ' (я)' : '');
+              item.onclick = (e) => {
+                e.stopPropagation();
+                menu.remove();
+                doReassign(faceId, p.id);
+              };
+              section.appendChild(item);
+            }
+            menu.appendChild(section);
+          }
+          
+          // Рендерим персон без группы (если есть)
+          if (noGroupPersons.length > 0) {
+            const section = document.createElement('div');
+            section.className = 'menu-section';
+            const title = document.createElement('div');
+            title.className = 'menu-section-title';
+            title.textContent = 'Без группы';
+            section.appendChild(title);
+            
+            for (const p of noGroupPersons) {
+              const item = document.createElement('button');
+              item.className = 'menu-item';
+              item.textContent = p.name + (p.is_me ? ' (я)' : '');
+              item.onclick = (e) => {
+                e.stopPropagation();
+                menu.remove();
+                doReassign(faceId, p.id);
+              };
+              section.appendChild(item);
+            }
+            menu.appendChild(section);
+          }
+          
+          // Добавляем кнопку "Очистить"
+          const clearSection = document.createElement('div');
+          clearSection.className = 'menu-section';
+          const clearItem = document.createElement('button');
+          clearItem.className = 'menu-item';
+          clearItem.textContent = 'Очистить (найти ближайший кластер)';
+          clearItem.onclick = (e) => {
+            e.stopPropagation();
+            menu.remove();
+            clearFaceAssignmentForFace(faceId);
+          };
+          clearSection.appendChild(clearItem);
+          menu.appendChild(clearSection);
+          
+          // Позиционируем меню относительно thumb-grid, чтобы избежать обрезания overflow:hidden
+          const thumbGrid = buttonElement.closest('.thumb-grid');
+          
+          if (thumbGrid) {
+            // Позиционируем меню относительно thumb-grid (не thumb), чтобы избежать обрезания
+            thumbGrid.style.position = 'relative';
+            thumbGrid.appendChild(menu);
+            
+            // Ждем, пока меню отрендерится, чтобы получить его размеры
+            setTimeout(() => {
+              const buttonRect = buttonElement.getBoundingClientRect();
+              const gridRect = thumbGrid.getBoundingClientRect();
+              const viewportWidth = window.innerWidth;
+              const viewportHeight = window.innerHeight;
+              
+              // Позиционируем меню снизу вверх от кнопки (относительно grid)
+              let left = buttonRect.left - gridRect.left;
+              let top = buttonRect.top - gridRect.top - menu.offsetHeight - 4; // Вверх от кнопки
+              
+              // Проверка левого края viewport
+              const menuLeftAbsolute = gridRect.left + left;
+              if (menuLeftAbsolute < 0) {
+                left = -gridRect.left; // Позиционируем по левому краю viewport
+              }
+              
+              // Проверка правого края viewport
+              const menuRightAbsolute = gridRect.left + left + menu.offsetWidth;
+              if (menuRightAbsolute > viewportWidth) {
+                left = viewportWidth - gridRect.left - menu.offsetWidth;
+                // Если меню все еще выходит (слишком широкое), позиционируем по правому краю viewport
+                if (left < -gridRect.left) {
+                  left = -gridRect.left;
+                }
+              }
+              
+              // Проверка правого края grid (внутренняя проверка)
+              if (left + menu.offsetWidth > gridRect.width) {
+                left = gridRect.width - menu.offsetWidth;
+                if (left < 0) {
+                  left = 0;
+                }
+              }
+              
+              // Проверка верхнего края viewport (меню показывается снизу вверх)
+              const menuTopAbsolute = gridRect.top + top;
+              if (menuTopAbsolute < 0) {
+                // Если не влезает сверху, показываем снизу от кнопки
+                top = buttonRect.bottom - gridRect.top + 4;
+                // Проверяем, не выходит ли снизу за viewport
+                const menuBottomAbsolute = gridRect.top + top + menu.offsetHeight;
+                if (menuBottomAbsolute > viewportHeight) {
+                  // Если не влезает снизу, позиционируем по верхнему краю viewport
+                  top = -gridRect.top;
+                  // Если все еще не влезает, позиционируем по нижнему краю viewport
+                  if (top + menu.offsetHeight > gridRect.height) {
+                    top = viewportHeight - gridRect.top - menu.offsetHeight;
+                  }
+                }
+              }
+              
+              // Проверка нижнего края viewport
+              const menuBottomAbsolute = gridRect.top + top + menu.offsetHeight;
+              if (menuBottomAbsolute > viewportHeight) {
+                // Если не влезает снизу, позиционируем по нижнему краю viewport
+                top = viewportHeight - gridRect.top - menu.offsetHeight;
+                // Если все еще не влезает, позиционируем по верхнему краю viewport
+                if (top < -gridRect.top) {
+                  top = -gridRect.top;
+                }
+              }
+              
+              // Проверка нижнего края grid (внутренняя проверка)
+              if (top + menu.offsetHeight > gridRect.height) {
+                // Если не влезает в grid, позиционируем по верхнему краю grid
+                top = 0;
+              }
+              
+              menu.style.position = 'absolute';
+              menu.style.left = `${left}px`;
+              menu.style.top = `${top}px`;
+              menu.style.bottom = 'auto';
+            }, 0);
+          }
+          
+          // Закрываем меню при клике вне его
+          const closeMenu = (e) => {
+            if (!menu.contains(e.target) && !buttonElement.contains(e.target)) {
+              menu.remove();
+              document.removeEventListener('click', closeMenu);
+            }
+          };
+          
+          setTimeout(() => {
+            document.addEventListener('click', closeMenu);
+          }, 10);
+        } catch (e) {
+          console.error('Ошибка загрузки данных:', e);
+          showToast(`Ошибка: ${e.message}`, true);
+        }
+      }
+      
+      async function doReassign(faceId, targetPersonId) {
+        try {
+          const resp = await fetch(`/api/persons/${personId}/faces/${faceId}/reassign`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ target_person_id: parseInt(targetPersonId) }),
+          });
+          
+          if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.detail || 'Ошибка переназначения');
+          }
+          
+          showToast('Лицо переназначено');
+          await loadPerson();
+        } catch (e) {
+          console.error('Ошибка переназначения:', e);
+          showToast(`Ошибка: ${e.message}`, true);
+        }
+      }
+      
       async function reassignFace(faceId) {
+        // Старая функция для совместимости (если где-то еще используется)
         currentReassignFaceId = faceId;
         
         // Загружаем список персон
@@ -1052,11 +1892,29 @@
         }
       }
 
-      async function clearFaceAssignment() {
-        if (!confirm('Удалить лицо из текущей персоны и найти ближайший кластер?')) {
-          return;
+      async function clearFaceAssignmentForFace(faceId) {
+        // Убрано подтверждение - выполняем действие сразу
+        try {
+          const resp = await fetch(`/api/persons/${personId}/faces/${faceId}/clear`, {
+            method: 'POST',
+          });
+          
+          if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.detail || 'Ошибка');
+          }
+          
+          showToast('Лицо удалено из персоны');
+          await loadPerson();
+        } catch (e) {
+          console.error('Ошибка:', e);
+          showToast(`Ошибка: ${e.message}`, true);
         }
-        
+      }
+      
+      async function clearFaceAssignment() {
+        // Старая функция для совместимости (используется в модальном окне)
+        // Убрано подтверждение - выполняем действие сразу
         try {
           const resp = await fetch(`/api/persons/${personId}/faces/${currentReassignFaceId}/clear`, {
             method: 'POST',
@@ -1197,11 +2055,103 @@
         btnFixClipping.onclick = handleFixClipping;
       }
       
+      // Функция для позиционирования на нужный элемент после обновления списка
+      function focusOnRectangle(focusData) {
+        if (!focusData) return;
+        
+        // Ищем элемент в обновленном списке по file_id + rectangle_id
+        const { file_id, file_path, face_rectangle_id, person_rectangle_id } = focusData;
+        
+        // Ищем элемент в сетке лиц
+        const thumbElements = document.querySelectorAll('.thumb[data-face-id], .thumb[data-person-rectangle-id], .thumb[data-file-id], .thumb[data-file-path]');
+        
+        for (const thumb of thumbElements) {
+          const thumbFileId = thumb.getAttribute('data-file-id');
+          const thumbFilePath = thumb.getAttribute('data-file-path');
+          const thumbFaceId = thumb.getAttribute('data-face-id');
+          const thumbPersonRectId = thumb.getAttribute('data-person-rectangle-id');
+          
+          // Проверяем совпадение по file_id или file_path
+          const fileMatches = (file_id && thumbFileId && parseInt(thumbFileId) === file_id) ||
+                             (file_path && thumbFilePath === file_path);
+          
+          if (fileMatches) {
+            // Проверяем совпадение rectangle_id
+            const rectMatches = (face_rectangle_id && thumbFaceId && parseInt(thumbFaceId) === face_rectangle_id) ||
+                               (person_rectangle_id && thumbPersonRectId && parseInt(thumbPersonRectId) === person_rectangle_id);
+            
+            if (rectMatches || (!face_rectangle_id && !person_rectangle_id)) {
+              // Прокручиваем к элементу и выделяем его
+              thumb.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              thumb.focus(); // Если элемент фокусируемый
+              
+              // Визуальное выделение (опционально)
+              thumb.style.outline = '3px solid #0b57d0';
+              setTimeout(() => {
+                thumb.style.outline = '';
+              }, 2000);
+              
+              console.log('[person_detail] Элемент найден и сфокусирован:', focusData);
+              return; // Найден и сфокусирован
+            }
+          }
+        }
+        
+        console.warn('[person_detail] Элемент для фокусировки не найден:', focusData);
+      }
+      
+      // Обработчик события закрытия карточки фотографий
+      window.addEventListener('photoCardClosed', async function(event) {
+        if (event.detail.source_page === 'person_detail') {
+          console.log('[person_detail] Карточка фотографий закрыта, обновляем список персоны');
+          
+          // Сохраняем данные для позиционирования после обновления
+          const focusData = {
+            file_id: event.detail.file_id,
+            file_path: event.detail.file_path,
+            face_rectangle_id: event.detail.face_rectangle_id,
+            person_rectangle_id: event.detail.person_rectangle_id,
+            rectangle_id: event.detail.rectangle_id
+          };
+          
+          // Обновляем список
+          await loadPerson();
+          
+          // Обновляем счетчики после обновления данных
+          updateTabCounts();
+          
+          // Позиционируемся на нужный элемент после обновления
+          // Используем setTimeout для того, чтобы DOM успел обновиться
+          setTimeout(() => {
+            focusOnRectangle(focusData);
+          }, 100);
+        }
+      });
+      
+      // Инициализация обработчиков событий
+      document.getElementById('btnViewModeGeneral')?.addEventListener('click', () => setViewMode('general'));
+      document.getElementById('btnViewModeDetailed')?.addEventListener('click', () => setViewMode('detailed'));
+      document.getElementById('tabArchive')?.addEventListener('click', () => setMainTab('archive'));
+      document.getElementById('tabRun')?.addEventListener('click', () => setMainTab('run'));
+      document.getElementById('subArchiveFaces')?.addEventListener('click', () => setSubtab('faces'));
+      document.getElementById('subArchiveRectangles')?.addEventListener('click', () => setSubtab('rectangles'));
+      document.getElementById('subArchiveDirect')?.addEventListener('click', () => setSubtab('direct'));
+      document.getElementById('subRunFaces')?.addEventListener('click', () => setSubtab('faces'));
+      document.getElementById('subRunRectangles')?.addEventListener('click', () => setSubtab('rectangles'));
+      document.getElementById('subRunDirect')?.addEventListener('click', () => setSubtab('direct'));
+      
+      // Обработчик для переключателя фильтра
+      document.getElementById('manualFilterSelect')?.addEventListener('change', (e) => {
+        manualFilterMode = e.target.value;
+        renderFaces();
+      });
+      
+      // Инициализация при загрузке страницы
       loadPerson();
     </script>
     
     <!-- Подключение единой карточки фотографий -->
     {% include "photo_card.html" %}
-    <script src="/static/photo_card.js?v=47"></script>
+    <script src="/static/photo_card.js?v=48"></script>
   </body>
 </html>

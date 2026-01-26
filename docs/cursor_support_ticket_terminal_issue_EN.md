@@ -1,0 +1,141 @@
+# Cursor Support Ticket - Terminal Issue (English)
+
+**Topic:** https://forum.cursor.com/t/connection-error-serialize-binary/148894/3
+
+**Request ID:** `af8369f5-0104-4a3a-aa97-e456ced56ac5`
+
+---
+
+## Problem Description
+
+After the latest Cursor update, the integrated terminal in my project stopped executing **any** commands (PowerShell). Previously, clearing `%APPDATA%\Cursor\User\workspaceStorage\` helped temporarily, but now **it doesn't help** — terminals break immediately after the update/launch.
+
+In parallel, an **Internal Error** popup appears in the chat UI, and I see an error in the logs/stack:
+`[internal] serialize binary: invalid int 32: 3221226505`
+
+## Environment
+
+- **OS**: Windows 10 (10.0.22631)
+- **Shell**: PowerShell
+- **Workspace**: `C:\Projects\PhotoSorter` (git repo)
+- **Terminal**: integrated terminal in Cursor
+- **Request ID**: `af8369f5-0104-4a3a-aa97-e456ced56ac5`
+
+## Steps to Reproduce
+
+1. Launch Cursor
+2. Open workspace `C:\Projects\PhotoSorter`
+3. Open integrated terminal (PowerShell)
+4. Execute any simple command (e.g., `Get-Date` or any other)
+
+## Actual Result
+
+- Commands in terminal don't execute / terminal becomes unresponsive
+- **Internal Error** popup appears
+- Error in stack trace (see below)
+- Clearing `%APPDATA%\Cursor\User\workspaceStorage\` no longer restores functionality
+
+## Expected Result
+
+- Terminal executes commands stably
+- No Internal Error in Cursor chat when working with terminal/agent
+
+## Error Stack Trace
+
+**Request ID:** `af8369f5-0104-4a3a-aa97-e456ced56ac5`
+
+```
+[internal] serialize binary: invalid int 32: 3221226505
+LTe: [internal] serialize binary: invalid int 32: 3221226505
+    at kmf (vscode-file://vscode-app/c:/Program%20Files/cursor/resources/app/out/vs/workbench/workbench.desktop.main.js:9095:38337)
+    at Cmf (vscode-file://vscode-app/c:/Program%20Files/cursor/resources/app/out/vs/workbench/workbench.desktop.main.js:9095:37240)
+    at $mf (vscode-file://vscode-app/c:/Program%20Files/cursor/resources/app/out/vs/workbench/workbench.desktop.main.js:9096:4395)
+    at ova.run (vscode-file://vscode-app/c:/Program%20Files/cursor/resources/app/out/vs/workbench/workbench.desktop.main.js:9096:8170)
+    at async qyt.runAgentLoop (vscode-file://vscode-app/c:/Program%20Files/cursor/resources/app/out/vs/workbench/workbench.desktop.main.js:34190:57047)
+    at async Wpc.streamFromAgentBackend (vscode-file://vscode-app/c:/Program%20Files/cursor/resources/app/out/vs/workbench/workbench.desktop.main.js:34239:7695)
+    at async Wpc.getAgentStreamResponse (vscode-file://vscode-app/c:/Program%20Files/cursor/resources/app/out/vs/workbench/workbench.desktop.main.js:34239:8436)
+    at async FTe.submitChatMaybeAbortCurrent (vscode-file://vscode-app/c:/Program%20Files/cursor/resources/app/out/vs/workbench/workbench.desktop.main.js:9170:14575)
+    at async Oi (vscode-file://vscode-app/c:/Program%20Files/cursor/resources/app/out/vs/workbench/workbench.desktop.main.js:32991:3808)
+```
+
+## Stack Trace Analysis
+
+The error stack indicates a **problem in Cursor's JavaScript code** (not in the user's environment):
+
+1. **All calls originate from Cursor's compiled JS code:**
+   - `vscode-file://vscode-app/c:/Program%20Files/cursor/resources/app/out/vs/workbench/workbench.desktop.main.js`
+   - This is Cursor's frontend bundle (Electron/VSCode-based application)
+
+2. **Error in binary data serialization:**
+   - `serialize binary: invalid int 32: 3221226505`
+   - The value `3221226505` exceeds the maximum value for int32 (`2,147,483,647`)
+   - This indicates **overflow** or incorrect value during data serialization
+
+3. **Call context:**
+   - `qyt.runAgentLoop` → `Wpc.streamFromAgentBackend` → `FTe.submitChatMaybeAbortCurrent`
+   - Error occurs during agent/chat operation, likely when transferring data between frontend and backend
+
+**Conclusion:** This is a bug in Cursor's code — during binary data serialization (likely when exchanging data with agent/terminal), a value is passed that doesn't fit into int32. This could be:
+- Overflow during calculations
+- Incorrect handling of terminal data
+- Serialization bug introduced in the update
+
+## What I've Already Tried
+
+### Workarounds Attempted (All Failed):
+
+1. **Full cleanup** of `%APPDATA%\Cursor\User\workspaceStorage\` and Cursor restart — **didn't help** (previously helped temporarily)
+
+2. **Switching to Command Prompt** (as suggested in the forum thread) — **didn't help**, the issue persists with any terminal
+
+3. **Disabling Shell Integration:**
+   - Set `terminal.integrated.shellIntegration.enabled: false` — **didn't help**
+
+4. **Disabling Persistent Sessions:**
+   - Set `terminal.integrated.enablePersistentSessions: false` — **didn't help**
+
+5. **Disabling PowerShell Extension:**
+   - Disabled PowerShell Extension v2025.4.0 for workspace — **didn't help**
+
+6. **Using External Terminal:**
+   - Set `terminal.external.windowsExec: "powershell.exe"` — **didn't help**
+   - Note: Manual terminals (opened outside Cursor) work fine — the issue is specific to Cursor's integrated terminal/agent interaction
+
+7. **Reducing terminal buffer:**
+   - Set `terminal.integrated.scrollback: 1000` — **didn't help**
+
+8. **Setting Unicode version:**
+   - Set `terminal.integrated.unicodeVersion: "11"` — **didn't help**
+
+**Important observation:** The error occurs in **client-side JavaScript code** (serialization in `workbench.desktop.main.js`), but Cursor displays it as "An unexpected error occurred on our servers" — this suggests a bug in error handling/display, where client-side errors are incorrectly labeled as server errors.
+
+The problem appeared **immediately after the latest Cursor update**.
+
+## Additional Information
+
+The issue occurs with **any command** in the terminal, not just Python commands. Even simple PowerShell commands like `Get-Date` or `Get-Location` cause the terminal to break and trigger the Internal Error.
+
+The error value `3221226505` is different from the one mentioned in the forum thread (`4294967295`), but both exceed int32 limits, suggesting a similar underlying issue.
+
+## Request to Support
+
+1. Confirm if the issue with `serialize binary: invalid int 32: 3221226505` and integrated terminal failure after update is known
+
+2. Suggest which **additional logs** to collect and where to attach them (e.g., from `%APPDATA%\Cursor\logs\`) to help quickly identify the root cause
+
+3. Investigate why a **client-side serialization error** is displayed as "server error" — this may indicate a bug in error handling/display logic
+
+4. Since all workarounds failed, please provide:
+   - A fix in the next update, or
+   - Instructions for rolling back to the previous Cursor version, or
+   - Any other workarounds we haven't tried
+
+**Additional Request IDs from testing:**
+- `26165cfe-e36c-436c-a4e9-af6742e7caa6` (from testing with disabled PowerShell Extension)
+- `6fb18e00-4ac9-4250-8099-b7051b90f975` (from another test)
+
+I can provide screenshots of the **Internal Error** popup and any logs/dumps you specify.
+
+---
+
+**Note:** The problem appeared after the latest Cursor update. Previously, clearing workspaceStorage temporarily solved the issue, but now it doesn't help.

@@ -69,7 +69,8 @@ console.error = function(...args) {
     dragState: null, // Состояние drag&drop/resize: {rectIndex, anchorType, startX, startY, originalX, originalY, originalW, originalH}
     allPersons: [], // Список всех персон для модального окна
     editingRectangleIndex: null, // Индекс rectangle, для которого открыто модальное окно выбора персоны
-    drawingState: null // Состояние рисования: {startX, startY, currentX, currentY, tempRectElement}
+    drawingState: null, // Состояние рисования: {startX, startY, currentX, currentY, tempRectElement}
+    person_id: null // ID персоны при открытии с person_detail (для кнопки «Аватар»)
   };
 
   /**
@@ -103,7 +104,8 @@ console.error = function(...args) {
       dragState: null,
       allPersons: [],
       editingRectangleIndex: null,
-      drawingState: null
+      drawingState: null,
+      person_id: null
     };
 
     // Если передан list_context, берем file_id, file_path и pipeline_run_id из него
@@ -145,19 +147,23 @@ console.error = function(...args) {
     
     console.log('[photo_card] pipeline_run_id:', currentState.pipeline_run_id, 'mode:', currentState.mode);
 
-    // Определяем режим (archive/sorting)
-    if (currentState.file_path) {
+    // Определяем режим (archive/sorting): приоритет у list_context.tab при открытии с person_detail
+    if (currentState.list_context && (currentState.list_context.tab === 'archive' || currentState.list_context.tab === 'run')) {
+      currentState.mode = currentState.list_context.tab === 'archive' ? 'archive' : 'sorting';
+      currentState.person_id = currentState.list_context.person_id || null;
+    } else if (currentState.file_path) {
       currentState.mode = currentState.file_path.startsWith('disk:/Фото') ? 'archive' : 'sorting';
+      currentState.person_id = null;
     } else {
-      // Если только file_id, нужно запросить путь из БД (будет сделано при загрузке)
-      currentState.mode = 'sorting'; // По умолчанию
+      currentState.mode = 'sorting';
+      currentState.person_id = null;
     }
     
-    // Показываем навигацию (она всегда видна, но кнопки навигации показываются только при наличии list_context)
+    // Навигация всегда видна, чтобы layout не «съезжал». При list_context — prev/next/позиция;
+    // без list_context — плейсхолдер «—», prev/next скрыты, но блок резервирует место.
     const navigation = document.getElementById('photoCardNavigation');
     if (navigation) {
       navigation.style.display = 'flex';
-      // Показываем кнопки навигации только если есть list_context
       const prevBtn = document.getElementById('photoCardPrev');
       const nextBtn = document.getElementById('photoCardNext');
       const positionElement = document.getElementById('photoCardPosition');
@@ -169,7 +175,12 @@ console.error = function(...args) {
       } else {
         if (prevBtn) prevBtn.style.display = 'none';
         if (nextBtn) nextBtn.style.display = 'none';
-        if (positionElement) positionElement.style.display = 'none';
+        if (positionElement) {
+          positionElement.style.display = '';
+          positionElement.textContent = '—';
+        }
+        if (prevBtn) prevBtn.disabled = true;
+        if (nextBtn) nextBtn.disabled = true;
       }
     }
 
@@ -248,6 +259,26 @@ console.error = function(...args) {
       menus.forEach(el => el.remove());
     }
     
+    // Отправляем событие о закрытии карточки для синхронизации списка персоны
+    if (currentState.list_context?.source_page === 'person_detail') {
+      // Определяем текущий rectangle для позиционирования
+      const currentItem = currentState.list_context.items[currentState.list_context.current_index];
+      const currentRectangleId = currentItem?.face_rectangle_id || currentItem?.person_rectangle_id || null;
+      
+      const event = new CustomEvent('photoCardClosed', {
+        detail: {
+          source_page: 'person_detail',
+          file_id: currentState.file_id,
+          file_path: currentState.file_path,
+          face_rectangle_id: currentItem?.face_rectangle_id || null,
+          person_rectangle_id: currentItem?.person_rectangle_id || null,
+          rectangle_id: currentRectangleId // Для удобства - один из двух выше
+        }
+      });
+      window.dispatchEvent(event);
+      console.log('[photo_card] Отправлено событие photoCardClosed:', event.detail);
+    }
+    
     // Очищаем состояние
     currentState.selectedRectangleIndex = null;
     currentState.rectangles = [];
@@ -296,7 +327,8 @@ console.error = function(...args) {
       dragState: null,
       allPersons: [],
       editingRectangleIndex: null,
-      drawingState: null
+      drawingState: null,
+      person_id: null
     };
   }
   
@@ -1206,7 +1238,9 @@ console.error = function(...args) {
   }
 
   /**
-   * Создает компактное меню действий для rectangle
+   * Создает компактное меню действий для rectangle.
+   * Архив: Посторонний, Назначить/Изменить персону, тип привязки, режим редактирования, Аватар (если person_id), Удалить.
+   * Сортируется: Посторонний, Кот, Не лицо, Другой (выпадашка).
    */
   function createRectangleActionsMenu(rectIndex) {
     const rect = currentState.rectangles[rectIndex];
@@ -1216,42 +1250,36 @@ console.error = function(...args) {
     menu.className = 'rectpill-actions-menu';
     
     const hasPerson = rect.person_id !== null && rect.person_id !== undefined;
+    const isArchive = currentState.mode === 'archive';
     
-    // Кнопка "Посторонние" - отдельный пункт меню первого уровня (первым)
+    // Посторонний — всегда
     const outsiderBtn = document.createElement('button');
     outsiderBtn.textContent = 'Посторонний';
     outsiderBtn.addEventListener('click', async function(e) {
       e.stopPropagation();
       menu.classList.remove('open');
       
-      // Находим персону "Посторонний" по флагу is_ignored
       if (!currentState.allPersons || currentState.allPersons.length === 0) {
         await loadPersons();
       }
-      
       const outsiderPerson = currentState.allPersons.find(p => p.is_ignored === true);
       if (!outsiderPerson) {
         alert('Персона "Посторонний" не найдена');
         return;
       }
-      
-      // Назначаем персону
-      const rect = currentState.rectangles[rectIndex];
-      if (!rect || !rect.id) return;
-      
+      const r = currentState.rectangles[rectIndex];
+      if (!r || !r.id) return;
       try {
-        const oldPersonId = rect.person_id || null;
-        await updateRectangle(rect.id, null, outsiderPerson.id, 'manual_face');
-        
+        const oldPersonId = r.person_id || null;
+        await updateRectangle(r.id, null, outsiderPerson.id, 'manual_face');
         pushUndoAction({
           type: 'assign_person',
-          rectangle_id: rect.id,
+          rectangle_id: r.id,
           oldPersonId: oldPersonId,
           newPersonId: outsiderPerson.id,
-          oldAssignmentType: rect.assignment_type || null,
+          oldAssignmentType: r.assignment_type || null,
           newAssignmentType: 'manual_face'
         });
-        
         updateUndoButton();
         await loadRectangles();
         await checkDuplicates();
@@ -1262,16 +1290,45 @@ console.error = function(...args) {
     });
     menu.appendChild(outsiderBtn);
     
-    // Кнопка "Назначить персону" или "Изменить персону" - с выпадающим списком
+    // Сортируется: Кот (пометка файла)
+    if (!isArchive) {
+      const catBtn = document.createElement('button');
+      catBtn.textContent = 'Кот';
+      catBtn.addEventListener('click', async function(e) {
+        e.stopPropagation();
+        menu.classList.remove('open');
+        try {
+          const response = await fetch('/api/faces/file/mark-as-cat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              pipeline_run_id: currentState.pipeline_run_id,
+              file_id: currentState.file_id,
+              path: currentState.file_path
+            })
+          });
+          if (response.ok) await loadRectangles();
+          else {
+            const err = await response.json().catch(() => ({}));
+            alert('Ошибка: ' + (err.detail || response.statusText));
+          }
+        } catch (err) {
+          console.error('[photo_card] Error marking as cat:', err);
+          alert('Ошибка: ' + err.message);
+        }
+      });
+      menu.appendChild(catBtn);
+    }
+    
+    // Другой / Назначить персону — выпадашка
     const personContainer = document.createElement('div');
     personContainer.style.position = 'relative';
-    
     const personBtn = document.createElement('button');
-    personBtn.textContent = hasPerson ? 'Изменить персону' : 'Назначить персону';
+    personBtn.textContent = isArchive ? (hasPerson ? 'Изменить персону' : 'Назначить персону') : 'Другой';
     personBtn.style.display = 'flex';
     personBtn.style.justifyContent = 'space-between';
     personBtn.style.alignItems = 'center';
-    personBtn.innerHTML = `<span>${hasPerson ? 'Изменить персону' : 'Назначить персону'}</span><span style="margin-left: 8px;">▶</span>`;
+    personBtn.innerHTML = `<span>${personBtn.textContent}</span><span style="margin-left: 8px;">▶</span>`;
     personBtn.addEventListener('mouseenter', function(e) {
       e.stopPropagation();
       showPersonSubmenu(personContainer, rectIndex);
@@ -1279,41 +1336,27 @@ console.error = function(...args) {
     personContainer.appendChild(personBtn);
     menu.appendChild(personContainer);
     
-    if (hasPerson) {
-      
-      // Кнопка "Изменить тип привязки" - переключение между кластером и ручной привязкой
-      // Показываем только если персона назначена и есть assignment_type
-      if (rect.assignment_type) {
+    // Архив: тип привязки, режим редактирования, Аватар
+    if (isArchive) {
+      if (hasPerson && rect.assignment_type) {
         const changeTypeBtn = document.createElement('button');
-        changeTypeBtn.textContent = rect.assignment_type === 'cluster' 
-          ? 'Изменить на ручную привязку' 
+        changeTypeBtn.textContent = rect.assignment_type === 'cluster'
+          ? 'Изменить на ручную привязку'
           : 'Изменить на кластер';
         changeTypeBtn.addEventListener('click', async function(e) {
           e.stopPropagation();
           menu.classList.remove('open');
-          
           const newType = rect.assignment_type === 'cluster' ? 'manual_face' : 'cluster';
-          
           try {
-            // Сохраняем старое состояние для UNDO
-            const oldAssignmentType = rect.assignment_type;
-            const oldPersonId = rect.person_id;
-            
-            // Обновляем через API (передаем тот же person_id, но меняем assignment_type)
-            await updateRectangle(rect.id, null, rect.person_id, newType);
-            
-            // Сохраняем действие в стек UNDO
             pushUndoAction({
               type: 'change_assignment_type',
               rectangle_id: rect.id,
-              oldAssignmentType: oldAssignmentType,
+              oldAssignmentType: rect.assignment_type,
               newAssignmentType: newType,
               person_id: rect.person_id
             });
-            
+            await updateRectangle(rect.id, null, rect.person_id, newType);
             updateUndoButton();
-            
-            // Перезагружаем rectangles
             await loadRectangles();
           } catch (error) {
             console.error('[photo_card] Error changing assignment type:', error);
@@ -1322,21 +1365,46 @@ console.error = function(...args) {
         });
         menu.appendChild(changeTypeBtn);
       }
+      
+      const editModeBtn = document.createElement('button');
+      editModeBtn.textContent = currentState.isEditMode ? 'Выйти из режима редактирования' : 'Режим редактирования';
+      editModeBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        menu.classList.remove('open');
+        toggleEditMode();
+      });
+      menu.appendChild(editModeBtn);
+      
+      // Аватар — только для архива и при открытии с person_detail
+      if (currentState.person_id && rect.id) {
+        const avatarBtn = document.createElement('button');
+        avatarBtn.textContent = 'Аватар';
+        avatarBtn.addEventListener('click', async function(e) {
+          e.stopPropagation();
+          menu.classList.remove('open');
+          try {
+            const response = await fetch(`/api/persons/${currentState.person_id}/set-avatar`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ face_id: rect.id })
+            });
+            if (response.ok) await loadRectangles();
+            else {
+              const err = await response.json().catch(() => ({}));
+              alert('Ошибка: ' + (err.detail || response.statusText));
+            }
+          } catch (err) {
+            console.error('[photo_card] Error setting avatar:', err);
+            alert('Ошибка: ' + err.message);
+          }
+        });
+        menu.appendChild(avatarBtn);
+      }
     }
     
-    // Кнопка "Режим редактирования" / "Выйти из режима редактирования"
-    const editModeBtn = document.createElement('button');
-    editModeBtn.textContent = currentState.isEditMode ? 'Выйти из режима редактирования' : 'Режим редактирования';
-    editModeBtn.addEventListener('click', function(e) {
-      e.stopPropagation();
-      menu.classList.remove('open');
-      toggleEditMode();
-    });
-    menu.appendChild(editModeBtn);
-    
-    // Кнопка "Удалить rectangle"
+    // Удалить rectangle / Не лицо
     const deleteBtn = document.createElement('button');
-    deleteBtn.textContent = 'Удалить rectangle';
+    deleteBtn.textContent = isArchive ? 'Удалить rectangle' : 'Не лицо';
     deleteBtn.className = 'danger';
     deleteBtn.addEventListener('click', function(e) {
       e.stopPropagation();
@@ -1395,14 +1463,59 @@ console.error = function(...args) {
     submenu.style.borderRadius = '8px';
     submenu.style.boxShadow = '0 4px 12px rgba(0,0,0,0.15)';
     submenu.style.minWidth = '200px';
-    submenu.style.maxHeight = '400px';
+    const desiredMaxHeight = 400;
+    submenu.style.maxHeight = desiredMaxHeight + 'px';
     submenu.style.overflowY = 'auto';
     submenu.style.zIndex = '10001';
     submenu.style.padding = '4px 0';
     
+    // Получаем текущий прямоугольник для определения is_face
+    const rect = currentState.rectangles[rectIndex];
+    const currentIsFace = rect ? (rect.is_face === 1 || rect.is_face === true) : true;
+    
+    // Добавляем переключатель "лицо"/"без лица" в начало меню
+    const faceToggleContainer = document.createElement('div');
+    faceToggleContainer.style.padding = '8px 14px';
+    faceToggleContainer.style.borderBottom = '1px solid #e5e7eb';
+    faceToggleContainer.style.display = 'flex';
+    faceToggleContainer.style.alignItems = 'center';
+    faceToggleContainer.style.gap = '8px';
+    faceToggleContainer.style.background = '#f9fafb';
+    
+    const faceToggle = document.createElement('input');
+    faceToggle.type = 'checkbox';
+    faceToggle.checked = currentIsFace;
+    faceToggle.style.width = '16px';
+    faceToggle.style.height = '16px';
+    faceToggle.style.cursor = 'pointer';
+    
+    const faceToggleLabel = document.createElement('label');
+    faceToggleLabel.textContent = 'Лицо';
+    faceToggleLabel.style.fontSize = '12px';
+    faceToggleLabel.style.fontWeight = '600';
+    faceToggleLabel.style.color = '#6b7280';
+    faceToggleLabel.style.cursor = 'pointer';
+    faceToggleLabel.style.userSelect = 'none';
+    faceToggleLabel.style.flex = '1';
+    
+    faceToggleContainer.appendChild(faceToggle);
+    faceToggleContainer.appendChild(faceToggleLabel);
+    submenu.appendChild(faceToggleContainer);
+    
     // Добавляем персон по группам
-    const sortedGroups = Object.keys(personsByGroup).sort();
-    sortedGroups.forEach(groupName => {
+    // Важно: сортируем группы по group_order (как в справочнике), а не по алфавиту.
+    // Иначе группа "Я и Супруга" уезжает в самый низ и создаёт ощущение, что персон нет.
+    const groupEntries = Object.entries(personsByGroup)
+      .map(([groupName, persons]) => {
+        const order = (persons || []).reduce((minOrder, p) => {
+          const v = (p && p.group_order !== null && p.group_order !== undefined) ? Number(p.group_order) : 999;
+          return Math.min(minOrder, Number.isFinite(v) ? v : 999);
+        }, 999);
+        return { groupName, order, persons: persons || [] };
+      })
+      .sort((a, b) => (a.order - b.order) || a.groupName.localeCompare(b.groupName, 'ru', { sensitivity: 'base' }));
+
+    groupEntries.forEach(({ groupName, persons }) => {
       const groupLabel = document.createElement('div');
       groupLabel.className = 'menu-group-label';
       groupLabel.textContent = groupName;
@@ -1413,8 +1526,15 @@ console.error = function(...args) {
       groupLabel.style.textTransform = 'uppercase';
       groupLabel.style.letterSpacing = '0.5px';
       submenu.appendChild(groupLabel);
-      
-      personsByGroup[groupName].forEach(person => {
+
+      // Сортируем персон внутри группы по имени
+      const personsSorted = [...persons].sort((p1, p2) => {
+        const a = (p1?.name || '');
+        const b = (p2?.name || '');
+        return a.localeCompare(b, 'ru', { sensitivity: 'base' });
+      });
+
+      personsSorted.forEach(person => {
         const personBtn = document.createElement('button');
         personBtn.textContent = person.name + (person.is_me ? ' (я)' : '');
         personBtn.style.display = 'block';
@@ -1441,7 +1561,12 @@ console.error = function(...args) {
           
           try {
             const oldPersonId = rect.person_id || null;
-            await updateRectangle(rect.id, null, person.id, 'manual_face');
+            // Берем значение is_face из переключателя (пользователь может изменить тип)
+            const isFace = faceToggle.checked;
+            // #region agent log
+            fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:1566',message:'showPersonSubmenu person clicked in group',data:{rectangleId:rect.id,personId:person.id,isFace,isFaceType:typeof isFace,faceToggleChecked:faceToggle.checked},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
+            // #endregion
+            await updateRectangle(rect.id, null, person.id, 'manual_face', isFace);
             
             pushUndoAction({
               type: 'assign_person',
@@ -1472,15 +1597,21 @@ console.error = function(...args) {
     
     // Добавляем персон без группы
     if (noGroupPersons.length > 0) {
-      if (sortedGroups.length > 0) {
+      if (groupEntries.length > 0) {
         const separator = document.createElement('div');
         separator.style.height = '1px';
         separator.style.background = '#e5e7eb';
         separator.style.margin = '4px 0';
         submenu.appendChild(separator);
       }
-      
-      noGroupPersons.forEach(person => {
+
+      const noGroupPersonsSorted = [...noGroupPersons].sort((p1, p2) => {
+        const a = (p1?.name || '');
+        const b = (p2?.name || '');
+        return a.localeCompare(b, 'ru', { sensitivity: 'base' });
+      });
+
+      noGroupPersonsSorted.forEach(person => {
         const personBtn = document.createElement('button');
         personBtn.textContent = person.name + (person.is_me ? ' (я)' : '');
         personBtn.style.display = 'block';
@@ -1507,7 +1638,12 @@ console.error = function(...args) {
           
           try {
             const oldPersonId = rect.person_id || null;
-            await updateRectangle(rect.id, null, person.id, 'manual_face');
+            // Берем значение is_face из переключателя (пользователь может изменить тип)
+            const isFace = faceToggle.checked;
+            // #region agent log
+            fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:1640',message:'showPersonSubmenu person clicked no group',data:{rectangleId:rect.id,personId:person.id,isFace,isFaceType:typeof isFace,faceToggleChecked:faceToggle.checked},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
+            // #endregion
+            await updateRectangle(rect.id, null, person.id, 'manual_face', isFace);
             
             pushUndoAction({
               type: 'assign_person',
@@ -1537,6 +1673,32 @@ console.error = function(...args) {
     }
     
     container.appendChild(submenu);
+
+    // Авто-позиционирование: если снизу мало места — раскрываем вверх.
+    // (Пользовательский UX: пункт "Другой" должен открываться вверх, когда меню у нижней границы.)
+    try {
+      const containerRect = container.getBoundingClientRect();
+      const viewportH = window.innerHeight || document.documentElement.clientHeight || 0;
+      const margin = 8;
+      const spaceDown = Math.max(0, viewportH - containerRect.top - margin);
+      const spaceUp = Math.max(0, containerRect.bottom - margin);
+
+      const minReasonable = 180; // если снизу меньше — лучше открывать вверх (если там больше)
+      const openUp = spaceDown < minReasonable && spaceUp > spaceDown;
+
+      const clampHeight = (h) => Math.max(140, Math.min(desiredMaxHeight, h));
+      if (openUp) {
+        submenu.style.top = 'auto';
+        submenu.style.bottom = '0';
+        submenu.style.maxHeight = clampHeight(spaceUp) + 'px';
+      } else {
+        submenu.style.bottom = 'auto';
+        submenu.style.top = '0';
+        submenu.style.maxHeight = clampHeight(spaceDown) + 'px';
+      }
+    } catch (e) {
+      // ignore
+    }
     
     // Закрываем подменю при клике вне его
     const closeSubmenu = function(e) {
@@ -1626,21 +1788,122 @@ console.error = function(...args) {
     menu.classList.add('open');
     menu.dataset.rectIndex = rectIndex;
     
-    // Позиционируем меню рядом с местом клика
+    // Позиционируем меню рядом с прямоугольником
     const imgWrap = document.getElementById('photoCardImgWrap');
-    if (imgWrap) {
-      imgWrap.style.position = 'relative';
-      const rectBounds = event.target.getBoundingClientRect();
-      const wrapRect = imgWrap.getBoundingClientRect();
-      menu.style.position = 'absolute';
-      menu.style.left = `${rectBounds.left - wrapRect.left}px`;
-      menu.style.top = `${rectBounds.top - wrapRect.top - menu.offsetHeight - 4}px`; // Вверх от rectangle
-      imgWrap.appendChild(menu);
+    if (!imgWrap) return;
+    
+    // Находим элемент прямоугольника по rectIndex (используем dataset, а не event.target)
+    const rectElement = imgWrap.querySelector(`.photo-card-rectangle[data-rect-index="${rectIndex}"]`);
+    if (!rectElement) {
+      console.warn('[photo_card] Rectangle element not found for index:', rectIndex);
+      return;
     }
+    
+    imgWrap.style.position = 'relative';
+    
+    // Получаем координаты самого прямоугольника (не event.target, который может быть label)
+    const rectBounds = rectElement.getBoundingClientRect();
+    const wrapRect = imgWrap.getBoundingClientRect();
+    
+    // Добавляем меню в DOM для получения его размеров
+    menu.style.visibility = 'hidden';
+    menu.style.position = 'absolute';
+    imgWrap.appendChild(menu);
+    
+    // Получаем размеры меню
+    const menuWidth = menu.offsetWidth;
+    const menuHeight = menu.offsetHeight;
+    
+    // Получаем размеры viewport (экрана)
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    
+    // Вычисляем позицию относительно imgWrap
+    // Пытаемся показать меню сверху от прямоугольника (по умолчанию)
+    let left = rectBounds.left - wrapRect.left;
+    let top = rectBounds.top - wrapRect.top - menuHeight - 4; // Вверх от rectangle
+    
+    // Проверяем границы viewport (экрана) - левый край
+    if (rectBounds.left < 0) {
+      // Прямоугольник частично за левым краем экрана - корректируем позицию меню
+      left = Math.max(0, left + rectBounds.left);
+    }
+    
+    // Проверяем границы viewport (экрана) - правый край
+    if (rectBounds.right + menuWidth > viewportWidth) {
+      // Меню выходит за правый край экрана - сдвигаем влево
+      const overflow = (rectBounds.right + menuWidth) - viewportWidth;
+      left = Math.max(0, left - overflow);
+    }
+    
+    // Проверяем границы контейнера - левый край
+    if (left < 0) {
+      left = 0;
+    }
+    
+    // Проверяем границы контейнера - правый край
+    const wrapWidth = wrapRect.width;
+    if (left + menuWidth > wrapWidth) {
+      left = Math.max(0, wrapWidth - menuWidth);
+    }
+    
+    // Проверяем границы viewport (экрана) - верхний край
+    if (rectBounds.top - menuHeight - 4 < 0) {
+      // Меню выходит за верхний край экрана - показываем снизу от rectangle
+      top = rectBounds.bottom - wrapRect.top + 4;
+    }
+    
+    // Проверяем границы viewport (экрана) - нижний край
+    if (rectBounds.bottom + menuHeight + 4 > viewportHeight) {
+      // Меню выходит за нижний край экрана - показываем сверху от rectangle
+      top = rectBounds.top - wrapRect.top - menuHeight - 4;
+    }
+    
+    // Проверяем границы контейнера - верхний край
+    if (top < 0) {
+      // Меню выходит за верхний край контейнера - показываем снизу от rectangle
+      top = rectBounds.bottom - wrapRect.top + 4;
+    }
+    
+    // Проверяем границы контейнера - нижний край
+    const wrapHeight = wrapRect.height;
+    if (top + menuHeight > wrapHeight) {
+      // Меню выходит за нижний край контейнера - показываем сверху от rectangle
+      top = rectBounds.top - wrapRect.top - menuHeight - 4;
+      // Если все еще выходит (слишком высокое меню), позиционируем по верхнему краю контейнера
+      if (top < 0) {
+        top = 0;
+      }
+    }
+    
+    // Финальная проверка границ viewport после всех корректировок
+    const finalViewportLeft = wrapRect.left + left;
+    const finalViewportRight = finalViewportLeft + menuWidth;
+    const finalViewportTop = wrapRect.top + top;
+    const finalViewportBottom = finalViewportTop + menuHeight;
+    
+    // Корректируем, если меню все еще выходит за границы viewport
+    if (finalViewportLeft < 0) {
+      left = left - finalViewportLeft; // Сдвигаем вправо
+    }
+    if (finalViewportRight > viewportWidth) {
+      left = left - (finalViewportRight - viewportWidth); // Сдвигаем влево
+    }
+    if (finalViewportTop < 0) {
+      top = top - finalViewportTop; // Сдвигаем вниз
+    }
+    if (finalViewportBottom > viewportHeight) {
+      top = top - (finalViewportBottom - viewportHeight); // Сдвигаем вверх
+    }
+    
+    // Устанавливаем финальную позицию
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+    menu.style.visibility = 'visible';
     
     // Закрываем меню при клике вне его
     const closeMenu = (e) => {
-      if (!menu.contains(e.target) && !event.target.contains(e.target)) {
+      if (!menu.contains(e.target) && !rectElement.contains(e.target)) {
         menu.remove();
         document.removeEventListener('click', closeMenu);
       }
@@ -2189,7 +2452,10 @@ console.error = function(...args) {
   /**
    * Обновляет rectangle через API
    */
-  async function updateRectangle(faceRectangleId, bbox, personId, assignmentType) {
+  async function updateRectangle(faceRectangleId, bbox, personId, assignmentType, isFace) {
+    // #region agent log
+    fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:2397',message:'updateRectangle entry',data:{faceRectangleId,personId,assignmentType,isFace,isFaceType:typeof isFace},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
+    // #endregion
     // Преобразуем rectangle_id в число, если это возможно
     const rectangleIdInt = faceRectangleId !== null && faceRectangleId !== undefined 
       ? parseInt(faceRectangleId, 10) 
@@ -2231,6 +2497,14 @@ console.error = function(...args) {
     
     if (assignmentType) {
       payload.assignment_type = assignmentType;
+    }
+    
+    // Передаем is_face, если указан (0 = без лица, 1 = лицо)
+    if (isFace !== undefined && isFace !== null) {
+      payload.is_face = isFace ? 1 : 0;
+      // #region agent log
+      fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:2443',message:'updateRectangle payload is_face',data:{faceRectangleId,personId,isFace,payloadIsFace:payload.is_face,payload:JSON.stringify(payload)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
+      // #endregion
     }
     
     const response = await fetch('/api/faces/rectangle/update', {
@@ -2371,6 +2645,9 @@ console.error = function(...args) {
   async function showPersonDialog(rectIndex) {
     currentState.editingRectangleIndex = rectIndex;
     
+    const rect = currentState.rectangles[rectIndex];
+    if (!rect) return;
+    
     // Загружаем список персон
     await loadPersons();
     
@@ -2390,6 +2667,13 @@ console.error = function(...args) {
     const input = document.getElementById('photoCardInputNewPersonName');
     if (input) {
       input.value = '';
+    }
+    
+    // Устанавливаем значение is_face на основе текущего прямоугольника
+    const isFaceCheckbox = document.getElementById('photoCardIsFace');
+    if (isFaceCheckbox) {
+      // Если у прямоугольника есть is_face, используем его, иначе по умолчанию "лицо"
+      isFaceCheckbox.checked = (rect.is_face === 1 || rect.is_face === true);
     }
     
     // Показываем модальное окно
@@ -2462,12 +2746,16 @@ console.error = function(...args) {
       return;
     }
     
+    // Получаем значение is_face из чекбокса
+    const isFaceCheckbox = document.getElementById('photoCardIsFace');
+    const isFace = isFaceCheckbox ? isFaceCheckbox.checked : true; // По умолчанию "лицо"
+    
     // Сохраняем старое состояние для UNDO
     const oldPersonId = rect.person_id || null;
     
     // Назначаем персону через API
     try {
-      await updateRectangle(rect.id, null, personId, 'manual_face');
+      await updateRectangle(rect.id, null, personId, 'manual_face', isFace);
       
       // Сохраняем действие в стек UNDO
       pushUndoAction({
@@ -3241,6 +3529,9 @@ console.error = function(...args) {
    * Показывает диалог выбора персоны для нового rectangle (лицо)
    */
   async function showPersonDialogForNewRectangle(bbox, isFace) {
+    // #region agent log
+    fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:3467',message:'showPersonDialogForNewRectangle entry',data:{isFace,isFaceType:typeof isFace,bbox},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    // #endregion
     // Загружаем список персон, если еще не загружен
     if (!currentState.allPersons || currentState.allPersons.length === 0) {
       await loadPersons();
@@ -3290,7 +3581,12 @@ console.error = function(...args) {
     
     const faceToggle = document.createElement('input');
     faceToggle.type = 'checkbox';
-    faceToggle.checked = isFace; // По умолчанию "лицо"
+    // Явно преобразуем isFace в boolean для правильной инициализации
+    const initialChecked = (isFace === true || isFace === 1);
+    faceToggle.checked = initialChecked;
+    // #region agent log
+    fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:3503',message:'faceToggle initialized',data:{isFace,initialChecked,faceToggleChecked:faceToggle.checked},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+    // #endregion
     faceToggle.style.width = '18px';
     faceToggle.style.height = '18px';
     faceToggle.style.cursor = 'pointer';
@@ -3329,8 +3625,17 @@ console.error = function(...args) {
     });
     
     // Добавляем группы
-    const sortedGroups = Object.keys(personsByGroup).sort();
-    sortedGroups.forEach(groupName => {
+    const groupEntries = Object.entries(personsByGroup)
+      .map(([groupName, persons]) => {
+        const order = (persons || []).reduce((minOrder, p) => {
+          const v = (p && p.group_order !== null && p.group_order !== undefined) ? Number(p.group_order) : 999;
+          return Math.min(minOrder, Number.isFinite(v) ? v : 999);
+        }, 999);
+        return { groupName, order, persons: persons || [] };
+      })
+      .sort((a, b) => (a.order - b.order) || a.groupName.localeCompare(b.groupName, 'ru', { sensitivity: 'base' }));
+
+    groupEntries.forEach(({ groupName, persons }) => {
       const groupLabel = document.createElement('div');
       groupLabel.textContent = groupName;
       groupLabel.style.fontWeight = '600';
@@ -3341,7 +3646,13 @@ console.error = function(...args) {
       groupLabel.style.textTransform = 'uppercase';
       personsList.appendChild(groupLabel);
       
-      personsByGroup[groupName].forEach(person => {
+      const personsSorted = [...persons].sort((p1, p2) => {
+        const a = (p1?.name || '');
+        const b = (p2?.name || '');
+        return a.localeCompare(b, 'ru', { sensitivity: 'base' });
+      });
+
+      personsSorted.forEach(person => {
         const personBtn = document.createElement('button');
         personBtn.textContent = person.name;
         personBtn.style.width = '100%';
@@ -3365,6 +3676,9 @@ console.error = function(...args) {
         personBtn.addEventListener('click', () => {
           modal.remove();
           const isFaceValue = faceToggle.checked;
+          // #region agent log
+          fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:3577',message:'person clicked in group',data:{personId:person.id,isFaceValue,isFaceValueType:typeof isFaceValue,faceToggleChecked:faceToggle.checked},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+          // #endregion
           createRectangle(bbox, person.id, isFaceValue);
         });
         
@@ -3373,7 +3687,13 @@ console.error = function(...args) {
     });
     
     // Добавляем персон без группы
-    noGroupPersons.forEach(person => {
+    const noGroupPersonsSorted = [...noGroupPersons].sort((p1, p2) => {
+      const a = (p1?.name || '');
+      const b = (p2?.name || '');
+      return a.localeCompare(b, 'ru', { sensitivity: 'base' });
+    });
+
+    noGroupPersonsSorted.forEach(person => {
       const personBtn = document.createElement('button');
       personBtn.textContent = person.name;
       personBtn.style.width = '100%';
@@ -3397,6 +3717,9 @@ console.error = function(...args) {
       personBtn.addEventListener('click', () => {
         modal.remove();
         const isFaceValue = faceToggle.checked;
+        // #region agent log
+        fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:3609',message:'person clicked no group',data:{personId:person.id,isFaceValue,isFaceValueType:typeof isFaceValue,faceToggleChecked:faceToggle.checked},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+        // #endregion
         createRectangle(bbox, person.id, isFaceValue);
       });
       
@@ -3471,6 +3794,9 @@ console.error = function(...args) {
    * Создает новый rectangle через API
    */
   async function createRectangle(bbox, personId, isFace) {
+    // #region agent log
+    fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:3719',message:'createRectangle entry',data:{personId,isFace,isFaceType:typeof isFace,bbox},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    // #endregion
     try {
       // Формируем payload в зависимости от режима
       const payload = {
@@ -3508,6 +3834,13 @@ console.error = function(...args) {
         payload.assignment_type = 'manual_face';
       }
       
+      // Передаем is_face (0 = без лица, 1 = лицо)
+      // Важно: явно преобразуем в число, чтобы избежать проблем с undefined/null
+      const isFaceValue = (isFace === true || isFace === 1) ? 1 : 0;
+      payload.is_face = isFaceValue;
+      // #region agent log
+      fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:3754',message:'createRectangle payload',data:{personId,isFace,isFaceValue,payloadIsFace:payload.is_face,payload:JSON.stringify(payload)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+      // #endregion
       const response = await fetch('/api/faces/rectangle/create', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3602,8 +3935,17 @@ console.error = function(...args) {
     });
     
     // Добавляем группы
-    const sortedGroups = Object.keys(personsByGroup).sort();
-    sortedGroups.forEach(groupName => {
+    const groupEntries = Object.entries(personsByGroup)
+      .map(([groupName, persons]) => {
+        const order = (persons || []).reduce((minOrder, p) => {
+          const v = (p && p.group_order !== null && p.group_order !== undefined) ? Number(p.group_order) : 999;
+          return Math.min(minOrder, Number.isFinite(v) ? v : 999);
+        }, 999);
+        return { groupName, order, persons: persons || [] };
+      })
+      .sort((a, b) => (a.order - b.order) || a.groupName.localeCompare(b.groupName, 'ru', { sensitivity: 'base' }));
+
+    groupEntries.forEach(({ groupName, persons }) => {
       const groupLabel = document.createElement('div');
       groupLabel.textContent = groupName;
       groupLabel.style.fontWeight = '600';
@@ -3614,7 +3956,13 @@ console.error = function(...args) {
       groupLabel.style.textTransform = 'uppercase';
       personsList.appendChild(groupLabel);
       
-      personsByGroup[groupName].forEach(person => {
+      const personsSorted = [...persons].sort((p1, p2) => {
+        const a = (p1?.name || '');
+        const b = (p2?.name || '');
+        return a.localeCompare(b, 'ru', { sensitivity: 'base' });
+      });
+
+      personsSorted.forEach(person => {
         const personBtn = document.createElement('button');
         personBtn.textContent = person.name;
         personBtn.style.width = '100%';
@@ -3645,7 +3993,13 @@ console.error = function(...args) {
     });
     
     // Добавляем персон без группы
-    noGroupPersons.forEach(person => {
+    const noGroupPersonsSorted = [...noGroupPersons].sort((p1, p2) => {
+      const a = (p1?.name || '');
+      const b = (p2?.name || '');
+      return a.localeCompare(b, 'ru', { sensitivity: 'base' });
+    });
+
+    noGroupPersonsSorted.forEach(person => {
       const personBtn = document.createElement('button');
       personBtn.textContent = person.name;
       personBtn.style.width = '100%';

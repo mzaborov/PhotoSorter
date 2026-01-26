@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.ico" />
+    <meta name="referrer" content="no-referrer" />
+    <title>PhotoSorter — Debug Photo Card</title>
+    <style>
+      :root { color-scheme: light; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      a { color: #0b57d0; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+      .wrap { max-width: 1200px; }
+      .card { background:#fff; border:1px solid #e5e7eb; border-radius:12px; padding:16px; }
+      .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+      .btn { appearance:none; border:1px solid #d1d5db; background:#fff; padding:8px 12px; border-radius:10px; cursor:pointer; font-weight:700; }
+      .btn.primary { background:#111827; color:#fff; border-color:#111827; }
+      .muted { color:#6b7280; }
+      input { width: 100%; max-width: 820px; border:1px solid #d1d5db; border-radius:10px; padding:8px 10px; font-size:14px; }
+      .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#f3f4f6; color:#374151; font-size:12px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h2 style="margin:0 0 12px 0;">Debug: открыть карточку фото</h2>
+      <div class="card">
+        <div class="row" style="margin-bottom:12px;">
+          <div class="pill">path: <code>{{ path or "—" }}</code></div>
+          <div class="pill">file_id: <code>{{ file_id if file_id is not none else "—" }}</code></div>
+          <div class="pill">pipeline_run_id: <code>{{ pipeline_run_id if pipeline_run_id is not none else "—" }}</code></div>
+        </div>
+
+        {% if inferred %}
+          <div class="muted" style="margin-bottom:12px;">
+            pipeline_run_id выведен автоматически: <code>{{ inferred.pipeline_run_id }}</code>
+            (face_run_id: <code>{{ inferred.face_run_id }}</code>)
+          </div>
+        {% endif %}
+
+        <div class="muted" style="margin-bottom:12px;">
+          Подсказка: для корректной работы в режиме sorting лучше передавать <code>pipeline_run_id</code>.
+        </div>
+
+        <div class="row" style="margin-bottom:10px;">
+          <form id="debugPhotoCardForm" method="get" action="/debug/photo-card" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; width:100%;">
+            <input id="debugPath" name="path" placeholder="path (например: local:C:\tmp\Photo\_faces\IMG.jpg)" value="{{ path or '' }}" />
+            <input id="debugPipelineRunId" name="pipeline_run_id" placeholder="pipeline_run_id (опционально)" value="{{ pipeline_run_id if pipeline_run_id is not none else '' }}" style="max-width:220px;" />
+            <input id="debugFileId" name="file_id" placeholder="file_id (опционально)" value="{{ file_id if file_id is not none else '' }}" style="max-width:160px;" />
+            <input type="hidden" name="auto_open" value="true" />
+            <button class="btn primary" type="submit">Открыть</button>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- Подключение единой карточки фотографий -->
+    {% include "photo_card.html" %}
+    <script src="/static/photo_card.js?v=49"></script>
+    <script>
+      (function() {
+        // Не отправляем пустые поля как query-параметры (FastAPI ругается на file_id=).
+        const form = document.getElementById('debugPhotoCardForm');
+        if (form) {
+          form.addEventListener('submit', function() {
+            const fileIdEl = document.getElementById('debugFileId');
+            const prEl = document.getElementById('debugPipelineRunId');
+            if (fileIdEl && String(fileIdEl.value || '').trim() === '') fileIdEl.disabled = true;
+            if (prEl && String(prEl.value || '').trim() === '') prEl.disabled = true;
+          });
+        }
+
+        const autoOpen = {{ 'true' if auto_open else 'false' }};
+        const filePath = {{ (path or '') | tojson }};
+        const fileId = {{ (file_id if file_id is not none else 'null') }};
+        const pipelineRunId = {{ (pipeline_run_id if pipeline_run_id is not none else 'null') }};
+
+        if (!autoOpen) return;
+        // Открываем карточку после загрузки скрипта.
+        // Передаём single-item list_context, чтобы показывались навигация (1 из 1) и кнопки,
+        // layout не «съезжал» из-за скрытых элементов.
+        window.addEventListener('load', function() {
+          if (!window.openPhotoCard) return;
+          const fid = (fileId !== null && !Number.isNaN(Number(fileId))) ? Number(fileId) : null;
+          const path = (typeof filePath === 'string' && filePath) ? filePath : null;
+          const prId = (pipelineRunId !== null && !Number.isNaN(Number(pipelineRunId))) ? Number(pipelineRunId) : null;
+          const listContext = (path || fid != null) ? {
+            source_page: 'debug',
+            items: [{ file_id: fid, file_path: path, face_rectangle_id: null, person_rectangle_id: null, pipeline_run_id: prId }],
+            current_index: 0,
+            total_count: 1
+          } : null;
+          window.openPhotoCard({
+            file_id: fid,
+            file_path: path,
+            pipeline_run_id: prId,
+            list_context: listContext,
+            highlight_rectangle: null
+          });
+        });
+      })();
+    </script>
+  </body>
+</html>
+

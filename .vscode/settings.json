@@ -2,14 +2,29 @@
   // Отключение Shell Integration для решения проблемы с терминалом при выполнении Python команд
   // Проблема: выполнение Python команд вызывает Connection Error и ломает чаты Cursor
   // Решение: отключение Shell Integration предотвращает конфликт с выводом Python
+  // WORKAROUND: отключено для обхода ошибки serialize binary: invalid int 32 после обновления Cursor
   "terminal.integrated.shellIntegration.enabled": false,
   
   // Настройки терминала для Windows
   "terminal.integrated.defaultProfile.windows": "PowerShell",
   
-  // Отключение автоматического определения команд в терминале
+  // Отключение persistent sessions для обхода ошибки сериализации
+  // WORKAROUND: отключено для обхода ошибки serialize binary: invalid int 32 после обновления Cursor
   "terminal.integrated.enablePersistentSessions": false,
   
-  // Настройки буферизации терминала
-  "terminal.integrated.scrollback": 10000
+  // WORKAROUND: Использование внешнего терминала вместо integrated для обхода ошибки сериализации
+  // ШАГ 2: Проверка с внешним терминалом (после того как отключение PowerShell Extension не помогло)
+  // Настройка внешнего терминала PowerShell (гарантированно установлен в Windows)
+  "terminal.external.windowsExec": "powershell.exe",
+  
+  // Дополнительные настройки для уменьшения проблем с сериализацией
+  "terminal.integrated.scrollback": 1000,
+  "terminal.integrated.unicodeVersion": "11",
+  
+  // WORKAROUND: Отключение PowerShell Extension для обхода ошибки сериализации
+  // PowerShell Extension может конфликтовать с сериализацией терминала в новой версии Cursor
+  "extensions.ignoreRecommendations": true,
+  // Отключение расширения PowerShell для этого workspace
+  // ВАЖНО: Отключите расширение вручную через UI: Extensions -> PowerShell -> Disable (Workspace)
+  // Или через Command Palette: "Extensions: Disable (Workspace)" для "PowerShell"
 }
