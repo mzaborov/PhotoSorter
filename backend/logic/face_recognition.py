@@ -193,18 +193,18 @@ def cluster_face_embeddings(
     # (для исключения из повторной кластеризации)
     if archive_scope == 'archive':
         cur.execute("""
-            SELECT DISTINCT fcm.rectangle_id
-            FROM face_cluster_members fcm
-            INNER JOIN face_clusters fc ON fcm.cluster_id = fc.id
+            SELECT DISTINCT fr.id
+            FROM photo_rectangles fr
+            INNER JOIN face_clusters fc ON fr.cluster_id = fc.id
             WHERE fc.archive_scope = 'archive'
         """)
     else:
         # Для run_id проверяем ВСЕ существующие кластеры (не только для этого run_id)
         # чтобы можно было добавлять новые лица в существующие кластеры
         cur.execute("""
-            SELECT DISTINCT fcm.rectangle_id
-            FROM face_cluster_members fcm
-            INNER JOIN face_clusters fc ON fcm.cluster_id = fc.id
+            SELECT DISTINCT fr.id
+            FROM photo_rectangles fr
+            INNER JOIN face_clusters fc ON fr.cluster_id = fc.id
         """)
     
     clustered_face_ids = {row['rectangle_id'] for row in cur.fetchall()}
@@ -310,9 +310,9 @@ def cluster_face_embeddings(
     # (чтобы избежать дубликатов при повторном запуске, но сохранить кластеры из других run_id)
     if run_id is not None and archive_scope != 'archive':
         # Удаляем старые кластеры для этого run_id
-        # Сначала удаляем связи (face_cluster_members), затем сами кластеры
+        # Сначала обнуляем cluster_id у прямоугольников (ранее face_cluster_members)
         cur.execute("""
-            DELETE FROM face_cluster_members
+            UPDATE photo_rectangles SET cluster_id = NULL
             WHERE cluster_id IN (
                 SELECT id FROM face_clusters WHERE run_id = ?
             )
@@ -382,8 +382,7 @@ def _try_add_to_existing_clusters(
             fr.id AS rectangle_id,
             fr.embedding
         FROM face_clusters fc
-        JOIN face_cluster_members fcm ON fcm.cluster_id = fc.id
-        JOIN photo_rectangles fr ON fr.id = fcm.rectangle_id
+        JOIN photo_rectangles fr ON fr.cluster_id = fc.id
         WHERE fr.embedding IS NOT NULL
           AND COALESCE(fr.ignore_flag, 0) = 0
         ORDER BY fc.id
@@ -495,15 +494,14 @@ def _try_add_to_existing_clusters(
     # НЕ создаем face_labels - если кластер привязан к персоне, 
     # то все лица в кластере автоматически относятся к персоне через JOIN
     # (согласно архитектуре: face_labels только для ручных привязок,
-    # кластер определяется через face_cluster_members)
+    # кластер определяется через photo_rectangles.cluster_id)
     added_count = 0
     
     for face_id, cluster_id in faces_to_add:
         try:
-            # Добавляем лицо в кластер
+            # Добавляем лицо в кластер (photo_rectangles.cluster_id)
             cur.execute("""
-                INSERT OR IGNORE INTO face_cluster_members (cluster_id, rectangle_id)
-                VALUES (?, ?)
+                UPDATE photo_rectangles SET cluster_id = ? WHERE id = ?
             """, (cluster_id, face_id))
             
             if cur.rowcount > 0:
@@ -577,14 +575,12 @@ def _save_clusters_to_db(
         if first_cluster_id is None:
             first_cluster_id = cluster_id
         
-        # Сохраняем связи лиц с этим кластером
-        # Для больших кластеров коммитим периодически
-        batch_size = 100  # Коммитим после каждых 100 лиц в кластере
+        # Сохраняем связи лиц с этим кластером (photo_rectangles.cluster_id)
+        batch_size = 100
         for i, face_id in enumerate(face_ids):
             cur.execute(
                 """
-                INSERT INTO face_cluster_members (cluster_id, rectangle_id)
-                VALUES (?, ?)
+                UPDATE photo_rectangles SET cluster_id = ? WHERE id = ?
                 """,
                 (cluster_id, face_id),
             )
@@ -658,8 +654,7 @@ def get_cluster_info(*, cluster_id: int, limit: int | None = None) -> dict[str, 
             fr.thumb_jpeg, fr.confidence,
             (fr.bbox_w * fr.bbox_h) as bbox_area
         FROM face_clusters fc
-        JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
-        JOIN photo_rectangles fr ON fcm.rectangle_id = fr.id
+        JOIN photo_rectangles fr ON fr.cluster_id = fc.id
         LEFT JOIN files f ON f.id = fr.file_id
         WHERE fc.id = ? AND COALESCE(fr.ignore_flag, 0) = 0
         ORDER BY 
@@ -731,9 +726,8 @@ def get_cluster_info(*, cluster_id: int, limit: int | None = None) -> dict[str, 
     cur.execute(
         """
         SELECT COUNT(*) as count
-        FROM face_cluster_members fcm
-        JOIN photo_rectangles fr ON fcm.rectangle_id = fr.id
-        WHERE fcm.cluster_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+        FROM photo_rectangles fr
+        WHERE fr.cluster_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
         """,
         (cluster_id,),
     )
@@ -838,8 +832,7 @@ def find_closest_cluster_for_face(*, rectangle_id: int, exclude_cluster_id: int 
             fc.id as cluster_id,
             fr.embedding
         FROM face_clusters fc
-        JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
-        JOIN photo_rectangles fr ON fcm.rectangle_id = fr.id
+        JOIN photo_rectangles fr ON fr.cluster_id = fc.id
         WHERE fr.embedding IS NOT NULL
           AND COALESCE(fr.ignore_flag, 0) = 0
           {exclude_clause}
@@ -970,8 +963,7 @@ def find_closest_cluster_with_person_for_face(
             p.name as person_name,
             fr.embedding
         FROM face_clusters fc
-        JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
-        JOIN photo_rectangles fr ON fcm.rectangle_id = fr.id
+        JOIN photo_rectangles fr ON fr.cluster_id = fc.id
         LEFT JOIN persons p ON fc.person_id = p.id
         WHERE fr.embedding IS NOT NULL
           AND COALESCE(fr.ignore_flag, 0) = 0
@@ -1121,8 +1113,7 @@ def find_closest_cluster_with_person_for_face_by_min_distance(
             p.name as person_name,
             fr.embedding
         FROM face_clusters fc
-        JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
-        JOIN photo_rectangles fr ON fcm.rectangle_id = fr.id
+        JOIN photo_rectangles fr ON fr.cluster_id = fc.id
         JOIN persons p ON fc.person_id = p.id
         WHERE fr.embedding IS NOT NULL
           AND COALESCE(fr.ignore_flag, 0) = 0
@@ -1207,22 +1198,20 @@ def remove_face_from_cluster(*, cluster_id: int, rectangle_id: int) -> None:
     # Проверяем, что лицо действительно в этом кластере
     cur.execute(
         """
-        SELECT 1 FROM face_cluster_members
-        WHERE cluster_id = ? AND rectangle_id = ?
+        SELECT 1 FROM photo_rectangles WHERE id = ? AND cluster_id = ?
         """,
-        (cluster_id, rectangle_id),
+        (rectangle_id, cluster_id),
     )
     
     if not cur.fetchone():
         raise ValueError(f"Face {rectangle_id} is not in cluster {cluster_id}")
     
-    # Удаляем связь
+    # Удаляем связь (обнуляем cluster_id)
     cur.execute(
         """
-        DELETE FROM face_cluster_members
-        WHERE cluster_id = ? AND rectangle_id = ?
+        UPDATE photo_rectangles SET cluster_id = NULL WHERE id = ? AND cluster_id = ?
         """,
-        (cluster_id, rectangle_id),
+        (rectangle_id, cluster_id),
     )
     
     # Если у кластера больше нет лиц, можно удалить и сам кластер (опционально)
@@ -1281,18 +1270,16 @@ def find_similar_single_face_clusters(
         f"""
         SELECT 
             fc.id as cluster_id,
-            fcm.rectangle_id as face_id,
+            fr.id as face_id,
             fr.embedding
         FROM face_clusters fc
-        JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
-        JOIN photo_rectangles fr ON fcm.rectangle_id = fr.id
+        JOIN photo_rectangles fr ON fr.cluster_id = fc.id
         WHERE {where_clause}
           AND COALESCE(fr.ignore_flag, 0) = 0
           AND fr.embedding IS NOT NULL
-          AND (SELECT COUNT(DISTINCT fcm2.rectangle_id)
-               FROM face_cluster_members fcm2
-               JOIN photo_rectangles fr2 ON fcm2.rectangle_id = fr2.id
-               WHERE fcm2.cluster_id = fc.id AND COALESCE(fr2.ignore_flag, 0) = 0) = 1
+          AND (SELECT COUNT(DISTINCT fr2.id)
+               FROM photo_rectangles fr2
+               WHERE fr2.cluster_id = fc.id AND COALESCE(fr2.ignore_flag, 0) = 0) = 1
           AND fc.person_id IS NULL
         ORDER BY fc.id
         """,
@@ -1429,10 +1416,9 @@ def find_small_clusters_to_merge_in_person(
             fc.person_id,
             p.name as person_name,
             fc.id as cluster_id,
-            COUNT(DISTINCT fcm.rectangle_id) as cluster_size
+            COUNT(DISTINCT fr.id) as cluster_size
         FROM face_clusters fc
-        JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
-        JOIN photo_rectangles fr ON fcm.rectangle_id = fr.id
+        JOIN photo_rectangles fr ON fr.cluster_id = fc.id
         LEFT JOIN persons p ON fc.person_id = p.id
         WHERE {where_clause}
           AND COALESCE(fr.ignore_flag, 0) = 0
@@ -1496,8 +1482,7 @@ def find_small_clusters_to_merge_in_person(
                 fr.id as face_id,
                 fr.embedding
             FROM face_clusters fc
-            JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
-            JOIN photo_rectangles fr ON fcm.rectangle_id = fr.id
+            JOIN photo_rectangles fr ON fr.cluster_id = fc.id
             WHERE fc.id IN ({placeholders})
               AND COALESCE(fr.ignore_flag, 0) = 0
               AND fr.embedding IS NOT NULL
@@ -1664,10 +1649,9 @@ def find_optimal_clusters_to_merge_in_person(
             fc.person_id,
             p.name as person_name,
             fc.id as cluster_id,
-            COUNT(DISTINCT fcm.rectangle_id) as cluster_size
+            COUNT(DISTINCT fr.id) as cluster_size
         FROM face_clusters fc
-        JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
-        JOIN photo_rectangles fr ON fcm.rectangle_id = fr.id
+        JOIN photo_rectangles fr ON fr.cluster_id = fc.id
         LEFT JOIN persons p ON fc.person_id = p.id
         WHERE {where_clause}
           AND COALESCE(fr.ignore_flag, 0) = 0
@@ -1734,10 +1718,9 @@ def find_optimal_clusters_to_merge_in_person(
         sql_all_clusters = f"""
             SELECT 
                 fc.id as cluster_id,
-                COUNT(DISTINCT fcm.rectangle_id) as cluster_size
+                COUNT(DISTINCT fr.id) as cluster_size
             FROM face_clusters fc
-            JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
-            JOIN photo_rectangles fr ON fcm.rectangle_id = fr.id
+            JOIN photo_rectangles fr ON fr.cluster_id = fc.id
             WHERE {where_clause}
               AND COALESCE(fr.ignore_flag, 0) = 0
               AND fr.embedding IS NOT NULL
@@ -1768,8 +1751,7 @@ def find_optimal_clusters_to_merge_in_person(
                 fr.id as face_id,
                 fr.embedding
             FROM face_clusters fc
-            JOIN face_cluster_members fcm ON fc.id = fcm.cluster_id
-            JOIN photo_rectangles fr ON fcm.rectangle_id = fr.id
+            JOIN photo_rectangles fr ON fr.cluster_id = fc.id
             WHERE fc.id IN ({placeholders})
               AND COALESCE(fr.ignore_flag, 0) = 0
               AND fr.embedding IS NOT NULL
@@ -1882,14 +1864,14 @@ def merge_clusters(*, source_cluster_id: int, target_cluster_id: int) -> None:
     # Получаем все лица из source_cluster
     cur.execute(
         """
-        SELECT rectangle_id
-        FROM face_cluster_members
+        SELECT id
+        FROM photo_rectangles
         WHERE cluster_id = ?
         """,
         (source_cluster_id,),
     )
     
-    face_ids = [row["rectangle_id"] for row in cur.fetchall()]
+    face_ids = [row["id"] for row in cur.fetchall()]
     
     if len(face_ids) == 0:
         # Источник пустой, нечего перемещать
@@ -1898,14 +1880,14 @@ def merge_clusters(*, source_cluster_id: int, target_cluster_id: int) -> None:
     # Проверяем, нет ли уже этих лиц в target_cluster (избегаем дублирования)
     cur.execute(
         """
-        SELECT rectangle_id
-        FROM face_cluster_members
-        WHERE cluster_id = ? AND rectangle_id IN ({})
+        SELECT id
+        FROM photo_rectangles
+        WHERE cluster_id = ? AND id IN ({})
         """.format(",".join("?" * len(face_ids))),
         [target_cluster_id] + face_ids,
     )
     
-    existing_face_ids = {row["rectangle_id"] for row in cur.fetchall()}
+    existing_face_ids = {row["id"] for row in cur.fetchall()}
     
     # Перемещаем только те лица, которых еще нет в target_cluster
     faces_to_move = [fid for fid in face_ids if fid not in existing_face_ids]
@@ -1923,35 +1905,22 @@ def merge_clusters(*, source_cluster_id: int, target_cluster_id: int) -> None:
             (source_person_id, target_cluster_id),
         )
     
-    # Если все лица уже в target_cluster, просто удаляем из source
+    # Если все лица уже в target_cluster, просто обнуляем source
     if len(faces_to_move) == 0:
-        # Удаляем все связи из source_cluster (даже если они дублируются)
         cur.execute(
             """
-            DELETE FROM face_cluster_members
-            WHERE cluster_id = ?
+            UPDATE photo_rectangles SET cluster_id = NULL WHERE cluster_id = ?
             """,
             (source_cluster_id,),
         )
     else:
         # Перемещаем лица в target_cluster
         for face_id in faces_to_move:
-            # Сначала удаляем из source
             cur.execute(
                 """
-                DELETE FROM face_cluster_members
-                WHERE cluster_id = ? AND rectangle_id = ?
+                UPDATE photo_rectangles SET cluster_id = ? WHERE id = ? AND cluster_id = ?
                 """,
-                (source_cluster_id, face_id),
-            )
-            
-            # Затем добавляем в target
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO face_cluster_members (cluster_id, rectangle_id)
-                VALUES (?, ?)
-                """,
-                (target_cluster_id, face_id),
+                (target_cluster_id, face_id, source_cluster_id),
             )
     
     # Ручные привязки (face_person_manual_assignments) не трогаем - они остаются как есть
@@ -1961,7 +1930,7 @@ def merge_clusters(*, source_cluster_id: int, target_cluster_id: int) -> None:
     cur.execute(
         """
         SELECT COUNT(*) as count
-        FROM face_cluster_members
+        FROM photo_rectangles
         WHERE cluster_id = ?
         """,
         (source_cluster_id,),

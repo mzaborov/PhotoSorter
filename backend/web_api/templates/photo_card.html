@@ -360,8 +360,9 @@
     
     <!-- Навигация -->
     <div class="photo-card-navigation" id="photoCardNavigation">
-      <div style="position: absolute; left: 12px;" id="photoCardAssignPersonContainer">
+      <div style="position: absolute; left: 12px; display: flex; gap: 8px; align-items: center;" id="photoCardAssignPersonContainer">
         <button class="btn" id="photoCardAssignPerson" type="button">Привязать персону ▶</button>
+        <button class="btn danger" id="photoCardDeleteFile" type="button" style="display: none;" title="Удалить файл (в _delete)">Удалить</button>
       </div>
       <div style="display: flex; align-items: center; gap: 12px;">
         <button class="btn" id="photoCardPrev" type="button" style="display:none;">←</button>
@@ -404,7 +405,7 @@
         <input type="checkbox" id="photoCardIsFace" style="width:18px; height:18px; cursor:pointer;" checked />
         <label for="photoCardIsFace" style="font-weight:700; cursor:pointer; user-select:none;">Лицо</label>
       </div>
-      <button class="btn" id="photoCardAssignPerson" type="button" style="width:100%; margin-top:16px;">Назначить</button>
+      <button class="btn" id="photoCardPersonModalAssign" type="button" style="width:100%; margin-top:16px;">Назначить</button>
     </div>
     <div class="photo-card-bottom" style="justify-content:flex-end;">
       <button class="btn" id="photoCardPersonModalCancel" type="button">Отмена</button>

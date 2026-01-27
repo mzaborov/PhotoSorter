@@ -94,6 +94,8 @@ console.error = function(...args) {
       file_path: options.file_path || null,
       list_context: options.list_context || null,
       highlight_rectangle: options.highlight_rectangle || null,
+      on_assign_success: options.on_assign_success || null,
+      on_close: options.on_close || null,
       rectangles: [],
       mode: 'archive',
       pipeline_run_id: null,
@@ -259,6 +261,15 @@ console.error = function(...args) {
       menus.forEach(el => el.remove());
     }
     
+    // Уведомляем открывший контекст (faces): обновить таблицу при любом закрытии карточки
+    if (currentState.list_context?.source_page === 'faces' && typeof currentState.on_close === 'function') {
+      try {
+        currentState.on_close();
+      } catch (e) {
+        console.warn('[photo_card] on_close failed:', e);
+      }
+    }
+    
     // Отправляем событие о закрытии карточки для синхронизации списка персоны
     if (currentState.list_context?.source_page === 'person_detail') {
       // Определяем текущий rectangle для позиционирования
@@ -340,7 +351,11 @@ console.error = function(...args) {
     if (!positionElement || !currentState.list_context) return;
     
     const currentIndex = currentState.list_context.current_index || 0;
-    const totalCount = currentState.list_context.total_count || 0;
+    // Убеждаемся, что total_count - это число, а не HTML-элемент или другой объект
+    let totalCount = currentState.list_context.total_count;
+    if (typeof totalCount !== 'number' || isNaN(totalCount)) {
+      totalCount = currentState.list_context.items?.length || 0;
+    }
     
     positionElement.textContent = `${currentIndex + 1} из ${totalCount}`;
     
@@ -466,6 +481,12 @@ console.error = function(...args) {
       const specialActions = document.getElementById('photoCardSpecialActions');
       if (specialActions) {
         specialActions.style.display = currentState.mode === 'sorting' ? 'block' : 'none';
+      }
+      
+      // Кнопка «Удалить» — только в режиме сортировки, рядом с «Привязать персону»
+      const deleteFileBtn = document.getElementById('photoCardDeleteFile');
+      if (deleteFileBtn) {
+        deleteFileBtn.style.display = currentState.mode === 'sorting' ? '' : 'none';
       }
       
       // Добавляем обработчики рисования
@@ -1239,8 +1260,8 @@ console.error = function(...args) {
 
   /**
    * Создает компактное меню действий для rectangle.
-   * Архив: Посторонний, Назначить/Изменить персону, тип привязки, режим редактирования, Аватар (если person_id), Удалить.
-   * Сортируется: Посторонний, Кот, Не лицо, Другой (выпадашка).
+   * Везде: Посторонний, Другой/Назначить персону (выпадашка), Режим редактирования (переместить/отредактировать), Удалить/Не лицо.
+   * Только архив: тип привязки, Аватар (если person_id). Сортировка: дополнительно Кот.
    */
   function createRectangleActionsMenu(rectIndex) {
     const rect = currentState.rectangles[rectIndex];
@@ -1248,6 +1269,14 @@ console.error = function(...args) {
     
     const menu = document.createElement('div');
     menu.className = 'rectpill-actions-menu';
+    
+    const closeMenuAction = () => {
+      if (menu.classList.contains('photo-card-rectangle-menu')) {
+        menu.remove();
+      } else {
+        menu.classList.remove('open');
+      }
+    };
     
     const hasPerson = rect.person_id !== null && rect.person_id !== undefined;
     const isArchive = currentState.mode === 'archive';
@@ -1257,7 +1286,7 @@ console.error = function(...args) {
     outsiderBtn.textContent = 'Посторонний';
     outsiderBtn.addEventListener('click', async function(e) {
       e.stopPropagation();
-      menu.classList.remove('open');
+      closeMenuAction();
       
       if (!currentState.allPersons || currentState.allPersons.length === 0) {
         await loadPersons();
@@ -1296,7 +1325,7 @@ console.error = function(...args) {
       catBtn.textContent = 'Кот';
       catBtn.addEventListener('click', async function(e) {
         e.stopPropagation();
-        menu.classList.remove('open');
+        closeMenuAction();
         try {
           const response = await fetch('/api/faces/file/mark-as-cat', {
             method: 'POST',
@@ -1333,10 +1362,49 @@ console.error = function(...args) {
       e.stopPropagation();
       showPersonSubmenu(personContainer, rectIndex);
     });
+    // Обработчики для контейнера, чтобы подменю не закрывалось при переходе от кнопки к подменю
+    // Используем свойство контейнера для хранения таймера
+    personContainer.addEventListener('mouseleave', function(e) {
+      // Проверяем, что мышь не перешла в подменю (теперь оно в body)
+      const submenu = document.querySelector('.person-submenu');
+      if (submenu && !submenu.contains(e.relatedTarget) && e.relatedTarget !== submenu) {
+        // Закрываем подменю только если мышь ушла не в подменю
+        if (personContainer._submenuTimeout) {
+          clearTimeout(personContainer._submenuTimeout);
+        }
+        personContainer._submenuTimeout = setTimeout(() => {
+          const currentSubmenu = document.querySelector('.person-submenu');
+          if (currentSubmenu && !currentSubmenu.matches(':hover') && !personContainer.matches(':hover')) {
+            currentSubmenu.remove();
+            if (currentSubmenu._containerRef) {
+              delete currentSubmenu._containerRef;
+            }
+          }
+          personContainer._submenuTimeout = null;
+        }, 150);
+      }
+    });
+    personContainer.addEventListener('mouseenter', function() {
+      // Отменяем закрытие подменю, если мышь вернулась в контейнер
+      if (personContainer._submenuTimeout) {
+        clearTimeout(personContainer._submenuTimeout);
+        personContainer._submenuTimeout = null;
+      }
+    });
     personContainer.appendChild(personBtn);
     menu.appendChild(personContainer);
     
-    // Архив: тип привязки, режим редактирования, Аватар
+    // Режим редактирования (переместить/отредактировать прямоугольник) — везде
+    const editModeBtn = document.createElement('button');
+    editModeBtn.textContent = currentState.isEditMode ? 'Выйти из режима редактирования' : 'Режим редактирования';
+    editModeBtn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      closeMenuAction();
+      toggleEditMode();
+    });
+    menu.appendChild(editModeBtn);
+    
+    // Архив: тип привязки, Аватар
     if (isArchive) {
       if (hasPerson && rect.assignment_type) {
         const changeTypeBtn = document.createElement('button');
@@ -1345,7 +1413,7 @@ console.error = function(...args) {
           : 'Изменить на кластер';
         changeTypeBtn.addEventListener('click', async function(e) {
           e.stopPropagation();
-          menu.classList.remove('open');
+          closeMenuAction();
           const newType = rect.assignment_type === 'cluster' ? 'manual_face' : 'cluster';
           try {
             pushUndoAction({
@@ -1366,22 +1434,13 @@ console.error = function(...args) {
         menu.appendChild(changeTypeBtn);
       }
       
-      const editModeBtn = document.createElement('button');
-      editModeBtn.textContent = currentState.isEditMode ? 'Выйти из режима редактирования' : 'Режим редактирования';
-      editModeBtn.addEventListener('click', function(e) {
-        e.stopPropagation();
-        menu.classList.remove('open');
-        toggleEditMode();
-      });
-      menu.appendChild(editModeBtn);
-      
       // Аватар — только для архива и при открытии с person_detail
       if (currentState.person_id && rect.id) {
         const avatarBtn = document.createElement('button');
         avatarBtn.textContent = 'Аватар';
         avatarBtn.addEventListener('click', async function(e) {
           e.stopPropagation();
-          menu.classList.remove('open');
+          closeMenuAction();
           try {
             const response = await fetch(`/api/persons/${currentState.person_id}/set-avatar`, {
               method: 'POST',
@@ -1408,7 +1467,7 @@ console.error = function(...args) {
     deleteBtn.className = 'danger';
     deleteBtn.addEventListener('click', function(e) {
       e.stopPropagation();
-      menu.classList.remove('open');
+      closeMenuAction();
       deleteRectangle(rect.id);
     });
     menu.appendChild(deleteBtn);
@@ -1424,6 +1483,12 @@ console.error = function(...args) {
     document.querySelectorAll('.person-submenu').forEach(submenu => {
       submenu.remove();
     });
+    
+    // Отменяем предыдущий таймер закрытия, если есть
+    if (container._submenuTimeout) {
+      clearTimeout(container._submenuTimeout);
+      container._submenuTimeout = null;
+    }
     
     // Загружаем список персон, если еще не загружен
     if (!currentState.allPersons || currentState.allPersons.length === 0) {
@@ -1454,7 +1519,7 @@ console.error = function(...args) {
     // Создаем подменю
     const submenu = document.createElement('div');
     submenu.className = 'person-submenu';
-    submenu.style.position = 'absolute';
+    submenu.style.position = 'fixed'; // fixed для позиционирования относительно viewport (так как подменю в body)
     submenu.style.left = '100%';
     submenu.style.top = '0';
     submenu.style.marginLeft = '4px';
@@ -1471,7 +1536,7 @@ console.error = function(...args) {
     
     // Получаем текущий прямоугольник для определения is_face
     const rect = currentState.rectangles[rectIndex];
-    const currentIsFace = rect ? (rect.is_face === 1 || rect.is_face === true) : true;
+    const currentIsFace = rect ? (rect.is_face !== 0) : true;
     
     // Добавляем переключатель "лицо"/"без лица" в начало меню
     const faceToggleContainer = document.createElement('div');
@@ -1550,9 +1615,13 @@ console.error = function(...args) {
         personBtn.addEventListener('click', async function(e) {
           e.stopPropagation();
           submenu.remove();
-          const menu = container.closest('.rectpill-actions-menu');
+          const menu = container.closest('.rectpill-actions-menu') || container.closest('.photo-card-rectangle-menu');
           if (menu) {
-            menu.classList.remove('open');
+            if (menu.classList.contains('photo-card-rectangle-menu')) {
+              menu.remove();
+            } else {
+              menu.classList.remove('open');
+            }
           }
           
           // Назначаем персону
@@ -1563,9 +1632,6 @@ console.error = function(...args) {
             const oldPersonId = rect.person_id || null;
             // Берем значение is_face из переключателя (пользователь может изменить тип)
             const isFace = faceToggle.checked;
-            // #region agent log
-            fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:1566',message:'showPersonSubmenu person clicked in group',data:{rectangleId:rect.id,personId:person.id,isFace,isFaceType:typeof isFace,faceToggleChecked:faceToggle.checked},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-            // #endregion
             await updateRectangle(rect.id, null, person.id, 'manual_face', isFace);
             
             pushUndoAction({
@@ -1580,6 +1646,15 @@ console.error = function(...args) {
             updateUndoButton();
             await loadRectangles();
             await checkDuplicates();
+            // На «К разбору» — обновить список (карточка не закрывается, только по кнопке «Закрыть»)
+            const ctx0 = currentState.list_context;
+            if (ctx0 && ctx0.source_page === 'faces' && (ctx0.subtab === 'unsorted' || ctx0.subtab === 'all') && typeof currentState.on_assign_success === 'function') {
+              try {
+                await currentState.on_assign_success(currentState.file_path);
+              } catch (e) {
+                console.warn('[photo_card] on_assign_success failed:', e);
+              }
+            }
           } catch (error) {
             console.error('[photo_card] Error assigning person:', error);
             alert('Ошибка при назначении персоны: ' + error.message);
@@ -1594,7 +1669,7 @@ console.error = function(...args) {
         submenu.appendChild(personBtn);
       });
     });
-    
+
     // Добавляем персон без группы
     if (noGroupPersons.length > 0) {
       if (groupEntries.length > 0) {
@@ -1627,9 +1702,13 @@ console.error = function(...args) {
         personBtn.addEventListener('click', async function(e) {
           e.stopPropagation();
           submenu.remove();
-          const menu = container.closest('.rectpill-actions-menu');
+          const menu = container.closest('.rectpill-actions-menu') || container.closest('.photo-card-rectangle-menu');
           if (menu) {
-            menu.classList.remove('open');
+            if (menu.classList.contains('photo-card-rectangle-menu')) {
+              menu.remove();
+            } else {
+              menu.classList.remove('open');
+            }
           }
           
           // Назначаем персону
@@ -1640,9 +1719,6 @@ console.error = function(...args) {
             const oldPersonId = rect.person_id || null;
             // Берем значение is_face из переключателя (пользователь может изменить тип)
             const isFace = faceToggle.checked;
-            // #region agent log
-            fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:1640',message:'showPersonSubmenu person clicked no group',data:{rectangleId:rect.id,personId:person.id,isFace,isFaceType:typeof isFace,faceToggleChecked:faceToggle.checked},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-            // #endregion
             await updateRectangle(rect.id, null, person.id, 'manual_face', isFace);
             
             pushUndoAction({
@@ -1657,6 +1733,15 @@ console.error = function(...args) {
             updateUndoButton();
             await loadRectangles();
             await checkDuplicates();
+            // На «К разбору» — обновить список (карточка не закрывается, только по кнопке «Закрыть»)
+            const ctx1 = currentState.list_context;
+            if (ctx1 && ctx1.source_page === 'faces' && (ctx1.subtab === 'unsorted' || ctx1.subtab === 'all') && typeof currentState.on_assign_success === 'function') {
+              try {
+                await currentState.on_assign_success(currentState.file_path);
+              } catch (e) {
+                console.warn('[photo_card] on_assign_success failed:', e);
+              }
+            }
           } catch (error) {
             console.error('[photo_card] Error assigning person:', error);
             alert('Ошибка при назначении персоны: ' + error.message);
@@ -1672,13 +1757,58 @@ console.error = function(...args) {
       });
     }
     
-    container.appendChild(submenu);
+    // Если нет персон (ни в группах, ни без группы), показываем сообщение
+    if (groupEntries.length === 0 && noGroupPersons.length === 0) {
+      const noPersonsMsg = document.createElement('div');
+      noPersonsMsg.textContent = 'Нет персон';
+      noPersonsMsg.style.padding = '8px 14px';
+      noPersonsMsg.style.textAlign = 'center';
+      noPersonsMsg.style.color = '#6b7280';
+      noPersonsMsg.style.fontSize = '12px';
+      noPersonsMsg.style.fontStyle = 'italic';
+      submenu.appendChild(noPersonsMsg);
+    }
+    
+    // Добавляем подменю в body для корректного позиционирования (portal pattern)
+    // Это предотвращает обрезку подменю родительскими контейнерами
+    document.body.appendChild(submenu);
+    
+    // Сохраняем ссылку на контейнер для правильного позиционирования
+    submenu._containerRef = container;
+    
+    // Обработчики для подменю, чтобы оно оставалось открытым при наведении мыши
+    submenu.addEventListener('mouseenter', function() {
+      // Отменяем закрытие подменю, если мышь находится над ним
+      if (container._submenuTimeout) {
+        clearTimeout(container._submenuTimeout);
+        container._submenuTimeout = null;
+      }
+    });
+    submenu.addEventListener('mouseleave', function(e) {
+      // Закрываем подменю, если мышь ушла из него и не вернулась в контейнер
+      if (container._submenuTimeout) {
+        clearTimeout(container._submenuTimeout);
+      }
+      container._submenuTimeout = setTimeout(() => {
+        // Ищем подменю в body (так как оно там теперь)
+        const currentSubmenu = document.querySelector('.person-submenu');
+        if (currentSubmenu && !currentSubmenu.matches(':hover') && !container.matches(':hover')) {
+          currentSubmenu.remove();
+          if (currentSubmenu._containerRef) {
+            delete currentSubmenu._containerRef;
+          }
+        }
+        container._submenuTimeout = null;
+      }, 150);
+    });
 
-    // Авто-позиционирование: если снизу мало места — раскрываем вверх.
+    // Авто-позиционирование: подменю добавлено в body, поэтому позиционируем его абсолютно относительно viewport
+    // Если снизу мало места — раскрываем вверх. Если справа мало места — открываем слева.
     // (Пользовательский UX: пункт "Другой" должен открываться вверх, когда меню у нижней границы.)
     try {
       const containerRect = container.getBoundingClientRect();
       const viewportH = window.innerHeight || document.documentElement.clientHeight || 0;
+      const viewportW = window.innerWidth || document.documentElement.clientWidth || 0;
       const margin = 8;
       const spaceDown = Math.max(0, viewportH - containerRect.top - margin);
       const spaceUp = Math.max(0, containerRect.bottom - margin);
@@ -1687,17 +1817,38 @@ console.error = function(...args) {
       const openUp = spaceDown < minReasonable && spaceUp > spaceDown;
 
       const clampHeight = (h) => Math.max(140, Math.min(desiredMaxHeight, h));
+      
+      // Позиционируем подменю относительно viewport (так как оно в body)
+      const submenuWidth = submenu.offsetWidth || 200;
+      const spaceRight = viewportW - containerRect.right - margin;
+      const spaceLeft = containerRect.left - margin;
+      const openLeft = spaceRight < submenuWidth && spaceLeft > spaceRight;
+      
+      if (openLeft) {
+        // Открываем слева от контейнера
+        submenu.style.left = (containerRect.left - submenuWidth - 4) + 'px';
+        submenu.style.right = 'auto';
+        submenu.style.marginLeft = '0';
+        submenu.style.marginRight = '0';
+      } else {
+        // Открываем справа от контейнера
+        submenu.style.left = (containerRect.right + 4) + 'px';
+        submenu.style.right = 'auto';
+        submenu.style.marginLeft = '0';
+        submenu.style.marginRight = '0';
+      }
+      
       if (openUp) {
         submenu.style.top = 'auto';
-        submenu.style.bottom = '0';
+        submenu.style.bottom = (viewportH - containerRect.bottom) + 'px';
         submenu.style.maxHeight = clampHeight(spaceUp) + 'px';
       } else {
         submenu.style.bottom = 'auto';
-        submenu.style.top = '0';
+        submenu.style.top = containerRect.top + 'px';
         submenu.style.maxHeight = clampHeight(spaceDown) + 'px';
       }
     } catch (e) {
-      // ignore
+      // ignore positioning errors
     }
     
     // Закрываем подменю при клике вне его
@@ -1705,6 +1856,10 @@ console.error = function(...args) {
       if (!submenu.contains(e.target) && !container.contains(e.target)) {
         submenu.remove();
         document.removeEventListener('click', closeSubmenu);
+        // Очищаем ссылку на контейнер
+        if (submenu._containerRef) {
+          delete submenu._containerRef;
+        }
       }
     };
     setTimeout(() => {
@@ -1744,7 +1899,12 @@ console.error = function(...args) {
     
     // Закрываем меню при клике вне его
     const closeMenu = (e) => {
-      if (!menu.contains(e.target) && !buttonElement.contains(e.target)) {
+      // Проверяем, что клик не был в меню, кнопке или подменю
+      const submenu = menu.querySelector('.person-submenu');
+      const clickedInSubmenu = submenu && submenu.contains(e.target);
+      const clickedInMenu = menu.contains(e.target);
+      const clickedInButton = buttonElement.contains(e.target);
+      if (!clickedInMenu && !clickedInButton && !clickedInSubmenu) {
         menu.classList.remove('open');
         document.removeEventListener('click', closeMenu);
       }
@@ -2539,8 +2699,17 @@ console.error = function(...args) {
     }
     
     // Формируем payload в зависимости от режима
+    // Преобразуем rectangle_id в число
+    const rectangleIdInt = faceRectangleId !== null && faceRectangleId !== undefined 
+      ? parseInt(faceRectangleId, 10) 
+      : null;
+    
+    if (rectangleIdInt === null || isNaN(rectangleIdInt)) {
+      throw new Error('rectangle_id is required and must be a valid number');
+    }
+    
     const payload = {
-      rectangle_id: faceRectangleId
+      rectangle_id: rectangleIdInt
     };
     
     // Для сортируемых фото требуется pipeline_run_id
@@ -2571,11 +2740,41 @@ console.error = function(...args) {
       throw new Error(error.detail || 'Failed to delete rectangle');
     }
     
+    // Удаляем rectangle из текущего состояния сразу, чтобы UI обновился немедленно
+    const rectIndex = currentState.rectangles.findIndex(r => r.id === rectangleIdInt);
+    if (rectIndex !== -1) {
+      currentState.rectangles.splice(rectIndex, 1);
+    }
+    
     updateUndoButton();
     
-    // Перезагружаем rectangles
-    await loadRectangles();
-    await checkDuplicates();
+    // Сбрасываем выделение, если удаленный rectangle был выделен
+    currentState.selectedRectangleIndex = null;
+    
+    // Немедленно обновляем UI (до перезагрузки с сервера)
+    updateRectanglesList();
+    drawRectangles();
+    
+    // Перезагружаем rectangles с сервера для синхронизации
+    try {
+      await loadRectangles();
+      
+      // Обновляем UI после перезагрузки
+      updateRectanglesList();
+      drawRectangles();
+    } catch (error) {
+      console.error('[photo_card] Error reloading rectangles after delete:', error);
+      // UI уже обновлен выше, ошибка не критична
+    }
+    
+    // Проверяем дубликаты только для sorting режима (не для архивных фото)
+    // Обернуто в try-catch, чтобы ошибка не прерывала обновление UI
+    try {
+      await checkDuplicates();
+    } catch (error) {
+      console.error('[photo_card] Error checking duplicates after delete:', error);
+      // Не прерываем выполнение - UI уже обновлен
+    }
     
   }
 
@@ -2672,8 +2871,8 @@ console.error = function(...args) {
     // Устанавливаем значение is_face на основе текущего прямоугольника
     const isFaceCheckbox = document.getElementById('photoCardIsFace');
     if (isFaceCheckbox) {
-      // Если у прямоугольника есть is_face, используем его, иначе по умолчанию "лицо"
-      isFaceCheckbox.checked = (rect.is_face === 1 || rect.is_face === true);
+      // Только явный 0 = "не лицо"; всё остальное (1, null, undefined) = "лицо"
+      isFaceCheckbox.checked = (rect.is_face !== 0);
     }
     
     // Показываем модальное окно
@@ -2702,7 +2901,6 @@ console.error = function(...args) {
   async function assignPersonToRectangle() {
     const rectIndex = currentState.editingRectangleIndex;
     if (rectIndex === null) return;
-    
     const rect = currentState.rectangles[rectIndex];
     if (!rect || !rect.id) return;
     
@@ -2772,6 +2970,15 @@ console.error = function(...args) {
       // Перезагружаем rectangles
       await loadRectangles();
       await checkDuplicates();
+      // Уведомляем открывший контекст (faces «К разбору»): обновить список (карточка не закрывается, только по кнопке «Закрыть»)
+      const ctx = currentState.list_context;
+      if (ctx && ctx.source_page === 'faces' && (ctx.subtab === 'unsorted' || ctx.subtab === 'all') && typeof currentState.on_assign_success === 'function') {
+        try {
+          await currentState.on_assign_success(currentState.file_path);
+        } catch (e) {
+          console.warn('[photo_card] on_assign_success failed:', e);
+        }
+      }
     } catch (error) {
       console.error('[photo_card] Error assigning person:', error);
       alert('Ошибка при назначении персоны: ' + error.message);
@@ -2874,10 +3081,10 @@ console.error = function(...args) {
       });
     }
     
-    // Модальное окно выбора персоны
+    // Модальное окно выбора персоны (кнопка «Назначить» в модалке — отдельный id, т.к. «Привязать персону ▶» тоже photoCardAssignPerson)
     const personModalClose = document.getElementById('photoCardPersonModalClose');
     const personModalCancel = document.getElementById('photoCardPersonModalCancel');
-    const personModalAssign = document.getElementById('photoCardAssignPerson');
+    const personModalAssign = document.getElementById('photoCardPersonModalAssign');
     
     if (personModalClose) {
       personModalClose.addEventListener('click', closePersonDialog);
@@ -2974,6 +3181,45 @@ console.error = function(...args) {
           }
         } catch (error) {
           console.error('[photo_card] Error marking as no people:', error);
+          alert('Ошибка: ' + error.message);
+        }
+      });
+    }
+    
+    // Кнопка «Удалить» (режим сортировки) — удаляет файл в _delete и переходит к следующему
+    const deleteFileBtn = document.getElementById('photoCardDeleteFile');
+    if (deleteFileBtn) {
+      deleteFileBtn.addEventListener('click', async function() {
+        if (currentState.mode !== 'sorting' || !currentState.pipeline_run_id || !currentState.file_path) {
+          alert('Удаление доступно только в режиме сортировки при открытом прогоне.');
+          return;
+        }
+        try {
+          const response = await fetch('/api/faces/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              pipeline_run_id: currentState.pipeline_run_id,
+              path: currentState.file_path
+            })
+          });
+          if (response.ok) {
+            const data = await response.json().catch(() => ({}));
+            if (data?.undo_data) {
+              pushUndoAction({
+                type: 'delete_file',
+                undo_data: data.undo_data,
+                pipeline_run_id: currentState.pipeline_run_id
+              });
+              updateUndoButton();
+            }
+            navigateNext();
+          } else {
+            const errorData = await response.json().catch(() => ({ detail: response.statusText }));
+            alert('Ошибка: ' + (errorData.detail || response.statusText));
+          }
+        } catch (error) {
+          console.error('[photo_card] Error deleting file:', error);
           alert('Ошибка: ' + error.message);
         }
       });
@@ -3126,6 +3372,35 @@ console.error = function(...args) {
           await updateRectangle(action.rectangle_id, action.oldBbox, null, null);
           await loadRectangles();
           await checkDuplicates();
+          break;
+        case 'delete_file':
+          // Восстанавливаем файл из _delete
+          if (!action.undo_data?.delete_path || !action.undo_data?.original_path || !action.pipeline_run_id) {
+            console.warn('[photo_card] Undo delete_file: missing undo_data');
+            break;
+          }
+          try {
+            const restoreRes = await fetch('/api/faces/restore-from-delete', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                pipeline_run_id: action.pipeline_run_id,
+                delete_path: action.undo_data.delete_path,
+                original_path: action.undo_data.original_path,
+                original_name: action.undo_data.original_name ?? '',
+                original_parent_path: action.undo_data.original_parent_path ?? ''
+              })
+            });
+            if (restoreRes.ok) {
+              // Файл восстановлен в папку; текущая карточка уже «следующая», перезагрузка не нужна
+            } else {
+              const err = await restoreRes.json().catch(() => ({}));
+              alert('Ошибка восстановления: ' + (err.detail || restoreRes.statusText));
+            }
+          } catch (err) {
+            console.error('[photo_card] Undo delete_file:', err);
+            alert('Ошибка: ' + err.message);
+          }
           break;
         default:
           console.warn('[photo_card] Unknown undo action type:', action.type);
@@ -4101,12 +4376,19 @@ console.error = function(...args) {
         person_id: personId
       };
       
-      // Для сортируемых фото требуется pipeline_run_id
+      // Для сортируемых фото требуется pipeline_run_id и file_id/file_path
       if (currentState.mode === 'sorting') {
         if (!currentState.pipeline_run_id) {
           throw new Error('pipeline_run_id is required for sorting mode');
         }
         payload.pipeline_run_id = currentState.pipeline_run_id;
+        if (currentState.file_id) {
+          payload.file_id = currentState.file_id;
+        } else if (currentState.file_path) {
+          payload.file_path = currentState.file_path;
+        } else {
+          throw new Error('file_id or file_path is required for sorting mode');
+        }
       } else {
         // Для архивных фото используем file_id или file_path
         if (currentState.file_id) {

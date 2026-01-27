@@ -627,10 +627,8 @@ def api_gold_faces_by_persons() -> dict[str, Any]:
                 p.name as person_name
             FROM photo_rectangles pr
             JOIN files f ON f.id = pr.file_id
-            LEFT JOIN person_rectangle_manual_assignments prma ON pr.id = prma.rectangle_id
-            LEFT JOIN face_cluster_members fcm ON pr.id = fcm.rectangle_id
-            LEFT JOIN face_clusters fc ON fcm.cluster_id = fc.id
-            LEFT JOIN persons p ON COALESCE(prma.person_id, fc.person_id) = p.id
+            LEFT JOIN face_clusters fc ON fc.id = pr.cluster_id
+            LEFT JOIN persons p ON p.id = COALESCE(pr.manual_person_id, fc.person_id)
             WHERE f.path IN ({placeholders})
               AND pr.is_face = 1
               AND COALESCE(pr.ignore_flag, 0) = 0
@@ -680,14 +678,12 @@ def api_gold_faces_by_persons() -> dict[str, Any]:
                     pr.id as face_id,
                     f.path as file_path,
                     pr.bbox_x, pr.bbox_y, pr.bbox_w, pr.bbox_h,
-                    COALESCE(prma.person_id, fc.person_id) as person_id,
+                    COALESCE(pr.manual_person_id, fc.person_id) as person_id,
                     p.name as person_name
                 FROM photo_rectangles pr
                 JOIN files f ON f.id = pr.file_id
-                LEFT JOIN person_rectangle_manual_assignments prma ON pr.id = prma.rectangle_id
-                LEFT JOIN face_cluster_members fcm ON pr.id = fcm.rectangle_id
-                LEFT JOIN face_clusters fc ON fcm.cluster_id = fc.id
-                LEFT JOIN persons p ON COALESCE(prma.person_id, fc.person_id) = p.id
+                LEFT JOIN face_clusters fc ON fc.id = pr.cluster_id
+                LEFT JOIN persons p ON p.id = COALESCE(pr.manual_person_id, fc.person_id)
                 WHERE f.path = ? 
                   AND pr.is_face = 1
                   AND ABS(pr.bbox_x - ?) <= 10
@@ -696,11 +692,8 @@ def api_gold_faces_by_persons() -> dict[str, Any]:
                   AND ABS(pr.bbox_h - ?) <= 10
                   AND COALESCE(pr.ignore_flag, 0) = 0
                 ORDER BY 
-                  -- Сначала берем лица с назначенной персоной
-                  CASE WHEN COALESCE(prma.person_id, fc.person_id) IS NOT NULL THEN 0 ELSE 1 END,
-                  -- Затем по точности совпадения координат
+                  CASE WHEN COALESCE(pr.manual_person_id, fc.person_id) IS NOT NULL THEN 0 ELSE 1 END,
                   (ABS(pr.bbox_x - ?) + ABS(pr.bbox_y - ?) + ABS(pr.bbox_w - ?) + ABS(pr.bbox_h - ?)) ASC,
-                  -- И наконец по ID для стабильности
                   pr.id ASC
                 LIMIT 1
                 """,
@@ -714,14 +707,12 @@ def api_gold_faces_by_persons() -> dict[str, Any]:
                 cur.execute(
                     """
                     SELECT DISTINCT
-                        COALESCE(prma.person_id, fc.person_id) as person_id,
+                        COALESCE(pr.manual_person_id, fc.person_id) as person_id,
                         p.name as person_name
                     FROM photo_rectangles pr
                     JOIN files f ON f.id = pr.file_id
-                    LEFT JOIN person_rectangle_manual_assignments prma ON pr.id = prma.rectangle_id
-                    LEFT JOIN face_cluster_members fcm ON pr.id = fcm.rectangle_id
-                    LEFT JOIN face_clusters fc ON fcm.cluster_id = fc.id
-                    LEFT JOIN persons p ON COALESCE(prma.person_id, fc.person_id) = p.id
+                    LEFT JOIN face_clusters fc ON fc.id = pr.cluster_id
+                    LEFT JOIN persons p ON p.id = COALESCE(pr.manual_person_id, fc.person_id)
                     WHERE f.path = ?
                       AND pr.is_face = 1
                       AND COALESCE(pr.ignore_flag, 0) = 0

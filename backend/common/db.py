@@ -625,6 +625,23 @@ class FaceStore:
             },
         )
         
+        # Кластер: принадлежность прямоугольника кластеру (вместо таблицы face_cluster_members)
+        _ensure_columns(
+            self.conn,
+            "photo_rectangles",
+            {
+                "cluster_id": "cluster_id INTEGER REFERENCES face_clusters(id)",  # NULL = не в кластере
+            },
+        )
+        # Ручная привязка к персоне (вместо person_rectangle_manual_assignments; CHECK: только один из cluster_id/manual_person_id)
+        _ensure_columns(
+            self.conn,
+            "photo_rectangles",
+            {
+                "manual_person_id": "manual_person_id INTEGER REFERENCES persons(id)",  # NULL = не назначено вручную
+            },
+        )
+        
         # Убеждаемся, что is_face имеет значение для всех записей
         cur.execute("UPDATE photo_rectangles SET is_face = 1 WHERE is_face IS NULL")
 
@@ -697,53 +714,10 @@ class FaceStore:
                 # Просто переименовываем таблицу
                 cur.execute("ALTER TABLE face_person_manual_assignments RENAME TO person_rectangle_manual_assignments")
 
-        # Связь лиц с кластерами
-        # Миграция: переименование face_rectangle_id → rectangle_id
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='face_cluster_members'")
-        if cur.fetchone():
-            cur.execute("PRAGMA table_info(face_cluster_members)")
-            columns = {row[1] for row in cur.fetchall()}
-            if "rectangle_id" not in columns and "face_rectangle_id" in columns:
-                # Пересоздаем таблицу с новым именем колонки
-                cur.execute("""
-                    CREATE TABLE face_cluster_members_new (
-                        cluster_id          INTEGER NOT NULL,
-                        rectangle_id        INTEGER NOT NULL,
-                        PRIMARY KEY (cluster_id, rectangle_id)
-                    )
-                """)
-                cur.execute("""
-                    INSERT INTO face_cluster_members_new (cluster_id, rectangle_id)
-                    SELECT cluster_id, face_rectangle_id
-                    FROM face_cluster_members
-                """)
-                cur.execute("DROP TABLE face_cluster_members")
-                cur.execute("ALTER TABLE face_cluster_members_new RENAME TO face_cluster_members")
+        # Связь лиц с кластерами: хранится в photo_rectangles.cluster_id (таблица face_cluster_members удалена миграцией migrate_face_cluster_members_to_photo_rectangles.py).
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS face_cluster_members (
-                cluster_id          INTEGER NOT NULL,
-                rectangle_id        INTEGER NOT NULL,
-                PRIMARY KEY (cluster_id, rectangle_id)
-            );
-        """)
-
-        # Ручные привязки лиц к персонам (только для ручных привязок, не через кластеры)
-        # Кластеры привязаны к персонам через face_clusters.person_id
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS person_rectangle_manual_assignments (
-                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                rectangle_id        INTEGER NOT NULL,
-                person_id           INTEGER NOT NULL,
-                source              TEXT NOT NULL,             -- 'manual'|'ai'
-                confidence          REAL,
-                created_at          TEXT NOT NULL
-            );
-        """)
-        
-        # Старая таблица face_labels больше не создаётся
-        # Миграция завершена: используется person_rectangle_manual_assignments для ручных привязок
-        # и face_clusters.person_id для привязки кластеров к персонам
+        # Ручные привязки перенесены в photo_rectangles.manual_person_id (миграция migrate_person_rectangle_manual_to_photo_rectangles.py).
+        # Таблица person_rectangle_manual_assignments больше не создаётся.
 
         # Archive scope для кластеров (аналогично photo_rectangles)
         _ensure_columns(
@@ -759,13 +733,7 @@ class FaceStore:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_clusters_person ON face_clusters(person_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photo_rect_archive_scope ON photo_rectangles(archive_scope);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_clusters_archive_scope ON face_clusters(archive_scope);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_cluster_members_cluster ON face_cluster_members(cluster_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_face_cluster_members_rect ON face_cluster_members(rectangle_id);")
-        # Индексы для person_rectangle_manual_assignments
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rectangle_manual_assignments_rect ON person_rectangle_manual_assignments(rectangle_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rectangle_manual_assignments_person ON person_rectangle_manual_assignments(person_id);")
-        # UNIQUE индекс для предотвращения дубликатов: одно лицо может быть назначено персоне только один раз
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_person_rectangle_manual_assignments_unique ON person_rectangle_manual_assignments(rectangle_id, person_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_photo_rect_cluster_id ON photo_rectangles(cluster_id);")
         # Старые индексы для face_labels (для обратной совместимости, будут удалены после миграции)
         # ВАЖНО: таблица face_labels больше не используется в рабочем коде, индексы оставлены только для совместимости
         # После полного тестирования можно удалить таблицу через migrate_drop_face_labels_table.py
@@ -773,36 +741,7 @@ class FaceStore:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_labels_person ON face_labels(person_id);")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_face_labels_unique ON face_labels(face_rectangle_id, person_id);")
 
-        # Прямоугольники без лица, но с человеком (для привязки к персоне)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS person_rectangles (
-                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                pipeline_run_id     INTEGER NOT NULL,
-                file_id             INTEGER NOT NULL,
-                frame_idx           INTEGER,                    -- для видео: 1..3 (NULL для фото)
-                bbox_x              INTEGER NOT NULL,
-                bbox_y              INTEGER NOT NULL,
-                bbox_w              INTEGER NOT NULL,
-                bbox_h              INTEGER NOT NULL,
-                person_id           INTEGER NOT NULL,
-                created_at          TEXT NOT NULL,
-                FOREIGN KEY (file_id) REFERENCES files(id),
-                FOREIGN KEY (person_id) REFERENCES persons(id)
-            );
-        """)
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rect_run ON person_rectangles(pipeline_run_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rect_file ON person_rectangles(file_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rect_person ON person_rectangles(person_id);")
-        
-        # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
-        _ensure_columns(
-            self.conn,
-            "person_rectangles",
-            {
-                "file_id": "file_id INTEGER",  # FOREIGN KEY на files.id, пока NULL (заполним миграцией)
-            },
-        )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_person_rect_file_id ON person_rectangles(file_id);")
+        # Таблица person_rectangles удалена миграцией (migrate_drop_person_rectangles.py).
 
         # Простая привязка файла к персоне (без прямоугольника)
         cur.execute("""
@@ -907,7 +846,8 @@ class FaceStore:
               fr.manual_person, fr.ignore_flag,
               fr.created_at,
               COALESCE(fr.is_manual, 0) AS is_manual,
-              fr.manual_created_at
+              fr.manual_created_at,
+              COALESCE(fr.is_face, 1) AS is_face
             FROM photo_rectangles fr
             JOIN files f ON f.id = fr.file_id
             WHERE fr.run_id = ? AND fr.file_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
@@ -1299,105 +1239,6 @@ class FaceStore:
         )
         self.conn.commit()
 
-    def insert_person_rectangle(
-        self,
-        *,
-        pipeline_run_id: int,
-        file_path: str,
-        frame_idx: int | None,
-        bbox_x: int,
-        bbox_y: int,
-        bbox_w: int,
-        bbox_h: int,
-        person_id: int,
-    ) -> int:
-        """
-        Вставляет прямоугольник без лица, но с человеком (person_rectangles).
-        Возвращает id созданной записи.
-        """
-        # Получаем file_id из file_path
-        resolved_file_id = _get_file_id_from_path(self.conn, file_path)
-        if resolved_file_id is None:
-            raise ValueError(f"File not found in files table: {file_path}")
-        
-        now = _now_utc_iso()
-        cur = self.conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO person_rectangles (
-                pipeline_run_id, file_id, frame_idx,
-                bbox_x, bbox_y, bbox_w, bbox_h,
-                person_id, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                int(pipeline_run_id),
-                resolved_file_id,
-                int(frame_idx) if frame_idx is not None else None,
-                int(bbox_x),
-                int(bbox_y),
-                int(bbox_w),
-                int(bbox_h),
-                int(person_id),
-                now,
-            ),
-        )
-        self.conn.commit()
-        return int(cur.lastrowid)
-
-    def delete_person_rectangle(self, *, rectangle_id: int) -> None:
-        """Удаляет прямоугольник без лица по id."""
-        cur = self.conn.cursor()
-        cur.execute("DELETE FROM person_rectangles WHERE id = ?", (int(rectangle_id),))
-        self.conn.commit()
-
-    def list_person_rectangles(
-        self,
-        *,
-        pipeline_run_id: int | None = None,
-        file_id: int | None = None,
-        file_path: str | None = None,
-        person_id: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """
-        Возвращает список прямоугольников без лица (person_rectangles).
-        Фильтры опциональны.
-        Приоритет для file_id/file_path: file_id (если передан), иначе file_path (если передан).
-        """
-        cur = self.conn.cursor()
-        where = []
-        params = []
-        if pipeline_run_id is not None:
-            where.append("pipeline_run_id = ?")
-            params.append(int(pipeline_run_id))
-        # Обрабатываем file_id/file_path
-        resolved_file_id = _get_file_id(self.conn, file_id=file_id, file_path=file_path) if (file_id is not None or file_path is not None) else None
-        if resolved_file_id is not None:
-            where.append("file_id = ?")
-            params.append(resolved_file_id)
-        elif file_path is not None:
-            # Fallback на file_path для обратной совместимости
-            where.append("file_path = ?")
-            params.append(str(file_path))
-        if person_id is not None:
-            where.append("person_id = ?")
-            params.append(int(person_id))
-        where_sql = " AND ".join(where) if where else "1=1"
-        cur.execute(
-            f"""
-            SELECT pr.id, pr.pipeline_run_id, f.path AS file_path, pr.frame_idx,
-                   pr.bbox_x, pr.bbox_y, pr.bbox_w, pr.bbox_h,
-                   pr.person_id, pr.created_at
-            FROM person_rectangles pr
-            JOIN files f ON f.id = pr.file_id
-            WHERE {where_sql}
-            ORDER BY pr.created_at DESC
-            """,
-            params,
-        )
-        return [dict(r) for r in cur.fetchall()]
-
     def insert_file_person(
         self,
         *,
@@ -1664,7 +1505,7 @@ class FaceStore:
             """
             SELECT 
                 group_path,
-                COUNT(DISTINCT file_path) AS files_count,
+                COUNT(DISTINCT file_id) AS files_count,
                 MAX(created_at) AS last_created_at
             FROM file_groups
             WHERE pipeline_run_id = ?
@@ -1683,9 +1524,8 @@ class FaceStore:
         file_path: str | None = None,
     ) -> dict[str, Any]:
         """
-        Возвращает все привязки файла к персонам (через все 3 способа):
-        - через лица (person_rectangle_manual_assignments + face_clusters.person_id через face_cluster_members)
-        - через прямоугольники без лица (person_rectangles)
+        Возвращает все привязки файла к персонам:
+        - через лица (photo_rectangles.manual_person_id и photo_rectangles.cluster_id → face_clusters.person_id)
         - прямая привязка (file_persons)
         
         Если указан pipeline_run_id, получает face_run_id из pipeline_runs для фильтрации photo_rectangles.
@@ -1713,78 +1553,54 @@ class FaceStore:
             except Exception:
                 pass
         
-        # Привязки через лица (ручные привязки + через кластеры)
+        # Привязки через лица (ручные привязки + через кластеры через photo_rectangles.cluster_id)
         if face_run_id is not None:
-            # Фильтруем по face_run_id для локальных прогонов
             cur.execute(
                 """
                 SELECT DISTINCT person_id, person_name
                 FROM (
-                    -- Ручные привязки
-                    SELECT DISTINCT fpma.person_id, p.name AS person_name
-                    FROM person_rectangle_manual_assignments fpma
-                    JOIN photo_rectangles fr ON fr.id = fpma.rectangle_id
-                    LEFT JOIN persons p ON p.id = fpma.person_id
-                    WHERE fr.file_id = ? AND fr.run_id = ?
+                    -- Ручные привязки (photo_rectangles.manual_person_id)
+                    SELECT DISTINCT fr.manual_person_id AS person_id, p.name AS person_name
+                    FROM photo_rectangles fr
+                    LEFT JOIN persons p ON p.id = fr.manual_person_id
+                    WHERE fr.file_id = ? AND fr.run_id = ? AND fr.manual_person_id IS NOT NULL
                     
                     UNION
                     
-                    -- Привязки через кластеры
+                    -- Привязки через кластеры (photo_rectangles.cluster_id)
                     SELECT DISTINCT fc.person_id, p.name AS person_name
-                    FROM face_cluster_members fcm
-                    JOIN photo_rectangles fr ON fr.id = fcm.rectangle_id
-                    WHERE fr.is_face = 1
-                    JOIN face_clusters fc ON fc.id = fcm.cluster_id
+                    FROM photo_rectangles fr
+                    JOIN face_clusters fc ON fc.id = fr.cluster_id
                     LEFT JOIN persons p ON p.id = fc.person_id
-                    WHERE fr.file_id = ? AND fr.run_id = ? AND fc.person_id IS NOT NULL
+                    WHERE fr.file_id = ? AND fr.run_id = ? AND fr.is_face = 1 AND fc.person_id IS NOT NULL
                 )
                 """,
                 (resolved_file_id, int(face_run_id), resolved_file_id, int(face_run_id)),
             )
         else:
-            # Для архивных данных (archive_scope='archive') или без фильтрации
             cur.execute(
                 """
                 SELECT DISTINCT person_id, person_name
                 FROM (
-                    -- Ручные привязки
-                    SELECT DISTINCT fpma.person_id, p.name AS person_name
-                    FROM person_rectangle_manual_assignments fpma
-                    JOIN photo_rectangles fr ON fr.id = fpma.rectangle_id
-                    LEFT JOIN persons p ON p.id = fpma.person_id
-                    WHERE fr.file_id = ?
+                    -- Ручные привязки (photo_rectangles.manual_person_id)
+                    SELECT DISTINCT fr.manual_person_id AS person_id, p.name AS person_name
+                    FROM photo_rectangles fr
+                    LEFT JOIN persons p ON p.id = fr.manual_person_id
+                    WHERE fr.file_id = ? AND fr.manual_person_id IS NOT NULL
                     
                     UNION
                     
-                    -- Привязки через кластеры
+                    -- Привязки через кластеры (photo_rectangles.cluster_id)
                     SELECT DISTINCT fc.person_id, p.name AS person_name
-                    FROM face_cluster_members fcm
-                    JOIN photo_rectangles fr ON fr.id = fcm.rectangle_id
-                    WHERE fr.is_face = 1
-                    JOIN face_clusters fc ON fc.id = fcm.cluster_id
+                    FROM photo_rectangles fr
+                    JOIN face_clusters fc ON fc.id = fr.cluster_id
                     LEFT JOIN persons p ON p.id = fc.person_id
-                    WHERE fr.file_id = ? AND fc.person_id IS NOT NULL
+                    WHERE fr.file_id = ? AND fr.is_face = 1 AND fc.person_id IS NOT NULL
                 )
                 """,
                 (resolved_file_id, resolved_file_id),
             )
         face_assignments = [dict(r) for r in cur.fetchall()]
-        
-        # Привязки через прямоугольники без лица
-        person_rects = self.list_person_rectangles(
-            pipeline_run_id=pipeline_run_id,
-            file_id=resolved_file_id,
-        )
-        person_rect_assignments = []
-        for pr in person_rects:
-            cur.execute("SELECT id, name FROM persons WHERE id = ?", (pr["person_id"],))
-            person_row = cur.fetchone()
-            if person_row:
-                person_rect_assignments.append({
-                    "person_id": pr["person_id"],
-                    "person_name": person_row["name"],
-                    "rectangle_id": pr["id"],
-                })
         
         # Прямые привязки
         file_persons_list = self.list_file_persons(
@@ -1803,7 +1619,7 @@ class FaceStore:
         
         return {
             "face_assignments": face_assignments,
-            "person_rectangle_assignments": person_rect_assignments,
+            "person_rectangle_assignments": [],  # таблица person_rectangles удалена
             "direct_assignments": direct_assignments,
         }
 
@@ -2607,6 +2423,9 @@ class DedupStore:
         """
         Ручная пометка "карантин" В РАМКАХ ПРОГОНА.
         """
+        resolved_file_id = _get_file_id_from_path(self.conn, path)
+        if resolved_file_id is None:
+            raise ValueError(f"File not found in files table: {path}")
         self._ensure_run_manual_row(pipeline_run_id=int(pipeline_run_id), path=str(path))
         cur = self.conn.cursor()
         if bool(is_quarantine):
@@ -2614,18 +2433,18 @@ class DedupStore:
                 """
                 UPDATE files_manual_labels
                 SET quarantine_manual = 1, quarantine_manual_at = ?
-                WHERE pipeline_run_id = ? AND path = ?
+                WHERE pipeline_run_id = ? AND file_id = ?
                 """,
-                (_now_utc_iso(), int(pipeline_run_id), str(path)),
+                (_now_utc_iso(), int(pipeline_run_id), resolved_file_id),
             )
         else:
             cur.execute(
                 """
                 UPDATE files_manual_labels
                 SET quarantine_manual = 0, quarantine_manual_at = NULL
-                WHERE pipeline_run_id = ? AND path = ?
+                WHERE pipeline_run_id = ? AND file_id = ?
                 """,
-                (int(pipeline_run_id), str(path)),
+                (int(pipeline_run_id), resolved_file_id),
             )
         self.conn.commit()
 

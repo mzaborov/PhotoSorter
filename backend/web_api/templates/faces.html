@@ -303,6 +303,10 @@
       </div>
     </div>
 
+    <!-- Подключение единой карточки фотографий (должно быть до основного скрипта) -->
+    {% include "photo_card.html" %}
+    <script src="/static/photo_card.js?v=48"></script>
+
     <script>
       // Глобальная обработка ошибок для предотвращения перезагрузки страницы
       window.addEventListener("error", (event) => {
@@ -624,15 +628,30 @@
       }
       
       async function loadGroupsSubtabs() {
-        if (!pipelineRunId || tab !== "no_faces") return;
+        console.log("[loadGroupsSubtabs] Начало, pipelineRunId:", pipelineRunId, "tab:", tab);
+        if (!pipelineRunId) {
+          console.warn("[loadGroupsSubtabs] Нет pipelineRunId, пропускаем");
+          return;
+        }
+        if (tab !== "no_faces") {
+          console.log("[loadGroupsSubtabs] Tab не 'no_faces', пропускаем. Текущий tab:", tab);
+          return;
+        }
         try {
+          console.log("[loadGroupsSubtabs] Загружаем группы для pipeline_run_id:", pipelineRunId);
           const data = await fetchJson(`/api/faces/groups-with-files?pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}`);
           const groups = data?.groups || [];
+          console.log("[loadGroupsSubtabs] Получено групп:", groups.length, groups);
+          
           const row = qs("#subtabsNoFaces");
-          if (!row) return;
+          if (!row) {
+            console.error("[loadGroupsSubtabs] Элемент #subtabsNoFaces не найден!");
+            return;
+          }
           
           // Удаляем старые подзакладки групп (кроме "К разбору")
           const existingGroupBtns = row.querySelectorAll('[data-group-path]');
+          console.log("[loadGroupsSubtabs] Удаляем старых подзакладок:", existingGroupBtns.length);
           existingGroupBtns.forEach(btn => btn.remove());
           
           // Сортируем группы: сначала поездки (по дате добавления - последние выше), потом остальные по алфавиту
@@ -664,23 +683,32 @@
             }
           });
           
+          console.log("[loadGroupsSubtabs] Отсортировано групп:", sortedGroups.length);
+          
           // Добавляем подзакладки для каждой группы
           sortedGroups.forEach(group => {
+            const groupPath = group.group_path || "";
+            if (!groupPath) {
+              console.warn("[loadGroupsSubtabs] Пропускаем группу без group_path:", group);
+              return;
+            }
             const btn = document.createElement("button");
             btn.className = "subtab";
-            btn.id = `subGroup_${encodeURIComponent(group.group_path)}`;
-            btn.setAttribute("data-group-path", String(group.group_path));
+            btn.id = `subGroup_${encodeURIComponent(groupPath)}`;
+            btn.setAttribute("data-group-path", String(groupPath));
             btn.type = "button";
-            btn.textContent = `${group.group_path || `Группа ${group.id}`} (${group.files_count || 0})`;
-            btn.onclick = () => setSubtab(`group_${encodeURIComponent(group.group_path)}`);
+            btn.textContent = `${groupPath} (${group.files_count || 0})`;
+            btn.onclick = () => setSubtab(`group_${encodeURIComponent(groupPath)}`);
             row.appendChild(btn);
+            console.log("[loadGroupsSubtabs] Добавлена подзакладка для группы:", groupPath);
           });
           
+          console.log("[loadGroupsSubtabs] Всего добавлено подзакладок:", sortedGroups.length);
           updateSubtabsVisibility();
           
           // НЕ обновляем выпадашки здесь - они будут обновлены в load() после рендеринга карточек
         } catch (e) {
-          console.error("Ошибка загрузки подзакладок групп:", e);
+          console.error("[loadGroupsSubtabs] Ошибка загрузки подзакладок групп:", e);
         }
       }
       
@@ -1805,7 +1833,7 @@
             }
           }
         } catch (e) {
-          // best-effort
+          console.warn("[refreshTabCounts] Ошибка:", e);
         }
       }
 
@@ -1891,11 +1919,13 @@
           }
         } else if (tab === "no_faces") {
           // Выпадашка для групп (как в кластерах)
+          // Для HTML-атрибутов экранируем только двойные кавычки (так как атрибут в двойных кавычках)
+          const escapedPathForAttr = (path ?? "").toString().replace(/"/g, '&quot;');
           const escapedPath = escapeHtml(path);
           const groupSelectId = `group-select-${escapedPath.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 50)}`;
           // Используем data-file-path атрибут для передачи пути, чтобы избежать проблем с экранированием в onchange
           // Обработчик будет получать путь из атрибута
-          const groupSelectHtml = `<select class="btn" style="padding:6px 12px; cursor:pointer; border:1px solid #d1d5db; border-radius:4px; background:white; min-width:180px;" onchange="handleGroupSelectFromDropdown(this, event)" id="${groupSelectId}" data-file-path="${escapedPath}">
+          const groupSelectHtml = `<select class="btn" style="padding:6px 12px; cursor:pointer; border:1px solid #d1d5db; border-radius:4px; background:white; min-width:180px;" onchange="handleGroupSelectFromDropdown(this, event)" id="${groupSelectId}" data-file-path="${escapedPathForAttr}">
             <option value="">Назначить группу...</option>
           </select>`;
           btn = `
@@ -3009,6 +3039,13 @@
             const person = allPersonsList.find(per => per.id === personIds[0]);
             const personName = person ? (person.name || `Персона ${personIds[0]}`) : `Персона ${personIds[0]}`;
             setToast(`Прямоугольник #${rectIndex + 1} назначен персоне "${personName}".`);
+            // На «К разбору» файл должен пропасть из списка — убираем карточку и закрываем lightbox
+            if (tab === "faces" && (subtab === "unsorted" || subtab === "all")) {
+              removeCardByPath(curPath);
+              await refreshTabCounts();
+              loadPersonsSubtabs(true);
+              closeLb();
+            }
           }
         });
       }
@@ -3042,23 +3079,47 @@
         });
         
         // Формируем list_context
+        // Определяем параметры сортировки и фильтров
+        const currentSort = (tab === "no_faces") ? nfSort : null;
+        const currentFrom = (tab === "no_faces") ? nfFrom : null;
+        const currentTo = (tab === "no_faces") ? nfTo : null;
+        
+        // Получаем общее количество элементов (totalCount может быть null)
+        const totalItemsCount = (typeof totalCount === "number" && totalCount > 0) ? totalCount : items.length;
+        
         const listContext = {
           source_page: "faces",
+          tab: tab,
+          subtab: subtab,
           items: items,
           current_index: currentIndex,
-          total_count: total || items.length,
+          total_count: totalItemsCount,
           api_fallback: {
             endpoint: "/api/faces/results",
             params: {
               pipeline_run_id: pipelineRunId,
               tab: tab,
               subtab: subtab,
-              sort: sort,
-              from: fromTs,
-              to: toTs,
+              sort: currentSort,
+              from: currentFrom,
+              to: currentTo,
               page_size: 60
             }
           }
+        };
+        // После назначения персоны на «К разбору» — убрать карточку из таблицы, обновить счётчики и закрыть карточку
+        const onAssignSuccess = (tab === "faces" && (subtab === "unsorted" || subtab === "all"))
+          ? async (path) => {
+              removeCardByPath(path);
+              await refreshTabCounts();
+              loadPersonsSubtabs(true);
+            }
+          : null;
+        // При любом закрытии карточки (Закрыть, крестик, клик вне) — обновить таблицу и счётчики
+        const onClose = () => {
+          load(true);
+          refreshTabCounts();
+          loadPersonsSubtabs(true);
         };
         
         // Открываем карточку фотографий
@@ -3067,7 +3128,9 @@
             file_id: fileId,
             file_path: p,
             pipeline_run_id: pipelineRunId,
-            list_context: listContext
+            list_context: listContext,
+            on_assign_success: onAssignSuccess,
+            on_close: onClose
           });
         } else {
           // Fallback на старый viewer, если новый модуль не загружен
@@ -3279,10 +3342,6 @@
         }
       };
     </script>
-    
-    <!-- Подключение единой карточки фотографий -->
-    {% include "photo_card.html" %}
-    <script src="/static/photo_card.js?v=48"></script>
   </body>
 </html>
 

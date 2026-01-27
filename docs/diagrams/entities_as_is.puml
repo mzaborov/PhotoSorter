@@ -206,6 +206,8 @@ class photo_rectangles <<table>> {
   run_id: INTEGER <<FK>>         ' NULL для архива (archive_scope='archive')
   archive_scope: TEXT             ' NULL|'' для прогонов, 'archive' для архива
   +file_id: INTEGER <<FK>> <<NOT NULL>>  ' FOREIGN KEY на files.id (путь через JOIN к files.path)
+  cluster_id: INTEGER <<FK>>        ' принадлежность кластеру (вместо face_cluster_members)
+  manual_person_id: INTEGER <<FK>>  ' ручная привязка к персоне (вместо person_rectangle_manual_assignments); CHECK: только один из cluster_id/manual_person_id
   face_index: INTEGER
   bbox_x: INTEGER
   bbox_y: INTEGER
@@ -248,42 +250,17 @@ class face_clusters <<table>> {
   created_at: TEXT
 }
 
-class face_cluster_members <<table>> {
-  cluster_id: INTEGER <<FK,PK>>
-  rectangle_id: INTEGER <<FK,PK>>  ' только is_face=1
-}
-
-class person_rectangle_manual_assignments <<table>> {
-  +id: INTEGER <<PK>>
-  rectangle_id: INTEGER <<FK>>  ' может быть лицо (is_face=1) или персона (is_face=0)
-  person_id: INTEGER <<FK>>
-  source: TEXT                  ' manual|restored_from_gold|ai
-  confidence: REAL
-  created_at: TEXT
-}
+' face_cluster_members удалена: принадлежность кластеру в photo_rectangles.cluster_id
+' person_rectangle_manual_assignments удалена: ручная привязка в photo_rectangles.manual_person_id
 
 files "1" -- "*" photo_rectangles : файл (file_id)
 photo_rectangles "0..1" -- "0..1" persons : avatar (avatar_face_id)
-photo_rectangles "1" -- "*" face_cluster_members : член кластера (только is_face=1)
-face_clusters "1" -- "*" face_cluster_members : кластер
+photo_rectangles "0..1" -- "0..1" face_clusters : кластер (cluster_id)
 face_clusters "0..1" -- "0..1" persons : привязка кластера к персоне (person_id)
-photo_rectangles "1" -- "0..*" person_rectangle_manual_assignments : ручные привязки (лица или персоны)
-persons "1" -- "*" person_rectangle_manual_assignments : ручная привязка к персоне
+photo_rectangles "0..1" -- "0..1" persons : ручная привязка (manual_person_id); CHECK: только один из cluster_id/manual_person_id
 face_runs "1" -- "*" face_clusters : прогон кластеризации
 
-class person_rectangles <<table>> {
-  +id: INTEGER <<PK>>
-  pipeline_run_id: INTEGER <<FK>>
-  file_path: TEXT                    ' дублирование для удобства/производительности, путь также в files.path
-  +file_id: INTEGER <<FK>> <<NOT NULL>>  ' FOREIGN KEY на files.id
-  frame_idx: INTEGER
-  bbox_x: INTEGER
-  bbox_y: INTEGER
-  bbox_w: INTEGER
-  bbox_h: INTEGER
-  person_id: INTEGER <<FK>>
-  created_at: TEXT
-}
+' person_rectangles удалена миграцией migrate_drop_person_rectangles.py
 
 class file_persons <<table>> {
   +pipeline_run_id: INTEGER <<PK>>
@@ -311,53 +288,29 @@ class file_group_persons <<table>> {
   created_at: TEXT
 }
 
-files "1" -- "*" person_rectangles : файл (file_id)
 files "1" -- "*" file_persons : файл (file_id)
 files "1" -- "*" file_groups : файл (file_id)
 files "1" -- "*" file_group_persons : файл (file_id)
-persons "1" -- "*" person_rectangles : прямоугольник без лица
 persons "1" -- "*" file_persons : прямая привязка файла
 persons "1" -- "*" file_group_persons : привязка через группу
-pipeline_runs "1" -- "*" person_rectangles : прогон
 pipeline_runs "1" -- "*" file_persons : прогон
 pipeline_runs "1" -- "*" file_groups : прогон
 pipeline_runs "1" -- "*" file_group_persons : прогон
-
-note right of person_rectangle_manual_assignments
-  ТОЛЬКО для ручных привязок отдельных лиц
-  (не через кластеры)
-  
-  Кластеры привязаны к персонам через
-  face_clusters.person_id напрямую
-  
-  Лица в кластере наследуют персону через:
-  face_rectangles → face_cluster_members → 
-  face_clusters.person_id
-end note
 
 note right of face_clusters
   person_id: прямая привязка кластера к персоне
   
   Все лица в кластере наследуют персону
-  через JOIN с face_cluster_members
+  через photo_rectangles.cluster_id
   
   Если person_id = NULL — кластер не назначен
 end note
 
-note right of face_cluster_members
-  Единственный источник истины:
-  какое лицо в каком кластере
-  
-  PRIMARY KEY (cluster_id, rectangle_id)
-  Одно лицо → один кластер
-  
-  Если лицо не в кластере (noise) —
-  записи нет
-  
-  ТОЛЬКО rectangles с is_face=1 могут быть в кластерах
-end note
-
 note right of photo_rectangles
+  cluster_id: принадлежность кластеру (вместо face_cluster_members)
+  manual_person_id: ручная привязка к персоне (вместо person_rectangle_manual_assignments)
+  CHECK: только один из cluster_id/manual_person_id
+  
   presence_score (photo) =
   area(face_bbox) / sum(area(all_face_bbox))
   
