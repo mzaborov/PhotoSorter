@@ -349,6 +349,8 @@
       }
 
       async function loadPerson() {
+        // Сразу восстанавливаем вкладку из hash, чтобы при обновлении карточки она не слетала
+        handleUrlAnchors();
         try {
           const resp = await fetch(`/api/persons/${personId}`);
           if (!resp.ok) {
@@ -386,10 +388,7 @@
           // Обновляем счетчики на вкладках
           updateTabCounts();
           
-          // Обрабатываем якоря URL для перехода на нужную закладку
-          handleUrlAnchors();
-          
-          // Рендерим элементы
+          // Рендерим элементы (вкладка уже восстановлена из hash в начале loadPerson)
           renderFaces();
         } catch (e) {
           console.error('Ошибка загрузки персоны:', e);
@@ -459,6 +458,7 @@
         mainTab = tab;
         updateTabs();
         renderFaces();
+        window.location.hash = `${subtab}-${mainTab}`;
       }
       
       // Переключение подвкладок
@@ -466,6 +466,7 @@
         subtab = sub;
         updateTabs();
         renderFaces();
+        window.location.hash = `${subtab}-${mainTab}`;
       }
       
       // Функция для обновления счетчиков на вкладках
@@ -690,9 +691,9 @@
           typeBadgeClass = 'badge-file'; // Зеленый цвет
         }
         
-        // Для прямой привязки (file_person) показываем файл целиком, без кропа
+        // Для прямой привязки (file_person) показываем файл целиком, без кропа; по dblclick открываем карточку
         const hasBbox = item.bbox && item.bbox.x !== null && item.bbox.y !== null;
-        const canDoubleClick = item.face_id || (item.person_rectangle_id && hasBbox);
+        const canDoubleClick = item.face_id || (item.person_rectangle_id && hasBbox) || (item.assignment_type === 'file_person' && item.file_path);
         
         let actionsHtml = '';
         if (item.face_id) {
@@ -910,7 +911,10 @@
             face_rectangle_id: f.face_id || null,
             person_rectangle_id: null,
             pipeline_run_id: f.pipeline_run_id || null,
-            run_id: f.run_id || null
+            run_id: f.run_id || null,
+            taken_at: f.taken_at ?? null,
+            place_country: f.place_country ?? null,
+            place_city: f.place_city ?? null
           }));
           
           const listContext = {

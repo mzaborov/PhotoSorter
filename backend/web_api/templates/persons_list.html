@@ -38,6 +38,18 @@
       .toast.error { color:#dc2626; }
       .loading { opacity: 0.6; pointer-events: none; }
       .empty { text-align: center; padding: 40px; color: #6b7280; }
+      /* Модалка создания персоны */
+      .modal { position: fixed; inset: 0; background: rgba(17,24,39,0.82); display: none; align-items: center; justify-content: center; padding: 18px; z-index: 9999; }
+      .modal.show { display: flex; }
+      .modal-panel { background: #fff; border-radius: 14px; max-width: 94vw; width: min(420px, 94vw); box-shadow: 0 20px 60px rgba(0,0,0,0.35); }
+      .modal-header { padding: 12px 16px; border-bottom: 1px solid #e5e7eb; font-weight: 700; font-size: 16px; }
+      .modal-body { padding: 16px; }
+      .modal-footer { padding: 12px 16px; border-top: 1px solid #e5e7eb; display: flex; gap: 10px; justify-content: flex-end; }
+      .form-group { margin-bottom: 14px; }
+      .form-group label { display: block; margin-bottom: 4px; font-weight: 600; font-size: 13px; }
+      .form-group input, .form-group select { width: 100%; border: 1px solid #d1d5db; border-radius: 8px; padding: 8px 10px; font-size: 14px; }
+      .form-group input:focus, .form-group select:focus { outline: none; border-color: #0b57d0; }
+      #createPersonNewGroupFields { margin-top: 10px; padding: 10px; background: #f9fafb; border-radius: 8px; border: 1px solid #e5e7eb; }
     </style>
   </head>
   <body>
@@ -48,6 +60,7 @@
           <div class="muted" style="margin-top: 6px;">Все персоны со статистикой кластеров и лиц</div>
         </div>
         <div style="display:flex; align-items:center; gap:12px;">
+          <button class="btn primary" id="btnCreatePerson" type="button" style="padding:6px 12px; font-size:14px;">Создать персону</button>
           <button class="btn primary" id="btnSaveAllToGold" type="button" style="padding:6px 12px; font-size:14px;">Сохранить все в gold</button>
           <span class="toast" id="toast"></span>
           <span style="color:#6b7280;">·</span>
@@ -72,6 +85,41 @@
         </tbody>
       </table>
       <div id="empty" class="empty" style="display: none;">Нет персон</div>
+    </div>
+
+    <!-- Модалка: Создать персону -->
+    <div class="modal" id="modalCreatePerson">
+      <div class="modal-panel">
+        <div class="modal-header">Создать персону</div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label for="createPersonName">Имя *</label>
+            <input type="text" id="createPersonName" placeholder="Имя персоны" />
+          </div>
+          <div class="form-group">
+            <label for="createPersonGroup">Группа</label>
+            <select id="createPersonGroup">
+              <option value="">Без группы</option>
+              <!-- опции групп подгружаются из API -->
+              <option value="__new__">+ Создать новую группу</option>
+            </select>
+            <div id="createPersonNewGroupFields" style="display: none;">
+              <div class="form-group" style="margin-bottom: 8px;">
+                <label for="createPersonNewGroupName">Название новой группы</label>
+                <input type="text" id="createPersonNewGroupName" placeholder="Название группы" />
+              </div>
+              <div class="form-group" style="margin-bottom: 0;">
+                <label for="createPersonNewGroupOrder">Приоритет (меньше — выше в списке)</label>
+                <input type="number" id="createPersonNewGroupOrder" min="1" max="999" value="10" />
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" type="button" id="btnCreatePersonCancel">Отмена</button>
+          <button class="btn primary" type="button" id="btnCreatePersonSubmit">Создать</button>
+        </div>
+      </div>
     </div>
 
     <script>
@@ -406,6 +454,96 @@
       
       // Инициализация обработчика кнопки
       document.getElementById('btnSaveAllToGold')?.addEventListener('click', saveAllToGold);
+
+      // --- Модалка «Создать персону» ---
+      const modalCreatePerson = document.getElementById('modalCreatePerson');
+      const createPersonGroupSelect = document.getElementById('createPersonGroup');
+      const createPersonNewGroupFields = document.getElementById('createPersonNewGroupFields');
+
+      function showCreatePersonModal() {
+        document.getElementById('createPersonName').value = '';
+        document.getElementById('createPersonNewGroupName').value = '';
+        document.getElementById('createPersonNewGroupOrder').value = '10';
+        createPersonGroupSelect.value = '';
+        createPersonNewGroupFields.style.display = 'none';
+        // Загружаем группы и заполняем select (оставляем «Без группы» и «+ Новая группа»)
+        const opts = createPersonGroupSelect.querySelectorAll('option');
+        for (let i = opts.length - 1; i >= 1; i--) {
+          if (opts[i].value !== '' && opts[i].value !== '__new__') opts[i].remove();
+        }
+        fetch('/api/persons/groups')
+          .then(r => r.json())
+          .then(data => {
+            const groups = data.groups || [];
+            const newOpt = createPersonGroupSelect.querySelector('option[value="__new__"]');
+            groups.forEach(g => {
+              const opt = document.createElement('option');
+              opt.value = g.name;
+              opt.textContent = g.name;
+              opt.dataset.order = String(g.order);
+              createPersonGroupSelect.insertBefore(opt, newOpt);
+            });
+          })
+          .catch(e => console.warn('Ошибка загрузки групп:', e));
+        modalCreatePerson.classList.add('show');
+      }
+
+      function closeCreatePersonModal() {
+        modalCreatePerson.classList.remove('show');
+      }
+
+      createPersonGroupSelect.addEventListener('change', () => {
+        createPersonNewGroupFields.style.display = createPersonGroupSelect.value === '__new__' ? 'block' : 'none';
+      });
+
+      document.getElementById('btnCreatePerson')?.addEventListener('click', showCreatePersonModal);
+      document.getElementById('btnCreatePersonCancel')?.addEventListener('click', closeCreatePersonModal);
+
+      document.getElementById('btnCreatePersonSubmit')?.addEventListener('click', async () => {
+        const nameEl = document.getElementById('createPersonName');
+        const name = (nameEl?.value || '').trim();
+        if (!name) {
+          showToast('Введите имя персоны', true);
+          return;
+        }
+        let group = null;
+        let group_order = undefined;
+        if (createPersonGroupSelect.value === '__new__') {
+          const newName = (document.getElementById('createPersonNewGroupName')?.value || '').trim();
+          const orderVal = document.getElementById('createPersonNewGroupOrder')?.value;
+          if (!newName) {
+            showToast('Введите название новой группы', true);
+            return;
+          }
+          group = newName;
+          group_order = orderVal != null && orderVal !== '' ? parseInt(orderVal, 10) : 10;
+        } else if (createPersonGroupSelect.value !== '') {
+          group = createPersonGroupSelect.value;
+        }
+        const btn = document.getElementById('btnCreatePersonSubmit');
+        btn.disabled = true;
+        try {
+          const payload = { name, mode: 'active' };
+          if (group != null) payload.group = group;
+          if (group_order !== undefined) payload.group_order = group_order;
+          const resp = await fetch('/api/persons/create', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          const data = await resp.json();
+          if (!resp.ok) {
+            throw new Error(data.detail || data.error || 'Ошибка создания');
+          }
+          closeCreatePersonModal();
+          loadPersons();
+          showToast('Персона создана: ' + name, false);
+        } catch (e) {
+          showToast('Ошибка: ' + e.message, true);
+        } finally {
+          btn.disabled = false;
+        }
+      });
     </script>
   </body>
 </html>

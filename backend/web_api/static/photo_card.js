@@ -60,6 +60,7 @@ console.error = function(...args) {
     list_context: null,
     highlight_rectangle: null,
     rectangles: [],
+    directBindings: [], // Прямая привязка файла к персонам (file_persons): [{person_id, person_name}, ...]
     mode: 'archive', // 'archive' | 'sorting'
     pipeline_run_id: null,
     showRectangles: true,
@@ -71,6 +72,15 @@ console.error = function(...args) {
     editingRectangleIndex: null, // Индекс rectangle, для которого открыто модальное окно выбора персоны
     drawingState: null, // Состояние рисования: {startX, startY, currentX, currentY, tempRectElement}
     person_id: null // ID персоны при открытии с person_detail (для кнопки «Аватар»)
+  };
+
+  // Состояние оверлея зума (на весь экран с pan/zoom)
+  let zoomState = {
+    open: false,
+    scale: 1,
+    translateX: 0,
+    translateY: 0,
+    panStart: null // { x, y, startTranslateX, startTranslateY }
   };
 
   /**
@@ -97,6 +107,7 @@ console.error = function(...args) {
       on_assign_success: options.on_assign_success || null,
       on_close: options.on_close || null,
       rectangles: [],
+      directBindings: [],
       mode: 'archive',
       pipeline_run_id: null,
       showRectangles: true,
@@ -147,19 +158,18 @@ console.error = function(...args) {
       }
     }
     
-    console.log('[photo_card] pipeline_run_id:', currentState.pipeline_run_id, 'mode:', currentState.mode);
-
-    // Определяем режим (archive/sorting): приоритет у list_context.tab при открытии с person_detail
-    if (currentState.list_context && (currentState.list_context.tab === 'archive' || currentState.list_context.tab === 'run')) {
-      currentState.mode = currentState.list_context.tab === 'archive' ? 'archive' : 'sorting';
-      currentState.person_id = currentState.list_context.person_id || null;
-    } else if (currentState.file_path) {
+    // Режим (archive/sorting) всегда берём из файла, не из переданного контекста
+    if (currentState.file_path) {
       currentState.mode = currentState.file_path.startsWith('disk:/Фото') ? 'archive' : 'sorting';
-      currentState.person_id = null;
+      if (currentState.mode === 'archive') {
+        currentState.pipeline_run_id = null;
+      }
     } else {
       currentState.mode = 'sorting';
-      currentState.person_id = null;
     }
+    currentState.person_id = (currentState.list_context && currentState.list_context.person_id) || null;
+
+    console.log('[photo_card] pipeline_run_id:', currentState.pipeline_run_id, 'mode:', currentState.mode);
     
     // Навигация всегда видна, чтобы layout не «съезжал». При list_context — prev/next/позиция;
     // без list_context — плейсхолдер «—», prev/next скрыты, но блок резервирует место.
@@ -237,6 +247,7 @@ console.error = function(...args) {
     // Очищаем состояние
     currentState.selectedRectangleIndex = null;
     currentState.rectangles = [];
+    currentState.directBindings = [];
     currentState.isEditMode = false;
     currentState.dragState = null;
   }
@@ -342,7 +353,121 @@ console.error = function(...args) {
       person_id: null
     };
   }
-  
+
+  /**
+   * Открывает оверлей зума (фото на весь экран с увеличением и панорамой)
+   */
+  function openPhotoZoom() {
+    const imgElement = document.getElementById('photoCardImg');
+    const zoomOverlay = document.getElementById('photoZoomOverlay');
+    const zoomImg = document.getElementById('photoZoomImg');
+    const zoomInner = document.getElementById('photoZoomInner');
+    if (!imgElement || !zoomOverlay || !zoomImg || !zoomInner) return;
+    const src = imgElement.src;
+    if (!src) return;
+    zoomImg.src = src;
+    zoomImg.alt = imgElement.alt || 'Фото';
+    zoomState.open = true;
+    zoomState.scale = 1;
+    zoomState.translateX = 0;
+    zoomState.translateY = 0;
+    zoomState.panStart = null;
+    zoomOverlay.setAttribute('aria-hidden', 'false');
+    applyZoomTransform();
+    zoomImg.style.cursor = 'grab';
+    document.addEventListener('wheel', onZoomWheel, { passive: false });
+    document.addEventListener('mousedown', onZoomPanStart);
+  }
+
+  /**
+   * Закрывает оверлей зума
+   */
+  function closePhotoZoom() {
+    const zoomOverlay = document.getElementById('photoZoomOverlay');
+    const zoomImg = document.getElementById('photoZoomImg');
+    if (!zoomOverlay) return;
+    zoomState.open = false;
+    zoomState.panStart = null;
+    zoomOverlay.setAttribute('aria-hidden', 'true');
+    if (zoomImg) {
+      zoomImg.style.transform = '';
+      zoomImg.style.cursor = 'grab';
+    }
+    document.removeEventListener('wheel', onZoomWheel);
+    document.removeEventListener('mousedown', onZoomPanStart);
+    document.removeEventListener('mousemove', onZoomPanMove);
+    document.removeEventListener('mouseup', onZoomPanEnd);
+  }
+
+  function applyZoomTransform() {
+    const zoomImg = document.getElementById('photoZoomImg');
+    if (!zoomImg) return;
+    const s = zoomState.scale;
+    const tx = zoomState.translateX;
+    const ty = zoomState.translateY;
+    zoomImg.style.transformOrigin = 'center center';
+    zoomImg.style.transform = `translate(${tx}px, ${ty}px) scale(${s})`;
+  }
+
+  function onZoomWheel(e) {
+    if (!zoomState.open) return;
+    const zoomOverlay = document.getElementById('photoZoomOverlay');
+    const zoomImg = document.getElementById('photoZoomImg');
+    if (!zoomOverlay || !zoomImg || zoomOverlay.getAttribute('aria-hidden') === 'true') return;
+    e.preventDefault();
+    const rect = zoomImg.getBoundingClientRect();
+    const nw = zoomImg.naturalWidth;
+    const nh = zoomImg.naturalHeight;
+    if (!nw || !nh) return;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const baseScale = Math.min(vw / nw, vh / nh);
+    const cursorX = e.clientX;
+    const cursorY = e.clientY;
+    const imgX = (cursorX - rect.left - rect.width / 2) / (zoomState.scale * baseScale) + nw / 2;
+    const imgY = (cursorY - rect.top - rect.height / 2) / (zoomState.scale * baseScale) + nh / 2;
+    const factor = e.deltaY > 0 ? 1 / 1.15 : 1.15;
+    let newScale = zoomState.scale * factor;
+    newScale = Math.max(0.3, Math.min(8, newScale));
+    const tx = cursorX - vw / 2 + (nw / 2 - imgX) * baseScale * newScale;
+    const ty = cursorY - vh / 2 + (nh / 2 - imgY) * baseScale * newScale;
+    zoomState.scale = newScale;
+    zoomState.translateX = tx;
+    zoomState.translateY = ty;
+    applyZoomTransform();
+  }
+
+  function onZoomPanStart(e) {
+    if (!zoomState.open) return;
+    const zoomImg = document.getElementById('photoZoomImg');
+    if (!zoomImg || e.target !== zoomImg) return;
+    e.preventDefault();
+    zoomState.panStart = {
+      x: e.clientX,
+      y: e.clientY,
+      startTranslateX: zoomState.translateX,
+      startTranslateY: zoomState.translateY
+    };
+    zoomImg.style.cursor = 'grabbing';
+    document.addEventListener('mousemove', onZoomPanMove);
+    document.addEventListener('mouseup', onZoomPanEnd);
+  }
+
+  function onZoomPanMove(e) {
+    if (!zoomState.panStart) return;
+    zoomState.translateX = zoomState.panStart.startTranslateX + (e.clientX - zoomState.panStart.x);
+    zoomState.translateY = zoomState.panStart.startTranslateY + (e.clientY - zoomState.panStart.y);
+    applyZoomTransform();
+  }
+
+  function onZoomPanEnd() {
+    const zoomImg = document.getElementById('photoZoomImg');
+    if (zoomImg) zoomImg.style.cursor = 'grab';
+    zoomState.panStart = null;
+    document.removeEventListener('mousemove', onZoomPanMove);
+    document.removeEventListener('mouseup', onZoomPanEnd);
+  }
+
   /**
    * Обновляет позицию в навигации
    */
@@ -467,12 +592,49 @@ console.error = function(...args) {
       if (pathElement) {
         pathElement.textContent = currentState.file_path || `file_id: ${currentState.file_id}`;
       }
+      // Дата и место справа от пути — плашками в стиле таблицы faces
+      const datePlaceEl = document.getElementById('photoCardDatePlace');
+      if (datePlaceEl) {
+        const item = currentState.list_context && currentState.list_context.items
+          ? currentState.list_context.items[currentState.list_context.current_index || 0]
+          : null;
+        const takenAt = (item && (item.taken_at != null && item.taken_at !== '')) ? String(item.taken_at) : '';
+        const country = (item && (item.place_country != null && item.place_country !== '')) ? String(item.place_country).trim() : '';
+        const city = (item && (item.place_city != null && item.place_city !== '')) ? String(item.place_city).trim() : '';
+        let takenDate = '';
+        if (takenAt.length >= 10) {
+          takenDate = takenAt.slice(0, 10);
+          if (takenAt.length >= 19) {
+            takenDate += ' ' + takenAt.slice(11, 19).replace('Z', '').slice(0, 5);
+          }
+        }
+        const placeLabel = country && city ? `${country}, ${city}` : (country || city || '');
+        const escapePc = (s) => (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+        if (takenDate || placeLabel) {
+          const pills = [];
+          if (takenDate) pills.push(`<span class="pill">дата: ${escapePc(takenDate)}</span>`);
+          if (placeLabel) pills.push(`<span class="pill">место: ${escapePc(placeLabel)}</span>`);
+          datePlaceEl.innerHTML = pills.join('');
+        } else {
+          datePlaceEl.textContent = '—';
+        }
+      }
 
       // Загружаем изображение
       await loadImage();
 
-      // Загружаем rectangles (для всех режимов, pipeline_run_id опционален для архивных фото)
-      await loadRectangles();
+      // Загружаем rectangles (при ошибке не блокируем загрузку прямых привязок)
+      try {
+        await loadRectangles();
+      } catch (e) {
+        console.warn('[photo_card] loadRectangles failed, continuing with direct bindings', e);
+        currentState.rectangles = [];
+      }
+      // Прямые привязки (file_persons) — всегда при наличии файла; pipeline_run_id на бэкенде выводится по file_id при отсутствии
+      if (currentState.file_id || currentState.file_path) {
+        await loadFilePersons();
+      }
+      updateRectanglesList();
       if (currentState.pipeline_run_id) {
         await checkDuplicates();
       }
@@ -488,11 +650,87 @@ console.error = function(...args) {
       if (deleteFileBtn) {
         deleteFileBtn.style.display = currentState.mode === 'sorting' ? '' : 'none';
       }
+
+      // Блок «Назначить группу» — только при mode=sorting и tab=no_faces
+      const assignGroupBlock = document.getElementById('photoCardAssignGroupBlock');
+      const tabParam = currentState.list_context?.api_fallback?.params?.tab;
+      if (assignGroupBlock) {
+        if (currentState.mode === 'sorting' && tabParam === 'no_faces') {
+          assignGroupBlock.style.display = 'block';
+          await loadGroupsForAssignBlock();
+          const assignGroupBtn = document.getElementById('photoCardAssignGroupBtn');
+          if (assignGroupBtn) {
+            assignGroupBtn.onclick = () => handleAssignGroupFromCard();
+          }
+        } else {
+          assignGroupBlock.style.display = 'none';
+        }
+      }
       
       // Добавляем обработчики рисования
       attachDrawingHandlers();
     } catch (error) {
       console.error('[photo_card] Error loading data:', error);
+    }
+  }
+
+  /**
+   * Заполняет выпадающий список групп для блока «Назначить группу» (tab=no_faces)
+   */
+  async function loadGroupsForAssignBlock() {
+    const sel = document.getElementById('photoCardGroupSelect');
+    if (!sel || !currentState.pipeline_run_id) return;
+    try {
+      const res = await fetch(`/api/faces/groups-with-files?pipeline_run_id=${encodeURIComponent(currentState.pipeline_run_id)}`);
+      const data = res.ok ? await res.json() : {};
+      const groups = data.groups || [];
+      sel.innerHTML = '<option value="">Назначить группу...</option>';
+      const sorted = [...groups].sort((a, b) => (a.group_path || '').localeCompare(b.group_path || '', 'ru', { sensitivity: 'base' }));
+      sorted.forEach(g => {
+        const path = g.group_path || '';
+        if (!path) return;
+        const opt = document.createElement('option');
+        opt.value = path;
+        opt.textContent = path;
+        sel.appendChild(opt);
+      });
+    } catch (e) {
+      console.warn('[photo_card] loadGroupsForAssignBlock failed:', e);
+    }
+  }
+
+  /**
+   * Обработчик «Назначить» в блоке «Назначить группу»: POST assign-group, закрыть карточку, toast
+   */
+  async function handleAssignGroupFromCard() {
+    const sel = document.getElementById('photoCardGroupSelect');
+    const groupPath = sel?.value?.trim();
+    if (!groupPath || groupPath.startsWith('__create_new')) {
+      if (typeof window.setToast === 'function') window.setToast('Выберите группу', true);
+      else alert('Выберите группу');
+      return;
+    }
+    if (!currentState.pipeline_run_id || !currentState.file_path) return;
+    try {
+      const res = await fetch('/api/faces/assign-group', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          pipeline_run_id: currentState.pipeline_run_id,
+          path: currentState.file_path,
+          group_path: groupPath
+        })
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || 'Ошибка назначения группы');
+      }
+      if (typeof window.setToast === 'function') window.setToast(`Файл назначен в группу «${groupPath}».`);
+      closePhotoCard();
+    } catch (e) {
+      console.error('[photo_card] handleAssignGroupFromCard:', e);
+      if (typeof window.setToast === 'function') window.setToast('Ошибка: ' + (e.message || 'не удалось назначить группу'), true);
+      else alert('Ошибка: ' + (e.message || 'не удалось назначить группу'));
     }
   }
 
@@ -531,14 +769,17 @@ console.error = function(...args) {
     // Определяем, это изображение или видео
     const isVideo = currentState.file_path.match(/\.(mp4|avi|mov|mkv|webm)$/i);
     
+    const zoomTrigger = document.getElementById('photoCardZoomTrigger');
     if (isVideo) {
       imgElement.style.display = 'none';
       videoElement.style.display = 'block';
       videoElement.src = imageUrl;
+      if (zoomTrigger) zoomTrigger.style.display = 'none';
     } else {
       imgElement.style.display = 'block';
       videoElement.style.display = 'none';
       imgElement.src = imageUrl;
+      if (zoomTrigger) zoomTrigger.style.display = 'inline-flex';
       
       // Ждем загрузки изображения перед отрисовкой rectangles
       imgElement.onload = function() {
@@ -655,6 +896,45 @@ console.error = function(...args) {
       }
     } catch (error) {
       console.error('[photo_card] Error loading rectangles:', error);
+    }
+  }
+
+  /**
+   * Загружает прямые привязки файла к персонам (file_persons) через API.
+   * pipeline_run_id опционален: бэкенд выводит его по file_id при отсутствии.
+   */
+  async function loadFilePersons() {
+    if (!currentState.file_id && !currentState.file_path) {
+      currentState.directBindings = [];
+      return;
+    }
+    try {
+      const params = new URLSearchParams();
+      if (currentState.file_id) params.append('file_id', currentState.file_id);
+      else params.append('path', currentState.file_path);
+      if (currentState.pipeline_run_id) params.append('pipeline_run_id', currentState.pipeline_run_id);
+      const url = `/api/faces/file-persons?${params.toString()}`;
+      const response = await fetch(url);
+      const raw = await response.text();
+      let data = { direct_bindings: [] };
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch (_) {
+        if (!response.ok) {
+          console.warn('[photo_card] loadFilePersons: HTTP', response.status, raw.slice(0, 200));
+        }
+      }
+      if (!response.ok) {
+        console.warn('[photo_card] loadFilePersons: response not ok', response.status, data?.detail || raw.slice(0, 100));
+      }
+      const bindings = Array.isArray(data.direct_bindings) ? data.direct_bindings : [];
+      currentState.directBindings = bindings;
+      if (bindings.length > 0) {
+        console.log('[photo_card] loadFilePersons: got', bindings.length, 'direct_bindings', bindings.map(b => b.person_name));
+      }
+    } catch (e) {
+      console.warn('[photo_card] loadFilePersons failed:', e);
+      currentState.directBindings = [];
     }
   }
 
@@ -1165,30 +1445,72 @@ console.error = function(...args) {
   }
 
   /**
-   * Обновляет список rectangles внизу карточки
+   * Обновляет список rectangles внизу карточки (включая плашки прямой привязки file_persons сверху)
    */
   function updateRectanglesList() {
     const rectList = document.getElementById('photoCardRectList');
-    if (!rectList) {
-      return;
+    if (!rectList) return;
+    const directCount = (currentState.directBindings || []).length;
+    const rectCount = (currentState.rectangles || []).length;
+    if (directCount > 0 || rectCount > 0) {
+      console.log('[photo_card] updateRectanglesList: directBindings=', directCount, 'rectangles=', rectCount);
     }
-
     rectList.innerHTML = '';
 
-    currentState.rectangles.forEach((rect, index) => {
-      // Добавляем разделитель перед каждым элементом, кроме первого
-      if (index > 0) {
-        const separator = document.createElement('span');
-        separator.textContent = ' • ';
-        separator.style.color = '#6b7280';
-        separator.style.margin = '0 6px';
-        separator.style.fontSize = '16px';
-        separator.style.fontWeight = 'bold';
-        separator.style.verticalAlign = 'middle';
-        rectList.appendChild(separator);
-        console.log('[photo_card] Added separator before rectangle', index);
+    const addSeparator = () => {
+      const sep = document.createElement('span');
+      sep.textContent = ' • ';
+      sep.style.color = '#6b7280';
+      sep.style.margin = '0 6px';
+      sep.style.fontSize = '16px';
+      sep.style.fontWeight = 'bold';
+      sep.style.verticalAlign = 'middle';
+      rectList.appendChild(sep);
+    };
+
+    // Плашки прямой привязки (файл целиком → персона), бирюзовый акцент
+    const directBindings = currentState.directBindings || [];
+    directBindings.forEach((db, dbIndex) => {
+      if (dbIndex > 0) addSeparator();
+      const pill = document.createElement('div');
+      pill.className = 'rectpill rectpill-direct';
+      pill.style.display = 'inline-flex';
+      pill.style.alignItems = 'center';
+      pill.style.gap = '8px';
+      pill.style.cursor = 'default';
+      pill.style.position = 'relative';
+      pill.style.background = '#ccfbf1';
+      pill.style.border = '1px solid #5eead4';
+      const text = document.createElement('span');
+      text.textContent = db.person_name || `Персона #${db.person_id}`;
+      pill.appendChild(text);
+      if (currentState.mode === 'sorting') {
+        const actionsBtn = document.createElement('button');
+        actionsBtn.className = 'rectpill-action';
+        actionsBtn.textContent = '⋮';
+        actionsBtn.style.background = 'none';
+        actionsBtn.style.border = 'none';
+        actionsBtn.style.cursor = 'pointer';
+        actionsBtn.style.padding = '2px 6px';
+        actionsBtn.style.fontSize = '16px';
+        actionsBtn.style.lineHeight = '1';
+        actionsBtn.style.color = '#0d9488';
+        actionsBtn.title = 'Действия с прямой привязкой';
+        actionsBtn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          e.preventDefault();
+          showDirectBindingActionsMenu(dbIndex, e.currentTarget);
+        });
+        pill.appendChild(actionsBtn);
       }
-      
+      rectList.appendChild(pill);
+    });
+
+    if (directBindings.length > 0 && currentState.rectangles.length > 0) addSeparator();
+
+    currentState.rectangles.forEach((rect, index) => {
+      if (index > 0) addSeparator();
+
       const pill = document.createElement('div');
       pill.className = 'rectpill';
       pill.style.display = 'inline-flex';
@@ -1197,46 +1519,37 @@ console.error = function(...args) {
       pill.style.cursor = 'pointer';
       pill.style.position = 'relative';
       pill.dataset.rectIndex = index;
-      
-      // Исходные стили для невыделенного rectangle
+
       const defaultBackground = '#eef2ff';
       const defaultBorder = '1px solid #c7d2fe';
       const selectedBackground = '#c7d2fe';
       const selectedBorder = '1px solid #6366f1';
-      
-      // Применяем исходные стили
+
       pill.style.background = defaultBackground;
       pill.style.border = defaultBorder;
-      
-      // Текст с именем персоны или номером
+
       const text = document.createElement('span');
       text.textContent = (rect.is_duplicate ? '⚠ ' : '') + (rect.person_name || `Rectangle ${index + 1}`);
-      if (rect.is_duplicate) {
-        text.style.color = '#dc2626'; // Красный текст для дубликатов в плашке
-      }
+      if (rect.is_duplicate) text.style.color = '#dc2626';
       pill.appendChild(text);
-      
-      // Выделение активного rectangle
+
       if (currentState.selectedRectangleIndex === index) {
         pill.style.background = selectedBackground;
         pill.style.border = selectedBorder;
       }
-      
-      // Клик по плашке - выделение/снятие выделения rectangle
+
       pill.addEventListener('click', function(e) {
-        if (e.target.closest('.rectpill-action')) return; // Игнорируем клики по кнопкам действий
+        if (e.target.closest('.rectpill-action')) return;
         selectRectangle(index);
       });
-      
-      // Двойной клик - назначение персоны (только для sorting режима)
+
       if (currentState.mode === 'sorting') {
         pill.addEventListener('dblclick', function(e) {
           e.stopPropagation();
           showPersonDialog(index);
         });
       }
-      
-      // Кнопка действий (выпадающее меню) - показываем всегда
+
       const actionsBtn = document.createElement('button');
       actionsBtn.className = 'rectpill-action';
       actionsBtn.textContent = '⋮';
@@ -1256,6 +1569,192 @@ console.error = function(...args) {
 
       rectList.appendChild(pill);
     });
+  }
+
+  /**
+   * Показывает выпадающее меню для плашки прямой привязки: «Другой человек», «Удалить».
+   * Та же схема, что у обычных плашек (showRectangleActionsMenu): меню с классом rectpill-actions-menu
+   * вешается внутрь pill, видимость через .open, без своих координат — только CSS (bottom:100%; right:0).
+   */
+  function showDirectBindingActionsMenu(directIndex, triggerEl) {
+    const db = (currentState.directBindings || [])[directIndex];
+    if (!db) return;
+    const pill = triggerEl.closest('.rectpill');
+    if (!pill) return;
+    // Закрываем все открытые меню (как у прямоугольников)
+    document.querySelectorAll('.rectpill-actions-menu.open, .photo-card-rectangle-menu.open').forEach(m => {
+      if (m.classList) m.classList.remove('open');
+    });
+    // Ищем или создаём меню — как showRectangleActionsMenu
+    let menu = pill.querySelector('.rectpill-actions-menu');
+    if (!menu) {
+      menu = document.createElement('div');
+      menu.className = 'rectpill-actions-menu rectpill-actions-menu-right';
+      menu.setAttribute('role', 'menu');
+      const addBtn = (label, fn) => {
+        const btn = document.createElement('button');
+        btn.textContent = label;
+        btn.type = 'button';
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          fn();
+          menu.classList.remove('open');
+          document.removeEventListener('click', close);
+        });
+        menu.appendChild(btn);
+      };
+      addBtn('Другой человек', () => showPersonDialogForDirectBinding(directIndex));
+      addBtn('Удалить', () => removeDirectBinding(directIndex));
+      pill.appendChild(menu);
+    }
+    menu.classList.add('open');
+    const close = (e) => {
+      const clickedInMenu = menu.contains(e.target);
+      const clickedInButton = triggerEl.contains(e.target);
+      if (!clickedInMenu && !clickedInButton) {
+        menu.classList.remove('open');
+        document.removeEventListener('click', close);
+      }
+    };
+    setTimeout(() => document.addEventListener('click', close), 10);
+  }
+
+  /**
+   * Удаляет прямую привязку и обновляет список; при открытии с faces — вызывает on_assign_success
+   */
+  async function removeDirectBinding(directIndex) {
+    const db = (currentState.directBindings || [])[directIndex];
+    if (!db || !currentState.pipeline_run_id) return;
+    try {
+      const payload = {
+        assignment_type: 'file',
+        pipeline_run_id: currentState.pipeline_run_id,
+        person_id: db.person_id
+      };
+      if (currentState.file_id) payload.file_id = currentState.file_id;
+      else if (currentState.file_path) payload.path = currentState.file_path;
+      else return;
+      const res = await fetch('/api/persons/remove-assignment', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || 'Ошибка снятия привязки');
+      }
+      await loadFilePersons();
+      updateRectanglesList();
+      if (currentState.list_context?.source_page === 'faces' && typeof currentState.on_assign_success === 'function') {
+        await currentState.on_assign_success(currentState.file_path);
+      }
+    } catch (e) {
+      console.error('[photo_card] removeDirectBinding:', e);
+      alert('Ошибка: ' + (e.message || 'не удалось снять привязку'));
+    }
+  }
+
+  /**
+   * Диалог выбора персоны для смены прямой привязки («Другой человек»): снять текущую, назначить выбранную
+   */
+  async function showPersonDialogForDirectBinding(directIndex) {
+    const db = (currentState.directBindings || [])[directIndex];
+    if (!db) return;
+    if (!currentState.allPersons || currentState.allPersons.length === 0) {
+      await loadPersons();
+    }
+    const currentPersonId = db.person_id;
+    const onSelect = async (personId) => {
+      if (personId === currentPersonId) return;
+      try {
+        const rmPayload = { assignment_type: 'file', pipeline_run_id: currentState.pipeline_run_id, person_id: currentPersonId };
+        if (currentState.file_id) rmPayload.file_id = currentState.file_id;
+        else if (currentState.file_path) rmPayload.path = currentState.file_path;
+        await fetch('/api/persons/remove-assignment', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(rmPayload) });
+        const assignPayload = { pipeline_run_id: currentState.pipeline_run_id, person_id: personId };
+        if (currentState.file_id) assignPayload.file_id = currentState.file_id;
+        else if (currentState.file_path) assignPayload.file_path = currentState.file_path;
+        const ar = await fetch('/api/persons/assign-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(assignPayload) });
+        if (!ar.ok) throw new Error((await ar.json()).detail || 'Ошибка назначения');
+        await loadFilePersons();
+        updateRectanglesList();
+        if (currentState.list_context?.source_page === 'faces' && typeof currentState.on_assign_success === 'function') {
+          await currentState.on_assign_success(currentState.file_path);
+        }
+      } catch (e) {
+        console.error('[photo_card] showPersonDialogForDirectBinding onSelect:', e);
+        alert('Ошибка: ' + (e.message || 'не удалось сменить персону'));
+      }
+    };
+    _showPersonChoiceModal('Выберите персону для прямой привязки файла', onSelect);
+  }
+
+  /**
+   * Внутренний хелпер: модальное окно выбора персоны с произвольным заголовком и callback
+   */
+  function _showPersonChoiceModal(titleText, onSelectPerson) {
+    const modal = document.createElement('div');
+    modal.className = 'person-dialog-modal';
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:10001';
+    const dialog = document.createElement('div');
+    dialog.style.cssText = 'background:#fff;border-radius:12px;padding:24px;min-width:400px;max-width:600px;max-height:80vh;overflow:auto;box-shadow:0 20px 60px rgba(0,0,0,0.3)';
+    const title = document.createElement('h3');
+    title.textContent = titleText;
+    title.style.cssText = 'margin:0 0 16px 0;font-size:18px;font-weight:600';
+    dialog.appendChild(title);
+    const personsList = document.createElement('div');
+    personsList.style.cssText = 'max-height:400px;overflow-y:auto';
+    const personsByGroup = {};
+    const noGroupPersons = [];
+    (currentState.allPersons || []).forEach(person => {
+      if (person.is_ignored === true) return;
+      const group = person.group || null;
+      if (group) {
+        if (!personsByGroup[group]) personsByGroup[group] = [];
+        personsByGroup[group].push(person);
+      } else {
+        noGroupPersons.push(person);
+      }
+    });
+    const groupEntries = Object.entries(personsByGroup)
+      .map(([groupName, persons]) => ({
+        groupName,
+        order: (persons || []).reduce((m, p) => Math.min(m, Number(p?.group_order ?? 999)), 999),
+        persons: persons || []
+      }))
+      .sort((a, b) => a.order - b.order || a.groupName.localeCompare(b.groupName, 'ru', { sensitivity: 'base' }));
+    const addPersonBtn = (person, listEl) => {
+      const btn = document.createElement('button');
+      btn.textContent = person.name;
+      btn.style.cssText = 'width:100%;padding:10px 12px;text-align:left;border:1px solid #e5e7eb;border-radius:8px;background:#fff;cursor:pointer;margin-bottom:4px;font-size:14px';
+      btn.addEventListener('click', () => { modal.remove(); onSelectPerson(person.id); });
+      listEl.appendChild(btn);
+    };
+    groupEntries.forEach(({ groupName, persons }) => {
+      const groupLabel = document.createElement('div');
+      groupLabel.textContent = groupName;
+      groupLabel.style.cssText = 'font-weight:600;font-size:12px;color:#6b7280;margin-top:16px;margin-bottom:8px;text-transform:uppercase';
+      personsList.appendChild(groupLabel);
+      [...persons].sort((a, b) => (a?.name || '').localeCompare(b?.name || '', 'ru', { sensitivity: 'base' })).forEach(p => addPersonBtn(p, personsList));
+    });
+    [...noGroupPersons].sort((a, b) => (a?.name || '').localeCompare(b?.name || '', 'ru', { sensitivity: 'base' })).forEach(p => addPersonBtn(p, personsList));
+    const outsider = (currentState.allPersons || []).find(p => p.is_ignored === true);
+    if (outsider) {
+      const ob = document.createElement('button');
+      ob.textContent = 'Посторонний';
+      ob.style.cssText = 'width:100%;padding:10px 12px;text-align:left;border:1px solid #e5e7eb;border-radius:8px;background:#fff;cursor:pointer;margin-top:16px;font-size:14px';
+      ob.addEventListener('click', () => { modal.remove(); onSelectPerson(outsider.id); });
+      personsList.appendChild(ob);
+    }
+    const cancelBtn = document.createElement('button');
+    cancelBtn.textContent = 'Отмена';
+    cancelBtn.style.cssText = 'width:100%;padding:10px 12px;margin-top:16px;border:1px solid #d1d5db;border-radius:8px;background:#fff;cursor:pointer;font-size:14px';
+    cancelBtn.addEventListener('click', () => modal.remove());
+    dialog.appendChild(personsList);
+    dialog.appendChild(cancelBtn);
+    modal.appendChild(dialog);
+    modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
+    document.body.appendChild(modal);
   }
 
   /**
@@ -3056,15 +3555,40 @@ console.error = function(...args) {
       });
     }
 
-    // Закрытие по Escape
+    // Закрытие по Escape (сначала зум, потом карточка)
     document.addEventListener('keydown', function(e) {
       if (e.key === 'Escape') {
-        const modal = document.getElementById('photoCardModal');
-        if (modal && modal.style.display !== 'none') {
-          closePhotoCard();
+        const zoomOverlay = document.getElementById('photoZoomOverlay');
+        if (zoomOverlay && zoomOverlay.getAttribute('aria-hidden') === 'false') {
+          closePhotoZoom();
+        } else {
+          const modal = document.getElementById('photoCardModal');
+          if (modal && modal.style.display !== 'none') {
+            closePhotoCard();
+          }
         }
       }
     });
+
+    // Зум: иконка-лупа в углу области фото
+    const zoomTriggerBtn = document.getElementById('photoCardZoomTrigger');
+    if (zoomTriggerBtn) {
+      zoomTriggerBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        openPhotoZoom();
+      });
+    }
+    // Оверлей зума: закрытие по кнопке и по клику на фон
+    const photoZoomCloseBtn = document.getElementById('photoZoomClose');
+    if (photoZoomCloseBtn) {
+      photoZoomCloseBtn.addEventListener('click', closePhotoZoom);
+    }
+    const photoZoomOverlayEl = document.getElementById('photoZoomOverlay');
+    if (photoZoomOverlayEl) {
+      photoZoomOverlayEl.addEventListener('click', function(e) {
+        if (e.target === photoZoomOverlayEl || e.target.id === 'photoZoomInner') closePhotoZoom();
+      });
+    }
 
     // Переключение видимости rectangles
     const toggleBtn = document.getElementById('photoCardToggleRectangles');
@@ -4416,8 +4940,12 @@ console.error = function(...args) {
         throw new Error(error.detail || 'Failed to assign person to file');
       }
       
-      // Перезагружаем данные
+      // Перезагружаем данные (rectangles и прямые привязки file_persons)
       await loadRectangles();
+      if (currentState.pipeline_run_id) {
+        await loadFilePersons();
+        updateRectanglesList();
+      }
       await checkDuplicates();
     } catch (error) {
       console.error('[photo_card] Error assigning person to whole photo:', error);

@@ -6,6 +6,7 @@ import json
 import math
 import mimetypes
 import os
+import re
 import shutil
 import sys
 import time
@@ -1722,15 +1723,14 @@ def scan_faces_local(
 
             # --- store taken_at + gps + place (best-effort) ---
             try:
-                taken_at: str | None = None
-                # mtime fallback for all media
-                try:
-                    st = os.stat(abspath)
-                    taken_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime))
-                except Exception:
-                    taken_at = None
-                # Записываем mtime сразу, а EXIF/GPS (и геокодинг) сделаем позже внутри image_open,
-                # чтобы не открывать файл дважды.
+                taken_at: str | None = _parse_date_from_filename(os.path.basename(abspath))
+                if taken_at is None:
+                    try:
+                        st = os.stat(abspath)
+                        taken_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime))
+                    except Exception:
+                        taken_at = None
+                # Записываем дату из имени/mtime сразу, EXIF/GPS (и геокодинг) — позже внутри image_open.
                 dedup.set_taken_at_and_gps(path=db_path, taken_at=taken_at, gps_lat=None, gps_lon=None)
             except Exception:
                 pass
@@ -2502,6 +2502,42 @@ def _sanitize_segment(s: str) -> str:
     seg = "".join(out).strip().strip(".")
     seg = seg.replace(" ", "_")
     return seg or "unknown"
+
+
+def _parse_date_from_filename(filename: str) -> Optional[str]:
+    """
+    Парсит дату из имени файла. Возвращает ISO 'YYYY-MM-DDTHH:MM:SSZ' или None.
+
+    Поддерживаемые форматы:
+    - IMG_/IMG-/VID_/VID-/PANO_ YYYYMMDD[_HHMMSS], IMG-YYYYMMDD-WAxxxx (WhatsApp)
+    - Screenshot_YYYY-MM-DD-HH-MM-SS, Screenshot YYYY.MM.DD HH.MM.SS
+    - YYYYMMDD, YYYY-MM-DD, YYYY.MM.DD, YYYY_MM_DD
+    - YYYYMMDD_HHMMSS, YYYYMMDDHHMMSS (14 цифр)
+    - Signal-YYYY-MM-DD-HH-MM-SS
+    """
+    if not filename or not isinstance(filename, str):
+        return None
+    s = os.path.splitext(filename)[0]
+
+    # Префиксы: IMG, VID, PANO, Screenshot, Signal и т.п.
+    prefix = r"(?:IMG[-_]|VID[-_]|PANO[-_]|Screenshot[-_\s]|SCREENSHOT[-_\s]|Signal[-_]|)?"
+    # Дата: YYYY [.-_] MM [.-_] DD
+    date_part = r"(\d{4})\s*[.\-_\s]?\s*(\d{2})\s*[.\-_\s]?\s*(\d{2})"
+    # Время (опционально): [.-_:T] HH [.:] MM [.:] SS
+    time_part = r"(?:[.\-_:T\s]+(\d{2})\s*[.:\-]?\s*(\d{2})\s*[.:\-]?\s*(\d{2}))?"
+    m = re.search(prefix + date_part + time_part, s, re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        yyyy, mm, dd = m.group(1), m.group(2), m.group(3)
+        hh = (m.group(4) or "00")
+        mi = (m.group(5) or "00")
+        ss = (m.group(6) or "00")
+        if yyyy.isdigit() and mm.isdigit() and dd.isdigit() and int(mm) in range(1, 13) and int(dd) in range(1, 32):
+            return f"{yyyy}-{mm}-{dd}T{hh}:{mi}:{ss}Z"
+    except Exception:
+        pass
+    return None
 
 
 def _try_exif_datetime_year(img: Image.Image) -> Optional[str]:

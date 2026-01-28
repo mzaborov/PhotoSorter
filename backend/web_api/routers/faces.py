@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -21,7 +22,7 @@ from fastapi.templating import Jinja2Templates
 
 logger = logging.getLogger(__name__)
 
-from common.db import DedupStore, FaceStore, PipelineStore, list_folders
+from common.db import DedupStore, FaceStore, PipelineStore, get_connection, list_folders
 from common.yadisk_client import get_disk
 from logic.gold.store import gold_expected_tab_by_path, gold_file_map, gold_read_lines, gold_write_lines, gold_read_ndjson_by_path, gold_write_ndjson_by_path, gold_faces_manual_rects_path, gold_faces_video_frames_path
 
@@ -709,6 +710,7 @@ def api_faces_results(
     tab: str = "faces",
     subtab: str | None = None,
     sort: str | None = None,
+    manual_filter: str | None = Query(None, description="Для закладки Посторонние лица: all|manual_only|no_manual"),
     from_ts: str | None = Query(None, alias="from"),
     to_ts: str | None = Query(None, alias="to"),
     page: int = 1,
@@ -728,14 +730,17 @@ def api_faces_results(
     subtab_n = (subtab or "").strip().lower() or "all"
     person_id_filter: int | None = None
     group_path_filter: str | None = None
+    manual_filter_n: str | None = (manual_filter or "").strip().lower() or None
+    if manual_filter_n and manual_filter_n not in ("all", "manual_only", "no_manual"):
+        manual_filter_n = "all"
     if tab_n == "faces":
         if subtab_n.startswith("person_"):
             try:
                 person_id_filter = int(subtab_n.replace("person_", ""))
             except Exception:
                 raise HTTPException(status_code=400, detail="Invalid person_id in subtab")
-        elif subtab_n not in ("all", "many_faces", "unsorted"):
-            raise HTTPException(status_code=400, detail="subtab for faces must be all|many_faces|unsorted|person_<id>")
+        elif subtab_n not in ("all", "many_faces", "unsorted", "all_faces"):
+            raise HTTPException(status_code=400, detail="subtab for faces must be all|many_faces|unsorted|all_faces|person_<id>")
     elif tab_n == "no_faces":
         if subtab_n.startswith("group_"):
             # Декодируем путь группы (может содержать "/" и другие спецсимволы)
@@ -815,30 +820,52 @@ def api_faces_results(
     
     where_sql = " AND ".join(where)
 
-    # Проверка привязок к персонам через прямоугольники (используется в eff_sql)
-    # Если у файла есть привязка к персоне через прямоугольники, он должен попадать в 'faces'
-    # Учитываем manual_person_id и кластеры; прямоугольники — run прогона или archive_scope='archive'
+    # ID персоны «Посторонний» — привязки к ней не переводят файл в «Люди»
+    _conn = get_connection()
+    ignored_person_id = -1
+    try:
+        from backend.web_api.routers.face_clusters import get_outsider_person_id
+        _val = get_outsider_person_id(_conn)
+        if _val is not None:
+            ignored_person_id = _val
+    finally:
+        try:
+            _conn.close()
+        except Exception:
+            pass
+
+    # Проверка привязок к персонам через прямоугольники и file_persons (используется в eff_sql)
+    # Файл попадает в 'faces', если есть привязка к не-постороннему: rectangles (manual/кластеры) или file_persons.
+    # Условие run_id/archive ИЛИ файл в текущем прогоне (faces_run_id) — чтобы учитывать привязки без run_id.
     has_person_binding_sql_results = """
     EXISTS (
-        -- Ручные привязки (photo_rectangles.manual_person_id)
+        -- Ручные привязки (photo_rectangles.manual_person_id), исключая «Посторонний»
         SELECT 1 FROM photo_rectangles fr
-        WHERE fr.file_id = f.id AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive') AND fr.manual_person_id IS NOT NULL
+        WHERE fr.file_id = f.id AND fr.manual_person_id IS NOT NULL AND fr.manual_person_id != ?
+          AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive' OR (SELECT f2.faces_run_id FROM files f2 WHERE f2.id = fr.file_id) = ?)
     ) OR EXISTS (
-        -- Привязки через кластеры (photo_rectangles.cluster_id)
+        -- Привязки через кластеры, исключая «Посторонний»
         SELECT 1 FROM photo_rectangles fr_cluster
         JOIN face_clusters fc ON fc.id = fr_cluster.cluster_id
         WHERE fr_cluster.file_id = f.id 
           AND (fr_cluster.run_id = ? OR COALESCE(TRIM(fr_cluster.archive_scope), '') = 'archive')
           AND COALESCE(fr_cluster.ignore_flag, 0) = 0
-          AND fc.person_id IS NOT NULL
+          AND fc.person_id IS NOT NULL AND fc.person_id != ?
           AND (fc.run_id = ? OR fc.archive_scope = 'archive')
+    ) OR EXISTS (
+        -- Прямая привязка файла к персоне (file_persons), исключая «Посторонний»
+        SELECT 1 FROM file_persons fp
+        WHERE fp.file_id = f.id AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL AND fp.person_id != ?
     )
     """
-    
+
+    # Привязка к персоне (file_persons или прямоугольники) — до проверки no_faces:
+    # иначе файл с меткой «no_faces» попадает во вкладку «Нет людей», где «К разбору» не смотрит на file_persons.
     eff_sql = f"""
     CASE
       WHEN COALESCE(m.people_no_face_manual, 0) = 1 THEN 'faces'
       WHEN lower(trim(coalesce(m.faces_manual_label, ''))) = 'faces' THEN 'faces'
+      WHEN ({has_person_binding_sql_results}) THEN 'faces'
       WHEN lower(trim(coalesce(m.faces_manual_label, ''))) = 'no_faces' THEN 'no_faces'
       WHEN COALESCE(m.quarantine_manual, 0) = 1 THEN 'no_faces'
       WHEN COALESCE(m.animals_manual, 0) = 1 THEN 'animals'
@@ -847,7 +874,6 @@ def api_faces_results(
            AND COALESCE(f.faces_count, 0) > 0
            AND lower(trim(coalesce(f.faces_quarantine_reason, ''))) != 'many_small_faces'
         THEN 'no_faces'
-      WHEN ({has_person_binding_sql_results}) THEN 'faces'
       ELSE (CASE WHEN COALESCE(f.faces_count, 0) > 0 THEN 'faces' ELSE 'no_faces' END)
     END
     """
@@ -860,19 +886,36 @@ def api_faces_results(
     group_filter_params: list[Any] = []
     media_filter_sql = "1=1"  # Фильтр по типу медиа (фото/видео)
     if tab_n == "faces" and subtab_n == "many_faces":
+        # Файлы с >= 8 лицами И с хотя бы одним неназначенным прямоугольником
         sub_where = "COALESCE(faces_count, 0) >= 8"
+        person_filter_sql = """
+        EXISTS (
+            SELECT 1 FROM photo_rectangles fr
+            WHERE fr.file_id = f.id
+              AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive')
+              AND COALESCE(fr.ignore_flag, 0) = 0
+              AND fr.manual_person_id IS NULL
+              AND (fr.cluster_id IS NULL OR NOT EXISTS (
+                  SELECT 1 FROM face_clusters fc
+                  WHERE fc.id = fr.cluster_id AND fc.person_id IS NOT NULL
+              ))
+        )
+        """
+        person_filter_params = [face_run_id_i]
     elif tab_n == "faces" and subtab_n == "all":
         sub_where = "COALESCE(faces_count, 0) < 8"
     elif tab_n == "faces" and subtab_n == "unsorted":
-        # "К разбору": файлы без привязки к персонам ИЛИ люди без лиц (people_no_face_manual=1).
-        # people_no_face_manual тянет в «К разбору» только если нет ручных привязок — иначе файл с уже назначенными лицами остаётся в списке.
+        # "К разбору": файлы без привязки к персонам ИЛИ люди без лиц (people_no_face_manual=1) без привязки.
+        # Ветка people_no_face_manual: показывать только если нет привязки ни по прямоугольникам, ни по file_persons.
         sub_where = "COALESCE(faces_count, 0) < 8"
+        # Условие «есть ручная привязка»: run_id/archive ИЛИ файл в текущем прогоне (faces_run_id).
         person_filter_sql = """
         (
           (
             NOT EXISTS (
                 SELECT 1 FROM photo_rectangles fr
-                WHERE fr.file_id = f.id AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive') AND fr.manual_person_id IS NOT NULL
+                WHERE fr.file_id = f.id AND fr.manual_person_id IS NOT NULL
+                  AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive' OR (SELECT f2.faces_run_id FROM files f2 WHERE f2.id = fr.file_id) = ?)
             )
             AND NOT EXISTS (
                 SELECT 1 FROM photo_rectangles fr_cluster
@@ -892,12 +935,17 @@ def api_faces_results(
             COALESCE(m.people_no_face_manual, 0) = 1
             AND NOT EXISTS (
                 SELECT 1 FROM photo_rectangles fr
-                WHERE fr.file_id = f.id AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive') AND fr.manual_person_id IS NOT NULL
+                WHERE fr.file_id = f.id AND fr.manual_person_id IS NOT NULL
+                  AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive' OR (SELECT f2.faces_run_id FROM files f2 WHERE f2.id = fr.file_id) = ?)
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM file_persons fp
+                WHERE fp.file_id = f.id AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL
             )
           )
         )
         """
-        person_filter_params = [face_run_id_i, face_run_id_i, face_run_id_i, int(pipeline_run_id), face_run_id_i]
+        person_filter_params = [face_run_id_i, face_run_id_i, face_run_id_i, face_run_id_i, int(pipeline_run_id), face_run_id_i, face_run_id_i, int(pipeline_run_id)]
     elif tab_n == "no_faces" and subtab_n in ("unsorted", "unsorted_photos", "unsorted_videos"):
         # "К разбору" для "Нет людей": файлы без группы
         group_filter_sql = """
@@ -938,14 +986,66 @@ def api_faces_results(
         group_filter_params = [int(pipeline_run_id), str(group_path_filter)]
         print(f"[DEBUG] Фильтр по группе '{group_path_filter}': group_filter_sql установлен, params={group_filter_params}")
     elif tab_n == "faces" and person_id_filter is not None:
-        # Фильтр по персоне: файл должен быть привязан к персоне через любой из 4 способов (run прогона или archive)
-        person_filter_sql = """
+        # Для персоны «Посторонний» (person_6): только фото где ВСЕ прямоугольники либо посторонние, либо неназначенные + manual_filter
+        if person_id_filter == ignored_person_id and ignored_person_id >= 0:
+            # Подзакладка «Посторонние» в «Люди»: только фото где ВСЕ прямоугольники либо посторонние, либо неназначенные
+            outsider_id = person_id_filter
+            run_archive = "(fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive')"
+            no_other_sql = f"""
+        NOT EXISTS (
+            SELECT 1 FROM photo_rectangles fr
+            WHERE fr.file_id = f.id AND {run_archive}
+              AND COALESCE(fr.ignore_flag, 0) = 0
+              AND (
+                  (fr.manual_person_id IS NOT NULL AND fr.manual_person_id != ?)
+                  OR (fr.cluster_id IS NOT NULL AND EXISTS (
+                      SELECT 1 FROM face_clusters fc WHERE fc.id = fr.cluster_id AND fc.person_id != ?
+                  ))
+              )
+        )
+        """
+            has_outsider_or_unassigned_sql = f"""
         EXISTS (
-            -- Через ручные привязки
+            SELECT 1 FROM photo_rectangles fr
+            LEFT JOIN face_clusters fc ON fc.id = fr.cluster_id
+            WHERE fr.file_id = f.id AND {run_archive}
+              AND COALESCE(fr.ignore_flag, 0) = 0
+              AND (
+                  fr.manual_person_id = ?
+                  OR (fc.person_id = ?)
+                  OR (fr.manual_person_id IS NULL AND (fr.cluster_id IS NULL OR fc.person_id IS NULL))
+              )
+        )
+        """
+            person_filter_sql = "(" + no_other_sql + " AND " + has_outsider_or_unassigned_sql + ")"
+            person_filter_params = [face_run_id_i, outsider_id, outsider_id, face_run_id_i, outsider_id, outsider_id]
+            sub_where = "COALESCE(faces_count, 0) > 0"
+            if manual_filter_n == "manual_only":
+                person_filter_sql += """
+            AND NOT EXISTS (
+                SELECT 1 FROM photo_rectangles fr
+                JOIN face_clusters fc ON fc.id = fr.cluster_id
+                WHERE fr.file_id = f.id AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive')
+                  AND COALESCE(fr.ignore_flag, 0) = 0 AND fc.person_id = ?
+            )
+            """
+                person_filter_params.extend([face_run_id_i, outsider_id])
+            elif manual_filter_n == "no_manual":
+                person_filter_sql += """
+            AND NOT EXISTS (
+                SELECT 1 FROM photo_rectangles fr
+                WHERE fr.file_id = f.id AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive')
+                  AND COALESCE(fr.ignore_flag, 0) = 0 AND fr.manual_person_id = ?
+            )
+            """
+                person_filter_params.extend([face_run_id_i, outsider_id])
+        else:
+            # Обычная персона: файл привязан к персоне через ручные привязки, кластеры или file_persons
+            person_filter_sql = """
+        EXISTS (
             SELECT 1 FROM photo_rectangles fr
             WHERE fr.file_id = f.id AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive') AND fr.manual_person_id = ?
         ) OR EXISTS (
-            -- Через кластеры (photo_rectangles.cluster_id)
             SELECT 1 FROM photo_rectangles fr_cluster
             JOIN face_clusters fc ON fc.id = fr_cluster.cluster_id
             WHERE fr_cluster.file_id = f.id 
@@ -954,12 +1054,11 @@ def api_faces_results(
               AND fc.person_id = ?
               AND (fc.run_id = ? OR fc.archive_scope = 'archive')
         ) OR EXISTS (
-            -- Прямая привязка (person_rectangles удалена)
             SELECT 1 FROM file_persons fp
             WHERE fp.file_id = f.id AND fp.pipeline_run_id = ? AND fp.person_id = ?
         )
         """
-        person_filter_params = [face_run_id_i, person_id_filter, face_run_id_i, person_id_filter, face_run_id_i, int(pipeline_run_id), person_id_filter]
+            person_filter_params = [face_run_id_i, person_id_filter, face_run_id_i, person_id_filter, face_run_id_i, int(pipeline_run_id), person_id_filter]
 
     def _norm_dt(s: str | None, *, is_to: bool) -> str | None:
         if not s:
@@ -1006,10 +1105,12 @@ def api_faces_results(
         """
         group_count_params = [int(pipeline_run_id)]
 
-    # Параметры для проверки привязок к персонам в eff_sql
-    # [face_run_id для ручных привязок, face_run_id для кластеров (run_id), face_run_id для кластеров (OR)]
-    person_binding_params_results = [face_run_id_i, face_run_id_i, face_run_id_i]
-    
+    # Параметры для проверки привязок к персонам в eff_sql:
+    # manual: ignored, run_id, run_id (subquery); cluster: run_id, ignored, run_id; file_persons: pipeline_run_id, ignored
+    person_binding_params_results = [
+        ignored_person_id, face_run_id_i, face_run_id_i, face_run_id_i, ignored_person_id, face_run_id_i,
+        int(pipeline_run_id), ignored_person_id,
+    ]
     ds = DedupStore()
     try:
         cur = ds.conn.cursor()
@@ -1308,30 +1409,46 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
         
         where_sql = " AND ".join(where)
 
-        # Проверка привязок к персонам через прямоугольники (используется в eff_sql)
-        # Если у файла есть привязка к персоне через прямоугольники, он должен попадать в 'faces'
-        # Учитываем manual_person_id и кластеры; прямоугольники — run прогона или archive_scope='archive'
+        # ID персоны «Посторонний» — привязки к ней не переводят файл в «Люди»
+        _conn_tc = get_connection()
+        ignored_person_id_tc = -1
+        try:
+            from backend.web_api.routers.face_clusters import get_outsider_person_id
+            _val_tc = get_outsider_person_id(_conn_tc)
+            if _val_tc is not None:
+                ignored_person_id_tc = _val_tc
+        finally:
+            try:
+                _conn_tc.close()
+            except Exception:
+                pass
+
+        # Проверка привязок к персонам (то же условие, что в api_faces_results: run_id/archive или файл в прогоне)
         has_person_binding_sql = """
     EXISTS (
-        -- Ручные привязки (photo_rectangles.manual_person_id)
         SELECT 1 FROM photo_rectangles fr
-        WHERE fr.file_id = f.id AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive') AND fr.manual_person_id IS NOT NULL
+        WHERE fr.file_id = f.id AND fr.manual_person_id IS NOT NULL AND fr.manual_person_id != ?
+          AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive' OR (SELECT f2.faces_run_id FROM files f2 WHERE f2.id = fr.file_id) = ?)
     ) OR EXISTS (
-        -- Привязки через кластеры (photo_rectangles.cluster_id)
         SELECT 1 FROM photo_rectangles fr_cluster
         JOIN face_clusters fc ON fc.id = fr_cluster.cluster_id
         WHERE fr_cluster.file_id = f.id 
           AND (fr_cluster.run_id = ? OR COALESCE(TRIM(fr_cluster.archive_scope), '') = 'archive')
           AND COALESCE(fr_cluster.ignore_flag, 0) = 0
-          AND fc.person_id IS NOT NULL
+          AND fc.person_id IS NOT NULL AND fc.person_id != ?
           AND (fc.run_id = ? OR fc.archive_scope = 'archive')
+    ) OR EXISTS (
+        SELECT 1 FROM file_persons fp
+        WHERE fp.file_id = f.id AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL AND fp.person_id != ?
     )
     """
-        
+
+        # Порядок как в api_faces_results: привязка до no_faces
         eff_sql = f"""
     CASE
       WHEN COALESCE(m.people_no_face_manual, 0) = 1 THEN 'faces'
       WHEN lower(trim(coalesce(m.faces_manual_label, ''))) = 'faces' THEN 'faces'
+      WHEN ({has_person_binding_sql}) THEN 'faces'
       WHEN lower(trim(coalesce(m.faces_manual_label, ''))) = 'no_faces' THEN 'no_faces'
       WHEN COALESCE(m.quarantine_manual, 0) = 1 THEN 'no_faces'
       WHEN COALESCE(m.animals_manual, 0) = 1 THEN 'animals'
@@ -1340,31 +1457,78 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
            AND COALESCE(f.faces_count, 0) > 0
            AND lower(trim(coalesce(f.faces_quarantine_reason, ''))) != 'many_small_faces'
         THEN 'no_faces'
-      WHEN ({has_person_binding_sql}) THEN 'faces'
       ELSE (CASE WHEN COALESCE(f.faces_count, 0) > 0 THEN 'faces' ELSE 'no_faces' END)
     END
     """
 
-        # Параметры для проверки привязок к персонам в eff_sql
-        # [face_run_id для ручных привязок, face_run_id для кластеров (run_id), face_run_id для кластеров (OR)]
-        person_binding_params = [face_run_id_i, face_run_id_i, face_run_id_i]
-        # В первом запросе eff_sql используется дважды (SELECT и GROUP BY) — по 3 плейсхолдера каждый раз, итого 9 = 1 + len(params) + 6
-        q1 = [int(pipeline_run_id)] + params + person_binding_params + person_binding_params
+        # Параметры для проверки привязок к персонам в eff_sql (8 плейсхолдеров)
+        person_binding_params = [
+            ignored_person_id_tc, face_run_id_i, face_run_id_i, face_run_id_i, ignored_person_id_tc, face_run_id_i,
+            int(pipeline_run_id), ignored_person_id_tc,
+        ]
+        # Считаем вкладки 1-го уровня тремя отдельными COUNT (как many_faces/unsorted),
+        # чтобы избежать проблем с порядком параметров при повторении eff_sql в GROUP BY.
         ds = DedupStore()
         try:
             cur = ds.conn.cursor()
+            base_params = [int(pipeline_run_id)] + params + person_binding_params
+            count_faces = 0
+            count_no_faces = 0
+            count_animals = 0
             cur.execute(
                 f"""
-                SELECT ({eff_sql}) AS tab, COUNT(*) AS cnt
+                SELECT COUNT(*) AS cnt
                 FROM files f
                 LEFT JOIN files_manual_labels m
                   ON m.pipeline_run_id = ? AND m.file_id = f.id
-                WHERE {where_sql}
-                GROUP BY ({eff_sql})
+                WHERE {where_sql} AND ({eff_sql}) = 'faces'
                 """,
-                q1,
+                base_params,
             )
-            rows = cur.fetchall()
+            count_faces = int(cur.fetchone()[0] or 0)
+            cur.execute(
+                f"""
+                SELECT COUNT(*) AS cnt
+                FROM files f
+                LEFT JOIN files_manual_labels m
+                  ON m.pipeline_run_id = ? AND m.file_id = f.id
+                WHERE {where_sql} AND ({eff_sql}) = 'no_faces'
+                """,
+                base_params,
+            )
+            count_no_faces = int(cur.fetchone()[0] or 0)
+            cur.execute(
+                f"""
+                SELECT COUNT(*) AS cnt
+                FROM files f
+                LEFT JOIN files_manual_labels m
+                  ON m.pipeline_run_id = ? AND m.file_id = f.id
+                WHERE {where_sql} AND ({eff_sql}) = 'animals'
+                """,
+                base_params,
+            )
+            count_animals = int(cur.fetchone()[0] or 0)
+            counts = {
+                "faces": count_faces,
+                "no_faces": count_no_faces,
+                "animals": count_animals,
+                "quarantine": 0,
+                "people_no_face": 0,
+            }
+            # «Много лиц»: только файлы с >= 8 лицами И с хотя бы одним неназначенным прямоугольником
+            many_faces_filter_sql = """
+                EXISTS (
+                    SELECT 1 FROM photo_rectangles fr
+                    WHERE fr.file_id = f.id
+                      AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive')
+                      AND COALESCE(fr.ignore_flag, 0) = 0
+                      AND fr.manual_person_id IS NULL
+                      AND (fr.cluster_id IS NULL OR NOT EXISTS (
+                          SELECT 1 FROM face_clusters fc
+                          WHERE fc.id = fr.cluster_id AND fc.person_id IS NOT NULL
+                      ))
+                )
+            """
             cur.execute(
                 f"""
                 SELECT COUNT(*) AS cnt
@@ -1374,8 +1538,9 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
                 WHERE {where_sql}
                   AND ({eff_sql}) = 'faces'
                   AND COALESCE(f.faces_count, 0) >= 8
+                  AND ({many_faces_filter_sql.strip()})
                 """,
-                [int(pipeline_run_id)] + params + person_binding_params,
+                [int(pipeline_run_id)] + params + person_binding_params + [face_run_id_i],
             )
             many_faces_cnt = int(cur.fetchone()[0] or 0)
             cur.execute(
@@ -1388,15 +1553,14 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
                   AND ({eff_sql}) = 'faces'
                   AND COALESCE(f.faces_count, 0) < 8
                   AND (
-                    -- Файл не привязан ни к одной персоне (run прогона или archive)
+                    -- Файл не привязан ни к одной персоне (run/archive или файл в прогоне)
                     (
                       NOT EXISTS (
-                          -- Ручные привязки
                           SELECT 1 FROM photo_rectangles fr
-                          WHERE fr.file_id = f.id AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive') AND fr.manual_person_id IS NOT NULL
+                          WHERE fr.file_id = f.id AND fr.manual_person_id IS NOT NULL
+                            AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive' OR (SELECT f2.faces_run_id FROM files f2 WHERE f2.id = fr.file_id) = ?)
                       )
                       AND NOT EXISTS (
-                          -- Привязки через кластеры (photo_rectangles.cluster_id)
                           SELECT 1 FROM photo_rectangles fr
                           JOIN face_clusters fc ON fc.id = fr.cluster_id
                           WHERE fr.file_id = f.id AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive') AND fc.person_id IS NOT NULL
@@ -1406,11 +1570,22 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
                           WHERE fp.file_id = f.id AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL
                       )
                     )
-                    -- ИЛИ это люди без лиц
-                    OR COALESCE(m.people_no_face_manual, 0) = 1
+                    -- ИЛИ люди без лиц без привязки (ни по прямоугольникам, ни по file_persons)
+                    OR (
+                      COALESCE(m.people_no_face_manual, 0) = 1
+                      AND NOT EXISTS (
+                          SELECT 1 FROM photo_rectangles fr
+                          WHERE fr.file_id = f.id AND fr.manual_person_id IS NOT NULL
+                            AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive' OR (SELECT f2.faces_run_id FROM files f2 WHERE f2.id = fr.file_id) = ?)
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM file_persons fp
+                          WHERE fp.file_id = f.id AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL
+                      )
+                    )
                   )
                 """,
-                [int(pipeline_run_id)] + params + person_binding_params + [face_run_id_i, face_run_id_i, int(pipeline_run_id)],
+                [int(pipeline_run_id)] + params + person_binding_params + [face_run_id_i, face_run_id_i, face_run_id_i, int(pipeline_run_id), face_run_id_i, face_run_id_i, int(pipeline_run_id)],
             )
             unsorted_cnt = int(cur.fetchone()[0] or 0)
             # Счетчик для "Фото к разбору" в "Нет людей" (файлы без группы, только фото)
@@ -1457,11 +1632,6 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
             no_faces_unsorted_videos_cnt = int(cur.fetchone()[0] or 0)
         finally:
             ds.close()
-        counts = {"faces": 0, "no_faces": 0, "quarantine": 0, "animals": 0, "people_no_face": 0}
-        for r in rows:
-            t = str(r["tab"] or "")
-            if t in counts:
-                counts[t] = int(r["cnt"] or 0)
         return {
             "ok": True,
             "pipeline_run_id": int(pipeline_run_id),
@@ -1625,27 +1795,39 @@ def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
         logger.info(msg)
         print(msg)
         
+        # ID персоны «Посторонний» для флага is_ignored
+        from backend.web_api.routers.face_clusters import get_outsider_person_id
+        _conn_apwf = get_connection()
+        outsider_id_apwf = None
+        try:
+            outsider_id_apwf = get_outsider_person_id(_conn_apwf)
+        finally:
+            try:
+                _conn_apwf.close()
+            except Exception:
+                pass
+
         # Объединяем все персоны и суммируем количество файлов
         all_persons: dict[int, dict[str, Any]] = {}
         for pid, pdata in persons_from_faces.items():
-            all_persons[pid] = {"id": pid, "name": pdata["name"], "files_count": pdata["files_count"]}
+            all_persons[pid] = {"id": pid, "name": pdata["name"], "files_count": pdata["files_count"], "is_ignored": pid == outsider_id_apwf}
         for pid, pdata in persons_from_clusters.items():
             if pid in all_persons:
                 all_persons[pid]["files_count"] += pdata["files_count"]
             else:
-                all_persons[pid] = {"id": pid, "name": pdata["name"], "files_count": pdata["files_count"]}
+                all_persons[pid] = {"id": pid, "name": pdata["name"], "files_count": pdata["files_count"], "is_ignored": pid == outsider_id_apwf}
         for pid, pdata in persons_from_rects.items():
             if pid in all_persons:
                 all_persons[pid]["files_count"] += pdata["files_count"]
             else:
-                all_persons[pid] = {"id": pid, "name": pdata["name"], "files_count": pdata["files_count"]}
+                all_persons[pid] = {"id": pid, "name": pdata["name"], "files_count": pdata["files_count"], "is_ignored": pid == outsider_id_apwf}
         for pid, pdata in persons_from_direct.items():
             if pid in all_persons:
                 all_persons[pid]["files_count"] += pdata["files_count"]
             else:
-                all_persons[pid] = {"id": pid, "name": pdata["name"], "files_count": pdata["files_count"]}
+                all_persons[pid] = {"id": pid, "name": pdata["name"], "files_count": pdata["files_count"], "is_ignored": pid == outsider_id_apwf}
         
-        # Сортируем по имени
+        # Сортируем по имени (Посторонние в конце — в loadPersonsSubtabs на фронте)
         persons_list = sorted(all_persons.values(), key=lambda x: (x["name"] or "").lower())
         
         elapsed = time.time() - start_time
@@ -1660,6 +1842,201 @@ def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
         "ok": True,
         "pipeline_run_id": int(pipeline_run_id),
         "persons": persons_list,
+    }
+
+
+@router.get("/api/faces/all-persons-faces")
+def api_faces_all_persons_faces(pipeline_run_id: int) -> dict[str, Any]:
+    """
+    Возвращает данные для всех персон (кроме Посторонних) из прогона.
+    Каждая персона содержит список лиц (кропов) из «Сортируется -> Через лица».
+    Используется для закладки «Лица» — сетка кропов с кнопками по персонам.
+    """
+    start_time = time.time()
+    from backend.web_api.routers.face_clusters import get_outsider_person_id
+
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    face_run_id = pr.get("face_run_id")
+    if not face_run_id:
+        raise HTTPException(status_code=400, detail="face_run_id is not set yet (step 3 not started)")
+    face_run_id_i = int(face_run_id)
+    root_path = str(pr.get("root_path") or "")
+
+    root_like = None
+    if root_path.startswith("disk:"):
+        rp = root_path.rstrip("/")
+        root_like = rp + "/%"
+    else:
+        try:
+            rp_abs = os.path.abspath(root_path)
+            rp_abs = rp_abs.rstrip("\\/") + "\\"
+            root_like = "local:" + rp_abs + "%"
+        except Exception:
+            root_like = None
+
+    where = ["f.status != 'deleted'"]
+    params: list[Any] = []
+    if root_like:
+        where.append(
+            "(f.faces_run_id = ? OR (f.faces_run_id IS NULL AND (COALESCE(f.media_type, '') = 'video' OR COALESCE(f.mime_type, '') LIKE 'video/%') AND f.path LIKE ?))"
+        )
+        params.extend([face_run_id_i, root_like])
+    else:
+        where.append("f.faces_run_id = ?")
+        params.append(face_run_id_i)
+    where_sql = " AND ".join(where)
+
+    _conn_apf = get_connection()
+    ignored_person_id_apf = -1
+    try:
+        _val = get_outsider_person_id(_conn_apf)
+        if _val is not None:
+            ignored_person_id_apf = _val
+    finally:
+        try:
+            _conn_apf.close()
+        except Exception:
+            pass
+
+    has_person_binding_sql_apf = """
+    EXISTS (
+        SELECT 1 FROM photo_rectangles fr
+        WHERE fr.file_id = f.id AND fr.manual_person_id IS NOT NULL AND fr.manual_person_id != ?
+          AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive' OR (SELECT f2.faces_run_id FROM files f2 WHERE f2.id = fr.file_id) = ?)
+    ) OR EXISTS (
+        SELECT 1 FROM photo_rectangles fr_cluster
+        JOIN face_clusters fc ON fc.id = fr_cluster.cluster_id
+        WHERE fr_cluster.file_id = f.id 
+          AND (fr_cluster.run_id = ? OR COALESCE(TRIM(fr_cluster.archive_scope), '') = 'archive')
+          AND COALESCE(fr_cluster.ignore_flag, 0) = 0
+          AND fc.person_id IS NOT NULL AND fc.person_id != ?
+          AND (fc.run_id = ? OR fc.archive_scope = 'archive')
+    ) OR EXISTS (
+        SELECT 1 FROM file_persons fp
+        WHERE fp.file_id = f.id AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL AND fp.person_id != ?
+    )
+    """
+    eff_sql_apf = f"""
+    CASE
+      WHEN COALESCE(m.people_no_face_manual, 0) = 1 THEN 'faces'
+      WHEN lower(trim(coalesce(m.faces_manual_label, ''))) = 'faces' THEN 'faces'
+      WHEN ({has_person_binding_sql_apf}) THEN 'faces'
+      WHEN lower(trim(coalesce(m.faces_manual_label, ''))) = 'no_faces' THEN 'no_faces'
+      WHEN COALESCE(m.quarantine_manual, 0) = 1 THEN 'no_faces'
+      WHEN COALESCE(m.animals_manual, 0) = 1 THEN 'animals'
+      WHEN COALESCE(f.animals_auto, 0) = 1 THEN 'animals'
+      WHEN COALESCE(f.faces_auto_quarantine, 0) = 1
+           AND COALESCE(f.faces_count, 0) > 0
+           AND lower(trim(coalesce(f.faces_quarantine_reason, ''))) != 'many_small_faces'
+        THEN 'no_faces'
+      ELSE (CASE WHEN COALESCE(f.faces_count, 0) > 0 THEN 'faces' ELSE 'no_faces' END)
+    END
+    """
+    person_binding_params_apf = [
+        ignored_person_id_apf, face_run_id_i, face_run_id_i, face_run_id_i, ignored_person_id_apf, face_run_id_i,
+        int(pipeline_run_id), ignored_person_id_apf,
+    ]
+
+    person_filter_sql_one = """
+    EXISTS (
+        SELECT 1 FROM photo_rectangles fr
+        WHERE fr.file_id = f.id AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive') AND fr.manual_person_id = ?
+    ) OR EXISTS (
+        SELECT 1 FROM photo_rectangles fr_cluster
+        JOIN face_clusters fc ON fc.id = fr_cluster.cluster_id
+        WHERE fr_cluster.file_id = f.id 
+          AND (fr_cluster.run_id = ? OR COALESCE(TRIM(fr_cluster.archive_scope), '') = 'archive')
+          AND COALESCE(fr_cluster.ignore_flag, 0) = 0
+          AND fc.person_id = ?
+          AND (fc.run_id = ? OR fc.archive_scope = 'archive')
+    ) OR EXISTS (
+        SELECT 1 FROM file_persons fp
+        WHERE fp.file_id = f.id AND fp.pipeline_run_id = ? AND fp.person_id = ?
+    )
+    """
+
+    data_persons = api_faces_persons_with_files(pipeline_run_id=int(pipeline_run_id))
+    persons_list = data_persons.get("persons") or []
+    persons_list = [p for p in persons_list if p.get("id") != ignored_person_id_apf]
+
+    # Лица (кропы) прогона: photo_rectangles с run_id = face_run_id, привязка через кластер или manual_person_id
+    conn_apf = get_connection()
+    result_persons = []
+    try:
+        cur = conn_apf.cursor()
+        cur.execute(
+            """
+            SELECT
+              fr.id AS face_id,
+              fr.file_id,
+              fr.face_index,
+              fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
+              fr.thumb_jpeg,
+              fr.manual_person_id,
+              fr.cluster_id,
+              f.path AS file_path,
+              fc.person_id AS cluster_person_id
+            FROM photo_rectangles fr
+            LEFT JOIN files f ON fr.file_id = f.id
+            LEFT JOIN face_clusters fc ON fc.id = fr.cluster_id
+            WHERE fr.run_id = ? AND fr.is_face = 1 AND COALESCE(fr.ignore_flag, 0) = 0
+              AND (f.status IS NULL OR f.status != 'deleted')
+              AND (fr.manual_person_id IS NOT NULL OR fr.cluster_id IS NOT NULL)
+            ORDER BY f.path ASC, fr.face_index ASC
+            """,
+            (face_run_id_i,),
+        )
+        rows = cur.fetchall()
+        by_person: dict[int, list[dict[str, Any]]] = {}
+        for r in rows:
+            row = dict(r)
+            pid = row.get("manual_person_id") or row.get("cluster_person_id")
+            if pid is None or pid == ignored_person_id_apf:
+                continue
+            thumb_b64 = None
+            if row.get("thumb_jpeg"):
+                thumb_b64 = base64.b64encode(row["thumb_jpeg"]).decode("utf-8")
+            bbox = None
+            bx, by, bw, bh = row.get("bbox_x"), row.get("bbox_y"), row.get("bbox_w"), row.get("bbox_h")
+            if bx is not None and by is not None and bw is not None and bh is not None:
+                bbox = {"x": float(bx), "y": float(by), "w": float(bw), "h": float(bh)}
+            assignment_type = "manual_face" if row.get("manual_person_id") else "cluster"
+            face_item = {
+                "face_id": row["face_id"],
+                "file_id": row.get("file_id"),
+                "file_path": row.get("file_path") or None,
+                "thumb_jpeg_base64": thumb_b64,
+                "bbox": bbox,
+                "assignment_type": assignment_type,
+            }
+            if pid not in by_person:
+                by_person[pid] = []
+            by_person[pid].append(face_item)
+        for p in persons_list:
+            person_id = p.get("id")
+            person_name = p.get("name") or f"Персона {person_id}"
+            if person_id is None:
+                continue
+            result_persons.append({
+                "person_id": person_id,
+                "person_name": person_name,
+                "faces": by_person.get(person_id, []),
+            })
+    finally:
+        conn_apf.close()
+
+    elapsed = time.time() - start_time
+    logger.info(f"[API] api_faces_all_persons_faces: завершено за {elapsed:.3f}с, персон: {len(result_persons)}")
+    return {
+        "ok": True,
+        "pipeline_run_id": int(pipeline_run_id),
+        "persons": result_persons,
     }
 
 
@@ -1831,15 +2208,24 @@ def api_faces_rectangles(pipeline_run_id: int | None = None, file_id: int | None
     
     fs = FaceStore()
     try:
-        # Если pipeline_run_id не передан, загружаем все rectangles для файла (без фильтрации по run_id)
+        # file_id передаётся явно при открытии карточки из списка — используем как есть
+        if file_id is not None:
+            resolved_file_id = int(file_id)
+        else:
+            resolved_file_id = _get_file_id(fs.conn, file_id=None, file_path=path)
+            # Fallback: на Windows путь может прийти с backslash, в БД — с forward slash
+            if resolved_file_id is None and path and str(path).strip().startswith("local:"):
+                path_norm = str(path).replace("\\", "/")
+                if path_norm != path:
+                    resolved_file_id = _get_file_id(fs.conn, file_id=None, file_path=path_norm)
+        if resolved_file_id is None:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        cur = fs.conn.cursor()
+        # Если pipeline_run_id не передан — загружаем все rectangles для файла (архив)
+        # Если передан — загружаем rectangles прогона И архива (run_id = ? OR archive_scope = 'archive'),
+        # чтобы в карточке были видны ручные привязки и из прогона, и из архива (как в eff_sql).
         if face_run_id_i is None:
-            # Получаем file_id
-            resolved_file_id = _get_file_id(fs.conn, file_id=file_id, file_path=path)
-            if resolved_file_id is None:
-                raise HTTPException(status_code=404, detail="File not found")
-            
-            # Загружаем все rectangles для файла (для архивных фотографий)
-            cur = fs.conn.cursor()
             cur.execute(
                 """
                 SELECT
@@ -1860,7 +2246,27 @@ def api_faces_rectangles(pipeline_run_id: int | None = None, file_id: int | None
             )
             rects = [dict(r) for r in cur.fetchall()]
         else:
-            rects = fs.list_rectangles(run_id=face_run_id_i, file_id=file_id, file_path=path)
+            cur.execute(
+                """
+                SELECT
+                  fr.id, fr.run_id, f.path AS file_path, fr.face_index,
+                  fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
+                  fr.confidence, fr.presence_score,
+                  fr.manual_person, fr.ignore_flag,
+                  fr.created_at,
+                  COALESCE(fr.is_manual, 0) AS is_manual,
+                  fr.manual_created_at,
+                  COALESCE(fr.is_face, 1) AS is_face
+                FROM photo_rectangles fr
+                JOIN files f ON f.id = fr.file_id
+                WHERE fr.file_id = ?
+                  AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive')
+                  AND COALESCE(fr.ignore_flag, 0) = 0
+                ORDER BY COALESCE(fr.is_manual, 0) ASC, fr.face_index ASC, fr.id ASC
+                """,
+                (resolved_file_id, face_run_id_i),
+            )
+            rects = [dict(r) for r in cur.fetchall()]
         
         # Добавляем информацию о персонах для каждого прямоугольника
         # face_clusters, manual_person_id в photo_rectangles и persons находятся в FaceStore
@@ -2021,148 +2427,181 @@ def api_faces_assign_face_person(payload: dict[str, Any] = Body(...)) -> dict[st
 
 
 @router.get("/api/faces/file-persons")
-def api_faces_file_persons(pipeline_run_id: int, file_id: int | None = None, path: str | None = None) -> dict[str, Any]:
+def api_faces_file_persons(
+    file_id: int | None = Query(None),
+    path: str | None = Query(None),
+    pipeline_run_id: int | None = Query(None),
+) -> dict[str, Any]:
     """
     Возвращает список персон, привязанных к файлу (через любые способы), с информацией о лицах.
     Приоритет: file_id (если передан), иначе path (если передан).
+    pipeline_run_id опционален: при отсутствии вычисляется по file_id (file_persons или photo_rectangles→pipeline_runs).
     """
     from backend.common.db import _get_file_id, get_connection
-    
+
     if file_id is None and path is None:
         raise HTTPException(status_code=400, detail="Either file_id or path must be provided")
-    ps = PipelineStore()
-    try:
-        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
-    finally:
-        ps.close()
-    if not pr:
-        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
-    face_run_id = pr.get("face_run_id")
-    if not face_run_id:
-        raise HTTPException(status_code=400, detail="face_run_id is not set yet")
-    face_run_id_i = int(face_run_id)
-    
-    # Получаем file_id
+
     conn = get_connection()
     try:
-        resolved_file_id = _get_file_id(conn, file_id=file_id, file_path=path)
+        if file_id is not None:
+            resolved_file_id = int(file_id)
+        else:
+            resolved_file_id = _get_file_id(conn, file_id=None, file_path=path)
+            if resolved_file_id is None and path and str(path).strip().startswith("local:"):
+                path_norm = str(path).replace("\\", "/")
+                if path_norm != path:
+                    resolved_file_id = _get_file_id(conn, file_id=None, file_path=path_norm)
         if resolved_file_id is None:
             raise HTTPException(status_code=404, detail="File not found")
     finally:
         conn.close()
-    
+
+    # Вывод pipeline_run_id по file_id, если не передан (боевой режим — один прогон по папке)
+    pipeline_run_id_i: int | None = int(pipeline_run_id) if pipeline_run_id is not None else None
+    if pipeline_run_id_i is None and resolved_file_id is not None:
+        ds_temp = DedupStore()
+        try:
+            cur = ds_temp.conn.cursor()
+            cur.execute(
+                "SELECT pipeline_run_id FROM file_persons WHERE file_id = ? ORDER BY pipeline_run_id DESC LIMIT 1",
+                (resolved_file_id,),
+            )
+            r = cur.fetchone()
+            if r and r["pipeline_run_id"] is not None:
+                pipeline_run_id_i = int(r["pipeline_run_id"])
+        finally:
+            ds_temp.close()
+        if pipeline_run_id_i is None:
+            fs_temp = FaceStore()
+            try:
+                cur = fs_temp.conn.cursor()
+                cur.execute(
+                    """
+                    SELECT run_id FROM photo_rectangles
+                    WHERE file_id = ? AND run_id IS NOT NULL AND run_id != 0 AND COALESCE(ignore_flag, 0) = 0
+                    ORDER BY run_id DESC LIMIT 1
+                    """,
+                    (resolved_file_id,),
+                )
+                r = cur.fetchone()
+                if r and r["run_id"] is not None:
+                    face_run_id_from_rect = int(r["run_id"])
+                    ps_temp = PipelineStore()
+                    try:
+                        cur2 = ps_temp.conn.cursor()
+                        cur2.execute(
+                            "SELECT id FROM pipeline_runs WHERE face_run_id = ? ORDER BY id DESC LIMIT 1",
+                            (face_run_id_from_rect,),
+                        )
+                        pr = cur2.fetchone()
+                        if pr and pr["id"] is not None:
+                            pipeline_run_id_i = int(pr["id"])
+                    finally:
+                        ps_temp.close()
+            finally:
+                fs_temp.close()
+
+    # Без pipeline_run_id нельзя получить face_run_id и заполнить persons по прямоугольникам; direct_bindings — по file_persons по file_id
+    if pipeline_run_id_i is not None:
+        ps = PipelineStore()
+        try:
+            pr = ps.get_run_by_id(run_id=int(pipeline_run_id_i))
+        finally:
+            ps.close()
+        if not pr:
+            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+        face_run_id = pr.get("face_run_id")
+        if not face_run_id:
+            raise HTTPException(status_code=400, detail="face_run_id is not set yet")
+        face_run_id_i = int(face_run_id)
+    else:
+        face_run_id_i = None
+
     fs = FaceStore()
     ds = DedupStore()
     try:
-        # Используем подключение из FaceStore для работы с face_labels и photo_rectangles
         fs_cur = fs.conn.cursor()
-        # Используем подключение из DedupStore для работы с persons и file_persons (person_rectangles удалена)
         ds_cur = ds.conn.cursor()
         persons_set = {}
-        
-        # 1. Через ручные привязки (photo_rectangles.manual_person_id) — получаем информацию о лицах (прямая привязка)
-        fs_cur.execute("""
-            SELECT 
-                fr.manual_person_id AS person_id,
-                p.name AS person_name,
-                fr.id AS rectangle_id,
-                fr.bbox_x AS x,
-                fr.bbox_y AS y,
-                fr.bbox_w AS w,
-                fr.bbox_h AS h
-            FROM photo_rectangles fr
-            LEFT JOIN persons p ON p.id = fr.manual_person_id
-            WHERE fr.file_id = ? AND fr.run_id = ? AND fr.manual_person_id IS NOT NULL
-            ORDER BY fr.id
-        """, (resolved_file_id, face_run_id_i))
-        for row in fs_cur.fetchall():
-            pid = row["person_id"]
-            if pid not in persons_set:
-                persons_set[pid] = {
-                    "id": pid, 
-                    "name": row["person_name"],
-                    "faces": []
-                }
-            persons_set[pid]["faces"].append({
-                "id": row["rectangle_id"],
-                "x": row["x"],
-                "y": row["y"],
-                "w": row["w"],
-                "h": row["h"]
-            })
-        
-        # 1b. Через кластеры (лицо в файле находится в кластере, привязанном к персоне)
-        # Логика:
-        # - Находим все кластеры, где есть лица из файла
-        # - Для каждого кластера определяем персону из face_clusters.person_id
-        # - ВСЕ лица в кластере наследуют эту персону (включая лица из файла)
-        # Важно: если в кластере person_id = NULL - кластер не назначен персоне
-        fs_cur.execute("""
-            SELECT DISTINCT
-                fc.person_id,
-                p.name AS person_name,
-                fr_file.id AS rectangle_id,
-                fr_file.bbox_x AS x,
-                fr_file.bbox_y AS y,
-                fr_file.bbox_w AS w,
-                fr_file.bbox_h AS h
-            FROM photo_rectangles fr_file
-            JOIN face_clusters fc ON fc.id = fr_file.cluster_id
-            -- Персона через face_clusters.person_id (photo_rectangles.cluster_id)
-            LEFT JOIN persons p ON p.id = fc.person_id
-            WHERE fr_file.file_id = ?
-              AND fr_file.run_id = ?
-              AND COALESCE(fr_file.ignore_flag, 0) = 0
-              AND fc.person_id IS NOT NULL
-              AND (fc.run_id = ? OR fc.archive_scope = 'archive')
-              -- Исключаем лица, которые уже есть в прямой привязке (manual_person_id) для этой персоны
-              AND (fr_file.manual_person_id IS NULL OR fr_file.manual_person_id <> fc.person_id)
-            ORDER BY fc.person_id, fr_file.id
-        """, (resolved_file_id, face_run_id_i, face_run_id_i))
-        for row in fs_cur.fetchall():
-            pid = row["person_id"]
-            if pid not in persons_set:
-                persons_set[pid] = {
-                    "id": pid, 
-                    "name": row["person_name"],
-                    "faces": []
-                }
-            # Проверяем, что это лицо еще не добавлено (может быть дубликат из-за нескольких кластеров)
-            face_id = row["rectangle_id"]
-            if not any(f["id"] == face_id for f in persons_set[pid]["faces"]):
+        direct_bindings: list[dict[str, Any]] = []
+
+        if face_run_id_i is not None:
+            # 1. Ручные привязки (photo_rectangles.manual_person_id)
+            fs_cur.execute("""
+                SELECT
+                    fr.manual_person_id AS person_id,
+                    p.name AS person_name,
+                    fr.id AS rectangle_id,
+                    fr.bbox_x AS x, fr.bbox_y AS y, fr.bbox_w AS w, fr.bbox_h AS h
+                FROM photo_rectangles fr
+                LEFT JOIN persons p ON p.id = fr.manual_person_id
+                WHERE fr.file_id = ? AND fr.run_id = ? AND fr.manual_person_id IS NOT NULL
+                ORDER BY fr.id
+            """, (resolved_file_id, face_run_id_i))
+            for row in fs_cur.fetchall():
+                pid = row["person_id"]
+                if pid not in persons_set:
+                    persons_set[pid] = {"id": pid, "name": row["person_name"], "faces": []}
                 persons_set[pid]["faces"].append({
-                    "id": face_id,
-                    "x": row["x"],
-                    "y": row["y"],
-                    "w": row["w"],
-                    "h": row["h"]
+                    "id": row["rectangle_id"], "x": row["x"], "y": row["y"], "w": row["w"], "h": row["h"]
                 })
-        
-        # 2. person_rectangles удалена
-        
-        # 3. Через file_persons (прямая привязка)
-        ds_cur.execute("""
-            SELECT DISTINCT fp.person_id, p.name AS person_name
-            FROM file_persons fp
-            LEFT JOIN persons p ON p.id = fp.person_id
-            WHERE fp.file_id = ? AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL
-        """, (resolved_file_id, int(pipeline_run_id)))
+            # 1b. Кластеры
+            fs_cur.execute("""
+                SELECT DISTINCT fc.person_id, p.name AS person_name,
+                    fr_file.id AS rectangle_id, fr_file.bbox_x AS x, fr_file.bbox_y AS y, fr_file.bbox_w AS w, fr_file.bbox_h AS h
+                FROM photo_rectangles fr_file
+                JOIN face_clusters fc ON fc.id = fr_file.cluster_id
+                LEFT JOIN persons p ON p.id = fc.person_id
+                WHERE fr_file.file_id = ? AND fr_file.run_id = ?
+                  AND COALESCE(fr_file.ignore_flag, 0) = 0 AND fc.person_id IS NOT NULL
+                  AND (fc.run_id = ? OR fc.archive_scope = 'archive')
+                  AND (fr_file.manual_person_id IS NULL OR fr_file.manual_person_id <> fc.person_id)
+                ORDER BY fc.person_id, fr_file.id
+            """, (resolved_file_id, face_run_id_i, face_run_id_i))
+            for row in fs_cur.fetchall():
+                pid = row["person_id"]
+                if pid not in persons_set:
+                    persons_set[pid] = {"id": pid, "name": row["person_name"], "faces": []}
+                face_id = row["rectangle_id"]
+                if not any(f["id"] == face_id for f in persons_set[pid]["faces"]):
+                    persons_set[pid]["faces"].append({
+                        "id": face_id, "x": row["x"], "y": row["y"], "w": row["w"], "h": row["h"]
+                    })
+
+        # 3. file_persons (прямая привязка): по run если есть, иначе по file_id без run — чтобы прямые привязки всегда были видны
+        if pipeline_run_id_i is not None:
+            ds_cur.execute("""
+                SELECT DISTINCT fp.person_id, p.name AS person_name
+                FROM file_persons fp
+                LEFT JOIN persons p ON p.id = fp.person_id
+                WHERE fp.file_id = ? AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL
+            """, (resolved_file_id, pipeline_run_id_i))
+        else:
+            ds_cur.execute("""
+                SELECT DISTINCT fp.person_id, p.name AS person_name
+                FROM file_persons fp
+                LEFT JOIN persons p ON p.id = fp.person_id
+                WHERE fp.file_id = ? AND fp.person_id IS NOT NULL
+            """, (resolved_file_id,))
         for row in ds_cur.fetchall():
+            direct_bindings.append({"person_id": row["person_id"], "person_name": row["person_name"] or ""})
             pid = row["person_id"]
             if pid not in persons_set:
                 persons_set[pid] = {"id": pid, "name": row["person_name"], "faces": []}
-        
+
         persons_list = list(persons_set.values())
     finally:
         fs.close()
         ds.close()
-    
+
     return {
         "ok": True,
-        "pipeline_run_id": int(pipeline_run_id),
+        "pipeline_run_id": pipeline_run_id_i,
         "file_id": resolved_file_id,
         "path": path,
         "persons": persons_list,
+        "direct_bindings": direct_bindings,
     }
 
 

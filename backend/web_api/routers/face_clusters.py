@@ -148,6 +148,59 @@ def _generate_face_thumbnail_on_fly(file_path: str, bbox: tuple[int, int, int, i
         logger.warning(f"Error generating thumbnail on fly for {file_path}: {e}")
         return None
 
+
+def _generate_full_file_thumbnail_on_fly(file_path: str, thumb_size: int = 200) -> str | None:
+    """
+    Генерирует превью целого файла на лету (без кропа по bbox). Для прямой привязки (file_person).
+    """
+    from PIL import Image
+    from PIL import ImageOps
+    from io import BytesIO
+    import base64
+    import requests
+
+    try:
+        img = None
+        if file_path.startswith("disk:"):
+            disk = get_disk()
+            p = _normalize_yadisk_path(file_path)
+            md = _yd_call_retry(lambda: disk.get_meta(p, limit=0))
+            sizes = getattr(md, "sizes", None)
+            if sizes and "ORIGINAL" in sizes:
+                original_url = sizes["ORIGINAL"]
+                resp = requests.get(original_url, timeout=10, stream=True)
+                resp.raise_for_status()
+                img = Image.open(BytesIO(resp.content))
+            else:
+                return None
+        elif file_path.startswith("local:"):
+            local_path = file_path.replace("local:", "")
+            if not os.path.isfile(local_path):
+                return None
+            img = Image.open(local_path)
+        else:
+            return None
+
+        if img is None:
+            return None
+
+        try:
+            img = ImageOps.exif_transpose(img)
+        except Exception:
+            pass
+
+        img.thumbnail((thumb_size, thumb_size), Image.Resampling.LANCZOS)
+        buf = BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=78, optimize=True)
+        thumb_bytes = buf.getvalue()
+        img.close()
+        return base64.b64encode(thumb_bytes).decode("utf-8")
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Error generating full-file thumbnail for {file_path}: {e}")
+        return None
+
+
 def _venv_face_python() -> Path:
     """Возвращает путь к Python из .venv-face."""
     rr = _repo_root()
@@ -1047,6 +1100,38 @@ async def api_persons_list() -> dict[str, Any]:
     return {"persons": persons}
 
 
+@router.get("/api/persons/groups")
+async def api_persons_groups() -> dict[str, Any]:
+    """Возвращает список групп персон с приоритетами (для выбора при создании/редактировании)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    # Из БД: уникальные группы с минимальным group_order по группе
+    cur.execute(
+        '''
+        SELECT "group", MIN(COALESCE(group_order, 999)) AS group_order
+        FROM persons
+        WHERE "group" IS NOT NULL AND "group" != ''
+        GROUP BY "group"
+        ORDER BY MIN(COALESCE(group_order, 999)) ASC, "group" ASC
+        '''
+    )
+    db_groups = {row["group"]: row["group_order"] for row in cur.fetchall()}
+    # Объединяем: PERSON_GROUPS (значение — dict с "order") + группы из БД
+    seen = set()
+    groups = []
+    for name, info in PERSON_GROUPS.items():
+        order = info["order"] if isinstance(info, dict) else 999
+        groups.append((name, order))
+        seen.add(name)
+    for name, order_val in db_groups.items():
+        if name not in seen:
+            groups.append((name, int(order_val) if order_val is not None else 999))
+            seen.add(name)
+    groups.sort(key=lambda x: (x[1], x[0]))
+    result = [{"name": name, "order": int(o)} for name, o in groups]
+    return {"groups": result}
+
+
 @router.get("/api/persons/stats")
 async def api_persons_stats() -> dict[str, Any]:
     """
@@ -1358,6 +1443,10 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 fr.archive_scope,
                 f.path as file_path,
                 f.id as file_id,
+                f.faces_run_id as file_faces_run_id,
+                f.taken_at,
+                f.place_country,
+                f.place_city,
                 fr.face_index,
                 fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
                 fr.confidence, fr.presence_score,
@@ -1394,6 +1483,10 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 fr.archive_scope,
                 f.path as file_path,
                 f.id as file_id,
+                f.faces_run_id as file_faces_run_id,
+                f.taken_at,
+                f.place_country,
+                f.place_city,
                 fr.face_index,
                 fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
                 fr.confidence, fr.presence_score,
@@ -1436,6 +1529,10 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                     fr.archive_scope,
                     f.path as file_path,
                     f.id as file_id,
+                    f.faces_run_id as file_faces_run_id,
+                    f.taken_at,
+                    f.place_country,
+                    f.place_city,
                     fr.face_index,
                     fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
                     fr.confidence, fr.presence_score,
@@ -1489,6 +1586,10 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 CASE WHEN f.path LIKE 'disk:/Фото%' THEN 'archive' ELSE NULL END as archive_scope,
                 f.path as file_path,
                 fp.file_id,
+                f.faces_run_id as file_faces_run_id,
+                f.taken_at,
+                f.place_country,
+                f.place_city,
                 0 as face_index,
                 NULL as bbox_x,
                 NULL as bbox_y,
@@ -1545,12 +1646,18 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 # Если thumb_jpeg отсутствует, пытаемся сгенерировать превью на лету
                 if not thumb_base64:
                     try:
-                        file_path_val = row["file_path"]
-                        bbox_x_val = row["bbox_x"]
-                        bbox_y_val = row["bbox_y"]
-                        bbox_w_val = row["bbox_w"]
-                        bbox_h_val = row["bbox_h"]
-                        if file_path_val and bbox_x_val is not None and bbox_y_val is not None and bbox_w_val is not None and bbox_h_val is not None:
+                        file_path_val = row.get("file_path")
+                        bbox_x_val = row.get("bbox_x")
+                        bbox_y_val = row.get("bbox_y")
+                        bbox_w_val = row.get("bbox_w")
+                        bbox_h_val = row.get("bbox_h")
+                        if assignment_type == "file_person" and file_path_val:
+                            try:
+                                thumb_base64 = _generate_full_file_thumbnail_on_fly(file_path=file_path_val)
+                            except Exception as e:
+                                logger.warning(f"Failed to generate full-file thumbnail for {file_path_val}: {e}")
+                                thumb_base64 = None
+                        elif file_path_val and bbox_x_val is not None and bbox_y_val is not None and bbox_w_val is not None and bbox_h_val is not None:
                             try:
                                 thumb_base64 = _generate_face_thumbnail_on_fly(
                                     file_path=file_path_val,
@@ -1598,19 +1705,14 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 except (KeyError, TypeError):
                     cluster_archive_scope_val = None
                 
-                # Определяем is_archive и is_run в зависимости от типа привязки
-                if assignment_type == "cluster":
-                    # Для кластеров используем данные из face_clusters, а не из photo_rectangles
-                    is_archive = (cluster_archive_scope_val == 'archive') if cluster_archive_scope_val else False
-                    is_run = not is_archive and (cluster_run_id_val is not None)
-                elif assignment_type == "manual_face":
-                    # Для ручных привязок лиц используем данные из photo_rectangles
-                    is_archive = (archive_scope_val == 'archive') if archive_scope_val else False
-                    is_run = not is_archive and (run_id_val is not None)
-                else:
-                    # Для file_persons (и бывших person_rectangle) определяем через file_path
-                    is_archive = (file_path_val and file_path_val.startswith("disk:/Фото")) if file_path_val else False
-                    is_run = not is_archive and (pipeline_run_id_val is not None)
+                try:
+                    file_faces_run_id_val = row.get("file_faces_run_id")
+                except (KeyError, TypeError):
+                    file_faces_run_id_val = None
+                
+                # Архив / прогон берём из файла (files.faces_run_id): если у файла есть faces_run_id — прогон, иначе архив
+                is_run = file_faces_run_id_val is not None
+                is_archive = not is_run
             except Exception as e:
                 # Логируем ошибку для отладки
                 import traceback
@@ -1699,6 +1801,9 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 except: pass
             # #endregion
             
+            taken_at_val = row.get("taken_at") if row.get("taken_at") else None
+            place_country_val = row.get("place_country") if row.get("place_country") else None
+            place_city_val = row.get("place_city") if row.get("place_city") else None
             faces.append({
                 "face_id": face_id_val,
                 "person_rectangle_id": person_rectangle_id_val,
@@ -1710,6 +1815,9 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 "is_run": is_run,
                 "file_path": file_path_val,
                 "file_id": file_id_val,
+                "taken_at": taken_at_val,
+                "place_country": place_country_val,
+                "place_city": place_city_val,
                 "face_index": face_index_val,
                 "bbox": {
                     "x": bbox_x,
@@ -1757,6 +1865,7 @@ async def api_person_update(*, person_id: int, payload: dict[str, Any] = Body(..
     
     name = payload.get("name")
     group = payload.get("group")  # Может быть None для удаления группы
+    group_order = payload.get("group_order")  # Опционально: приоритет группы (для новой группы)
     
     if not name:
         raise HTTPException(status_code=400, detail="Field 'name' is required")
@@ -1769,8 +1878,14 @@ async def api_person_update(*, person_id: int, payload: dict[str, Any] = Body(..
     if not cur.fetchone():
         raise HTTPException(status_code=404, detail="Person not found")
     
-    # Вычисляем group_order на основе группы
-    group_order = get_group_order(group)
+    # group_order: из payload или по названию группы
+    if group_order is not None and group_order != "":
+        try:
+            group_order = int(group_order)
+        except (TypeError, ValueError):
+            group_order = get_group_order(group)
+    else:
+        group_order = get_group_order(group)
     
     # Обновляем имя и группу
     now = datetime.now(timezone.utc).isoformat()
@@ -2227,9 +2342,16 @@ async def api_persons_create(payload: dict[str, Any] = Body(...)) -> dict[str, A
     is_me = payload.get("is_me", 0)
     kinship = payload.get("kinship")
     group = payload.get("group")  # Может быть None
+    group_order_param = payload.get("group_order")  # Опционально: приоритет для новой группы
     
-    # Вычисляем group_order на основе группы
-    group_order = get_group_order(group)
+    # group_order: из payload или по названию группы
+    if group_order_param is not None and group_order_param != "":
+        try:
+            group_order = int(group_order_param)
+        except (TypeError, ValueError):
+            group_order = get_group_order(group)
+    else:
+        group_order = get_group_order(group)
     
     now = datetime.now(timezone.utc).isoformat()
     
@@ -2959,23 +3081,44 @@ async def api_assign_person_to_face(*, rectangle_id: int, payload: dict[str, Any
     if not cur.fetchone():
         raise HTTPException(status_code=404, detail="Face rectangle not found")
     
-    # Получаем cluster_id для этого лица (если есть)
+    # Получаем cluster_id и file_id для этого прямоугольника
     cur.execute(
         """
-        SELECT cluster_id FROM photo_rectangles WHERE id = ? LIMIT 1
+        SELECT cluster_id, file_id FROM photo_rectangles WHERE id = ? LIMIT 1
         """,
         (rectangle_id,),
     )
-    cluster_row = cur.fetchone()
-    cluster_id = cluster_row["cluster_id"] if cluster_row else None
+    pr_row = cur.fetchone()
+    cluster_id = pr_row["cluster_id"] if pr_row else None
+    file_id = pr_row["file_id"] if pr_row else None
     
-    # Назначаем ручную привязку в photo_rectangles.manual_person_id (и снимаем кластер)
-    cur.execute(
-        """
-        UPDATE photo_rectangles SET manual_person_id = ?, cluster_id = NULL WHERE id = ?
-        """,
-        (person_id, rectangle_id),
-    )
+    # run_id для фильтра «К разбору»: если у прямоугольника нет run_id, берём faces_run_id файла
+    run_id_to_set = None
+    if file_id is not None:
+        cur.execute(
+            "SELECT faces_run_id FROM files WHERE id = ?",
+            (file_id,),
+        )
+        f_row = cur.fetchone()
+        if f_row and f_row["faces_run_id"] is not None:
+            run_id_to_set = int(f_row["faces_run_id"])
+    
+    # Назначаем ручную привязку в photo_rectangles.manual_person_id (и снимаем кластер).
+    # run_id выставляем, чтобы фильтр «К разбору» (fr.run_id = ? OR archive) видел привязку.
+    if run_id_to_set is not None:
+        cur.execute(
+            """
+            UPDATE photo_rectangles SET manual_person_id = ?, cluster_id = NULL, run_id = ? WHERE id = ?
+            """,
+            (person_id, run_id_to_set, rectangle_id),
+        )
+    else:
+        cur.execute(
+            """
+            UPDATE photo_rectangles SET manual_person_id = ?, cluster_id = NULL WHERE id = ?
+            """,
+            (person_id, rectangle_id),
+        )
     
     conn.commit()
     
