@@ -8,8 +8,8 @@
 import sys
 from pathlib import Path
 
-# Корень проекта
-project_root = Path(__file__).resolve().parents[2]
+# Корень проекта (backend/scripts/tools/ -> parents[3] = PhotoSorter)
+project_root = Path(__file__).resolve().parents[3]
 BACKUPS_DIR = project_root / "data" / "backups"
 
 

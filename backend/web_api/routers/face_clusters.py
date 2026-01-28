@@ -1070,9 +1070,7 @@ async def api_persons_list() -> dict[str, Any]:
     
     # Получаем или создаем персону "Посторонний" один раз
     outsider_person_id = get_outsider_person_id(conn)
-    if outsider_person_id:
-        print(f"Персона 'Посторонний' найдена (ID: {outsider_person_id})")
-    
+
     cur.execute(
         """
         SELECT id, name, mode, is_me, kinship, avatar_face_id, created_at, updated_at, "group", group_order

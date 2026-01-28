@@ -719,7 +719,6 @@ def api_faces_results(
     start_time = time.time()
     msg = f"[API] api_faces_results: начало, pipeline_run_id={pipeline_run_id}, tab={tab}, subtab={subtab}, page={page}, page_size={page_size}"
     logger.info(msg)
-    print(msg)  # Дублируем в print для гарантированного вывода
     tab_n = (tab or "").strip().lower()
     if tab_n not in ("faces", "no_faces", "quarantine", "animals", "people_no_face"):
         raise HTTPException(status_code=400, detail="tab must be faces|no_faces|quarantine|animals|people_no_face")
@@ -747,7 +746,6 @@ def api_faces_results(
             group_path_filter = urllib.parse.unquote(subtab_n.replace("group_", ""))
             # Убираем лишние пробелы (данные уже нормализованы в БД)
             group_path_filter = group_path_filter.strip()
-            print(f"[DEBUG] Декодирован group_path_filter: '{group_path_filter}' из subtab_n='{subtab_n}'")
         elif subtab_n not in ("all", "unsorted", "unsorted_photos", "unsorted_videos"):
             raise HTTPException(status_code=400, detail="subtab for no_faces must be all|unsorted|unsorted_photos|unsorted_videos|group_<path>")
         else:
@@ -971,8 +969,6 @@ def api_faces_results(
         else:
             # Старый формат "unsorted" - показываем все
             media_filter_sql = "1=1"
-        
-        print(f"[DEBUG] Фильтр 'К разбору': group_filter_sql установлен, media_filter={subtab_n}, params={group_filter_params}")
     elif tab_n == "no_faces" and group_path_filter is not None:
         # Фильтр по конкретной группе
         # Ищем точно по названию (данные уже нормализованы в БД)
@@ -984,7 +980,6 @@ def api_faces_results(
         )
         """
         group_filter_params = [int(pipeline_run_id), str(group_path_filter)]
-        print(f"[DEBUG] Фильтр по группе '{group_path_filter}': group_filter_sql установлен, params={group_filter_params}")
     elif tab_n == "faces" and person_id_filter is not None:
         # Для персоны «Посторонний» (person_6): только фото где ВСЕ прямоугольники либо посторонние, либо неназначенные + manual_filter
         if person_id_filter == ignored_person_id and ignored_person_id >= 0:
@@ -1129,7 +1124,6 @@ def api_faces_results(
         count_time = time.time() - count_start
         msg = f"[API] api_faces_results: COUNT запрос занял {count_time:.3f}с, total={total}"
         logger.info(msg)
-        print(msg)
 
         sort_n = str((sort or "").strip().lower() or "")
         select_start = time.time()
@@ -1180,7 +1174,6 @@ def api_faces_results(
         select_time = time.time() - select_start
         msg = f"[API] api_faces_results: SELECT запрос занял {select_time:.3f}с, строк: {len(rows)}"
         logger.info(msg)
-        print(msg)
 
         # Диагностика пустой вкладки персоны: при tab=faces, subtab=person_N и total=0
         # проверяем, сколько файлов в прогоне привязаны к персоне без учёта eff_sql
@@ -1208,7 +1201,6 @@ def api_faces_results(
                         "interpretation": "cnt_attached>0 значит eff_sql отсекает; cnt_attached=0 значит where_sql или person_filter не находят файлов",
                     },
                 )
-                print(f"[DEBUG] person_{person_id_filter} empty tab: total={total}, cnt_attached(no eff_sql)={cnt_attached}")
             except Exception as e:
                 _agent_dbg(
                     hypothesis_id="PERSON_TAB_EMPTY",
@@ -1216,66 +1208,6 @@ def api_faces_results(
                     message="person subtab diagnostic failed",
                     data={"person_id": person_id_filter, "error": str(e)},
                 )
-                print(f"[DEBUG] person_{person_id_filter} diagnostic error: {e}")
-        
-        # Отладочный вывод для проверки фильтрации
-        if tab_n == "no_faces":
-            print(f"[DEBUG] Загружено строк: {len(rows)} для tab_n={tab_n}, subtab_n={subtab_n}")
-            if len(rows) == 0 and (subtab_n == "unsorted" or group_path_filter):
-                # Проверяем, почему нет результатов
-                print(f"[DEBUG] Проверяем почему нет результатов для subtab_n={subtab_n}, group_path_filter={group_path_filter}")
-                # Делаем тестовый запрос
-                test_cur = ds.conn.cursor()
-                
-                if group_path_filter:
-                    # Проверяем файлы в группе БЕЗ фильтра по eff_sql
-                    test_cur.execute(f"""
-                        SELECT COUNT(*) as cnt
-                        FROM files f
-                        LEFT JOIN files_manual_labels m ON m.pipeline_run_id = ? AND m.file_id = f.id
-                        WHERE f.faces_run_id = ? AND f.status != 'deleted'
-                        AND EXISTS (
-                            SELECT 1 FROM file_groups fg
-                            WHERE fg.file_id = f.id AND fg.pipeline_run_id = ? 
-                            AND fg.group_path = ?
-                        )
-                    """, [int(pipeline_run_id), face_run_id_i, int(pipeline_run_id), str(group_path_filter)])
-                    group_count_all = test_cur.fetchone()[0]
-                    print(f"[DEBUG] Файлов в группе '{group_path_filter}' (без фильтра по tab): {group_count_all}")
-                    
-                    # Проверяем файлы в группе С фильтром по eff_sql = 'no_faces'
-                    test_cur.execute(f"""
-                        SELECT COUNT(*) as cnt
-                        FROM files f
-                        LEFT JOIN files_manual_labels m ON m.pipeline_run_id = ? AND m.file_id = f.id
-                        WHERE f.faces_run_id = ? AND f.status != 'deleted'
-                        AND ({eff_sql}) = 'no_faces'
-                        AND EXISTS (
-                            SELECT 1 FROM file_groups fg
-                            WHERE fg.file_id = f.id AND fg.pipeline_run_id = ? 
-                            AND fg.group_path = ?
-                        )
-                    """, [int(pipeline_run_id), face_run_id_i, int(pipeline_run_id), str(group_path_filter)])
-                    group_count_no_faces = test_cur.fetchone()[0]
-                    print(f"[DEBUG] Файлов в группе '{group_path_filter}' с eff_sql='no_faces': {group_count_no_faces}")
-                    
-                    # Проверяем конкретные файлы в группе
-                    test_cur.execute(f"""
-                        SELECT f.path, ({eff_sql}) as eff_tab, f.faces_count, 
-                               COALESCE(m.faces_manual_label, '') as manual_label
-                        FROM files f
-                        LEFT JOIN files_manual_labels m ON m.pipeline_run_id = ? AND m.file_id = f.id
-                        WHERE EXISTS (
-                            SELECT 1 FROM file_groups fg
-                            WHERE fg.file_id = f.id AND fg.pipeline_run_id = ? 
-                            AND fg.group_path = ?
-                        )
-                        LIMIT 5
-                    """, [int(pipeline_run_id), int(pipeline_run_id), str(group_path_filter)])
-                    group_files = test_cur.fetchall()
-                    print(f"[DEBUG] Файлы в группе '{group_path_filter}':")
-                    for row in group_files:
-                        print(f"  {row[0]}: eff_tab={row[1]}, faces_count={row[2]}, manual_label={row[3]}")
     finally:
         ds.close()
 
@@ -1287,7 +1219,6 @@ def api_faces_results(
             rows = _group_into_trips(rows)
         except Exception as e:
             logger.error(f"[API] api_faces_results: ошибка в _group_into_trips: {e}", exc_info=True)
-            print(f"[ERROR] api_faces_results: ошибка в _group_into_trips: {e}")
             # В случае ошибки возвращаем строки без группировки
             rows = rows
     
@@ -1339,8 +1270,7 @@ def api_faces_results(
     elapsed = time.time() - start_time
     msg = f"[API] api_faces_results: завершено за {elapsed:.3f}с, элементов: {len(items)}, всего: {total}, tab={tab_n}, subtab={subtab_n}"
     logger.info(msg)
-    print(msg)
-    
+
     return {
         "ok": True,
         "pipeline_run_id": int(pipeline_run_id),
@@ -1657,7 +1587,6 @@ def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
     start_time = time.time()
     msg = f"[API] api_faces_persons_with_files: начало, pipeline_run_id={pipeline_run_id}"
     logger.info(msg)
-    print(msg)
     ps = PipelineStore()
     try:
         pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
@@ -1725,8 +1654,7 @@ def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
         query1_time = time.time() - query1_start
         msg = f"[API] api_faces_persons_with_files: запрос 1 (manual_person_id) занял {query1_time:.3f}с, персон: {len(persons_from_faces)}"
         logger.info(msg)
-        print(msg)
-        
+
         # 1b. Через кластеры — только файлы текущего прогона и не удалённые
         file_scope_sql_cluster = file_scope_sql.replace("f.", "f_cluster.")
         where_parts_cluster = [
@@ -1763,8 +1691,7 @@ def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
         query2_time = time.time() - query2_start
         msg = f"[API] api_faces_persons_with_files: запрос 2 (clusters) занял {query2_time:.3f}с, персон: {len(persons_from_clusters)}"
         logger.info(msg)
-        print(msg)
-        
+
         # 2. person_rectangles удалена — персоны только через лица, кластеры и file_persons
         persons_from_rects: dict[int, dict[str, Any]] = {}
 
@@ -1793,8 +1720,7 @@ def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
         query4_time = time.time() - query4_start
         msg = f"[API] api_faces_persons_with_files: запрос 4 (file_persons) занял {query4_time:.3f}с, персон: {len(persons_from_direct)}"
         logger.info(msg)
-        print(msg)
-        
+
         # ID персоны «Посторонний» для флага is_ignored
         from backend.web_api.routers.face_clusters import get_outsider_person_id
         _conn_apwf = get_connection()
@@ -1826,15 +1752,110 @@ def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
                 all_persons[pid]["files_count"] += pdata["files_count"]
             else:
                 all_persons[pid] = {"id": pid, "name": pdata["name"], "files_count": pdata["files_count"], "is_ignored": pid == outsider_id_apwf}
-        
+
+        # Для персоны «Посторонний» счётчик должен совпадать с содержимым вкладки:
+        # только файлы, где ВСЕ прямоугольники — посторонние или неназначенные,
+        # и (eff_sql) = 'faces' — как в api_faces_results
+        if outsider_id_apwf is not None and outsider_id_apwf in all_persons:
+            run_archive_apwf = "(fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive')"
+            no_other_apwf = f"""
+                NOT EXISTS (
+                    SELECT 1 FROM photo_rectangles fr
+                    WHERE fr.file_id = f.id AND {run_archive_apwf}
+                      AND COALESCE(fr.ignore_flag, 0) = 0
+                      AND (
+                          (fr.manual_person_id IS NOT NULL AND fr.manual_person_id != ?)
+                          OR (fr.cluster_id IS NOT NULL AND EXISTS (
+                              SELECT 1 FROM face_clusters fc WHERE fc.id = fr.cluster_id AND fc.person_id != ?
+                          ))
+                      )
+                )
+            """
+            has_outsider_or_unassigned_apwf = f"""
+                EXISTS (
+                    SELECT 1 FROM photo_rectangles fr
+                    LEFT JOIN face_clusters fc ON fc.id = fr.cluster_id
+                    WHERE fr.file_id = f.id AND {run_archive_apwf}
+                      AND COALESCE(fr.ignore_flag, 0) = 0
+                      AND (
+                          fr.manual_person_id = ?
+                          OR (fc.person_id = ?)
+                          OR (fr.manual_person_id IS NULL AND (fr.cluster_id IS NULL OR fc.person_id IS NULL))
+                      )
+                )
+            """
+            # eff_sql — тот же CASE, что в api_faces_results: вкладка «Люди» показывает только файлы с eff_sql = 'faces'
+            has_person_binding_apwf = """
+                EXISTS (
+                    SELECT 1 FROM photo_rectangles fr
+                    WHERE fr.file_id = f.id AND fr.manual_person_id IS NOT NULL AND fr.manual_person_id != ?
+                      AND (fr.run_id = ? OR COALESCE(TRIM(fr.archive_scope), '') = 'archive' OR (SELECT f2.faces_run_id FROM files f2 WHERE f2.id = fr.file_id) = ?)
+                ) OR EXISTS (
+                    SELECT 1 FROM photo_rectangles fr_cluster
+                    JOIN face_clusters fc ON fc.id = fr_cluster.cluster_id
+                    WHERE fr_cluster.file_id = f.id 
+                      AND (fr_cluster.run_id = ? OR COALESCE(TRIM(fr_cluster.archive_scope), '') = 'archive')
+                      AND COALESCE(fr_cluster.ignore_flag, 0) = 0
+                      AND fc.person_id IS NOT NULL AND fc.person_id != ?
+                      AND (fc.run_id = ? OR fc.archive_scope = 'archive')
+                ) OR EXISTS (
+                    SELECT 1 FROM file_persons fp
+                    WHERE fp.file_id = f.id AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL AND fp.person_id != ?
+                )
+            """
+            eff_sql_apwf = f"""
+                CASE
+                  WHEN COALESCE(m.people_no_face_manual, 0) = 1 THEN 'faces'
+                  WHEN lower(trim(coalesce(m.faces_manual_label, ''))) = 'faces' THEN 'faces'
+                  WHEN ({has_person_binding_apwf}) THEN 'faces'
+                  WHEN lower(trim(coalesce(m.faces_manual_label, ''))) = 'no_faces' THEN 'no_faces'
+                  WHEN COALESCE(m.quarantine_manual, 0) = 1 THEN 'no_faces'
+                  WHEN COALESCE(m.animals_manual, 0) = 1 THEN 'animals'
+                  WHEN COALESCE(f.animals_auto, 0) = 1 THEN 'animals'
+                  WHEN COALESCE(f.faces_auto_quarantine, 0) = 1
+                       AND COALESCE(f.faces_count, 0) > 0
+                       AND lower(trim(coalesce(f.faces_quarantine_reason, ''))) != 'many_small_faces'
+                    THEN 'no_faces'
+                  ELSE (CASE WHEN COALESCE(f.faces_count, 0) > 0 THEN 'faces' ELSE 'no_faces' END)
+                END
+            """
+            # Параметры: JOIN m (pipeline_run_id), file_scope, eff_sql (8), 'faces', no_other+has_outsider (6)
+            person_binding_apwf = [
+                outsider_id_apwf, face_run_id_i, face_run_id_i, face_run_id_i, outsider_id_apwf, face_run_id_i,
+                int(pipeline_run_id), outsider_id_apwf,
+            ]
+            outsider_count_params = (
+                [int(pipeline_run_id)]
+                + file_scope_params
+                + person_binding_apwf
+                + ["faces"]
+                + [
+                    face_run_id_i, outsider_id_apwf, outsider_id_apwf,
+                    face_run_id_i, outsider_id_apwf, outsider_id_apwf,
+                ]
+            )
+            cur.execute(
+                f"""
+                SELECT COUNT(*) AS cnt
+                FROM files f
+                LEFT JOIN files_manual_labels m ON m.pipeline_run_id = ? AND m.file_id = f.id
+                WHERE {file_scope_sql}
+                  AND ({eff_sql_apwf}) = ?
+                  AND COALESCE(f.faces_count, 0) > 0
+                  AND ({no_other_apwf} AND {has_outsider_or_unassigned_apwf})
+                """,
+                outsider_count_params,
+            )
+            outsider_count = int(cur.fetchone()[0] or 0)
+            all_persons[outsider_id_apwf]["files_count"] = outsider_count
+
         # Сортируем по имени (Посторонние в конце — в loadPersonsSubtabs на фронте)
         persons_list = sorted(all_persons.values(), key=lambda x: (x["name"] or "").lower())
         
         elapsed = time.time() - start_time
         msg = f"[API] api_faces_persons_with_files: завершено за {elapsed:.3f}с, персон: {len(persons_list)}"
         logger.info(msg)
-        print(msg)
-        
+
     finally:
         fs.close()
     
@@ -2101,38 +2122,25 @@ def api_faces_assign_group(payload: dict[str, Any] = Body(...)) -> dict[str, Any
         # Проверяем, что группа не пустая
         if not normalized_group_path:
             raise HTTPException(status_code=400, detail="group_path cannot be empty")
-        
-        print(f"[DEBUG assign-group] Получено: pipeline_run_id={pipeline_run_id} (type: {type(pipeline_run_id)}), path={repr(path)} (type: {type(path)}), group_path={repr(group_path)} (type: {type(group_path)})")
-        print(f"[DEBUG assign-group] Нормализовано: path={repr(str(path))}, group_path={repr(normalized_group_path)}")
-        
+
         try:
             fs.insert_file_group(
                 pipeline_run_id=int(pipeline_run_id),
                 file_path=str(path),
                 group_path=normalized_group_path,
             )
-            print(f"[DEBUG assign-group] INSERT выполнен успешно")
         except Exception as e:
-            print(f"[DEBUG assign-group] ОШИБКА при INSERT: {type(e).__name__}: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("api_faces_assign_group: INSERT failed: %s", e)
             raise
-        
+
         # Проверяем, что группа действительно сохранилась
         groups = fs.list_file_groups(
             pipeline_run_id=int(pipeline_run_id),
             file_path=str(path),
         )
-        print(f"[DEBUG assign-group] После сохранения найдено групп для файла: {len(groups)}")
-        for g in groups:
-            print(f"[DEBUG assign-group]   Группа: {repr(g.get('group_path'))}")
-        
         saved = any(g.get("group_path") == normalized_group_path for g in groups)
         if not saved:
-            print(f"[DEBUG assign-group] ОШИБКА: Группа не сохранилась! Искали: {repr(normalized_group_path)}, нашли: {[repr(g.get('group_path')) for g in groups]}")
             raise HTTPException(status_code=500, detail=f"Failed to save group assignment. Expected: '{normalized_group_path}', found: {[g.get('group_path') for g in groups]}")
-        else:
-            print(f"[DEBUG assign-group] ✅ Группа успешно сохранена и проверена")
     finally:
         fs.close()
     
@@ -2751,6 +2759,113 @@ def api_faces_manual_rectangles(payload: dict[str, Any] = Body(...)) -> dict[str
         ds.close()
 
     return {"ok": True}
+
+
+@router.post("/api/faces/rotate-photo")
+def api_faces_rotate_photo(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Поворачивает изображение на 90° влево или вправо и пересчитывает все прямоугольники (photo_rectangles).
+    Только для локальных файлов (path должен начинаться с local:).
+    Параметры: path (обязателен для local) или file_id; direction: "left" | "right".
+    """
+    from PIL import Image
+    from PIL import ImageOps
+
+    from backend.common.db import _get_file_id, get_connection
+
+    path = payload.get("path")
+    file_id = payload.get("file_id")
+    direction = (payload.get("direction") or "").strip().lower()
+
+    if direction not in ("left", "right"):
+        raise HTTPException(status_code=400, detail="direction must be 'left' or 'right'")
+    if not path and file_id is None:
+        raise HTTPException(status_code=400, detail="path or file_id required")
+    if path is not None and not isinstance(path, str):
+        raise HTTPException(status_code=400, detail="path must be str")
+    if path is not None and not path.startswith("local:"):
+        raise HTTPException(status_code=400, detail="path must start with local: (only local files can be rotated)")
+
+    conn = get_connection()
+    try:
+        resolved_file_id = _get_file_id(conn, file_id=int(file_id) if file_id is not None else None, file_path=path)
+        if path is None and resolved_file_id:
+            cur = conn.cursor()
+            cur.execute("SELECT path FROM files WHERE id = ? LIMIT 1", (resolved_file_id,))
+            row = cur.fetchone()
+            path = str(row["path"]) if row and row["path"] else None
+        if not path or not path.startswith("local:"):
+            raise HTTPException(status_code=404, detail="file not found or not local")
+        abs_path = _strip_local_prefix(path)
+        if not os.path.isfile(abs_path):
+            raise HTTPException(status_code=404, detail="file not found on disk")
+
+        with Image.open(abs_path) as img0:
+            img = ImageOps.exif_transpose(img0)
+            if img.mode not in ("RGB", "RGBA"):
+                img = img.convert("RGB")
+            W, H = img.size
+            # PIL: положительный угол = против часовой (влево), отрицательный = по часовой (вправо)
+            angle = 90 if direction == "left" else -90
+            img_rot = img.rotate(angle, expand=True)
+            new_W, new_H = img_rot.size
+            out_format = img0.format or "JPEG"
+
+        save_kw = {"format": out_format}
+        if out_format.upper() == "JPEG":
+            save_kw["quality"] = 95
+            save_kw["subsampling"] = 0
+            # Пиксели уже в нужной ориентации — сбрасываем EXIF Orientation, иначе браузер повернёт ещё раз
+            save_kw["exif"] = b""
+        # Сохраняем во временный файл и заменяем оригинал — иначе на Windows файл может быть занят (превью)
+        fd, temp_path = tempfile.mkstemp(suffix=Path(abs_path).suffix, dir=os.path.dirname(abs_path) or ".")
+        try:
+            os.close(fd)
+            img_rot.save(temp_path, **save_kw)
+            img_rot.close()
+            os.replace(temp_path, abs_path)
+        except Exception:
+            if os.path.isfile(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+            raise
+
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE files SET image_width = ?, image_height = ?, exif_orientation = 1 WHERE id = ?",
+            (new_W, new_H, resolved_file_id),
+        )
+
+        cur.execute(
+            "SELECT id, bbox_x, bbox_y, bbox_w, bbox_h FROM photo_rectangles WHERE file_id = ? AND (ignore_flag IS NULL OR ignore_flag = 0)",
+            (resolved_file_id,),
+        )
+        rows = cur.fetchall()
+        for r in rows:
+            x, y, w, h = int(r["bbox_x"]), int(r["bbox_y"]), int(r["bbox_w"]), int(r["bbox_h"])
+            # Преобразование bbox при повороте: PIL rotate(-90)=CW (вправо), rotate(90)=CCW (влево).
+            # Ранее прямоугольник после поворота «вправо» оказывался не на лице — пробуем поменять формулы местами.
+            if direction == "right":
+                x2, y2, w2, h2 = H - (y + h), x, h, w
+            else:
+                x2, y2, w2, h2 = y, W - (x + w), h, w
+            x2 = max(0, min(x2, new_W - 1))
+            y2 = max(0, min(y2, new_H - 1))
+            w2 = max(1, min(w2, new_W - x2))
+            h2 = max(1, min(h2, new_H - y2))
+            cur.execute(
+                "UPDATE photo_rectangles SET bbox_x = ?, bbox_y = ?, bbox_w = ?, bbox_h = ? WHERE id = ?",
+                (x2, y2, w2, h2, r["id"]),
+            )
+        # Инвалидируем сохранённые кропы — на странице персоны они пересчитаются на лету по новому файлу и bbox
+        cur.execute("UPDATE photo_rectangles SET thumb_jpeg = NULL WHERE file_id = ?", (resolved_file_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"ok": True, "image_width": new_W, "image_height": new_H}
 
 
 @router.post("/api/faces/rectangle/update")

@@ -121,6 +121,42 @@
     outline: none;
     box-shadow: 0 0 0 2px rgba(59,130,246,0.6);
   }
+  /* Группа кнопок над изображением: поворот + зум */
+  .photo-card-image-actions {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    z-index: 100;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .photo-card-image-actions .photo-card-zoom-trigger,
+  .photo-card-image-actions .photo-card-rotate-btn {
+    position: static;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    border: none;
+    border-radius: 8px;
+    background: rgba(255,255,255,0.25);
+    color: rgba(255,255,255,0.85);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s, color 0.15s;
+  }
+  .photo-card-image-actions .photo-card-zoom-trigger:hover,
+  .photo-card-image-actions .photo-card-rotate-btn:hover {
+    background: rgba(255,255,255,0.4);
+    color: #fff;
+  }
+  .photo-card-image-actions .photo-card-zoom-trigger:focus,
+  .photo-card-image-actions .photo-card-rotate-btn:focus {
+    outline: none;
+    box-shadow: 0 0 0 2px rgba(59,130,246,0.6);
+  }
   /* Оверлей зума на весь экран */
   .photo-zoom-overlay {
     position: fixed;
@@ -445,12 +481,20 @@
     
     <!-- Область изображения -->
     <div class="photo-card-body">
-      <button type="button" class="photo-card-zoom-trigger" id="photoCardZoomTrigger" title="Зум (на весь экран)" aria-label="Зум" style="display: none;">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <circle cx="11" cy="11" r="8"/>
-          <path d="m21 21-4.35-4.35"/>
-        </svg>
-      </button>
+      <div class="photo-card-image-actions" id="photoCardImageActions" style="display: none;">
+        <button type="button" class="photo-card-rotate-btn" id="photoCardRotateLeft" title="Повернуть на 90° влево" aria-label="Повернуть влево">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+        </button>
+        <button type="button" class="photo-card-rotate-btn" id="photoCardRotateRight" title="Повернуть на 90° вправо" aria-label="Повернуть вправо">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="transform: scaleX(-1);"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+        </button>
+        <button type="button" class="photo-card-zoom-trigger" id="photoCardZoomTrigger" title="Зум (на весь экран)" aria-label="Зум">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="11" cy="11" r="8"/>
+            <path d="m21 21-4.35-4.35"/>
+          </svg>
+        </button>
+      </div>
       <div class="imgwrap" id="photoCardImgWrap">
         <img id="photoCardImg" alt="preview" />
         <video id="photoCardVideo" controls preload="metadata" style="display:none;"></video>

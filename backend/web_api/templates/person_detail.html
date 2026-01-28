@@ -321,16 +321,10 @@
       // Пробуем получить функции из глобальной области видимости
       if (typeof drawAllFaceRectangles !== 'undefined') {
         drawAllFaceRectanglesFromModule = drawAllFaceRectangles;
-        console.log('Module loaded: drawAllFaceRectangles found', typeof drawAllFaceRectangles);
-      } else {
-        console.warn('Module not loaded: drawAllFaceRectangles is undefined');
       }
       
       if (typeof drawFaceRectangle !== 'undefined') {
         drawFaceRectangleFromModule = drawFaceRectangle;
-        console.log('Module loaded: drawFaceRectangle found', typeof drawFaceRectangle);
-      } else {
-        console.warn('Module not loaded: drawFaceRectangle is undefined');
       }
       
       // Проверяем, что модуль загрузился

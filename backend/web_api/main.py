@@ -14,6 +14,7 @@ from json import JSONDecodeError
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
+import logging
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
@@ -1333,7 +1334,7 @@ def api_archive_reconcile_start() -> dict[str, Any]:
                             )
                     except Exception as e:  # noqa: BLE001
                         # Логируем, но не блокируем reconcile
-                        print(f"face_scan_archive failed: {type(e).__name__}: {e}", file=sys.stderr)
+                        logging.getLogger(__name__).exception("face_scan_archive failed: %s", e)
                 
                 # Запускаем в отдельном потоке, чтобы не блокировать
                 threading.Thread(target=_scan_faces_runner, daemon=True).start()

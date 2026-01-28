@@ -26,53 +26,32 @@ function formatFaceLabel(personName, isMe, clusterId) {
  * @param {Function} onFaceClick - Callback при клике на лицо (faceId) -> void
  */
 function drawAllFaceRectangles(allFacesOnImage, currentFaceId, originalImageSize, onFaceClick) {
+  const lbImg = document.getElementById('lbImg');
+  const lbBody = document.getElementById('lbBody');
   try {
-    console.log('drawAllFaceRectangles MODULE: START', { 
-      facesCount: allFacesOnImage?.length || 0, 
-      currentFaceId, 
-      hasOriginalSize: !!originalImageSize 
-    });
-    
-    const lbImg = document.getElementById('lbImg');
-    const lbBody = document.getElementById('lbBody');
-    console.log('drawAllFaceRectangles MODULE: elements check', { 
-      lbImg: !!lbImg, 
-      lbBody: !!lbBody, 
-      complete: lbImg?.complete,
-      naturalWidth: lbImg?.naturalWidth,
-      naturalHeight: lbImg?.naturalHeight,
-      src: lbImg?.src?.substring(0, 50)
-    });
-    
     if (!lbImg || !lbBody || !lbImg.complete) {
-      console.log('drawAllFaceRectangles MODULE: EXIT early - lbImg or lbBody not ready');
       return;
     }
   } catch (e) {
-    console.error('drawAllFaceRectangles MODULE: ERROR in start', e, e.stack);
     return;
   }
-  
+
   // Удаляем старые желтые rectangles
   const oldRects = lbBody.querySelectorAll('.lb-rectangle.other, .lb-rectangle-label:not(.current)');
   oldRects.forEach(el => el.remove());
-  
+
   if (!allFacesOnImage || allFacesOnImage.length === 0) {
-    console.log('drawAllFaceRectangles: no faces to draw', { allFacesOnImage: allFacesOnImage?.length || 0 });
     return;
   }
-  
-  console.log('drawAllFaceRectangles: drawing', allFacesOnImage.length, 'faces, currentFaceId:', currentFaceId);
-  
+
   // Получаем размеры изображения
   const imgRect = lbImg.getBoundingClientRect();
   const imgNaturalWidth = lbImg.naturalWidth;
   const imgNaturalHeight = lbImg.naturalHeight;
   const imgDisplayWidth = imgRect.width;
   const imgDisplayHeight = imgRect.height;
-  
+
   if (imgNaturalWidth === 0 || imgNaturalHeight === 0) {
-    console.log('drawAllFaceRectangles: image dimensions are zero', { imgNaturalWidth, imgNaturalHeight });
     return;
   }
   
@@ -234,8 +213,6 @@ function drawAllFaceRectangles(allFacesOnImage, currentFaceId, originalImageSize
     lbBody.appendChild(label);
     drawnCount++;
   }
-  
-  console.log('drawAllFaceRectangles: drawn', drawnCount, 'yellow rectangles');
 }
 
 /**

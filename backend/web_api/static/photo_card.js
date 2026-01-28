@@ -3,53 +3,6 @@
  * Используется на всех страницах проекта (faces.html, person_detail.html, face_cluster_detail.html)
  */
 
-/**
- * Отправляет лог на сервер для записи в файл
- */
-async function logToServer(level, message, data = null) {
-  try {
-    await fetch('/api/debug/client-log', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ level, message, data })
-    });
-  } catch (error) {
-    // Игнорируем ошибки отправки логов
-  }
-}
-
-// Обертка для console.log с записью на сервер
-const originalConsoleLog = console.log;
-const originalConsoleWarn = console.warn;
-const originalConsoleError = console.error;
-
-console.log = function(...args) {
-  originalConsoleLog.apply(console, args);
-  if (args[0] && typeof args[0] === 'string' && args[0].includes('[photo_card]')) {
-    const message = args.join(' ');
-    const data = args.length > 1 && typeof args[args.length - 1] === 'object' ? args[args.length - 1] : null;
-    logToServer('log', message, data);
-  }
-};
-
-console.warn = function(...args) {
-  originalConsoleWarn.apply(console, args);
-  if (args[0] && typeof args[0] === 'string' && args[0].includes('[photo_card]')) {
-    const message = args.join(' ');
-    const data = args.length > 1 && typeof args[args.length - 1] === 'object' ? args[args.length - 1] : null;
-    logToServer('warn', message, data);
-  }
-};
-
-console.error = function(...args) {
-  originalConsoleError.apply(console, args);
-  if (args[0] && typeof args[0] === 'string' && args[0].includes('[photo_card]')) {
-    const message = args.join(' ');
-    const data = args.length > 1 && typeof args[args.length - 1] === 'object' ? args[args.length - 1] : null;
-    logToServer('error', message, data);
-  }
-};
-
 (function() {
   'use strict';
 
@@ -98,7 +51,7 @@ console.error = function(...args) {
       return;
     }
 
-    // Инициализация состояния
+    // Инициализация состояния (imageCacheBust — при каждом открытии карточки грузим изображение заново, без кэша)
     currentState = {
       file_id: options.file_id || null,
       file_path: options.file_path || null,
@@ -118,7 +71,8 @@ console.error = function(...args) {
       allPersons: [],
       editingRectangleIndex: null,
       drawingState: null,
-      person_id: null
+      person_id: null,
+      imageCacheBust: Date.now()
     };
 
     // Если передан list_context, берем file_id, file_path и pipeline_run_id из него
@@ -169,8 +123,6 @@ console.error = function(...args) {
     }
     currentState.person_id = (currentState.list_context && currentState.list_context.person_id) || null;
 
-    console.log('[photo_card] pipeline_run_id:', currentState.pipeline_run_id, 'mode:', currentState.mode);
-    
     // Навигация всегда видна, чтобы layout не «съезжал». При list_context — prev/next/позиция;
     // без list_context — плейсхолдер «—», prev/next скрыты, но блок резервирует место.
     const navigation = document.getElementById('photoCardNavigation');
@@ -298,9 +250,8 @@ console.error = function(...args) {
         }
       });
       window.dispatchEvent(event);
-      console.log('[photo_card] Отправлено событие photoCardClosed:', event.detail);
     }
-    
+
     // Очищаем состояние
     currentState.selectedRectangleIndex = null;
     currentState.rectangles = [];
@@ -623,6 +574,16 @@ console.error = function(...args) {
       // Загружаем изображение
       await loadImage();
 
+      // Группа над изображением (поворот + зум) — для изображений; кнопки поворота только для локальных
+      const imageActionsEl = document.getElementById('photoCardImageActions');
+      const rotateLeftBtn = document.getElementById('photoCardRotateLeft');
+      const rotateRightBtn = document.getElementById('photoCardRotateRight');
+      const isVideo = currentState.file_path && currentState.file_path.match(/\.(mp4|avi|mov|mkv|webm)$/i);
+      const isLocalImage = currentState.file_path && currentState.file_path.startsWith('local:') && !isVideo;
+      if (imageActionsEl) imageActionsEl.style.display = (currentState.file_path && !isVideo) ? 'inline-flex' : 'none';
+      if (rotateLeftBtn) rotateLeftBtn.style.display = isLocalImage ? 'inline-flex' : 'none';
+      if (rotateRightBtn) rotateRightBtn.style.display = isLocalImage ? 'inline-flex' : 'none';
+
       // Загружаем rectangles (при ошибке не блокируем загрузку прямых привязок)
       try {
         await loadRectangles();
@@ -735,6 +696,71 @@ console.error = function(...args) {
   }
 
   /**
+   * Поворот фото на 90° влево или вправо (только локальные изображения).
+   * После успеха перезагружает изображение и прямоугольники.
+   */
+  async function handleRotatePhoto(direction) {
+    if (!currentState.file_path || !currentState.file_path.startsWith('local:')) {
+      if (typeof window.setToast === 'function') window.setToast('Поворот доступен только для локальных файлов', true);
+      else alert('Поворот доступен только для локальных файлов');
+      return;
+    }
+    if (currentState.file_path.match(/\.(mp4|avi|mov|mkv|webm)$/i)) {
+      if (typeof window.setToast === 'function') window.setToast('Поворот недоступен для видео', true);
+      else alert('Поворот недоступен для видео');
+      return;
+    }
+    const rotateLeftBtn = document.getElementById('photoCardRotateLeft');
+    const rotateRightBtn = document.getElementById('photoCardRotateRight');
+    try {
+      if (rotateLeftBtn) rotateLeftBtn.disabled = true;
+      if (rotateRightBtn) rotateRightBtn.disabled = true;
+      const body = { direction };
+      if (currentState.file_id) body.file_id = currentState.file_id;
+      if (currentState.file_path) body.path = currentState.file_path;
+      const response = await fetch('/api/faces/rotate-photo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || 'Ошибка поворота');
+      }
+      const imgElement = document.getElementById('photoCardImg');
+      if (imgElement && imgElement.src) {
+        const sep = imgElement.src.indexOf('?') >= 0 ? '&' : '?';
+        const newSrc = imgElement.src + sep + 't=' + Date.now();
+        imgElement.src = newSrc;
+        // Ждём загрузки нового изображения, иначе drawRectangles() использует старые naturalWidth/Height
+        await new Promise((resolve, reject) => {
+          const done = () => { imgElement.onload = null; imgElement.onerror = null; resolve(); };
+          imgElement.onload = done;
+          imgElement.onerror = done;
+          setTimeout(done, 8000);
+        });
+      }
+      await loadRectangles();
+      if (currentState.originalImageSize && data.image_width != null && data.image_height != null) {
+        currentState.originalImageSize.width = data.image_width;
+        currentState.originalImageSize.height = data.image_height;
+        currentState.originalImageSize.exif_orientation = 1;
+      }
+      if (currentState.showRectangles && currentState.rectangles.length > 0) {
+        drawRectangles();
+      }
+      if (typeof window.setToast === 'function') window.setToast('Фото повёрнуто');
+    } catch (e) {
+      console.error('[photo_card] handleRotatePhoto failed:', e);
+      if (typeof window.setToast === 'function') window.setToast('Ошибка: ' + (e.message || 'не удалось повернуть'), true);
+      else alert('Ошибка: ' + (e.message || 'не удалось повернуть'));
+    } finally {
+      if (rotateLeftBtn) rotateLeftBtn.disabled = false;
+      if (rotateRightBtn) rotateRightBtn.disabled = false;
+    }
+  }
+
+  /**
    * Загружает изображение
    */
   async function loadImage() {
@@ -758,9 +784,10 @@ console.error = function(...args) {
       const encodedPath = encodeURIComponent(currentState.file_path);
       imageUrl = `/api/yadisk/preview-image?size=XL&path=${encodedPath}`;
     } else if (currentState.file_path.startsWith('local:')) {
-      // Локальный файл
+      // Локальный файл: cache-bust при каждом открытии карточки, чтобы после поворота/изменений показывать актуальный файл
       const encodedPath = encodeURIComponent(currentState.file_path);
-      imageUrl = `/api/local/preview?path=${encodedPath}`;
+      const bust = currentState.imageCacheBust != null ? currentState.imageCacheBust : Date.now();
+      imageUrl = `/api/local/preview?path=${encodedPath}&t=${bust}`;
     } else {
       console.error('[photo_card] Unknown file path format:', currentState.file_path);
       return;
@@ -783,7 +810,6 @@ console.error = function(...args) {
       
       // Ждем загрузки изображения перед отрисовкой rectangles
       imgElement.onload = function() {
-        console.log('[photo_card] Image loaded, drawing rectangles if available');
         if (currentState.showRectangles && currentState.rectangles.length > 0) {
           // Небольшая задержка для гарантии, что размеры изображения обновлены
           setTimeout(() => {
@@ -794,7 +820,6 @@ console.error = function(...args) {
       
       // Если изображение уже загружено, рисуем сразу
       if (imgElement.complete && imgElement.naturalWidth > 0 && imgElement.naturalHeight > 0) {
-        console.log('[photo_card] Image already complete, drawing rectangles if available');
         if (currentState.showRectangles && currentState.rectangles.length > 0) {
           // Небольшая задержка для гарантии, что размеры изображения обновлены
           setTimeout(() => {
@@ -828,14 +853,6 @@ console.error = function(...args) {
         params.append('path', currentState.file_path);
       }
 
-      console.log('[photo_card] Loading rectangles with params:', {
-        pipeline_run_id: currentState.pipeline_run_id,
-        file_id: currentState.file_id,
-        file_path: currentState.file_path,
-        mode: currentState.mode,
-        params: params.toString()
-      });
-
       const response = await fetch(`/api/faces/rectangles?${params.toString()}`);
       if (!response.ok) {
         const errorText = await response.text();
@@ -844,11 +861,6 @@ console.error = function(...args) {
       }
 
       const data = await response.json();
-      console.log('[photo_card] Loaded rectangles:', data.ok, data.rectangles?.length || 0, 'rectangles', {
-        ok: data.ok,
-        count: data.rectangles?.length || 0,
-        has_pipeline_run_id: !!currentState.pipeline_run_id
-      });
       if (data.ok && data.rectangles) {
         currentState.rectangles = data.rectangles;
         // Сохраняем размеры изображения и EXIF orientation из ответа, если есть
@@ -859,15 +871,6 @@ console.error = function(...args) {
             exif_orientation: data.exif_orientation || null
           };
         }
-        console.log('[photo_card] Rectangles data sample:', currentState.rectangles.slice(0, 2).map(r => ({
-          id: r.id,
-          bbox_x: r.bbox_x,
-          bbox_y: r.bbox_y,
-          bbox_w: r.bbox_w,
-          bbox_h: r.bbox_h,
-          bbox: r.bbox,
-          person_name: r.person_name
-        })));
         // Всегда обновляем список плашек, даже если изображение еще не загружено
         updateRectanglesList();
         
@@ -875,19 +878,16 @@ console.error = function(...args) {
         // Это важно, когда rectangles были помечены как ignore_flag = 1 (например, после "нет людей")
         const imgElement = document.getElementById('photoCardImg');
         if (imgElement && imgElement.complete && imgElement.naturalWidth > 0 && imgElement.naturalHeight > 0) {
-          console.log('[photo_card] Image already loaded, drawing rectangles');
           // Небольшая задержка для гарантии, что DOM обновлен
           setTimeout(() => {
             drawRectangles();
           }, 50);
         } else {
-          console.log('[photo_card] Image not ready yet, will draw on load');
           // Даже если изображение не готово, нужно удалить старые rectangles
           // (они могут остаться на экране после обновления данных)
           const imgWrap = document.getElementById('photoCardImgWrap');
           if (imgWrap) {
             const oldRects = imgWrap.querySelectorAll('.photo-card-rectangle');
-            console.log('[photo_card] Removing old rectangles (image not ready):', oldRects.length);
             oldRects.forEach(el => el.remove());
           }
         }
@@ -929,9 +929,6 @@ console.error = function(...args) {
       }
       const bindings = Array.isArray(data.direct_bindings) ? data.direct_bindings : [];
       currentState.directBindings = bindings;
-      if (bindings.length > 0) {
-        console.log('[photo_card] loadFilePersons: got', bindings.length, 'direct_bindings', bindings.map(b => b.person_name));
-      }
     } catch (e) {
       console.warn('[photo_card] loadFilePersons failed:', e);
       currentState.directBindings = [];
@@ -1203,17 +1200,14 @@ console.error = function(...args) {
     // ВСЕГДА очищаем старые rectangles (даже если новых нет)
     // Это важно, когда rectangles были удалены или помечены как ignore_flag = 1
     const oldRects = imgWrap.querySelectorAll('.photo-card-rectangle');
-    console.log('[photo_card] Removing old rectangles:', oldRects.length);
     oldRects.forEach(el => el.remove());
-    
+
     // Если rectangles скрыты или их нет, просто удаляем старые и выходим
     if (!currentState.showRectangles) {
-      console.log('[photo_card] Rectangles hidden by showRectangles flag');
       return;
     }
-    
+
     if (!currentState.rectangles || currentState.rectangles.length === 0) {
-      console.log('[photo_card] No rectangles to draw (all removed)');
       return;
     }
 
@@ -1239,16 +1233,6 @@ console.error = function(...args) {
     const imgOffsetX = imgElement.offsetLeft || 0;
     const imgOffsetY = imgElement.offsetTop || 0;
 
-    console.log('[photo_card] drawRectangles called:', {
-      rectanglesCount: currentState.rectangles.length,
-      imageComplete: imgElement.complete,
-      naturalSize: { w: imgNaturalWidth, h: imgNaturalHeight },
-      displaySize: { w: imgDisplayWidth, h: imgDisplayHeight },
-      imgRect: { width: imgRect.width, height: imgRect.height, left: imgRect.left, top: imgRect.top },
-      imgWrapRect: { left: imgWrapRect.left, top: imgWrapRect.top, width: imgWrapRect.width, height: imgWrapRect.height },
-      imgOffset: { x: imgOffsetX, y: imgOffsetY }
-    });
-
     if (imgNaturalWidth === 0 || imgNaturalHeight === 0) {
       console.warn('[photo_card] Image not loaded yet, skipping draw:', { naturalWidth: imgNaturalWidth, naturalHeight: imgNaturalHeight });
       return;
@@ -1263,12 +1247,6 @@ console.error = function(...args) {
     const scaleX = imgDisplayWidth / imgNaturalWidth;
     const scaleY = imgDisplayHeight / imgNaturalHeight;
 
-    console.log('[photo_card] Drawing rectangles:', {
-      count: currentState.rectangles.length,
-      scale: { x: scaleX, y: scaleY },
-      imageSize: { natural: { w: imgNaturalWidth, h: imgNaturalHeight }, display: { w: imgDisplayWidth, h: imgDisplayHeight } }
-    });
-    
     // Рисуем каждый rectangle
     currentState.rectangles.forEach((rect, index) => {
       // Поддерживаем оба формата: bbox объект или отдельные поля
@@ -1303,13 +1281,6 @@ console.error = function(...args) {
       const y = displayBbox.y;
       const w = displayBbox.w;
       const h = displayBbox.h;
-      
-      console.log('[photo_card] Drawing rectangle', rect.id, {
-        bbox: { x: bbox_x, y: bbox_y, w: bbox_w, h: bbox_h },
-        display: { x, y, w, h },
-        imageSize: { natural: { w: imgNaturalWidth, h: imgNaturalHeight }, display: { w: imgDisplayWidth, h: imgDisplayHeight } },
-        originalImageSize: currentState.originalImageSize
-      });
 
       // Проверяем дубликаты (красный восклицательный знак и красный текст)
       const isDuplicate = rect.is_duplicate || false;
@@ -1428,19 +1399,6 @@ console.error = function(...args) {
       
       // Добавляем rectangle в контейнер изображения
       imgWrap.appendChild(rectElement);
-      
-      console.log('[photo_card] Rectangle element added to DOM:', {
-        rectId: rect.id,
-        element: rectElement,
-        parent: imgWrap,
-        position: { x, y, w, h },
-        styles: {
-          left: rectElement.style.left,
-          top: rectElement.style.top,
-          width: rectElement.style.width,
-          height: rectElement.style.height
-        }
-      });
     });
   }
 
@@ -1452,9 +1410,6 @@ console.error = function(...args) {
     if (!rectList) return;
     const directCount = (currentState.directBindings || []).length;
     const rectCount = (currentState.rectangles || []).length;
-    if (directCount > 0 || rectCount > 0) {
-      console.log('[photo_card] updateRectanglesList: directBindings=', directCount, 'rectangles=', rectCount);
-    }
     rectList.innerHTML = '';
 
     const addSeparator = () => {
@@ -3113,7 +3068,6 @@ console.error = function(...args) {
    */
   async function updateRectangle(faceRectangleId, bbox, personId, assignmentType, isFace) {
     // #region agent log
-    fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:2397',message:'updateRectangle entry',data:{faceRectangleId,personId,assignmentType,isFace,isFaceType:typeof isFace},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
     // #endregion
     // Преобразуем rectangle_id в число, если это возможно
     const rectangleIdInt = faceRectangleId !== null && faceRectangleId !== undefined 
@@ -3162,7 +3116,6 @@ console.error = function(...args) {
     if (isFace !== undefined && isFace !== null) {
       payload.is_face = isFace ? 1 : 0;
       // #region agent log
-      fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:2443',message:'updateRectangle payload is_face',data:{faceRectangleId,personId,isFace,payloadIsFace:payload.is_face,payload:JSON.stringify(payload)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
       // #endregion
     }
     
@@ -3603,6 +3556,16 @@ console.error = function(...args) {
           oldRects.forEach(el => el.remove());
         }
       });
+    }
+
+    // Поворот фото влево/вправо (только локальные изображения)
+    const rotateLeftBtn = document.getElementById('photoCardRotateLeft');
+    const rotateRightBtn = document.getElementById('photoCardRotateRight');
+    if (rotateLeftBtn) {
+      rotateLeftBtn.addEventListener('click', function() { handleRotatePhoto('left'); });
+    }
+    if (rotateRightBtn) {
+      rotateRightBtn.addEventListener('click', function() { handleRotatePhoto('right'); });
     }
     
     // Модальное окно выбора персоны (кнопка «Назначить» в модалке — отдельный id, т.к. «Привязать персону ▶» тоже photoCardAssignPerson)
@@ -4329,7 +4292,6 @@ console.error = function(...args) {
    */
   async function showPersonDialogForNewRectangle(bbox, isFace) {
     // #region agent log
-    fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:3467',message:'showPersonDialogForNewRectangle entry',data:{isFace,isFaceType:typeof isFace,bbox},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
     // #endregion
     // Загружаем список персон, если еще не загружен
     if (!currentState.allPersons || currentState.allPersons.length === 0) {
@@ -4384,7 +4346,6 @@ console.error = function(...args) {
     const initialChecked = (isFace === true || isFace === 1);
     faceToggle.checked = initialChecked;
     // #region agent log
-    fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:3503',message:'faceToggle initialized',data:{isFace,initialChecked,faceToggleChecked:faceToggle.checked},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
     // #endregion
     faceToggle.style.width = '18px';
     faceToggle.style.height = '18px';
@@ -4476,7 +4437,6 @@ console.error = function(...args) {
           modal.remove();
           const isFaceValue = faceToggle.checked;
           // #region agent log
-          fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:3577',message:'person clicked in group',data:{personId:person.id,isFaceValue,isFaceValueType:typeof isFaceValue,faceToggleChecked:faceToggle.checked},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
           // #endregion
           createRectangle(bbox, person.id, isFaceValue);
         });
@@ -4517,7 +4477,6 @@ console.error = function(...args) {
         modal.remove();
         const isFaceValue = faceToggle.checked;
         // #region agent log
-        fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:3609',message:'person clicked no group',data:{personId:person.id,isFaceValue,isFaceValueType:typeof isFaceValue,faceToggleChecked:faceToggle.checked},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
         // #endregion
         createRectangle(bbox, person.id, isFaceValue);
       });
@@ -4594,7 +4553,6 @@ console.error = function(...args) {
    */
   async function createRectangle(bbox, personId, isFace) {
     // #region agent log
-    fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:3719',message:'createRectangle entry',data:{personId,isFace,isFaceType:typeof isFace,bbox},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
     // #endregion
     try {
       // Формируем payload в зависимости от режима
@@ -4638,7 +4596,6 @@ console.error = function(...args) {
       const isFaceValue = (isFace === true || isFace === 1) ? 1 : 0;
       payload.is_face = isFaceValue;
       // #region agent log
-      fetch('http://127.0.0.1:7246/ingest/b4622c78-c76d-4ac4-95a3-ef36a66a2b3f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'photo_card.js:3754',message:'createRectangle payload',data:{personId,isFace,isFaceValue,payloadIsFace:payload.is_face,payload:JSON.stringify(payload)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
       // #endregion
       const response = await fetch('/api/faces/rectangle/create', {
         method: 'POST',

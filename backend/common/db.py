@@ -304,6 +304,7 @@ def init_db():
             # Размеры исходного изображения (для правильного масштабирования bbox координат)
             "image_width": "image_width INTEGER",  # ширина исходного изображения (после EXIF transpose)
             "image_height": "image_height INTEGER",  # высота исходного изображения (после EXIF transpose)
+            "exif_orientation": "exif_orientation INTEGER",  # EXIF Orientation (1-8), 1 = normal
             },
         )
 
