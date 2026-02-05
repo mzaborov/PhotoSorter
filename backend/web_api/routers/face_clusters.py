@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException, Request, Body
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
-from backend.common.db import get_connection, FaceStore, PipelineStore
+from backend.common.db import get_connection, get_outsider_person_id, set_file_processed, FaceStore, OUTSIDER_PERSON_NAME, PipelineStore
 from backend.common.yadisk_client import get_disk
 from backend.logic.face_recognition import (
     get_cluster_info,
@@ -209,47 +209,6 @@ def _venv_face_python() -> Path:
 router = APIRouter()
 APP_DIR = Path(__file__).resolve().parents[1]
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
-
-# Константа для специальной персоны "Посторонний" (или "Посторонние")
-IGNORED_PERSON_NAME = "Посторонние"  # Для обратной совместимости, но используем ID
-
-def get_outsider_person_id(conn) -> int | None:
-    """
-    Получает ID персоны "Посторонний" (ID = 6).
-    Всегда использует фиксированный ID 6.
-    Если персона с ID 6 не существует - создает её с именем "Посторонний".
-    НЕ ищет по имени и НЕ создает дубликатов - всегда использует только ID 6.
-    """
-    cur = conn.cursor()
-    # Проверяем существование персоны с ID 6
-    cur.execute("SELECT id FROM persons WHERE id = 6")
-    person_row = cur.fetchone()
-    if person_row:
-        return 6
-    
-    # Персона с ID 6 не найдена - создаем её
-    # ВАЖНО: SQLite не позволяет явно указать ID в INSERT,
-    # но если ID 6 свободен (был удален), автоинкремент может его использовать
-    # Если нет - создастся персона с другим ID, что нежелательно
-    # В этом случае нужно будет запустить миграцию для исправления
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    cur.execute("""
-        INSERT INTO persons (name, mode, is_me, created_at, updated_at)
-        VALUES ('Посторонний', 'active', 0, ?, ?)
-    """, (now, now))
-    conn.commit()
-    created_id = cur.lastrowid
-    
-    # Если созданная персона получила ID 6 - отлично
-    if created_id == 6:
-        return 6
-    
-    # Если получила другой ID - это проблема, но возвращаем его для работоспособности
-    # В логе можно будет увидеть, что нужна миграция
-    import logging
-    logging.warning(f"Персона 'Посторонний' создана с ID {created_id} вместо ожидаемого ID 6. Требуется миграция.")
-    return created_id
 
 # Группы персон с порядком сортировки
 PERSON_GROUPS = {
@@ -566,7 +525,7 @@ async def api_face_clusters_suggestions_for_single(*, max_distance: float = 0.45
             rectangle_id=face_id,
             exclude_cluster_id=cluster_id,
             max_distance=max_distance,
-            ignored_person_name=IGNORED_PERSON_NAME,
+            ignored_person_name=OUTSIDER_PERSON_NAME,
         )
         
         if suggestion:
@@ -2137,6 +2096,7 @@ async def api_person_face_reassign(*, person_id: int, face_id: int, payload: dic
             cur.execute("UPDATE face_clusters SET person_id = NULL WHERE id = ?", (cluster_id,))
         else:
             cur.execute("UPDATE face_clusters SET person_id = ? WHERE id = ?", (target_person_id, cluster_id))
+            set_file_processed(conn, cluster_id=cluster_id)
     else:
         # Если лицо привязано вручную — работаем с photo_rectangles.manual_person_id
         if target_person_id is None:
@@ -2149,6 +2109,7 @@ async def api_person_face_reassign(*, person_id: int, face_id: int, payload: dic
                 "UPDATE photo_rectangles SET manual_person_id = ?, cluster_id = NULL WHERE id = ?",
                 (target_person_id, face_id),
             )
+            set_file_processed(conn, rectangle_id=face_id)
     
     conn.commit()
     
@@ -2215,6 +2176,7 @@ async def api_person_face_clear(*, person_id: int, face_id: int) -> dict[str, An
                 """,
                 (target_cluster_id, face_id),
             )
+            set_file_processed(conn, rectangle_id=face_id)
     
     conn.commit()
     
@@ -2409,9 +2371,15 @@ async def api_assign_cluster_to_person(*, cluster_id: int, payload: dict[str, An
     # person_id может быть None для снятия назначения
     if person_id is not None:
         person_id = int(person_id)
-    
+
     try:
         assign_cluster_to_person(cluster_id=cluster_id, person_id=person_id)
+        if person_id is not None:
+            conn = get_connection()
+            try:
+                set_file_processed(conn, cluster_id=cluster_id)
+            finally:
+                conn.close()
         return {"status": "ok", "cluster_id": cluster_id, "person_id": person_id}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to assign cluster: {e}")
@@ -2474,7 +2442,7 @@ async def api_add_face_to_cluster(*, cluster_id: int, payload: dict[str, Any] = 
         """,
         (cluster_id, int(rectangle_id)),
     )
-    
+    set_file_processed(conn, rectangle_id=int(rectangle_id))
     conn.commit()
     
     return {"status": "ok", "cluster_id": cluster_id, "rectangle_id": int(rectangle_id)}
@@ -2595,7 +2563,7 @@ async def api_move_face_to_cluster(*, cluster_id: int, payload: dict[str, Any] =
         """,
         (target_cluster_id, rectangle_id),
     )
-    
+    set_file_processed(conn, rectangle_id=rectangle_id)
     conn.commit()
     
     return {"status": "ok", "rectangle_id": rectangle_id, "target_cluster_id": target_cluster_id}
@@ -3117,7 +3085,7 @@ async def api_assign_person_to_face(*, rectangle_id: int, payload: dict[str, Any
             """,
             (person_id, rectangle_id),
         )
-    
+    set_file_processed(conn, file_id=file_id)
     conn.commit()
     
     # Получаем информацию о персоне для ответа

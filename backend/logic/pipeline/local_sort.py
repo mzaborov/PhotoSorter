@@ -6,7 +6,6 @@ import json
 import math
 import mimetypes
 import os
-import re
 import shutil
 import sys
 import time
@@ -20,7 +19,7 @@ import cv2  # type: ignore[import-untyped]
 import numpy as np  # type: ignore[import-untyped]
 from PIL import Image, ExifTags, ImageOps  # type: ignore[import-untyped]
 
-from common.db import DedupStore, FaceStore, PipelineStore
+from common.db import DedupStore, FaceStore, PipelineStore, _get_file_id_from_path
 from logic.gold.store import gold_file_map, gold_normalize_path, gold_read_lines
 
 
@@ -1587,7 +1586,10 @@ def scan_faces_local(
         def _rectangles_count_db() -> int:
             try:
                 cur0 = store.conn.cursor()
-                cur0.execute("SELECT COUNT(*) FROM photo_rectangles WHERE run_id = ? AND is_face = 1", (int(run_id_i),))
+                cur0.execute(
+                    "SELECT COUNT(*) FROM photo_rectangles WHERE run_id = ? AND COALESCE(is_face, 1) = 1",
+                    (int(run_id_i),),
+                )
                 v = cur0.fetchone()
                 return int(v[0] or 0) if v else 0
             except Exception:
@@ -1723,14 +1725,15 @@ def scan_faces_local(
 
             # --- store taken_at + gps + place (best-effort) ---
             try:
-                taken_at: str | None = _parse_date_from_filename(os.path.basename(abspath))
-                if taken_at is None:
-                    try:
-                        st = os.stat(abspath)
-                        taken_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime))
-                    except Exception:
-                        taken_at = None
-                # Записываем дату из имени/mtime сразу, EXIF/GPS (и геокодинг) — позже внутри image_open.
+                taken_at: str | None = None
+                # mtime fallback for all media
+                try:
+                    st = os.stat(abspath)
+                    taken_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime))
+                except Exception:
+                    taken_at = None
+                # Записываем mtime сразу, а EXIF/GPS (и геокодинг) сделаем позже внутри image_open,
+                # чтобы не открывать файл дважды.
                 dedup.set_taken_at_and_gps(path=db_path, taken_at=taken_at, gps_lat=None, gps_lon=None)
             except Exception:
                 pass
@@ -1748,19 +1751,17 @@ def scan_faces_local(
                     data={"i": int(stats.images_scanned), "has_row": bool(row), "row_keys": sorted(list(row.keys())) if row else None},
                 )
             if row and row.get("faces_run_id") is not None and int(row.get("faces_run_id")) == run_id_i and row.get("faces_scanned_at"):
-                # Проверяем, есть ли photo_rectangles для этого файла
-                cur_check = store.conn.cursor()
-                cur_check.execute(
-                    """
-                    SELECT COUNT(*) FROM photo_rectangles pr
-                    JOIN files f ON f.id = pr.file_id
-                    WHERE pr.run_id = ? AND f.path = ? AND pr.is_face = 1 AND COALESCE(pr.ignore_flag, 0) = 0
-                    """,
-                    (run_id_i, db_path)
-                )
-                has_rectangles = int(cur_check.fetchone()[0] or 0) > 0
-                if has_rectangles:
-                    continue  # Файл уже обработан корректно
+                # Проверяем, есть ли photo_rectangles для этого файла (по file_id)
+                file_id = row.get("id")
+                if file_id is not None:
+                    cur_check = store.conn.cursor()
+                    cur_check.execute(
+                        "SELECT COUNT(*) FROM photo_rectangles WHERE run_id = ? AND file_id = ? AND COALESCE(ignore_flag, 0) = 0 AND COALESCE(is_face, 1) = 1",
+                        (run_id_i, int(file_id)),
+                    )
+                    has_rectangles = int(cur_check.fetchone()[0] or 0) > 0
+                    if has_rectangles:
+                        continue  # Файл уже обработан корректно
                 # Если faces_scanned_at есть, но photo_rectangles нет — пересканируем
                 _pipe_log(
                     pipeline,
@@ -2254,17 +2255,20 @@ def scan_faces_local(
                 # с количеством прямоугольников (auto+manual) в photo_rectangles.
                 stage = "db_faces_count_recompute"
                 try:
-                    cur1 = store.conn.cursor()
-                    cur1.execute(
-                        """
-                        SELECT COUNT(*) FROM photo_rectangles pr
-                        JOIN files f ON f.id = pr.file_id
-                        WHERE pr.run_id = ? AND f.path = ? AND pr.is_face = 1 AND COALESCE(pr.ignore_flag, 0) = 0
-                        """,
-                        (int(run_id_i), db_path),
-                    )
-                    v = cur1.fetchone()
-                    faces_count_db_file = int(v[0] or 0) if v else int(len(faces))
+                    file_id_for_count = row.get("id") if row else None
+                    if file_id_for_count is not None:
+                        cur1 = store.conn.cursor()
+                        cur1.execute(
+                            """
+                            SELECT COUNT(*) FROM photo_rectangles
+                            WHERE run_id = ? AND file_id = ? AND COALESCE(ignore_flag, 0) = 0 AND COALESCE(is_face, 1) = 1
+                            """,
+                            (int(run_id_i), int(file_id_for_count)),
+                        )
+                        v = cur1.fetchone()
+                        faces_count_db_file = int(v[0] or 0) if v else int(len(faces))
+                    else:
+                        faces_count_db_file = int(len(faces))
                 except Exception:
                     faces_count_db_file = int(len(faces))
 
@@ -2456,12 +2460,16 @@ def sort_by_faces(
             # update DB paths (files + photo_rectangles) ONLY when не dry-run
             if not dry_run:
                 new_db_path = _as_local_path(dst_abs)
+                target_folder_value = _as_local_path(os.path.dirname(dst_abs))
+                file_id = _get_file_id_from_path(dedup.conn, file_path)
                 dedup.update_path(
                     old_path=file_path,
                     new_path=new_db_path,
                     new_name=os.path.basename(dst_abs),
-                    new_parent_path=_as_local_path(os.path.dirname(dst_abs)),
+                    new_parent_path=target_folder_value,
                 )
+                if file_id is not None:
+                    dedup.set_target_folder(file_id=file_id, target_folder=target_folder_value)
                 if pipeline_run_id is not None:
                     try:
                         dedup.update_run_manual_labels_path(
@@ -2502,42 +2510,6 @@ def _sanitize_segment(s: str) -> str:
     seg = "".join(out).strip().strip(".")
     seg = seg.replace(" ", "_")
     return seg or "unknown"
-
-
-def _parse_date_from_filename(filename: str) -> Optional[str]:
-    """
-    Парсит дату из имени файла. Возвращает ISO 'YYYY-MM-DDTHH:MM:SSZ' или None.
-
-    Поддерживаемые форматы:
-    - IMG_/IMG-/VID_/VID-/PANO_ YYYYMMDD[_HHMMSS], IMG-YYYYMMDD-WAxxxx (WhatsApp)
-    - Screenshot_YYYY-MM-DD-HH-MM-SS, Screenshot YYYY.MM.DD HH.MM.SS
-    - YYYYMMDD, YYYY-MM-DD, YYYY.MM.DD, YYYY_MM_DD
-    - YYYYMMDD_HHMMSS, YYYYMMDDHHMMSS (14 цифр)
-    - Signal-YYYY-MM-DD-HH-MM-SS
-    """
-    if not filename or not isinstance(filename, str):
-        return None
-    s = os.path.splitext(filename)[0]
-
-    # Префиксы: IMG, VID, PANO, Screenshot, Signal и т.п.
-    prefix = r"(?:IMG[-_]|VID[-_]|PANO[-_]|Screenshot[-_\s]|SCREENSHOT[-_\s]|Signal[-_]|)?"
-    # Дата: YYYY [.-_] MM [.-_] DD
-    date_part = r"(\d{4})\s*[.\-_\s]?\s*(\d{2})\s*[.\-_\s]?\s*(\d{2})"
-    # Время (опционально): [.-_:T] HH [.:] MM [.:] SS
-    time_part = r"(?:[.\-_:T\s]+(\d{2})\s*[.:\-]?\s*(\d{2})\s*[.:\-]?\s*(\d{2}))?"
-    m = re.search(prefix + date_part + time_part, s, re.IGNORECASE)
-    if not m:
-        return None
-    try:
-        yyyy, mm, dd = m.group(1), m.group(2), m.group(3)
-        hh = (m.group(4) or "00")
-        mi = (m.group(5) or "00")
-        ss = (m.group(6) or "00")
-        if yyyy.isdigit() and mm.isdigit() and dd.isdigit() and int(mm) in range(1, 13) and int(dd) in range(1, 32):
-            return f"{yyyy}-{mm}-{dd}T{hh}:{mi}:{ss}Z"
-    except Exception:
-        pass
-    return None
 
 
 def _try_exif_datetime_year(img: Image.Image) -> Optional[str]:
@@ -2685,8 +2657,8 @@ def sort_faces_into_named_folders(
     """
     Шаг 3: внутри faces раскладываем по папкам с именами.
 
-    MVP-логика: используем ручные метки `manual_person` в photo_rectangles.
-    Если меток нет -> _unassigned.
+    MVP-логика: используем привязки к персонам в photo_rectangles (manual_person_id и cluster_id → persons.name).
+    Если привязок нет -> _unassigned.
     """
     stats = Stats()
     root = os.path.abspath(root_dir)
@@ -2700,14 +2672,23 @@ def sort_faces_into_named_folders(
 
         def _people_for_file(db_path: str) -> list[str]:
             cur = store.conn.cursor()
+            cur.execute("SELECT id FROM files WHERE path = ? LIMIT 1", (str(db_path),))
+            row = cur.fetchone()
+            file_id = row[0] if row and row[0] is not None else None
+            if file_id is None:
+                return []
             cur.execute(
                 """
-                SELECT DISTINCT pr.manual_person
-                FROM photo_rectangles pr
-                JOIN files f ON f.id = pr.file_id
-                WHERE pr.run_id = ? AND f.path = ? AND pr.is_face = 1 AND pr.manual_person IS NOT NULL AND TRIM(pr.manual_person) != ''
+                SELECT DISTINCT p.name FROM photo_rectangles pr
+                JOIN persons p ON pr.manual_person_id = p.id
+                WHERE pr.run_id = ? AND pr.file_id = ? AND pr.manual_person_id IS NOT NULL
+                UNION
+                SELECT DISTINCT p2.name FROM photo_rectangles pr2
+                JOIN face_clusters fc ON pr2.cluster_id = fc.id
+                JOIN persons p2 ON fc.person_id = p2.id
+                WHERE pr2.run_id = ? AND pr2.file_id = ? AND pr2.cluster_id IS NOT NULL
                 """,
-                (int(run_id), str(db_path)),
+                (int(run_id), int(file_id), int(run_id), int(file_id)),
             )
             return sorted({str(r[0]).strip() for r in cur.fetchall() if r and r[0]})
 

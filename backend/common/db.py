@@ -2,6 +2,7 @@ import os
 import sqlite3
 import json
 import threading
+import time as _time
 from pathlib import Path
 from typing import Any
 from datetime import datetime, timezone
@@ -11,18 +12,20 @@ DB_PATH = Path(__file__).resolve().parents[2] / "data" / "photosorter.db"
 
 
 def get_connection():
-    # ВАЖНО (Windows/SQLite): при параллельной работе web-сервера и worker-процесса
-    # возможны кратковременные write-lock. Даем коннекту шанс "подождать", а не падать.
+    # ВАЖНО (Windows/SQLite): при параллельной работе web-сервера и pipeline (subprocess)
+    # возможны write-lock. Даём коннекту подождать (busy_timeout), а не падать сразу.
+    # Увеличенный таймаут по умолчанию (20 с) снижает вероятность "database is locked".
     try:
-        timeout_sec = float(os.getenv("PHOTOSORTER_SQLITE_TIMEOUT_SEC") or "5")
+        timeout_sec = float(os.getenv("PHOTOSORTER_SQLITE_TIMEOUT_SEC") or "20")
     except Exception:
-        timeout_sec = 5.0
-    timeout_sec = max(0.1, min(60.0, timeout_sec))
+        timeout_sec = 20.0
+    timeout_sec = max(0.1, min(120.0, timeout_sec))
     conn = sqlite3.connect(DB_PATH, timeout=timeout_sec)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute(f"PRAGMA busy_timeout={int(timeout_sec * 1000)}")
-        # Включаем поддержку FOREIGN KEY constraints
+        # WAL: один писатель и читатели не блокируют друг друга — меньше "database is locked"
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys = ON")
     except Exception:
         pass
@@ -85,6 +88,36 @@ def _get_file_id(conn: sqlite3.Connection, *, file_id: int | None = None, file_p
     return None
 
 
+def set_file_processed(conn: sqlite3.Connection, *, file_id: int | None = None, rectangle_id: int | None = None, cluster_id: int | None = None) -> None:
+    """
+    Устанавливает files.processed=1 для файла с привязками.
+    Вызывать после назначения персоны на лицо (manual_person_id или cluster_id).
+    Колонка processed может отсутствовать до миграции — тогда ничего не делаем.
+    """
+    file_ids: list[int] = []
+    cur = conn.cursor()
+    if file_id is not None:
+        file_ids = [int(file_id)]
+    elif rectangle_id is not None:
+        cur.execute("SELECT file_id FROM photo_rectangles WHERE id = ? LIMIT 1", (int(rectangle_id),))
+        row = cur.fetchone()
+        if row:
+            file_ids = [row[0]]
+    elif cluster_id is not None:
+        cur.execute(
+            "SELECT DISTINCT file_id FROM photo_rectangles WHERE cluster_id = ? AND file_id IS NOT NULL",
+            (int(cluster_id),),
+        )
+        file_ids = [row[0] for row in cur.fetchall()]
+    if not file_ids:
+        return
+    try:
+        for fid in file_ids:
+            cur.execute("UPDATE files SET processed = 1 WHERE id = ?", (fid,))
+    except sqlite3.OperationalError:
+        pass  # колонка processed может отсутствовать до миграции
+
+
 # Глобальный флаг для отслеживания инициализации БД
 _db_initialized = False
 _db_init_lock = threading.Lock()
@@ -112,12 +145,11 @@ def init_db():
         cur = conn.cursor()
         
         # Быстрая проверка: существует ли уже таблица files (основная таблица)?
-        # Если да, значит БД уже инициализирована, пропускаем создание таблиц
+        # Если да, значит БД уже инициализирована, пропускаем создание таблиц.
+        # DDL для существующих БД (новые колонки) — только скриптами миграции, не в runtime.
         try:
             cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='files'")
             if cur.fetchone():
-                # БД уже инициализирована, только проверяем миграции (если нужно)
-                # Миграции выполняются ниже, но без создания всех таблиц
                 conn.close()
                 _db_initialized = True
                 return
@@ -305,6 +337,10 @@ def init_db():
             "image_width": "image_width INTEGER",  # ширина исходного изображения (после EXIF transpose)
             "image_height": "image_height INTEGER",  # высота исходного изображения (после EXIF transpose)
             "exif_orientation": "exif_orientation INTEGER",  # EXIF Orientation (1-8), 1 = normal
+            # Исключение из 3NF: кэш целевой папки по правилам (шаг 4). Заполняется кнопкой «Заполнить целевые папки», обнуляется при выполнении перемещения (кнопка «Переместить»).
+            "target_folder": "target_folder TEXT",
+            # Защита от перерасчёта лиц: processed=1 означает «есть привязки к персонам», не трогать при досчёте.
+            "processed": "processed INTEGER NOT NULL DEFAULT 0",
             },
         )
 
@@ -361,6 +397,8 @@ def init_db():
             "last_dst_path": "last_dst_path TEXT",
             "log_tail": "log_tail TEXT",
             "updated_at": "updated_at TEXT",
+            "step4_processed": "step4_processed INTEGER",
+            "step4_total": "step4_total INTEGER",
         },
     )
 
@@ -670,6 +708,15 @@ class FaceStore:
                 "group_order": "group_order INTEGER",  # Порядок группы для сортировки
             },
         )
+
+        # Справочник групп персон (id для правил папок contains_group_id и т.п.)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS person_groups (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                name            TEXT UNIQUE NOT NULL,
+                sort_order      INTEGER
+            );
+        """)
 
         # Кластеры лиц
         cur.execute("""
@@ -1568,12 +1615,12 @@ class FaceStore:
                     
                     UNION
                     
-                    -- Привязки через кластеры (photo_rectangles.cluster_id)
+                    -- Привязки через кластеры (photo_rectangles.cluster_id), включая is_face=0 (персона без лица)
                     SELECT DISTINCT fc.person_id, p.name AS person_name
                     FROM photo_rectangles fr
                     JOIN face_clusters fc ON fc.id = fr.cluster_id
                     LEFT JOIN persons p ON p.id = fc.person_id
-                    WHERE fr.file_id = ? AND fr.run_id = ? AND fr.is_face = 1 AND fc.person_id IS NOT NULL
+                    WHERE fr.file_id = ? AND fr.run_id = ? AND fc.person_id IS NOT NULL
                 )
                 """,
                 (resolved_file_id, int(face_run_id), resolved_file_id, int(face_run_id)),
@@ -1591,12 +1638,12 @@ class FaceStore:
                     
                     UNION
                     
-                    -- Привязки через кластеры (photo_rectangles.cluster_id)
+                    -- Привязки через кластеры (photo_rectangles.cluster_id), включая is_face=0 (персона без лица)
                     SELECT DISTINCT fc.person_id, p.name AS person_name
                     FROM photo_rectangles fr
                     JOIN face_clusters fc ON fc.id = fr.cluster_id
                     LEFT JOIN persons p ON p.id = fc.person_id
-                    WHERE fr.file_id = ? AND fr.is_face = 1 AND fc.person_id IS NOT NULL
+                    WHERE fr.file_id = ? AND fc.person_id IS NOT NULL
                 )
                 """,
                 (resolved_file_id, resolved_file_id),
@@ -1663,6 +1710,101 @@ def list_folders(*, location: str | None = None, role: str | None = None) -> lis
 
         rows = cur.fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_person_ids_by_group(group_name: str) -> list[int]:
+    """
+    Возвращает список person_id персон с persons."group" = group_name (для правил папок по группам).
+    """
+    if not (group_name or "").strip():
+        return []
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            '''SELECT id FROM persons WHERE "group" = ? ORDER BY group_order ASC, id ASC''',
+            (group_name.strip(),),
+        )
+        return [row["id"] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+# Единственное место в коде: персона «Посторонний» (не считаем за людей при сортировке и в UI).
+OUTSIDER_PERSON_NAME = "Посторонний"
+OUTSIDER_PERSON_NAMES_LEGACY = ("Посторонний", "Посторонние")
+
+
+def get_outsider_person_id(conn, create_if_missing: bool = True) -> int | None:
+    """
+    ID персоны «Посторонний» — при сортировке по правилам и в UI не считаем за людей (игнорируем так же, как неназначенных).
+    Единственный экземпляр функции в коде; используется в sort_by_rules, face_clusters, faces.
+    Сначала проверяет id=6, затем поиск по имени, при create_if_missing=True создаёт персону, если нет.
+    """
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM persons WHERE id = 6")
+    row = cur.fetchone()
+    if row:
+        return 6
+    cur.execute("SELECT id FROM persons WHERE name IN (?, ?) LIMIT 1", OUTSIDER_PERSON_NAMES_LEGACY)
+    row = cur.fetchone()
+    if row:
+        return int(row["id"])
+    if not create_if_missing:
+        return None
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    cur.execute(
+        """
+        INSERT INTO persons (name, mode, is_me, created_at, updated_at)
+        VALUES (?, 'active', 0, ?, ?)
+        """,
+        (OUTSIDER_PERSON_NAME, now, now),
+    )
+    conn.commit()
+    created_id = cur.lastrowid
+    if created_id != 6:
+        import logging
+
+        logging.warning(
+            "Персона 'Посторонний' создана с ID %s вместо ожидаемого 6. Требуется миграция.",
+            created_id,
+        )
+    return created_id
+
+
+def update_folder_content_rule(folder_id: int, content_rule: str | None) -> bool:
+    """
+    Обновляет content_rule у папки по id. Возвращает True, если обновлена хотя бы одна строка.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        value = (content_rule or "").strip() or None
+        cur.execute("UPDATE folders SET content_rule = ? WHERE id = ?", (value, folder_id))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def update_folder_rule_and_order(
+    folder_id: int, content_rule: str | None, sort_order: int | None = None
+) -> bool:
+    """Обновляет content_rule и опционально sort_order у папки по id."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        value = (content_rule or "").strip() or None
+        if sort_order is not None:
+            cur.execute("UPDATE folders SET content_rule = ?, sort_order = ? WHERE id = ?", (value, int(sort_order), folder_id))
+        else:
+            cur.execute("UPDATE folders SET content_rule = ? WHERE id = ?", (value, folder_id))
+        conn.commit()
+        return cur.rowcount > 0
     finally:
         conn.close()
 
@@ -2030,16 +2172,43 @@ class DedupStore:
         return int(cur.rowcount or 0)
 
     def update_path(self, *, old_path: str, new_path: str, new_name: str | None, new_parent_path: str | None) -> None:
+        last_err: Exception | None = None
+        for attempt in range(5):
+            try:
+                cur = self.conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE files
+                    SET path = ?, name = COALESCE(?, name), parent_path = COALESCE(?, parent_path)
+                    WHERE path = ?
+                    """,
+                    (new_path, new_name, new_parent_path, old_path),
+                )
+                self.conn.commit()
+                return
+            except sqlite3.OperationalError as e:
+                last_err = e
+                if "locked" not in str(e).lower():
+                    raise
+                _time.sleep(0.05 * (attempt + 1))
+        if last_err:
+            raise last_err
+
+    def set_target_folder(self, *, file_id: int, target_folder: str | None) -> None:
+        """Устанавливает целевую папку по правилам (шаг 4). Обнулять при выполнении перемещения (кнопка «Переместить»)."""
         cur = self.conn.cursor()
-        cur.execute(
-            """
-            UPDATE files
-            SET path = ?, name = COALESCE(?, name), parent_path = COALESCE(?, parent_path)
-            WHERE path = ?
-            """,
-            (new_path, new_name, new_parent_path, old_path),
-        )
+        cur.execute("UPDATE files SET target_folder = ? WHERE id = ?", (target_folder, int(file_id)))
         self.conn.commit()
+
+    def clear_target_folder(self, *, paths: list[str]) -> int:
+        """Обнуляет target_folder для файлов (вызывать после перемещения файлов в папки). Возвращает число обновлённых строк."""
+        if not paths:
+            return 0
+        cur = self.conn.cursor()
+        q = ",".join(["?"] * len(paths))
+        cur.execute(f"UPDATE files SET target_folder = NULL WHERE path IN ({q})", paths)
+        self.conn.commit()
+        return int(cur.rowcount or 0)
 
     def set_faces_summary(self, *, path: str, faces_run_id: int, faces_count: int, faces_scanned_at: str | None = None) -> None:
         cur = self.conn.cursor()
@@ -2888,6 +3057,22 @@ class PipelineStore:
         row = cur.fetchone()
         return dict(row) if row else None
 
+    def get_latest_with_step_num_ge(self, *, kind: str, min_step_num: int) -> dict[str, Any] | None:
+        """Последний по id прогон с step_num >= min_step_num (для отображения статуса шага 4 после рестарта)."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT *
+            FROM pipeline_runs
+            WHERE kind = ? AND step_num >= ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (str(kind), int(min_step_num)),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
     def update_run(
         self,
         *,
@@ -2903,6 +3088,8 @@ class PipelineStore:
         last_dst_path: str | None = None,
         last_error: str | None = None,
         finished_at: str | None = None,
+        step4_processed: int | None = None,
+        step4_total: int | None = None,
     ) -> None:
         fields: list[str] = []
         params: list[Any] = []
@@ -2933,6 +3120,10 @@ class PipelineStore:
             _set("last_error", str(last_error))
         if finished_at is not None:
             _set("finished_at", str(finished_at))
+        if step4_processed is not None:
+            _set("step4_processed", int(step4_processed))
+        if step4_total is not None:
+            _set("step4_total", int(step4_total))
 
         # updated_at всегда двигаем при любом update
         _set("updated_at", _now_utc_iso())
@@ -3249,16 +3440,27 @@ class PipelineStore:
         return int(cur.rowcount or 0)
 
     def update_path(self, *, old_path: str, new_path: str, new_name: str | None, new_parent_path: str | None) -> None:
-        cur = self.conn.cursor()
-        cur.execute(
-            """
-            UPDATE files
-            SET path = ?, name = COALESCE(?, name), parent_path = COALESCE(?, parent_path)
-            WHERE path = ?
-            """,
-            (new_path, new_name, new_parent_path, old_path),
-        )
-        self.conn.commit()
+        last_err: Exception | None = None
+        for attempt in range(5):
+            try:
+                cur = self.conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE files
+                    SET path = ?, name = COALESCE(?, name), parent_path = COALESCE(?, parent_path)
+                    WHERE path = ?
+                    """,
+                    (new_path, new_name, new_parent_path, old_path),
+                )
+                self.conn.commit()
+                return
+            except sqlite3.OperationalError as e:
+                last_err = e
+                if "locked" not in str(e).lower():
+                    raise
+                _time.sleep(0.05 * (attempt + 1))
+        if last_err:
+            raise last_err
 
     def set_faces_summary(self, *, path: str, faces_run_id: int, faces_count: int, faces_scanned_at: str | None = None) -> None:
         cur = self.conn.cursor()

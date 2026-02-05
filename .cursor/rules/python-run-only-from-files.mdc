@@ -3,6 +3,8 @@ alwaysApply: true
 ---
 Python запускать только из файлов (PhotoSorter)
 
+**Все скрипты Python — только через файлы:** `python path/to/script.py [args...]`. Никакого `python -c "..."` и inline-кода в терминале.
+
 ## Цель
 Минимизировать зависания терминалов/REPL и экономить время/токены: никакого inline‑Python в PowerShell.
 

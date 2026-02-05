@@ -164,7 +164,7 @@
       <div class="sticky-top" id="stickyTop">
         <div class="header">
           <div>
-            <h2 style="margin:0;">Результаты “лица / нет лиц” (шаг 2)</h2>
+            <h2 style="margin:0;">Результаты “лица / нет лиц” (шаг 3)</h2>
             <div class="muted" style="margin-top:6px;">Двойной клик по превью — показать прямоугольники лиц. В “Нет лиц” можно разметить лица вручную.</div>
           </div>
           <div class="muted"><a href="/">← на главную</a></div>
@@ -215,7 +215,6 @@
           <span class="pill">всего: <b id="total">—</b></span>
           <button class="btn" id="btnReload" type="button">Обновить</button>
           <button class="btn" id="btnUndo" type="button" style="display:none;" title="Undo: отменить последнее действие (поддерживается несколько последних действий).">Undo</button>
-          <button class="btn" id="btnSortIntoFolders" type="button" title="Переместить файлы в папки по категориям: _non_media, _broken_media, _faces, _quarantine, _animals, _people_no_face, _no_faces">Переместить файлы в папки</button>
         </div>
 
         <div class="toolbar">
@@ -2882,8 +2881,18 @@
       const rid = getParam("pipeline_run_id");
       if (rid && /^\d+$/.test(rid)) pipelineRunId = Number(rid);
       qs("#prId").textContent = pipelineRunId != null ? String(pipelineRunId) : "—";
-      // Управление доступностью кнопки "Переместить файлы в папки"
+      // Управление доступностью кнопок шага 4
+      const btnFill = qs("#btnFillTargetFolders");
       const btnSort = qs("#btnSortIntoFolders");
+      if (btnFill) {
+        if (pipelineRunId != null) {
+          btnFill.disabled = false;
+          btnFill.style.display = "";
+        } else {
+          btnFill.disabled = true;
+          btnFill.title = "Заполнить целевые папки (требуется pipeline_run_id)";
+        }
+      }
       if (btnSort) {
         if (pipelineRunId != null) {
           btnSort.disabled = false;
@@ -3538,40 +3547,48 @@
         }
       };
 
-      // Sort into folders
-      qs("#btnSortIntoFolders").onclick = async () => {
-        if (pipelineRunId == null) {
-          setToast("pipeline_run_id не задан", true);
-          return;
-        }
-        if (!confirm("Переместить файлы в папки по категориям?\n\nШаг 1: _non_media, _broken_media\nШаг 3: _faces, _quarantine, _animals, _people_no_face, _no_faces\n\nЭто действие переместит файлы на YaDisk (или локально) в соответствующие папки.")) {
-          return;
-        }
-        try {
-          qs("#btnSortIntoFolders").disabled = true;
-          setToast("Сортировка файлов...");
-          const payload = { pipeline_run_id: Number(pipelineRunId), dry_run: false };
-          const resp = await postJson("/api/faces/sort-into-folders", payload);
-          if (resp.ok) {
-            const moved = resp.moved_count || 0;
-            const errors = resp.errors || [];
-            if (errors.length > 0) {
-              setToast(`Перенесено: ${moved}, ошибок: ${errors.length}`, true);
-              console.error("Sort errors:", errors);
-            } else {
-              setToast(`Успешно перенесено файлов: ${moved}`);
-            }
-            await refreshTabCounts();
-            await load(true);
-          } else {
-            setToast("Ошибка при сортировке", true);
-          }
-        } catch (e) {
-          setToast(e?.message || String(e), true);
-        } finally {
-          qs("#btnSortIntoFolders").disabled = false;
-        }
-      };
+      // Кнопки шага 4 (Заполнить целевые папки, Переместить) на странице /sorting-folders.
+      const _btnFill = qs("#btnFillTargetFolders");
+      const _btnSort = qs("#btnSortIntoFolders");
+      if (_btnFill) {
+        _btnFill.onclick = async () => {
+          if (pipelineRunId == null) { setToast("pipeline_run_id не задан", true); return; }
+          try {
+            _btnFill.disabled = true;
+            setToast("Заполняю target_folder...");
+            const resp = await postJson("/api/faces/fill-target-folders", { pipeline_run_id: Number(pipelineRunId) });
+            if (resp.ok) {
+              const filled = resp.filled_count || 0;
+              const errs = resp.errors || [];
+              if (errs.length > 0) setToast(`Заполнено: ${filled}, ошибок: ${errs.length}`, true);
+              else setToast(`Заполнено целевых папок: ${filled}. Проверьте отчёт на странице шага 4 (/sorting-folders), затем «Переместить».`);
+              await refreshTabCounts();
+              await load(true);
+            } else setToast("Ошибка при заполнении целевых папок", true);
+          } catch (e) { setToast(e?.message || String(e), true); }
+          finally { _btnFill.disabled = false; }
+        };
+      }
+      if (_btnSort) {
+        _btnSort.onclick = async () => {
+          if (pipelineRunId == null) { setToast("pipeline_run_id не задан", true); return; }
+          if (!confirm("Переместить файлы в папки?\n\nСначала «Заполнить целевые папки». По категориям и персонам: Агата, Другие люди, _no_faces и т.д.")) return;
+          try {
+            _btnSort.disabled = true;
+            setToast("Перемещаю файлы...");
+            const resp = await postJson("/api/faces/sort-into-folders", { pipeline_run_id: Number(pipelineRunId), dry_run: false });
+            if (resp.ok) {
+              const moved = resp.moved_count || 0;
+              const errors = resp.errors || [];
+              if (errors.length > 0) setToast(`Перенесено: ${moved}, ошибок: ${errors.length}`, true);
+              else setToast(`Успешно перенесено файлов: ${moved}`);
+              await refreshTabCounts();
+              await load(true);
+            } else setToast("Ошибка при сортировке", true);
+          } catch (e) { setToast(e?.message || String(e), true); }
+          finally { _btnSort.disabled = false; }
+        };
+      }
     </script>
   </body>
 </html>

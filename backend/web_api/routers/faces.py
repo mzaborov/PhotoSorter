@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import logging
+import sqlite3
 import mimetypes
 import os
 import re
@@ -22,7 +23,14 @@ from fastapi.templating import Jinja2Templates
 
 logger = logging.getLogger(__name__)
 
-from common.db import DedupStore, FaceStore, PipelineStore, get_connection, list_folders
+from common.db import DedupStore, FaceStore, PipelineStore, get_connection, get_outsider_person_id, list_folders, set_file_processed
+from common.sort_rules import (
+    determine_target_folder as _determine_target_folder,
+    folder_rules_match as _folder_rules_match,
+    get_all_person_names_for_file as _get_all_person_names_for_file,
+    parse_content_rule as _parse_content_rule,
+    resolve_target_folder_for_faces as _resolve_target_folder_for_faces,
+)
 from common.yadisk_client import get_disk
 from logic.gold.store import gold_expected_tab_by_path, gold_file_map, gold_read_lines, gold_write_lines, gold_read_ndjson_by_path, gold_write_ndjson_by_path, gold_faces_manual_rects_path, gold_faces_video_frames_path
 
@@ -822,7 +830,7 @@ def api_faces_results(
     _conn = get_connection()
     ignored_person_id = -1
     try:
-        from backend.web_api.routers.face_clusters import get_outsider_person_id
+        from backend.common.db import get_outsider_person_id
         _val = get_outsider_person_id(_conn)
         if _val is not None:
             ignored_person_id = _val
@@ -1299,51 +1307,56 @@ def api_faces_tab_counts(pipeline_run_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="face_run_id is not set yet (step 3 not started)")
     face_run_id_i = int(face_run_id)
     root_path = str(pr.get("root_path") or "")
+    dedup_run_id = pr.get("dedup_run_id")
 
-    try:
-        root_like = None
-        if root_path.startswith("disk:"):
-            rp = root_path.rstrip("/")
-            root_like = rp + "/%"
-        else:
-            try:
-                rp_abs = os.path.abspath(root_path)
-                rp_abs = rp_abs.rstrip("\\/") + "\\"
-                root_like = "local:" + rp_abs + "%"
-            except Exception:
-                root_like = None
+    where = ["f.status != 'deleted'"]
+    params: list[Any] = []
 
-        # Показываем файлы с faces_run_id = ? ИЛИ (видео без faces_run_id в корневой папке)
-        # Это нужно, потому что видео могут быть не обработаны для детекции лиц
-        where = ["f.status != 'deleted'"]
-        params: list[Any] = []
-        
-        if root_like:
-            # Показываем файлы с faces_run_id = ? ИЛИ видео без faces_run_id в корневой папке
-            where.append("""
+    if dedup_run_id is not None:
+        # Тот же набор, что в step4-report: inventory_scope='source' и last_run_id прогона
+        where.append("COALESCE(f.inventory_scope, '') = 'source' AND f.last_run_id = ?")
+        params.append(int(dedup_run_id))
+    else:
+        try:
+            root_like = None
+            if root_path.startswith("disk:"):
+                rp = root_path.rstrip("/")
+                root_like = rp + "/%"
+            else:
+                try:
+                    rp_abs = os.path.abspath(root_path)
+                    rp_abs = rp_abs.rstrip("\\/") + "\\"
+                    root_like = "local:" + rp_abs + "%"
+                except Exception:
+                    root_like = None
+            if root_like:
+                where.append("""
         (
           f.faces_run_id = ?
           OR (
-            f.faces_run_id IS NULL 
+            f.faces_run_id IS NULL
             AND (COALESCE(f.media_type, '') = 'video' OR COALESCE(f.mime_type, '') LIKE 'video/%')
             AND f.path LIKE ?
           )
         )
         """)
-            params.append(face_run_id_i)
-            params.append(root_like)
-        else:
-            # Если нет root_like, используем только faces_run_id
+                params.append(face_run_id_i)
+                params.append(root_like)
+            else:
+                where.append("f.faces_run_id = ?")
+                params.append(face_run_id_i)
+        except Exception:
             where.append("f.faces_run_id = ?")
             params.append(face_run_id_i)
-        
-        where_sql = " AND ".join(where)
 
+    where_sql = " AND ".join(where)
+
+    try:
         # ID персоны «Посторонний» — привязки к ней не переводят файл в «Люди»
         _conn_tc = get_connection()
         ignored_person_id_tc = -1
         try:
-            from backend.web_api.routers.face_clusters import get_outsider_person_id
+            from backend.common.db import get_outsider_person_id
             _val_tc = get_outsider_person_id(_conn_tc)
             if _val_tc is not None:
                 ignored_person_id_tc = _val_tc
@@ -1722,7 +1735,7 @@ def api_faces_persons_with_files(pipeline_run_id: int) -> dict[str, Any]:
         logger.info(msg)
 
         # ID персоны «Посторонний» для флага is_ignored
-        from backend.web_api.routers.face_clusters import get_outsider_person_id
+        from backend.common.db import get_outsider_person_id
         _conn_apwf = get_connection()
         outsider_id_apwf = None
         try:
@@ -1874,7 +1887,7 @@ def api_faces_all_persons_faces(pipeline_run_id: int) -> dict[str, Any]:
     Используется для закладки «Лица» — сетка кропов с кнопками по персонам.
     """
     start_time = time.time()
-    from backend.web_api.routers.face_clusters import get_outsider_person_id
+    from backend.common.db import get_outsider_person_id
 
     ps = PipelineStore()
     try:
@@ -2421,6 +2434,7 @@ def api_faces_assign_face_person(payload: dict[str, Any] = Body(...)) -> dict[st
             cur.execute("""
                 UPDATE photo_rectangles SET manual_person_id = ?, cluster_id = NULL WHERE id = ?
             """, (int(person_id), int(rectangle_id)))
+        set_file_processed(conn, rectangle_id=int(rectangle_id))
         conn.commit()
     finally:
         fs.close()
@@ -3008,6 +3022,7 @@ def api_faces_rectangle_update(payload: dict[str, Any] = Body(...)) -> dict[str,
                             """,
                             (int(person_id), int(rectangle_id)),
                         )
+                    set_file_processed(conn, rectangle_id=int(rectangle_id))
                 elif assignment_type == "cluster":
                     # Добавляем в кластер (только для сортируемых фото с face_run_id)
                     if face_run_id_i is None:
@@ -3018,6 +3033,7 @@ def api_faces_rectangle_update(payload: dict[str, Any] = Body(...)) -> dict[str,
                             """,
                             (int(person_id), int(rectangle_id)),
                         )
+                        set_file_processed(conn, rectangle_id=int(rectangle_id))
                     else:
                         # Добавляем в кластер (нужно найти или создать кластер для персоны)
                         # Сначала снимаем ручную привязку (если была)
@@ -3062,6 +3078,7 @@ def api_faces_rectangle_update(payload: dict[str, Any] = Body(...)) -> dict[str,
                             """,
                             (cluster_id, int(rectangle_id)),
                         )
+                        set_file_processed(conn, rectangle_id=int(rectangle_id))
             else:
                 raise HTTPException(status_code=400, detail="person_id must be int or null")
         
@@ -3494,7 +3511,7 @@ def api_faces_rectangles_assign_outsider(payload: dict[str, Any] = Body(...)) ->
         cur = conn.cursor()
         
         # Используем функцию для получения ID персоны "Посторонний"
-        from backend.web_api.routers.face_clusters import get_outsider_person_id
+        from backend.common.db import get_outsider_person_id
         outsider_person_id = get_outsider_person_id(conn)
         if not outsider_person_id:
             raise HTTPException(status_code=500, detail="Персона 'Посторонний' не найдена. Требуется миграция.")
@@ -3791,7 +3808,7 @@ def api_faces_rectangles_duplicates_check(
         # Находим дубликаты (персоны с более чем одним rectangle)
         # ИСКЛЮЧЕНИЕ: "Посторонний" - это специальная персона, для нее дубликаты разрешены
         # Получаем ID персоны "Посторонний" для исключения из проверки
-        from backend.web_api.routers.face_clusters import get_outsider_person_id
+        from backend.common.db import get_outsider_person_id
         outsider_person_id = get_outsider_person_id(conn)
         
         duplicates: dict[int, list[int]] = {}
@@ -3837,85 +3854,26 @@ def _normalize_yadisk_path(path: str) -> str:
     return p.replace("\\", "/")
 
 
-def _determine_target_folder(
-    *,
-    path: str,
-    effective_tab: str,
-    root_path: str,
-    preclean_kind: str | None = None,
-) -> str | None:
+def _parent_segment_starts_with_underscore(path: str) -> bool:
+    """True, если родительская папка пути начинается с '_' (файл уже в отсортированной папке)."""
+    p = (path or "").replace("\\", "/").strip("/")
+    if not p:
+        return True
+    parts = p.split("/")
+    if len(parts) < 2:
+        return False
+    parent_segment = parts[-2]
+    return parent_segment.startswith("_")
+
+
+@router.get("/api/faces/step4-report")
+def api_faces_step4_report(pipeline_run_id: int) -> dict[str, Any]:
     """
-    Определяет целевую папку для файла на основе результатов первых 3 шагов.
-
-    Шаг 1 (предочистка):
-    - non_media -> _non_media
-    - broken_media -> _broken_media
-
-    Шаг 3 (сортировка по лицам):
-    - faces -> _faces
-    - quarantine -> _quarantine
-    - animals -> _animals
-    - people_no_face -> _people_no_face
-    - no_faces -> _no_faces
-
-    Возвращает путь к целевой папке (например, "disk:/Фото/_faces" или "local:C:\\tmp\\Photo\\_faces") или None.
+    Отчёт шага 4 «разложить по правилам»:
+    - by_folder: файлы прогона с заполненным target_folder в БД (после fill — те же папки, что new_target_folder в скрипте).
+    - unsorted: файлы прогона без target_folder в БД.
+    Возвращает: pipeline_run_id, root_path, by_folder, total, unsorted, unsorted_count.
     """
-    # Определяем базовый путь (root_path)
-    if root_path.startswith("disk:"):
-        base_path = root_path.rstrip("/")
-    elif root_path.startswith("local:"):
-        base_path = root_path[6:]  # убираем "local:"
-    else:
-        base_path = root_path
-
-    # Шаг 1: предочистка (non_media, broken_media)
-    if preclean_kind:
-        if preclean_kind == "non_media":
-            folder_name = "_non_media"
-        elif preclean_kind == "broken_media":
-            folder_name = "_broken_media"
-        else:
-            return None
-    # Шаг 3: сортировка по лицам
-    elif effective_tab == "faces":
-        folder_name = "_faces"
-    elif effective_tab == "quarantine":
-        folder_name = "_quarantine"
-    elif effective_tab == "animals":
-        folder_name = "_animals"
-    elif effective_tab == "people_no_face":
-        folder_name = "_people_no_face"
-    elif effective_tab == "no_faces":
-        folder_name = "_no_faces"
-    else:
-        return None  # Неизвестная категория
-
-    # Формируем полный путь
-    if root_path.startswith("disk:"):
-        result = f"{base_path}/{folder_name}"
-    else:
-        # Локальный путь
-        result = f"local:{os.path.join(base_path, folder_name)}"
-    return result
-
-
-@router.post("/api/faces/sort-into-folders")
-def api_faces_sort_into_folders(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    """
-    Сортирует файлы по папкам на основе правил приоритета.
-
-    Параметры:
-    - pipeline_run_id: int (обязательно)
-    - dry_run: bool (опционально, по умолчанию False)
-
-    Возвращает статистику перемещённых файлов.
-    """
-    pipeline_run_id = payload.get("pipeline_run_id")
-    dry_run = payload.get("dry_run", False)
-
-    if not isinstance(pipeline_run_id, int):
-        raise HTTPException(status_code=400, detail="pipeline_run_id is required")
-
     ps = PipelineStore()
     try:
         pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
@@ -3923,76 +3881,296 @@ def api_faces_sort_into_folders(payload: dict[str, Any] = Body(...)) -> dict[str
         ps.close()
     if not pr:
         raise HTTPException(status_code=404, detail="pipeline_run_id not found")
-
-    face_run_id = pr.get("face_run_id")
-    if not face_run_id:
-        raise HTTPException(status_code=400, detail="face_run_id is not set yet (step 3 not started)")
-
-    face_run_id_i = int(face_run_id)
     root_path = str(pr.get("root_path") or "")
+    dedup_run_id = pr.get("dedup_run_id")
+    face_run_id = pr.get("face_run_id")
+    if not root_path or dedup_run_id is None:
+        return {
+            "pipeline_run_id": pipeline_run_id,
+            "root_path": root_path or None,
+            "by_folder": {},
+            "total": 0,
+            "unsorted": [],
+            "unsorted_count": 0,
+        }
 
-    # Получаем все файлы для данного прогона
-    ds = DedupStore()
-    fs = FaceStore()
-    ps = PipelineStore()
+    conn = get_connection()
     try:
-        # Получаем данные из preclean_moves для шага 1
-        cur_preclean = ps.conn.cursor()
-        cur_preclean.execute(
-            """
-            SELECT src_path, kind
-            FROM preclean_moves
-            WHERE pipeline_run_id = ?
-            """,
-            (int(pipeline_run_id),),
-        )
-        preclean_map: dict[str, str] = {}  # path -> kind (non_media или broken_media)
-        for row in cur_preclean.fetchall():
-            src_path = str(row[0] or "")
-            kind = str(row[1] or "")
-            if src_path and kind:
-                preclean_map[src_path] = kind
-
-        # Получаем список файлов с их категориями и метками
-        cur = ds.conn.cursor()
+        cur = conn.cursor()
+        # Сортируемые файлы = inventory_scope='source' и last_run_id прогона (не path под корнем).
+        scope_run = (int(dedup_run_id),)
         cur.execute(
             """
-            SELECT
-              f.path, f.name, f.parent_path,
-              COALESCE(m.faces_manual_label, '') AS faces_manual_label,
-              COALESCE(m.quarantine_manual, 0) AS quarantine_manual,
-              COALESCE(f.faces_auto_quarantine, 0) AS faces_auto_quarantine,
-              COALESCE(f.faces_quarantine_reason, '') AS faces_quarantine_reason,
-              COALESCE(f.animals_auto, 0) AS animals_auto,
-              COALESCE(f.animals_kind, '') AS animals_kind,
-              COALESCE(m.animals_manual, 0) AS animals_manual,
-              COALESCE(m.animals_manual_kind, '') AS animals_manual_kind,
-              COALESCE(m.people_no_face_manual, 0) AS people_no_face_manual,
-              COALESCE(m.people_no_face_person, '') AS people_no_face_person,
-              COALESCE(f.faces_count, 0) AS faces_count
-            FROM files f
-            LEFT JOIN files_manual_labels m
-              ON m.pipeline_run_id = ? AND m.file_id = f.id
-            WHERE f.faces_run_id = ? AND f.status != 'deleted'
+            SELECT id, path, name, target_folder
+            FROM files
+            WHERE COALESCE(inventory_scope, '') = 'source' AND last_run_id = ?
+              AND (status IS NULL OR status != 'deleted') AND target_folder IS NOT NULL AND trim(target_folder) != ''
+            ORDER BY target_folder, path
             """,
-            (int(pipeline_run_id), face_run_id_i),
+            scope_run,
         )
-        rows = [dict(r) for r in cur.fetchall()]
+        rows = cur.fetchall()
 
-        # Формируем список файлов с их категориями
-        files_data: list[dict[str, Any]] = []
+        unsorted: list[dict[str, Any]] = []
+        cur.execute(
+            """
+            SELECT id, path, name
+            FROM files
+            WHERE COALESCE(inventory_scope, '') = 'source' AND last_run_id = ?
+              AND (status IS NULL OR status != 'deleted')
+              AND (target_folder IS NULL OR trim(target_folder) = '')
+            ORDER BY path
+            """,
+            scope_run,
+        )
+        for r in cur.fetchall():
+            unsorted.append({"id": r["id"], "path": r["path"], "name": r["name"]})
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    by_folder: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        folder = str(r["target_folder"] or "").strip()
+        if not folder:
+            continue
+        entry = {"id": r["id"], "path": r["path"], "name": r["name"]}
+        if folder not in by_folder:
+            by_folder[folder] = []
+        by_folder[folder].append(entry)
+    total = sum(len(v) for v in by_folder.values())
+    unsorted_count_val = len(unsorted)
+    # #region agent log
+    try:
+        _dl = open(r"c:\Projects\PhotoSorter\.cursor\debug.log", "a", encoding="utf-8")
+        _dl.write(json.dumps({"hypothesisId": "H2,H3", "location": "faces.py:step4-report", "message": "step4-report scope", "data": {"pipeline_run_id": pipeline_run_id, "dedup_run_id": dedup_run_id, "total_with_folder": total, "unsorted_count": unsorted_count_val, "scope_total": total + unsorted_count_val}, "timestamp": time.time()}, ensure_ascii=False) + "\n")
+        _dl.close()
+    except Exception:
+        pass
+    # #endregion
+    return {
+        "pipeline_run_id": pipeline_run_id,
+        "root_path": root_path,
+        "by_folder": by_folder,
+        "total": total,
+        "unsorted": unsorted,
+        "unsorted_count": unsorted_count_val,
+    }
+
+
+def clear_target_folders_for_run_impl(pipeline_run_id: int) -> dict[str, Any]:
+    """
+    Обнуляет target_folder у всех файлов прогона (inventory_scope='source' + last_run_id).
+    Вызывается из API и из local_pipeline напрямую (без HTTP), чтобы избежать дедлока.
+    Возвращает: {"cleared_count": N} или raises ValueError.
+    """
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise ValueError("pipeline_run_id not found")
+    dedup_run_id = pr.get("dedup_run_id")
+    if dedup_run_id is None:
+        return {"cleared_count": 0}
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT path FROM files
+            WHERE COALESCE(inventory_scope, '') = 'source' AND last_run_id = ?
+              AND (status IS NULL OR status != 'deleted')
+            """,
+            (int(dedup_run_id),),
+        )
+        paths = [str(r[0] or "") for r in cur.fetchall() if r[0]]
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if not paths:
+        return {"cleared_count": 0}
+    ds = DedupStore()
+    try:
+        n = ds.clear_target_folder(paths=paths)
+        return {"cleared_count": n}
+    finally:
+        ds.close()
+
+
+@router.post("/api/faces/clear-target-folders-for-run")
+def api_faces_clear_target_folders_for_run(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """HTTP-обёртка: обнуляет target_folder (см. clear_target_folders_for_run_impl)."""
+    pipeline_run_id = payload.get("pipeline_run_id")
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required")
+    try:
+        return clear_target_folders_for_run_impl(pipeline_run_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+def fill_target_folders_impl(pipeline_run_id: int) -> dict[str, Any]:
+    """
+    Заполняет target_folder в БД по тому же правилу, что new_target_folder в скрипте.
+    Вызывается из API и из local_pipeline напрямую (без HTTP), чтобы избежать дедлока при одном воркере.
+    Возвращает: {"ok": True, "filled_count": N, "errors": [...]} или raises ValueError.
+    """
+    # #region agent log
+    try:
+        _dl = open(r"c:\Projects\PhotoSorter\.cursor\debug.log", "a", encoding="utf-8")
+        _dl.write(json.dumps({"hypothesisId": "fill-entry", "location": "faces.py:fill_target_folders_impl", "message": "fill_target_folders_impl entered", "data": {"pipeline_run_id": pipeline_run_id}, "timestamp": time.time()}, ensure_ascii=False) + "\n")
+        _dl.close()
+    except Exception:
+        pass
+    # #endregion
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise ValueError("pipeline_run_id not found")
+    face_run_id = pr.get("face_run_id")
+    if not face_run_id:
+        raise ValueError("face_run_id is not set yet (step 3 not started)")
+    face_run_id_i = int(face_run_id)
+    root_path = str(pr.get("root_path") or "")
+    dedup_run_id = pr.get("dedup_run_id")
+    if not root_path:
+        raise ValueError("root_path is not set")
+
+    if root_path.startswith("disk:"):
+        root_like = root_path.rstrip("/") + "/%"
+    else:
+        try:
+            rp_clean = root_path[6:] if root_path.startswith("local:") else root_path
+            rp_abs = os.path.abspath(rp_clean).rstrip("\\/") + ("\\" if os.name == "nt" else "/")
+            root_like = "local:" + rp_abs + "%"
+        except Exception:
+            root_like = root_path.rstrip("/") + "/%"
+
+    ds = DedupStore()
+    ps = PipelineStore()
+    conn = get_connection()
+    try:
+        ignored_person_id_fill = get_outsider_person_id(conn) if conn else None
+        if ignored_person_id_fill is None:
+            ignored_person_id_fill = -1
+        cur_preclean = ps.conn.cursor()
+        cur_preclean.execute(
+            "SELECT src_path, kind FROM preclean_moves WHERE pipeline_run_id = ?",
+            (int(pipeline_run_id),),
+        )
+        preclean_map = {str(r[0] or ""): str(r[1] or "") for r in cur_preclean.fetchall() if r[0] and r[1]}
+
+        # has_person_binding: file_persons ИЛИ привязки по лицам (manual/cluster) — как в tab-counts, чтобы файлы с людьми без лиц тоже шли в папки по правилам
+        has_person_binding_sql = """
+          (EXISTS (
+            SELECT 1 FROM file_persons fp
+            WHERE fp.file_id = f.id AND fp.pipeline_run_id = ? AND fp.person_id IS NOT NULL AND fp.person_id != ?
+          ) OR EXISTS (
+            SELECT 1 FROM photo_rectangles fr
+            LEFT JOIN face_clusters fc ON fc.id = fr.cluster_id
+            WHERE fr.file_id = f.id
+              AND (fr.run_id = ? OR COALESCE(TRIM(COALESCE(fr.archive_scope, '')), '') = 'archive')
+              AND (fr.manual_person_id IS NOT NULL OR fc.person_id IS NOT NULL)
+              AND COALESCE(fr.manual_person_id, fc.person_id) != ?
+          ))
+        """
+        cur = ds.conn.cursor()
+        # Тот же набор, что step4-report: только inventory_scope='source' + last_run_id (без OR по path, чтобы не зависеть от формата путей)
+        # group_path для no_faces: как на вкладке «Нет людей» (file_groups)
+        group_path_subquery = """
+        LEFT JOIN (
+            SELECT file_id, MIN(group_path) AS group_path
+            FROM file_groups
+            WHERE pipeline_run_id = ?
+            GROUP BY file_id
+        ) fg ON fg.file_id = f.id
+        """
+        group_path_select = ", COALESCE(fg.group_path, '') AS group_path"
+        if dedup_run_id is not None:
+            cur.execute(
+                f"""
+                SELECT
+                  f.id, f.path, f.name, f.parent_path,
+                  COALESCE(m.faces_manual_label, '') AS faces_manual_label,
+                  COALESCE(m.quarantine_manual, 0) AS quarantine_manual,
+                  COALESCE(f.faces_auto_quarantine, 0) AS faces_auto_quarantine,
+                  COALESCE(f.faces_count, 0) AS faces_count,
+                  COALESCE(m.animals_manual, 0) AS animals_manual,
+                  COALESCE(f.animals_auto, 0) AS animals_auto,
+                  COALESCE(m.people_no_face_manual, 0) AS people_no_face_manual,
+                  {has_person_binding_sql} AS has_person_binding
+                  {group_path_select}
+                FROM files f
+                LEFT JOIN files_manual_labels m ON m.pipeline_run_id = ? AND m.file_id = f.id
+                {group_path_subquery}
+                WHERE (f.status IS NULL OR f.status != 'deleted')
+                  AND COALESCE(f.inventory_scope, '') = 'source' AND f.last_run_id = ?
+                """,
+                (int(pipeline_run_id), ignored_person_id_fill, face_run_id_i, ignored_person_id_fill, int(pipeline_run_id), int(pipeline_run_id), int(dedup_run_id)),
+            )
+        else:
+            cur.execute(
+                f"""
+                SELECT
+                  f.id, f.path, f.name, f.parent_path,
+                  COALESCE(m.faces_manual_label, '') AS faces_manual_label,
+                  COALESCE(m.quarantine_manual, 0) AS quarantine_manual,
+                  COALESCE(f.faces_auto_quarantine, 0) AS faces_auto_quarantine,
+                  COALESCE(f.faces_count, 0) AS faces_count,
+                  COALESCE(m.animals_manual, 0) AS animals_manual,
+                  COALESCE(f.animals_auto, 0) AS animals_auto,
+                  COALESCE(m.people_no_face_manual, 0) AS people_no_face_manual,
+                  {has_person_binding_sql} AS has_person_binding
+                  {group_path_select}
+                FROM files f
+                LEFT JOIN files_manual_labels m ON m.pipeline_run_id = ? AND m.file_id = f.id
+                {group_path_subquery}
+                WHERE (f.status IS NULL OR f.status != 'deleted') AND f.path LIKE ? AND f.faces_run_id = ?
+                """,
+                (int(pipeline_run_id), ignored_person_id_fill, face_run_id_i, ignored_person_id_fill, int(pipeline_run_id), int(pipeline_run_id), root_like, face_run_id_i),
+            )
+        rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        ds.close()
+        ps.close()
+
+    # #region agent log
+    try:
+        _dl = open(r"c:\Projects\PhotoSorter\.cursor\debug.log", "a", encoding="utf-8")
+        _dl.write(json.dumps({"hypothesisId": "H3,H4", "location": "faces.py:fill", "message": "fill query result", "data": {"len_rows": len(rows), "dedup_run_id": dedup_run_id, "pipeline_run_id": pipeline_run_id, "first_id": rows[0].get("id") if rows else None}, "timestamp": time.time()}, ensure_ascii=False) + "\n")
+        _dl.close()
+    except Exception:
+        pass
+    # #endregion
+
+    target_folders = list_folders(role="target")
+    filled_count = 0
+    errors: list[dict[str, str]] = []
+    step4_total_rows = len(rows)
+    _step4_progress_interval = 10  # обновлять прогресс в БД каждые N файлов (главная страница)
+    ds = DedupStore()
+    try:
         for r in rows:
             path = str(r.get("path") or "")
             if not path:
                 continue
+            file_id = r.get("id")
+            if file_id is None:
+                continue
 
-            # Проверяем, есть ли файл в preclean_moves (шаг 1)
+            # То же правило, что в отладочном скрипте (new_target_folder)
             preclean_kind = preclean_map.get(path)
-
-            # Определяем effective_tab (шаг 3)
             effective_tab = "no_faces"
             if preclean_kind:
-                # Файл уже обработан на шаге 1, пропускаем шаг 3
                 effective_tab = None
             elif r.get("people_no_face_manual"):
                 effective_tab = "people_no_face"
@@ -4000,61 +4178,195 @@ def api_faces_sort_into_folders(payload: dict[str, Any] = Body(...)) -> dict[str
                 effective_tab = "faces"
             elif (r.get("faces_manual_label") or "").lower().strip() == "no_faces":
                 effective_tab = "no_faces"
-            elif r.get("quarantine_manual") and r.get("faces_count", 0) > 0:
+            elif r.get("quarantine_manual") and (r.get("faces_count") or 0) > 0:
                 effective_tab = "quarantine"
             elif r.get("animals_manual") or r.get("animals_auto"):
                 effective_tab = "animals"
-            elif r.get("faces_auto_quarantine") and r.get("faces_count", 0) > 0:
+            elif (r.get("faces_auto_quarantine") or 0) and (r.get("faces_count") or 0) > 0:
                 effective_tab = "quarantine"
-            elif r.get("faces_count", 0) > 0:
+            elif (r.get("faces_count") or 0) > 0:
+                effective_tab = "faces"
+            # Файлы с привязкой к персоне (file_persons или лица): раскладываем по правилам, не в _people_no_face
+            if r.get("has_person_binding") and effective_tab in ("no_faces", "people_no_face"):
                 effective_tab = "faces"
 
-            files_data.append(
-                {
-                    "path": path,
-                    "name": str(r.get("name") or ""),
-                    "parent_path": str(r.get("parent_path") or ""),
-                    "effective_tab": effective_tab,
-                    "preclean_kind": preclean_kind,
-                }
-            )
+            person_name = None
+            if effective_tab == "faces":
+                try:
+                    person_name = _resolve_target_folder_for_faces(
+                        conn,
+                        file_id=int(file_id),
+                        pipeline_run_id=int(pipeline_run_id),
+                        face_run_id=face_run_id_i,
+                        target_folders=target_folders,
+                    )
+                except Exception as e:
+                    errors.append({
+                        "path": path,
+                        "file_id": file_id,
+                        "error": f"{type(e).__name__}: {e}",
+                        "traceback": traceback.format_exc(),
+                    })
+                    # Не подставляем «Другие люди» — файл остаётся без target_folder, причину смотрим в errors
+                    continue
 
+            # Вычисляем target_folder по тому же правилу, что new_target_folder в скрипте
+            # Для no_faces передаём group_path: поездки → Путешествия/..., остальное → под корнем; без группы — несортировано
+            group_path_val = (r.get("group_path") or "").strip() or None
+            target_folder = _determine_target_folder(
+                path=path,
+                effective_tab=effective_tab or "no_faces",
+                root_path=root_path,
+                preclean_kind=preclean_kind,
+                person_name=person_name,
+                target_folders=target_folders,
+                group_path=group_path_val,
+            )
+            if not target_folder:
+                # #region agent log
+                try:
+                    _dl = open(r"c:\Projects\PhotoSorter\.cursor\debug.log", "a", encoding="utf-8")
+                    _dl.write(json.dumps({"hypothesisId": "H4", "location": "faces.py:fill skip", "message": "skip no target_folder", "data": {"file_id": file_id, "path": path[:80]}, "timestamp": time.time()}, ensure_ascii=False) + "\n")
+                    _dl.close()
+                except Exception:
+                    pass
+                # #endregion
+                continue
+            try:
+                ds.set_target_folder(file_id=int(file_id), target_folder=target_folder)
+                filled_count += 1
+                # Прогресс шага 4 на главной: обновляем run в БД периодически
+                if filled_count == 1 or filled_count % _step4_progress_interval == 0 or filled_count == step4_total_rows:
+                    # #region agent log
+                    try:
+                        _dl = open(r"c:\Projects\PhotoSorter\.cursor\debug.log", "a", encoding="utf-8")
+                        _dl.write(json.dumps({"hypothesisId": "H1,H4", "location": "faces.py:fill progress", "message": "writing step4 progress to DB", "data": {"filled_count": filled_count, "step4_total_rows": step4_total_rows}, "timestamp": time.time()}, ensure_ascii=False) + "\n")
+                        _dl.close()
+                    except Exception:
+                        pass
+                    # #endregion
+                    ps_prog = PipelineStore()
+                    try:
+                        ps_prog.update_run(
+                            run_id=int(pipeline_run_id),
+                            step4_processed=filled_count,
+                            step4_total=step4_total_rows or None,
+                        )
+                    finally:
+                        ps_prog.close()
+            except sqlite3.OperationalError as e:
+                # Не глушить «database is locked» — пробросить, чтобы пользователь видел ошибку
+                if "locked" in str(e).lower():
+                    raise
+                errors.append({"path": path, "error": f"{type(e).__name__}: {e}"})
+            except Exception as e:
+                errors.append({"path": path, "error": f"{type(e).__name__}: {e}"})
     finally:
         ds.close()
-        fs.close()
-        ps.close()
+    try:
+        conn.close()
+    except Exception:
+        pass
 
-    # Определяем целевую папку для каждого файла и перемещаем
+    return {"ok": True, "filled_count": filled_count, "errors": errors}
+
+
+@router.post("/api/faces/fill-target-folders")
+def api_faces_fill_target_folders(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    HTTP-обёртка: заполняет target_folder в БД (см. fill_target_folders_impl).
+    Параметры: pipeline_run_id (int). Возвращает: filled_count, errors.
+    """
+    pipeline_run_id = payload.get("pipeline_run_id")
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required")
+    try:
+        return fill_target_folders_impl(pipeline_run_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+def sort_into_folders_impl(
+    pipeline_run_id: int,
+    dry_run: bool = False,
+    destination: str | None = None,
+) -> dict[str, Any]:
+    """
+    Перемещает файлы с заполненным target_folder.
+    Вызывается из API и из local_pipeline напрямую (без HTTP), чтобы избежать дедлока.
+    Возвращает: {"ok": True, "moved_count": N, "errors": [...]} или raises ValueError.
+    """
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise ValueError("pipeline_run_id not found")
+    face_run_id = pr.get("face_run_id")
+    if not face_run_id:
+        raise ValueError("face_run_id is not set yet (step 3 not started)")
+    face_run_id_i = int(face_run_id)
+    root_path = str(pr.get("root_path") or "")
+    dedup_run_id = pr.get("dedup_run_id")
+    if dedup_run_id is None:
+        raise ValueError("dedup_run_id is not set (step 1 not started)")
+
+    ds = DedupStore()
+    try:
+        cur = ds.conn.cursor()
+        cur.execute(
+            """
+            SELECT id, path, name, target_folder
+            FROM files
+            WHERE COALESCE(inventory_scope, '') = 'source' AND last_run_id = ?
+              AND (status IS NULL OR status != 'deleted')
+              AND target_folder IS NOT NULL AND trim(target_folder) != ''
+            """,
+            (int(dedup_run_id),),
+        )
+        files_to_move = [dict(r) for r in cur.fetchall()]
+    finally:
+        ds.close()
+
+    if destination == "local":
+        files_to_move = [
+            r for r in files_to_move
+            if not (str(r.get("target_folder") or "").strip().startswith("disk:"))
+        ]
+    elif destination == "archive":
+        files_to_move = [
+            r for r in files_to_move
+            if (str(r.get("target_folder") or "").strip().startswith("disk:/Фото"))
+        ]
+
+    if not files_to_move:
+        msg = "Нет файлов с заполненным target_folder. Сначала нажмите «Заполнить целевые папки»."
+        if destination == "local":
+            msg = "Нет файлов для перемещения локально (целевая папка под корнем прогона)."
+        elif destination == "archive":
+            msg = "Нет файлов для перемещения в фотоархив (целевая папка disk:/Фото/...)."
+        raise ValueError(msg)
+
     moved_count = 0
     errors: list[dict[str, str]] = []
     disk = None
+    # Прогресс шага 4: 50–100% = move; step4_total в БД = 2*кол-во файлов, fill_total = step4_total//2
+    step4_total_db = int(pr.get("step4_total") or 0)
+    fill_total = (step4_total_db // 2) if step4_total_db >= 2 else 0
+    _step4_move_progress_interval = 20  # обновлять прогресс в БД каждые N перемещённых файлов
 
-    for file_data in files_data:
-        path = file_data["path"]
-        target_folder = _determine_target_folder(
-            path=path,
-            effective_tab=file_data["effective_tab"],
-            root_path=root_path,
-            preclean_kind=file_data.get("preclean_kind"),
-        )
-
-        if not target_folder:
-            continue  # Пропускаем файлы, для которых не определена целевая папка
-
-        # Формируем путь назначения
-        file_name = file_data["name"]
-        if not file_name:
-            file_name = os.path.basename(path)
-
-        # Если файл уже в целевой папке, пропускаем
+    for row in files_to_move:
+        path = str(row["path"] or "")
+        file_name = str(row.get("name") or "") or os.path.basename(path)
+        target_folder = str(row.get("target_folder") or "").strip()
+        if not path or not target_folder:
+            continue
         if path.startswith(target_folder + "/"):
             continue
-
         dst_path = target_folder + "/" + file_name
 
-        # Перемещаем файл
         if path.startswith("disk:"):
-            # YaDisk
             if disk is None:
                 disk = get_disk()
             try:
@@ -4062,7 +4374,6 @@ def api_faces_sort_into_folders(payload: dict[str, Any] = Body(...)) -> dict[str
                     src_norm = _normalize_yadisk_path(path)
                     dst_norm = _normalize_yadisk_path(dst_path)
                     disk.move(src_norm, dst_norm, overwrite=False)
-                    # Обновляем путь в БД
                     ds = DedupStore()
                     try:
                         ds.update_path(
@@ -4076,50 +4387,41 @@ def api_faces_sort_into_folders(payload: dict[str, Any] = Body(...)) -> dict[str
                             old_path=path,
                             new_path=dst_path,
                         )
+                        # Не очищаем target_folder после перемещения — отчёт шага 4 показывает распределение по папкам
                     finally:
                         ds.close()
-                    # Обновляем пути в gold файлах
                     _update_gold_file_paths(old_path=path, new_path=dst_path)
                 moved_count += 1
+                if fill_total > 0 and (moved_count % _step4_move_progress_interval == 0 or moved_count == len(files_to_move)):
+                    ps_move = PipelineStore()
+                    try:
+                        ps_move.update_run(run_id=pipeline_run_id, step4_processed=fill_total + moved_count)
+                    finally:
+                        ps_move.close()
             except Exception as e:  # noqa: BLE001
                 errors.append({"path": path, "error": f"{type(e).__name__}: {e}"})
         elif path.startswith("local:"):
-            # Локальный файл
-            local_path = path[6:]  # убираем "local:"
+            local_path = path[6:]
             if not os.path.exists(local_path):
                 errors.append({"path": path, "error": "File not found"})
                 continue
-            # target_folder может быть "local:C:\tmp\Photo\_faces" или "disk:/Фото/_faces"
             if target_folder.startswith("local:"):
-                # target_folder уже локальный путь к папке, добавляем имя файла
-                dst_local = os.path.join(target_folder[6:], file_name)  # убираем "local:" и добавляем file_name
+                dst_local = os.path.join(target_folder[6:], file_name)
             elif target_folder.startswith("disk:"):
-                # target_folder это путь YaDisk, нужно преобразовать в локальный
-                # target_folder = "disk:/Фото/_faces" -> "_faces"
                 folder_name = os.path.basename(target_folder)
-                # Используем root_path для формирования локального пути
-                root_path_clean = root_path
-                if root_path.startswith("local:"):
-                    root_path_clean = root_path[6:]  # убираем "local:"
+                root_path_clean = root_path[6:] if root_path.startswith("local:") else root_path
                 if root_path_clean and not root_path_clean.startswith("disk:"):
-                    # root_path локальный, например "C:\tmp\Photo"
                     dst_local = os.path.join(root_path_clean, folder_name, file_name)
                 else:
-                    # Fallback: используем имя папки из target_folder
                     dst_local = os.path.join(os.path.dirname(local_path), folder_name, file_name)
             else:
-                # target_folder уже локальный путь без префикса
                 dst_local = os.path.join(target_folder, file_name)
             dst_dir = os.path.dirname(dst_local)
-            # Проверяем, существует ли путь и что это (файл или директория)
             if os.path.exists(dst_dir):
                 if not os.path.isdir(dst_dir):
-                    # Путь существует, но это файл, а не директория
                     errors.append({"path": path, "error": f"Path {dst_dir} exists but is a file, not a directory"})
                     continue
-                # Директория уже существует, продолжаем
             else:
-                # Директории нет, создаём
                 try:
                     os.makedirs(dst_dir, exist_ok=True)
                 except Exception as e:  # noqa: BLE001
@@ -4128,7 +4430,6 @@ def api_faces_sort_into_folders(payload: dict[str, Any] = Body(...)) -> dict[str
             if not dry_run:
                 try:
                     os.rename(local_path, dst_local)
-                    # Обновляем путь в БД
                     new_db_path = "local:" + dst_local
                     ds = DedupStore()
                     try:
@@ -4143,6 +4444,7 @@ def api_faces_sort_into_folders(payload: dict[str, Any] = Body(...)) -> dict[str
                             old_path=path,
                             new_path=new_db_path,
                         )
+                        # Не очищаем target_folder после перемещения — отчёт шага 4 показывает распределение по папкам
                     finally:
                         ds.close()
                     fs = FaceStore()
@@ -4150,14 +4452,17 @@ def api_faces_sort_into_folders(payload: dict[str, Any] = Body(...)) -> dict[str
                         fs.update_file_path(old_file_path=path, new_file_path=new_db_path)
                     finally:
                         fs.close()
-                    # Обновляем пути в gold файлах
-                    _update_gold_file_paths(old_path=path, new_path=new_db_path)
-                    # Обновляем пути в gold файлах
                     _update_gold_file_paths(old_path=path, new_path=new_db_path)
                 except Exception as e:  # noqa: BLE001
                     errors.append({"path": path, "error": f"{type(e).__name__}: {e}"})
                     continue
             moved_count += 1
+            if fill_total > 0 and (moved_count % _step4_move_progress_interval == 0 or moved_count == len(files_to_move)):
+                ps_move = PipelineStore()
+                try:
+                    ps_move.update_run(run_id=pipeline_run_id, step4_processed=fill_total + moved_count)
+                finally:
+                    ps_move.close()
 
     return {
         "ok": True,
@@ -4166,6 +4471,237 @@ def api_faces_sort_into_folders(payload: dict[str, Any] = Body(...)) -> dict[str
         "moved_count": moved_count,
         "errors": errors,
     }
+
+
+@router.post("/api/faces/sort-into-folders")
+def api_faces_sort_into_folders(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """HTTP-обёртка: перемещает файлы по целевым папкам (см. sort_into_folders_impl)."""
+    pipeline_run_id = payload.get("pipeline_run_id")
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required")
+    dry_run = payload.get("dry_run", False)
+    destination = payload.get("destination")
+    try:
+        return sort_into_folders_impl(pipeline_run_id=pipeline_run_id, dry_run=dry_run, destination=destination)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.post("/api/faces/resort-file")
+def api_faces_resort_file(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Пересортировка одного файла: заново вычисляет target_folder (с учётом персоны),
+    записывает в БД, перемещает файл и обнуляет target_folder.
+    Используется для исправления ошибочно размещённых файлов (например, в «Другие люди» вместо «Агата»).
+
+    Параметры: pipeline_run_id (int), path (str).
+    Возвращает: ok, new_path, error (при ошибке).
+    """
+    pipeline_run_id = payload.get("pipeline_run_id")
+    path = payload.get("path")
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required")
+    if not isinstance(path, str) or not (path.startswith("local:") or path.startswith("disk:")):
+        raise HTTPException(status_code=400, detail="path must start with local: or disk:")
+
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    face_run_id = pr.get("face_run_id")
+    if not face_run_id:
+        raise HTTPException(status_code=400, detail="face_run_id is not set yet (step 3 not started)")
+    face_run_id_i = int(face_run_id)
+    root_path = str(pr.get("root_path") or "")
+
+    conn = get_connection()
+    try:
+        from common.db import _get_file_id
+
+        file_id = _get_file_id(conn, file_path=path)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if not file_id:
+        raise HTTPException(status_code=404, detail="File not found in DB by path")
+
+    ds = DedupStore()
+    ps = PipelineStore()
+    conn = get_connection()
+    try:
+        cur_preclean = ps.conn.cursor()
+        cur_preclean.execute(
+            "SELECT kind FROM preclean_moves WHERE pipeline_run_id = ? AND src_path = ?",
+            (int(pipeline_run_id), path),
+        )
+        preclean_row = cur_preclean.fetchone()
+        preclean_kind = str(preclean_row[0] or "").strip() if preclean_row else None
+
+        cur = ds.conn.cursor()
+        cur.execute(
+            """
+            SELECT
+              f.id, f.path, f.name,
+              COALESCE(m.faces_manual_label, '') AS faces_manual_label,
+              COALESCE(m.quarantine_manual, 0) AS quarantine_manual,
+              COALESCE(f.faces_auto_quarantine, 0) AS faces_auto_quarantine,
+              COALESCE(f.faces_count, 0) AS faces_count,
+              COALESCE(m.animals_manual, 0) AS animals_manual,
+              COALESCE(f.animals_auto, 0) AS animals_auto,
+              COALESCE(m.people_no_face_manual, 0) AS people_no_face_manual
+            FROM files f
+            LEFT JOIN files_manual_labels m ON m.pipeline_run_id = ? AND m.file_id = f.id
+            WHERE f.id = ?
+            """,
+            (int(pipeline_run_id), file_id),
+        )
+        r = cur.fetchone()
+    finally:
+        ds.close()
+        ps.close()
+
+    if not r:
+        raise HTTPException(status_code=404, detail="File row not found")
+    r = dict(r)
+    path = str(r.get("path") or "")
+    file_name = str(r.get("name") or "") or os.path.basename(path)
+
+    effective_tab = "no_faces"
+    if preclean_kind:
+        effective_tab = None
+    elif r.get("people_no_face_manual"):
+        effective_tab = "people_no_face"
+    elif (r.get("faces_manual_label") or "").lower().strip() == "faces":
+        effective_tab = "faces"
+    elif (r.get("faces_manual_label") or "").lower().strip() == "no_faces":
+        effective_tab = "no_faces"
+    elif r.get("quarantine_manual") and (r.get("faces_count") or 0) > 0:
+        effective_tab = "quarantine"
+    elif r.get("animals_manual") or r.get("animals_auto"):
+        effective_tab = "animals"
+    elif (r.get("faces_auto_quarantine") or 0) and (r.get("faces_count") or 0) > 0:
+        effective_tab = "quarantine"
+    elif (r.get("faces_count") or 0) > 0:
+        effective_tab = "faces"
+
+    target_folders = list_folders(role="target")
+    person_name = None
+    if effective_tab == "faces":
+        try:
+            person_name = _resolve_target_folder_for_faces(
+                conn,
+                file_id=int(file_id),
+                pipeline_run_id=int(pipeline_run_id),
+                face_run_id=face_run_id_i,
+                target_folders=target_folders,
+            )
+        except Exception as e:
+            return {"ok": False, "error": f"resolve_target_folder: {type(e).__name__}: {e}"}
+
+    target_folder = _determine_target_folder(
+        path=path,
+        effective_tab=effective_tab or "no_faces",
+        root_path=root_path,
+        preclean_kind=preclean_kind,
+        person_name=person_name,
+        target_folders=target_folders,
+    )
+    if not target_folder:
+        return {"ok": False, "error": "target_folder could not be determined"}
+
+    ds = DedupStore()
+    try:
+        ds.set_target_folder(file_id=int(file_id), target_folder=target_folder)
+    finally:
+        ds.close()
+
+    dst_path = target_folder + "/" + file_name
+    if path.startswith(target_folder + "/"):
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return {"ok": True, "new_path": path, "message": "Already in target folder"}
+
+    if path.startswith("disk:"):
+        try:
+            disk = get_disk()
+            src_norm = _normalize_yadisk_path(path)
+            dst_norm = _normalize_yadisk_path(dst_path)
+            disk.move(src_norm, dst_norm, overwrite=False)
+            ds = DedupStore()
+            try:
+                ds.update_path(old_path=path, new_path=dst_path, new_name=file_name, new_parent_path=target_folder)
+                ds.update_run_manual_labels_path(pipeline_run_id=int(pipeline_run_id), old_path=path, new_path=dst_path)
+                ds.clear_target_folder(paths=[path])
+            finally:
+                ds.close()
+            _update_gold_file_paths(old_path=path, new_path=dst_path)
+        except Exception as e:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    else:
+        local_path = path[6:]
+        if not os.path.exists(local_path):
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return {"ok": False, "error": "File not found on disk"}
+        if target_folder.startswith("local:"):
+            dst_local = os.path.join(target_folder[6:], file_name)
+        elif target_folder.startswith("disk:"):
+            folder_name = os.path.basename(target_folder)
+            root_path_clean = root_path[6:] if root_path.startswith("local:") else root_path
+            dst_local = os.path.join(root_path_clean, folder_name, file_name) if root_path_clean and not root_path_clean.startswith("disk:") else os.path.join(os.path.dirname(local_path), folder_name, file_name)
+        else:
+            dst_local = os.path.join(target_folder, file_name)
+        dst_dir = os.path.dirname(dst_local)
+        if not os.path.exists(dst_dir):
+            try:
+                os.makedirs(dst_dir, exist_ok=True)
+            except Exception as e:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return {"ok": False, "error": f"Cannot create directory: {type(e).__name__}: {e}"}
+        try:
+            os.rename(local_path, dst_local)
+            new_db_path = "local:" + dst_local
+            ds = DedupStore()
+            try:
+                ds.update_path(old_path=path, new_path=new_db_path, new_name=file_name, new_parent_path="local:" + os.path.dirname(dst_local))
+                ds.update_run_manual_labels_path(pipeline_run_id=int(pipeline_run_id), old_path=path, new_path=new_db_path)
+                ds.clear_target_folder(paths=[path])
+            finally:
+                ds.close()
+            fs = FaceStore()
+            try:
+                fs.update_file_path(old_file_path=path, new_file_path=new_db_path)
+            finally:
+                fs.close()
+            _update_gold_file_paths(old_path=path, new_path=new_db_path)
+        except Exception as e:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    try:
+        conn.close()
+    except Exception:
+        pass
+    return {"ok": True, "new_path": dst_path}
 
 
 def _update_gold_file_paths(old_path: str, new_path: str) -> int:

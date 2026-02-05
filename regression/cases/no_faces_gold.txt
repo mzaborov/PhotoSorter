@@ -20,6 +20,5 @@ local:C:\tmp\Photo\_no_faces\IMG-20250620-WA0000.jpeg
 local:C:\tmp\Photo\_no_faces\IMG-20250720-WA0014.jpg
 local:C:\tmp\Photo\_no_faces\IMG-20250920-WA0011.jpeg
 local:C:\tmp\Photo\_no_faces\IMG-20251025-WA0000.jpeg
-local:C:\tmp\Photo\_no_faces\IMG-20251111-WA0003.jpg
 local:C:\tmp\Photo\_no_faces\IMG-20251228-WA0000.jpg
 local:C:\tmp\Photo\_no_faces\IMG-20251228-WA0004.jpg

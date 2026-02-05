@@ -60,11 +60,12 @@
           <th>Путь</th>
           <th class="nowrap">Код</th>
           <th class="nowrap">Роль</th>
+          <th>Правило</th>
         </tr>
       </thead>
       <tbody>
         {% for f in folders %}
-        <tr>
+        <tr data-folder-id="{{ f.id }}">
           <td class="num">
             {% if f.sort_order is not none %}
               <span class="pill">{{ f.sort_order }}</span>
@@ -79,6 +80,10 @@
           </td>
           <td class="nowrap"><code>{{ f.code }}</code></td>
           <td class="nowrap"><span class="pill">{{ f.role }}</span></td>
+          <td class="rule-cell">
+            <input type="text" class="rule-input" value="{{ f.content_rule or '' }}" placeholder="только:[Имя]; вместе:[A,B]; содержит:[A,B]" data-folder-id="{{ f.id }}" style="width: 100%; min-width: 180px; max-width: 320px; padding: 4px 8px; border: 1px solid #e5e7eb; border-radius: 8px; font-family: ui-monospace, monospace; font-size: 12px;" />
+            <button type="button" class="btn rule-save" data-folder-id="{{ f.id }}" style="margin-top: 4px;">Сохранить</button>
+          </td>
         </tr>
         {% endfor %}
       </tbody>
@@ -393,6 +398,36 @@
         pollDedupArchiveStatusOnce();
         pollArchiveReconcileStatusOnce();
       }, DEDUP_POLL_MS);
+
+      // Сохранение правила папки (content_rule)
+      document.querySelectorAll(".rule-save").forEach((btn) => {
+        btn.addEventListener("click", async (e) => {
+          const folderId = btn.getAttribute("data-folder-id");
+          const row = btn.closest("tr");
+          const input = row?.querySelector(".rule-input");
+          if (!folderId || !input) return;
+          const value = (input.value || "").trim() || null;
+          btn.disabled = true;
+          btn.textContent = "…";
+          try {
+            const resp = await fetch(`/api/folders/${folderId}`, {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ content_rule: value }),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) throw new Error(data.detail || "HTTP " + resp.status);
+            btn.textContent = "Сохранено";
+            setTimeout(() => { btn.textContent = "Сохранить"; }, 1500);
+          } catch (err) {
+            btn.textContent = "Ошибка";
+            setTimeout(() => { btn.textContent = "Сохранить"; }, 2000);
+            setHint("Правило не сохранено: " + String(err));
+          } finally {
+            btn.disabled = false;
+          }
+        });
+      });
     </script>
   </body>
 </html>

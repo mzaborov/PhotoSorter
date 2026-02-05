@@ -1,20 +1,36 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, HTTPException, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
 
 from common.db import DedupStore, FaceStore, PipelineStore
 from web_api.routers import gold as gold_api
 
+_API_BASE = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+
 router = APIRouter()
+
+_WEB_API_DIR = Path(__file__).resolve().parents[1]
+_templates = Jinja2Templates(directory=str(_WEB_API_DIR / "templates"))
+
+
+@router.get("/sorting-folders", response_class=HTMLResponse)
+def sorting_folders_page(request: Request) -> HTMLResponse:
+    """Шаг 4 — Сортировка по финальным папкам (результаты: sorting-folders)."""
+    return _templates.TemplateResponse("sorting_folders.html", {"request": request})
 
 # Локальный "конвейер" (ML в отдельном процессе через .venv-face).
 _LOCAL_PIPELINE_EXEC = ThreadPoolExecutor(max_workers=1)
@@ -188,13 +204,254 @@ def _run_local_pipeline(*, root_path: str, apply: bool, skip_dedup: bool, no_ded
                 ps3.update_run(run_id=int(pipeline_run_id), status="failed", last_error=f"{type(e).__name__}: {e}", finished_at=_now_utc_iso())
             except sqlite3.OperationalError as e2:
                 if "locked" in str(e2).lower():
-                    pass
+                    _local_pipeline_log_append(f"ERROR: не удалось записать статус failed в БД (database is locked): {e2}\n")
+                    _local_pipeline_log_append(f"ERROR: исходная ошибка: {type(e).__name__}: {e}\n")
                 else:
                     raise
         finally:
             ps3.close()
         with _LOCAL_PIPELINE_LOCK:
             _LOCAL_PIPELINE_STATE.update({"running": False, "finished_at": _now_utc_iso(), "exit_code": 1, "error": f"{type(e).__name__}: {e}"})
+
+
+def _get_step4_total(pipeline_run_id: int) -> int | None:
+    """Возвращает общее число файлов в прогоне (total + unsorted_count) из step4-report."""
+    try:
+        req = urllib.request.Request(
+            f"{_API_BASE}/api/faces/step4-report?pipeline_run_id={pipeline_run_id}",
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode("utf-8")) if r.length else {}
+        total = data.get("total") or 0
+        unsorted = data.get("unsorted_count") or 0
+        return int(total) + int(unsorted)
+    except Exception:
+        return None
+
+
+def _run_step4_only(pipeline_run_id: int, apply: bool, clear_first: bool = False) -> None:
+    """Выполняет только шаг 4: опционально обнуление target_folder → fill-target-folders → sort-into-folders (через HTTP к API)."""
+    global _LOCAL_PIPELINE_RUN_ID  # noqa: PLW0603
+    step4_total = _get_step4_total(pipeline_run_id) or 0
+    # #region agent log
+    try:
+        _dl = open(r"c:\Projects\PhotoSorter\.cursor\debug.log", "a", encoding="utf-8")
+        _dl.write(json.dumps({"hypothesisId": "H1,H2", "location": "local_pipeline.py:_run_step4_only", "message": "step4_total from _get_step4_total", "data": {"pipeline_run_id": pipeline_run_id, "step4_total": step4_total}, "timestamp": time.time()}, ensure_ascii=False) + "\n")
+        _dl.close()
+    except Exception:
+        pass
+    # #endregion
+    with _LOCAL_PIPELINE_LOCK:
+        _LOCAL_PIPELINE_STATE.update(
+            {
+                "running": True,
+                "root_path": None,
+                "apply": bool(apply),
+                "started_at": _now_utc_iso(),
+                "finished_at": None,
+                "exit_code": None,
+                "error": None,
+                "log": "",
+                "step4_pct": 0,
+                "step4_phase": "clear" if clear_first else "fill",
+                "step4_processed": 0,
+                "step4_total": step4_total,
+            }
+        )
+        _LOCAL_PIPELINE_RUN_ID = int(pipeline_run_id)
+    # Прогресс 0–50% = fill, 50–100% = move; в БД step4_total = 2 * кол-во файлов
+    step4_total_doubled = max(0, int(step4_total) * 2)
+    with _LOCAL_PIPELINE_LOCK:
+        _LOCAL_PIPELINE_STATE["step4_total"] = step4_total_doubled
+    ps_start = PipelineStore()
+    try:
+        ps_start.update_run(run_id=pipeline_run_id, step4_processed=0, step4_total=step4_total_doubled)
+        # #region agent log
+        try:
+            _dl = open(r"c:\Projects\PhotoSorter\.cursor\debug.log", "a", encoding="utf-8")
+            _dl.write(json.dumps({"hypothesisId": "H1,H2", "location": "local_pipeline.py:after update_run start", "message": "wrote step4_processed=0 step4_total to DB", "data": {"pipeline_run_id": pipeline_run_id, "step4_total": step4_total}, "timestamp": time.time()}, ensure_ascii=False) + "\n")
+            _dl.close()
+        except Exception:
+            pass
+        # #endregion
+    finally:
+        ps_start.close()
+
+    # Не меняем status прогона в БД: при «только шаг 4» прогон остаётся completed (после шага 3),
+    # чтобы прогресс шагов 1–3 не сбрасывался в UI. Факт «шаг 4 идёт» только в _LOCAL_PIPELINE_STATE.
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=pipeline_run_id)
+        root_path = str(pr.get("root_path") or "") if pr else ""
+    finally:
+        ps.close()
+
+    _local_pipeline_log_append(f"STEP4: pipeline_run_id={pipeline_run_id} apply={apply} clear_first={clear_first} root={root_path}\n")
+
+    if clear_first:
+        _local_pipeline_log_append("STEP4: clear-target-folders-for-run...\n")
+        try:
+            from web_api.routers.faces import clear_target_folders_for_run_impl as _clear_impl
+            data_clear = _clear_impl(pipeline_run_id)
+        except Exception as e_clear:
+            err_clear = str(e_clear)
+            _local_pipeline_log_append(f"STEP4: clear-target-folders error: {err_clear}\n")
+            with _LOCAL_PIPELINE_LOCK:
+                _LOCAL_PIPELINE_STATE.update({"running": False, "finished_at": _now_utc_iso(), "exit_code": 1, "error": err_clear})
+            ps_clear = PipelineStore()
+            try:
+                ps_clear.update_run(run_id=pipeline_run_id, status="failed", last_error=err_clear or "clear-target-folders failed", finished_at=_now_utc_iso())
+            finally:
+                ps_clear.close()
+            return
+        cleared = data_clear.get("cleared_count") or 0
+        _local_pipeline_log_append(f"STEP4: cleared target_folder for {cleared} files\n")
+        with _LOCAL_PIPELINE_LOCK:
+            _LOCAL_PIPELINE_STATE["step4_pct"] = 15
+            _LOCAL_PIPELINE_STATE["step4_phase"] = "fill"
+        ps_clear2 = PipelineStore()
+        try:
+            ps_clear2.update_run(run_id=pipeline_run_id, step4_processed=0)
+        finally:
+            ps_clear2.close()
+
+    def _post(path: str, body: dict[str, Any]) -> tuple[bool, dict[str, Any] | None, str]:
+        req = urllib.request.Request(
+            f"{_API_BASE}{path}",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                data = json.loads(r.read().decode("utf-8")) if r.length else {}
+                return True, data, ""
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode("utf-8")
+                try:
+                    err_data = json.loads(err_body)
+                    msg = err_data.get("detail", err_body)
+                except Exception:
+                    msg = err_body
+            except Exception:
+                msg = str(e)
+            return False, None, msg
+        except Exception as e:
+            return False, None, str(e)
+
+    # 1) Заполнить целевые папки (прямой вызов, без HTTP — иначе дедлок при одном воркере)
+    with _LOCAL_PIPELINE_LOCK:
+        _LOCAL_PIPELINE_STATE["step4_pct"] = 25
+        _LOCAL_PIPELINE_STATE["step4_phase"] = "fill"
+    _local_pipeline_log_append("STEP4: fill-target-folders...\n")
+    # Ленивый импорт, чтобы избежать циклических зависимостей при загрузке модуля
+    try:
+        from web_api.routers.faces import fill_target_folders_impl as _fill_impl
+    except ImportError as _e_imp:
+        _local_pipeline_log_append(f"STEP4: ImportError fill_target_folders_impl: {_e_imp}\n")
+        try:
+            _dl = open(r"c:\Projects\PhotoSorter\.cursor\debug.log", "a", encoding="utf-8")
+            _dl.write(json.dumps({"location": "local_pipeline.py:fill import", "message": "ImportError", "data": {"error": str(_e_imp)}, "timestamp": time.time()}, ensure_ascii=False) + "\n")
+            _dl.close()
+        except Exception:
+            pass
+        raise RuntimeError(f"Не удалось загрузить fill_target_folders_impl: {_e_imp}") from _e_imp
+    try:
+        try:
+            _dl = open(r"c:\Projects\PhotoSorter\.cursor\debug.log", "a", encoding="utf-8")
+            _dl.write(json.dumps({"location": "local_pipeline.py:before fill call", "message": "calling fill_target_folders_impl", "data": {"pipeline_run_id": pipeline_run_id}, "timestamp": time.time()}, ensure_ascii=False) + "\n")
+            _dl.close()
+        except Exception:
+            pass
+        data_fill = _fill_impl(pipeline_run_id)
+    except Exception as e:
+        err_fill = str(e)
+        # #region agent log
+        try:
+            _dl = open(r"c:\Projects\PhotoSorter\.cursor\debug.log", "a", encoding="utf-8")
+            _dl.write(json.dumps({"hypothesisId": "fill-fail", "location": "local_pipeline.py:fill except", "message": "fill_target_folders_impl raised", "data": {"error": err_fill, "type": type(e).__name__}, "timestamp": time.time()}, ensure_ascii=False) + "\n")
+            _dl.close()
+        except Exception:
+            pass
+        # #endregion
+        _local_pipeline_log_append(f"STEP4: fill-target-folders error: {err_fill}\n")
+        with _LOCAL_PIPELINE_LOCK:
+            _LOCAL_PIPELINE_STATE.update({"running": False, "finished_at": _now_utc_iso(), "exit_code": 1, "error": err_fill})
+        ps2 = PipelineStore()
+        try:
+            try:
+                ps2.update_run(run_id=pipeline_run_id, status="failed", last_error=err_fill or "fill-target-folders failed", finished_at=_now_utc_iso())
+            except sqlite3.OperationalError as e2:
+                if "locked" in str(e2).lower():
+                    # Не глушить: пишем в лог прогона, чтобы пользователь видел и блокировку, и исходную ошибку
+                    _local_pipeline_log_append(f"STEP4: не удалось записать статус failed в БД (database is locked): {e2}\n")
+                    _local_pipeline_log_append(f"STEP4: исходная ошибка: {err_fill}\n")
+                else:
+                    raise
+        finally:
+            ps2.close()
+        return
+    filled = data_fill.get("filled_count") or 0
+    _local_pipeline_log_append(f"STEP4: fill-target-folders ok, filled={filled}\n")
+    with _LOCAL_PIPELINE_LOCK:
+        _LOCAL_PIPELINE_STATE["step4_pct"] = 50
+        _LOCAL_PIPELINE_STATE["step4_phase"] = "move"
+        _LOCAL_PIPELINE_STATE["step4_processed"] = filled
+        step4_total_state = _LOCAL_PIPELINE_STATE.get("step4_total")
+        if step4_total_state is None:
+            _LOCAL_PIPELINE_STATE["step4_total"] = max(filled * 2, filled)
+            step4_total_state = _LOCAL_PIPELINE_STATE["step4_total"]
+    ps_fill = PipelineStore()
+    try:
+        ps_fill.update_run(run_id=pipeline_run_id, step4_processed=int(filled), step4_total=int(step4_total_state))
+    finally:
+        ps_fill.close()
+
+    # 2) Переместить локально (прямой вызов, без HTTP — иначе дедлок при одном воркере)
+    with _LOCAL_PIPELINE_LOCK:
+        _LOCAL_PIPELINE_STATE["step4_pct"] = 55
+    _local_pipeline_log_append("STEP4: sort-into-folders (destination=local)...\n")
+    try:
+        from web_api.routers.faces import sort_into_folders_impl as _sort_impl
+        data_sort = _sort_impl(pipeline_run_id=pipeline_run_id, dry_run=not apply, destination="local")
+    except Exception as e_sort:
+        err_sort = str(e_sort)
+        _local_pipeline_log_append(f"STEP4: sort-into-folders error: {err_sort}\n")
+        with _LOCAL_PIPELINE_LOCK:
+            _LOCAL_PIPELINE_STATE.update({"running": False, "finished_at": _now_utc_iso(), "exit_code": 1, "error": err_sort})
+        ps3 = PipelineStore()
+        try:
+            ps3.update_run(run_id=pipeline_run_id, status="failed", last_error=err_sort or "sort-into-folders failed", finished_at=_now_utc_iso())
+        finally:
+            ps3.close()
+        return
+    moved = data_sort.get("moved_count") or 0
+    _local_pipeline_log_append(f"STEP4: sort-into-folders ok, moved={moved}\n")
+
+    step4_total_final = _LOCAL_PIPELINE_STATE.get("step4_total") or 0
+    with _LOCAL_PIPELINE_LOCK:
+        _LOCAL_PIPELINE_STATE.update({
+            "running": False,
+            "finished_at": _now_utc_iso(),
+            "exit_code": 0,
+            "error": None,
+            "step4_pct": 100,
+            "step4_processed": int(step4_total_final),
+        })
+    ps4 = PipelineStore()
+    try:
+        ps4.update_run(
+            run_id=pipeline_run_id,
+            status="completed",
+            last_error="",
+            finished_at=_now_utc_iso(),
+            step4_processed=int(step4_total_final),
+            step4_total=int(step4_total_final),
+        )
+    finally:
+        ps4.close()
 
 
 @router.post("/api/local-pipeline/start")
@@ -387,6 +644,8 @@ def api_local_pipeline_start(payload: dict[str, Any] = Body(...)) -> dict[str, A
     except Exception:
         pass
 
+    # При resume: если шаг 3 уже выполнен (face_run_id задан), продолжаем только шаг 4 (не перезапускаем 1–3).
+    run_only_step4 = bool(resumed) and pr is not None and pr.get("face_run_id")
     global _LOCAL_PIPELINE_FUTURE  # noqa: PLW0603
     with _LOCAL_PIPELINE_LOCK:
         fut = _LOCAL_PIPELINE_FUTURE
@@ -394,18 +653,25 @@ def api_local_pipeline_start(payload: dict[str, Any] = Body(...)) -> dict[str, A
             return {"ok": False, "message": "local pipeline already running"}
         global _LOCAL_PIPELINE_RUN_ID  # noqa: PLW0603
         _LOCAL_PIPELINE_RUN_ID = int(pipeline_run_id)
-        _LOCAL_PIPELINE_FUTURE = _LOCAL_PIPELINE_EXEC.submit(
-            _run_local_pipeline,
-            root_path=root_path,
-            apply=apply,
-            skip_dedup=skip_dedup,
-            no_dedup_move=no_dedup_move,
-            pipeline_run_id=int(pipeline_run_id),
-        )
+        if run_only_step4:
+            _LOCAL_PIPELINE_FUTURE = _LOCAL_PIPELINE_EXEC.submit(
+                _run_step4_only,
+                pipeline_run_id=int(pipeline_run_id),
+                apply=apply,
+            )
+        else:
+            _LOCAL_PIPELINE_FUTURE = _LOCAL_PIPELINE_EXEC.submit(
+                _run_local_pipeline,
+                root_path=root_path,
+                apply=apply,
+                skip_dedup=skip_dedup,
+                no_dedup_move=no_dedup_move,
+                pipeline_run_id=int(pipeline_run_id),
+            )
 
     return {
         "ok": True,
-        "message": "started",
+        "message": "step4_only" if run_only_step4 else "started",
         "run_id": int(pipeline_run_id),
         "resumed": bool(resumed),
         "start_mode": start_mode or ("continue" if resumed else "new"),
@@ -413,6 +679,53 @@ def api_local_pipeline_start(payload: dict[str, Any] = Body(...)) -> dict[str, A
         "apply": apply,
         "skip_dedup": skip_dedup,
         "no_dedup_move": no_dedup_move,
+    }
+
+
+@router.post("/api/local-pipeline/start-step4")
+def api_local_pipeline_start_step4(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Запускает только шаг 4 (заполнить целевые папки → переместить локально).
+    Требуется pipeline_run_id с уже выполненным шагом 3 (face_run_id задан).
+    """
+    pipeline_run_id = payload.get("pipeline_run_id")
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required")
+    apply = bool(payload.get("apply") or False)
+    clear_first = bool(payload.get("clear_first") or False)
+
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+    finally:
+        ps.close()
+    if not pr:
+        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    if str(pr.get("kind") or "") != "local_sort":
+        raise HTTPException(status_code=400, detail="run is not local_sort")
+    if not pr.get("face_run_id"):
+        raise HTTPException(status_code=400, detail="face_run_id not set (step 3 not done); run full pipeline first")
+
+    global _LOCAL_PIPELINE_FUTURE  # noqa: PLW0603
+    with _LOCAL_PIPELINE_LOCK:
+        fut = _LOCAL_PIPELINE_FUTURE
+        if fut is not None and not fut.done():
+            return {"ok": False, "message": "local pipeline or step4 already running", "run_id": int(pipeline_run_id)}
+        global _LOCAL_PIPELINE_RUN_ID  # noqa: PLW0603
+        _LOCAL_PIPELINE_RUN_ID = int(pipeline_run_id)
+        _LOCAL_PIPELINE_FUTURE = _LOCAL_PIPELINE_EXEC.submit(
+            _run_step4_only,
+            pipeline_run_id=int(pipeline_run_id),
+            apply=apply,
+            clear_first=clear_first,
+        )
+
+    return {
+        "ok": True,
+        "message": "step4 started",
+        "run_id": int(pipeline_run_id),
+        "apply": apply,
+        "clear_first": clear_first,
     }
 
 
@@ -449,6 +762,7 @@ def api_local_pipeline_status() -> dict[str, Any]:
             "step": {"num": 0, "total": 0, "title": ""},
             "step1": {"status": "idle", "pct": 0, "processed": None, "total": None},
             "step2": {"status": "idle", "pct": 0, "images": None, "total": None, "faces": None},
+            "step3": {"status": "idle", "pct": 0},
             "log_tail": "",
         }
 
@@ -584,7 +898,15 @@ def api_local_pipeline_status() -> dict[str, Any]:
 
     scan_pct = _scan_pct()
     is_split_phase = "разлож" in step_title.lower()
+    # Шаг 4 идёт отдельно (без смены status в БД): определяем по in-memory state.
+    step4_only_running = (
+        not running
+        and _LOCAL_PIPELINE_RUN_ID is not None
+        and pr.get("id") == _LOCAL_PIPELINE_RUN_ID
+        and _LOCAL_PIPELINE_STATE.get("running") is True
+    )
 
+    # Шаг 3 (лица): при failed прогоне считаем выполненным, если дошли до step_num >= 2; ошибку относим к шагу 4.
     if status == "completed":
         step2_pct = 100
         step2_status = "done"
@@ -598,13 +920,55 @@ def api_local_pipeline_status() -> dict[str, Any]:
             if is_split_phase:
                 step2_pct = max(step2_pct, 95)
     elif status == "failed":
-        step2_status = "error" if step_num >= 2 else "idle"
-        step2_pct = scan_pct
+        if step_num >= 2:
+            step2_status = "done"
+            step2_pct = 100
+        else:
+            step2_status = "error" if step_num >= 2 else "idle"
+            step2_pct = scan_pct
         if is_split_phase:
             step2_pct = max(step2_pct, 95)
     else:
         step2_pct = 0
         step2_status = "idle"
+
+    # Шаг 4 (разложить по правилам): при step4_only_running показываем running и прогресс из БД (видят все воркеры).
+    step3_processed = None
+    step3_total = None
+    if step4_only_running:
+        step3_status = "running"
+        step3_processed = pr.get("step4_processed")
+        step3_total = pr.get("step4_total")
+        if step3_total is not None and int(step3_total) > 0 and step3_processed is not None:
+            step3_pct = int(round((int(step3_processed) / int(step3_total)) * 100))
+            step3_pct = max(0, min(100, step3_pct))
+        else:
+            step3_pct = int(_LOCAL_PIPELINE_STATE.get("step4_pct") or 0)
+            step3_pct = max(0, min(100, step3_pct))
+        # #region agent log
+        try:
+            _dl = open(r"c:\Projects\PhotoSorter\.cursor\debug.log", "a", encoding="utf-8")
+            _dl.write(json.dumps({"hypothesisId": "H1,H3", "location": "local_pipeline.py:status step4", "message": "step4 progress from pr", "data": {"step4_processed": step3_processed, "step4_total": step3_total, "step3_pct": step3_pct, "run_id": pr.get("id")}, "timestamp": time.time()}, ensure_ascii=False) + "\n")
+            _dl.close()
+        except Exception:
+            pass
+        # #endregion
+    elif status == "completed":
+        step3_status = "done"
+        step3_pct = 100
+    elif status == "failed" and step_num >= 2:
+        step3_status = "error"
+        step3_pct = 0
+    elif running and step_num >= 2:
+        step3_status = "pending" if not is_split_phase else "running"
+        step3_pct = 0
+    else:
+        step3_status = "idle"
+        step3_pct = 0
+
+    # Чтобы главная страница показывала «прогон идёт», возвращаем running=True и при только шаге 4.
+    if step4_only_running:
+        running = True
 
     plan_total = 6
     if "предочист" in title_l:
@@ -636,6 +1000,8 @@ def api_local_pipeline_status() -> dict[str, Any]:
         "step0": {"status": step0_status, "pct": step0_pct, "checked": step0_checked, "non_media": step0_non_media, "broken_media": step0_broken_media},
         "step1": {"status": step1_status, "pct": step1_pct, "processed": dedup_proc, "total": dedup_total},
         "step2": {"status": step2_status, "pct": step2_pct, "images": faces_img, "total": faces_total, "faces": faces_found},
+        "step3": {"status": step3_status, "pct": step3_pct, "processed": step3_processed, "total": step3_total},
+        "face_run_id": int(face_run_id) if face_run_id else None,
         "debug": {"video_samples_env": video_samples_env, "cmd_has_video_samples": cmd_has_video_samples, "cmd_video_samples": cmd_video_samples},
         "log_tail": log_tail,
     }

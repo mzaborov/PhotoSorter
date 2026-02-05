@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>PhotoSorter — Шаг 4: Сортировка по финальным папкам</title>
+    <style>
+      :root { color-scheme: light; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      a { color: #0b57d0; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+      .muted { color: #6b7280; }
+      .wrap { max-width: 1400px; }
+      .header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+      .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f3f4f6; color: #374151; font-size: 12px; }
+      .btn { appearance: none; border: 1px solid #d1d5db; background: #fff; padding: 8px 12px; border-radius: 10px; cursor: pointer; font-weight: 700; }
+      .btn:hover { background: #f9fafb; }
+      .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+      .btn.primary { border-color: #c7d2fe; background: #eef2ff; }
+      .btn.primary:hover { background: #e0e7ff; }
+      .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+      .section { margin-top: 16px; border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px 14px; background: #fff; }
+      .section h3 { margin: 0 0 8px 0; font-size: 14px; }
+      .report-summary { margin-bottom: 10px; font-size: 13px; color: #374151; }
+      .tabs { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+      .tab { appearance: none; border: 1px solid #d1d5db; background: #fff; padding: 8px 14px; border-radius: 999px; cursor: pointer; font-weight: 700; }
+      .tab.active { background: #111827; color: #fff; border-color: #111827; }
+      .tab-panel { display: none; margin-top: 12px; }
+      .tab-panel.active { display: block; }
+      .folder-tree { margin-top: 8px; }
+      .folder-tree-node { margin-left: 0; margin-bottom: 4px; }
+      .folder-tree-node .folder-tree-children { margin-left: 16px; margin-top: 4px; border-left: 1px solid #e5e7eb; padding-left: 10px; }
+      .folder-tree-toggle { appearance: none; border: none; background: none; cursor: pointer; padding: 4px 6px; font-size: 12px; color: #6b7280; }
+      .folder-tree-toggle:hover { color: #111827; }
+      .folder-tree-row { display: flex; align-items: center; gap: 6px; padding: 4px 0; }
+      .folder-tree-row .folder-label { font-weight: 700; font-size: 13px; }
+      .folder-tree-row .folder-count { color: #6b7280; font-size: 12px; }
+      .subtabs-wrap { margin-top: 10px; margin-bottom: 12px; padding: 10px 12px; background: #f8fafc; border-radius: 10px; border: 1px solid #e2e8f0; }
+      .subtabs { display: flex; gap: 6px; flex-wrap: wrap; }
+      .subtabs .tab { padding: 5px 10px; font-size: 12px; font-weight: 600; border-radius: 6px; border: 1px solid #cbd5e1; background: #fff; color: #475569; }
+      .subtabs .tab:hover { background: #f1f5f9; border-color: #94a3b8; }
+      .subtabs .tab.active { background: #e0e7ff; border-color: #818cf8; color: #3730a3; }
+      .trips-subpanel { display: none; margin-top: 8px; }
+      .trips-subpanel.active { display: block; }
+      .cards { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
+      .card2 { border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; background: #fff; }
+      .thumb { height: 140px; background: #fff; display: flex; align-items: center; justify-content: center; position: relative; cursor: pointer; }
+      .thumb img { width: 100%; height: 100%; object-fit: contain; display: block; background: #fff; }
+      .thumb .noimg { color: #6b7280; font-size: 12px; padding: 10px; text-align: center; }
+      .card2-body { padding: 10px; font-size: 12px; color: #374151; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="header">
+        <div>
+          <h2 style="margin: 0;">Шаг 4 — Сортировка по финальным папкам</h2>
+          <div class="muted" style="margin-top: 6px;">Файлы с заполненной целевой папкой по вкладкам. Переместить локально или в фотоархив.</div>
+        </div>
+        <div class="muted">
+          <a href="/">← на главную</a>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <span class="pill">pipeline_run_id: <b id="prId">—</b></span>
+        <span class="pill">root: <code id="rootPath">—</code></span>
+        <button class="btn" id="btnMoveLocal" type="button" title="Переместить файлы в целевые подпапки под корнем прогона.">Переместить локально</button>
+        <button class="btn" id="btnMoveArchive" type="button" title="Переместить файлы в фотоархив disk:/Фото/...">Переместить в фотоархив</button>
+        <button class="btn" id="btnReload" type="button">Обновить отчёт</button>
+        <span class="muted" id="toast"></span>
+      </div>
+
+      <div class="section" id="reportSection">
+        <h3>Результаты: файлы с заполненной целевой папкой</h3>
+        <div class="report-summary" id="facesVsStep4Summary" style="margin-bottom: 8px;"></div>
+        <div class="report-summary" id="reportSummary">—</div>
+        <div id="tabsWrap" class="tabs" style="display: none;"></div>
+        <div id="tabPanels"></div>
+      </div>
+    </div>
+
+    {% include "photo_card.html" %}
+    <script src="/static/photo_card.js?v=48"></script>
+    <script>
+      (function () {
+        function qs(s) { return document.querySelector(s); }
+        function getParam(name) {
+          const p = new URLSearchParams(window.location.search);
+          return p.get(name);
+        }
+        function setToast(msg, isErr) {
+          const el = qs("#toast");
+          if (el) { el.textContent = msg || ""; el.style.color = isErr ? "#991b1b" : ""; }
+        }
+        async function fetchJson(url) {
+          const r = await fetch(url);
+          if (!r.ok) throw new Error(r.status + " " + r.statusText);
+          return r.json();
+        }
+        async function postJson(url, body) {
+          const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+          const raw = await r.text().catch(() => "");
+          let data = {};
+          try { if (raw) data = JSON.parse(raw); } catch (_) {}
+          return { ok: r.ok, status: r.status, ...data };
+        }
+        function escapeHtml(s) {
+          const div = document.createElement("div");
+          div.textContent = s;
+          return div.innerHTML;
+        }
+        function folderDisplayName(folderKey) {
+          const s = (folderKey || "").replace(/\\/g, "/").trim();
+          if (!s) return folderKey;
+          const parts = s.split("/").filter(Boolean);
+          if (parts.length) return parts[parts.length - 1];
+          return folderKey;
+        }
+        function previewUrl(path, runId) {
+          if (!path) return "";
+          const pathQ = "path=" + encodeURIComponent(path.startsWith("local:") || path.startsWith("disk:") ? path : "local:" + path);
+          if (path.startsWith("local:")) {
+            const base = "/api/local/preview?" + pathQ;
+            return (runId != null) ? base + "&pipeline_run_id=" + encodeURIComponent(String(runId)) : base;
+          }
+          if (path.startsWith("disk:")) return "/api/yadisk/preview-image?size=M&path=" + encodeURIComponent(path);
+          return "/api/local/preview?" + pathQ + (runId != null ? "&pipeline_run_id=" + encodeURIComponent(String(runId)) : "");
+        }
+
+        let pipelineRunId = null;
+        const rid = getParam("pipeline_run_id");
+        if (rid && /^\d+$/.test(rid)) pipelineRunId = Number(rid);
+        qs("#prId").textContent = pipelineRunId != null ? String(pipelineRunId) : "—";
+
+        if (pipelineRunId == null) {
+          qs("#btnMoveLocal").disabled = true;
+          qs("#btnMoveArchive").disabled = true;
+          setToast("Укажите pipeline_run_id в адресе: /sorting-folders?pipeline_run_id=26", true);
+        }
+
+        const UNSORTED_KEY = "__unsorted__";
+        let reportByFolder = {};
+        let reportTotal = 0;
+
+        const TRIPS_FOLDER = "Путешествия";
+        const TRIPS_OLD_PREFIX = "_no_faces/Поездки";
+        const TRIPS_OLD_PREFIX2 = "_no_faces/Путешествия";
+        function isTripsKey(key) {
+          const k = (key || "").replace(/\\/g, "/");
+          if (k.indexOf("/" + TRIPS_FOLDER + "/") >= 0 || k.endsWith("/" + TRIPS_FOLDER)) return true;
+          if (k.indexOf("\\" + TRIPS_FOLDER + "\\") >= 0 || k.endsWith("\\" + TRIPS_FOLDER)) return true;
+          if (k.indexOf("/" + TRIPS_OLD_PREFIX + "/") >= 0 || k.indexOf(TRIPS_OLD_PREFIX + "/") >= 0) return true;
+          if (k.indexOf("/" + TRIPS_OLD_PREFIX2 + "/") >= 0 || k.indexOf(TRIPS_OLD_PREFIX2 + "/") >= 0) return true;
+          if (k.endsWith("/" + TRIPS_OLD_PREFIX) || k.endsWith("/" + TRIPS_OLD_PREFIX2)) return true;
+          return false;
+        }
+
+        function tripsRelPath(key) {
+          const k = (key || "").replace(/\\/g, "/");
+          const prefixes = ["/" + TRIPS_FOLDER + "/", "/" + TRIPS_OLD_PREFIX + "/", "/" + TRIPS_OLD_PREFIX2 + "/", TRIPS_OLD_PREFIX + "/", TRIPS_OLD_PREFIX2 + "/"];
+          for (let i = 0; i < prefixes.length; i++) {
+            const idx = k.indexOf(prefixes[i]);
+            if (idx >= 0) return k.slice(idx + prefixes[i].length);
+          }
+          if (k.endsWith("/" + TRIPS_FOLDER) || k.endsWith("\\" + TRIPS_FOLDER) || k.endsWith("/" + TRIPS_OLD_PREFIX) || k.endsWith("/" + TRIPS_OLD_PREFIX2)) return "";
+          return "";
+        }
+
+        function buildTripsTree(tripsByFolder) {
+          const rootKeys = [];
+          const tree = {};
+          for (const key of Object.keys(tripsByFolder)) {
+            const rel = tripsRelPath(key);
+            const flist = tripsByFolder[key] || [];
+            if (rel === "") {
+              rootKeys.push(key);
+              continue;
+            }
+            const parts = rel.split("/").filter(Boolean);
+            let current = tree;
+            for (let i = 0; i < parts.length; i++) {
+              const name = parts[i];
+              if (!current[name]) {
+                current[name] = { key: key, name: name, files: [], filesByKey: {}, children: {} };
+              }
+              if (i === parts.length - 1) {
+                current[name].files = (current[name].files || []).concat(flist);
+                current[name].filesByKey[key] = (current[name].filesByKey[key] || []).concat(flist);
+              }
+              current = current[name].children;
+            }
+          }
+          const rootFiles = rootKeys.reduce((acc, k) => acc.concat(tripsByFolder[k] || []), []);
+          const rootFilesByKey = {};
+          rootKeys.forEach(k => { rootFilesByKey[k] = tripsByFolder[k] || []; });
+          function toArray(obj) {
+            const names = Object.keys(obj).sort();
+            return names.map(n => {
+              const node = obj[n];
+              return {
+                key: node.key,
+                name: node.name,
+                files: node.files || [],
+                filesByKey: node.filesByKey || {},
+                children: toArray(node.children || {})
+              };
+            });
+          }
+          const children = toArray(tree);
+          if (rootFiles.length === 0 && children.length === 0) return [];
+          const firstRootKey = rootKeys[0] || "";
+          return [{ key: firstRootKey, name: TRIPS_FOLDER, files: rootFiles, filesByKey: rootFilesByKey, children: children }];
+        }
+
+        function totalFilesInNode(node) {
+          let n = (node.files || []).length;
+          (node.children || []).forEach(c => { n += totalFilesInNode(c); });
+          return n;
+        }
+
+        function cardsHtmlForFiles(files, folderKey) {
+          let html = "";
+          for (const f of files || []) {
+            const path = f.path || "";
+            const name = f.name || path || "";
+            const fileId = f.id != null ? f.id : "";
+            const src = previewUrl(path, pipelineRunId);
+            const thumbHtml = src
+              ? '<img src="' + escapeHtml(src) + '" alt="" loading="lazy" />'
+              : '<span class="noimg">превью</span>';
+            html += '<div class="card2" data-path="' + escapeHtml(path) + '" data-file-id="' + escapeHtml(String(fileId)) + '" data-folder="' + escapeHtml(folderKey) + '">' +
+              '<div class="thumb" data-kind="image">' + thumbHtml + '</div>' +
+              '<div class="card2-body">' + escapeHtml(name) + '</div></div>';
+          }
+          return html;
+        }
+
+        function renderTripsTreeNode(node, expandedByDefault) {
+          const total = totalFilesInNode(node);
+          if (total === 0) return "";
+          const hasChildren = (node.children || []).length > 0;
+          const id = "ft_" + escapeHtml(node.key).replace(/[^a-zA-Z0-9_]/g, "_");
+          const expanded = !!expandedByDefault;
+          let html = '<div class="folder-tree-node" data-folder="' + escapeHtml(node.key) + '">';
+          html += '<div class="folder-tree-row">';
+          if (hasChildren) {
+            html += '<button type="button" class="folder-tree-toggle" data-toggle="' + escapeHtml(id) + '" aria-expanded="' + (expanded ? "true" : "false") + '">' + (expanded ? "▾" : "▸") + '</button>';
+          } else {
+            html += '<span class="folder-tree-toggle" style="visibility:hidden;">▸</span>';
+          }
+          html += '<span class="folder-label">' + escapeHtml(node.name) + '</span>';
+          html += '<span class="folder-count">(' + total + ')</span>';
+          html += '</div>';
+          if (hasChildren) {
+            html += '<div class="folder-tree-children" id="' + id + '" style="' + (expanded ? "" : "display:none;") + '">';
+            const fbk = node.filesByKey || {};
+            if (Object.keys(fbk).length) {
+              for (const fk of Object.keys(fbk)) {
+                html += '<div class="cards" style="margin-bottom:8px;">' + cardsHtmlForFiles(fbk[fk], fk) + '</div>';
+              }
+            }
+            (node.children || []).forEach(child => {
+              html += renderTripsTreeNode(child, false);
+            });
+            html += '</div>';
+          } else {
+            const fbk = node.filesByKey || {};
+            if (Object.keys(fbk).length) {
+              for (const fk of Object.keys(fbk)) {
+                html += '<div class="cards">' + cardsHtmlForFiles(fbk[fk], fk) + '</div>';
+              }
+            } else if ((node.files || []).length > 0) {
+              html += '<div class="cards">' + cardsHtmlForFiles(node.files, node.key) + '</div>';
+            }
+          }
+          html += '</div>';
+          return html;
+        }
+
+        function renderTabsAndPanels(byFolder, unsorted) {
+          const folders = Object.keys(byFolder).sort();
+          const hasUnsorted = Array.isArray(unsorted) && unsorted.length > 0;
+          const tripsKeys = folders.filter(isTripsKey);
+          const otherKeys = folders.filter(k => !isTripsKey(k));
+
+          const tabItems = [];
+          otherKeys.forEach(key => {
+            tabItems.push({ key: key, files: byFolder[key], isUnsorted: false, isTrips: false });
+          });
+          if (tripsKeys.length > 0) {
+            const tripsByFolder = {};
+            tripsKeys.forEach(k => { tripsByFolder[k] = byFolder[k]; });
+            const tripsTotal = tripsKeys.reduce((sum, k) => sum + (byFolder[k] || []).length, 0);
+            tabItems.push({
+              key: TRIPS_FOLDER,
+              files: [],
+              isUnsorted: false,
+              isTrips: true,
+              tripsByFolder: tripsByFolder,
+              tripsTotal: tripsTotal
+            });
+          }
+          if (hasUnsorted) {
+            tabItems.push({ key: UNSORTED_KEY, files: unsorted, isUnsorted: true, isTrips: false });
+          }
+
+          const tabsWrap = qs("#tabsWrap");
+          const tabPanels = qs("#tabPanels");
+          tabsWrap.innerHTML = "";
+          tabPanels.innerHTML = "";
+          if (tabItems.length === 0) return;
+          tabsWrap.style.display = "flex";
+
+          tabItems.forEach((item, idx) => {
+            const folderKey = item.key;
+            const files = item.files || [];
+            const total = item.isTrips ? (item.tripsTotal || 0) : files.length;
+            const label = item.isUnsorted
+              ? "Неотсортировано (нет целевой папки)"
+              : (item.isTrips ? TRIPS_FOLDER : folderDisplayName(folderKey));
+
+            const tab = document.createElement("button");
+            tab.className = "tab" + (idx === 0 ? " active" : "");
+            tab.type = "button";
+            tab.textContent = label + " (" + total + ")";
+            tab.dataset.folder = folderKey;
+            tab.title = item.isUnsorted
+              ? "Не папка в фотоархиве — файлы без целевой папки"
+              : ("Целевая папка: " + (folderKey || "").replace(/\\/g, "/"));
+            tab.dataset.tabIndex = idx;
+            tab.onclick = () => {
+              tabsWrap.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+              tabPanels.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
+              tab.classList.add("active");
+              const panel = tabPanels.children[parseInt(tab.dataset.tabIndex, 10)];
+              if (panel) panel.classList.add("active");
+            };
+            tabsWrap.appendChild(tab);
+
+            const panel = document.createElement("div");
+            panel.className = "tab-panel" + (idx === 0 ? " active" : "");
+            panel.dataset.folder = folderKey;
+
+            if (item.isUnsorted) {
+              panel.innerHTML = '<div class="cards">' + cardsHtmlForFiles(files, folderKey) + '</div>';
+            } else if (item.isTrips) {
+              const tripsTree = buildTripsTree(item.tripsByFolder);
+              const subtabItems = [];
+              tripsTree.forEach(rootNode => {
+                const rootFilesByKey = rootNode.filesByKey || {};
+                const rootKeys = Object.keys(rootFilesByKey);
+                const rootTotal = rootNode.files ? rootNode.files.length : rootKeys.reduce((s, k) => s + (rootFilesByKey[k] || []).length, 0);
+                if (rootTotal > 0) {
+                  subtabItems.push({ label: rootNode.name, filesByKey: rootFilesByKey, total: rootTotal });
+                }
+                (rootNode.children || []).forEach(child => {
+                  const fbk = child.filesByKey || {};
+                  const keys = Object.keys(fbk);
+                  const flist = keys.length ? (fbk[keys[0]] || []) : (child.files || []);
+                  const fk = keys[0] || child.key;
+                  subtabItems.push({ label: child.name, filesByKey: { [fk]: flist }, total: flist.length });
+                });
+              });
+              let panelHtml = '<div class="trips-nested">';
+              if (subtabItems.length > 0) {
+                panelHtml += '<div class="subtabs-wrap"><div class="subtabs" role="tablist">';
+                subtabItems.forEach((st, si) => {
+                  const activeClass = si === 0 ? " tab active" : " tab";
+                  panelHtml += '<button type="button" class="tab' + activeClass + '" data-trips-subindex="' + si + '" role="tab">' + escapeHtml(st.label) + ' (' + st.total + ')</button>';
+                });
+                panelHtml += '</div></div>';
+                panelHtml += '<div class="trips-subpanels">';
+                subtabItems.forEach((st, si) => {
+                  const activeClass = si === 0 ? " trips-subpanel active" : " trips-subpanel";
+                  panelHtml += '<div class="' + activeClass + '" data-trips-subindex="' + si + '" role="tabpanel">';
+                  const fbk = st.filesByKey || {};
+                  for (const fk of Object.keys(fbk)) {
+                    panelHtml += '<div class="cards">' + cardsHtmlForFiles(fbk[fk], fk) + '</div>';
+                  }
+                  panelHtml += '</div>';
+                });
+                panelHtml += '</div>';
+              }
+              panelHtml += '</div>';
+              panel.innerHTML = panelHtml;
+              const subTabsWrap = panel.querySelector(".subtabs");
+              if (subTabsWrap) {
+                subTabsWrap.querySelectorAll(".tab[data-trips-subindex]").forEach(btn => {
+                  btn.addEventListener("click", function () {
+                    const subIdx = this.getAttribute("data-trips-subindex");
+                    const panelEl = this.closest(".tab-panel");
+                    if (!panelEl) return;
+                    panelEl.querySelectorAll(".subtabs .tab").forEach(t => t.classList.remove("active"));
+                    panelEl.querySelectorAll(".trips-subpanel").forEach(p => p.classList.remove("active"));
+                    this.classList.add("active");
+                    const subPanel = panelEl.querySelector('.trips-subpanel[data-trips-subindex="' + subIdx + '"]');
+                    if (subPanel) subPanel.classList.add("active");
+                  });
+                });
+              }
+            } else {
+              panel.innerHTML = '<div class="cards">' + cardsHtmlForFiles(files, folderKey) + '</div>';
+            }
+            tabPanels.appendChild(panel);
+          });
+
+          tabsWrap.querySelectorAll(".folder-tree-toggle[data-toggle]").forEach(btn => {
+            btn.addEventListener("click", function () {
+              const id = this.getAttribute("data-toggle");
+              const el = document.getElementById(id);
+              if (!el) return;
+              const isHidden = el.style.display === "none";
+              el.style.display = isHidden ? "" : "none";
+              this.textContent = isHidden ? "▾" : "▸";
+              this.setAttribute("aria-expanded", isHidden ? "true" : "false");
+            });
+          });
+          bindCardClicks();
+        }
+
+        function bindCardClicks() {
+          qs("#tabPanels").querySelectorAll(".card2").forEach(card => {
+            card.onclick = (e) => {
+              if (e.target.closest("button")) return;
+              const path = card.getAttribute("data-path");
+              const fileIdAttr = card.getAttribute("data-file-id");
+              const fileId = fileIdAttr ? parseInt(fileIdAttr, 10) : null;
+              if (!path) return;
+              const folderKey = card.getAttribute("data-folder") || (card.closest(".tab-panel") && card.closest(".tab-panel").dataset.folder) || "";
+              const files = reportByFolder[folderKey] || [];
+              const items = files.map((f, idx) => ({
+                file_id: f.id != null ? f.id : null,
+                file_path: f.path || "",
+                path: f.path || "",
+                taken_at: null,
+                place_country: null,
+                place_city: null,
+                face_rectangle_id: null,
+                person_rectangle_id: null
+              }));
+              const currentIndex = items.findIndex(it => (it.path || "") === path);
+              const listContext = {
+                source_page: "sorting_folders",
+                items: items,
+                current_index: currentIndex >= 0 ? currentIndex : 0,
+                total_count: items.length
+              };
+              if (window.openPhotoCard) {
+                window.openPhotoCard({
+                  file_id: fileId,
+                  file_path: path,
+                  pipeline_run_id: pipelineRunId,
+                  list_context: listContext,
+                  on_assign_success: null,
+                  on_close: () => loadReport()
+                });
+              }
+            };
+          });
+        }
+
+        async function loadReport() {
+          const summaryEl = qs("#reportSummary");
+          const facesVsEl = qs("#facesVsStep4Summary");
+          const tabsWrap = qs("#tabsWrap");
+          const tabPanels = qs("#tabPanels");
+          if (pipelineRunId == null) {
+            summaryEl.textContent = "—";
+            if (facesVsEl) facesVsEl.textContent = "";
+            tabsWrap.style.display = "none";
+            tabPanels.innerHTML = "";
+            return;
+          }
+          try {
+            const [data, tabCounts] = await Promise.all([
+              fetchJson("/api/faces/step4-report?pipeline_run_id=" + encodeURIComponent(String(pipelineRunId))),
+              fetchJson("/api/faces/tab-counts?pipeline_run_id=" + encodeURIComponent(String(pipelineRunId))).catch(() => null)
+            ]);
+            qs("#rootPath").textContent = data.root_path != null ? data.root_path : "—";
+            const byFolder = data.by_folder || {};
+            const unsorted = data.unsorted || [];
+            const total = data.total || 0;
+            const unsortedCount = data.unsorted_count != null ? data.unsorted_count : unsorted.length;
+            const step4Total = total + unsortedCount;
+            const counts = tabCounts && tabCounts.counts ? tabCounts.counts : null;
+            const facesCnt = counts ? (counts.faces || 0) : null;
+            const noFacesCnt = counts ? (counts.no_faces || 0) : null;
+            const animalsCnt = counts ? (counts.animals || 0) : null;
+            const quarantineCnt = counts ? (counts.quarantine || 0) : null;
+            const peopleNoFaceCnt = counts ? (counts.people_no_face || 0) : null;
+            const totalRunFromTabs = (facesCnt != null && noFacesCnt != null && animalsCnt != null)
+              ? facesCnt + noFacesCnt + animalsCnt + quarantineCnt + peopleNoFaceCnt
+              : null;
+            if (facesVsEl) {
+              if (totalRunFromTabs != null) {
+                const match = step4Total === totalRunFromTabs;
+                const parts = ["Лица: <b>" + facesCnt + "</b>", "Нет людей: <b>" + noFacesCnt + "</b>", "Животные: <b>" + animalsCnt + "</b>"];
+                if (quarantineCnt) parts.push("Карантин: <b>" + quarantineCnt + "</b>");
+                if (peopleNoFaceCnt) parts.push("Люди без лиц: <b>" + peopleNoFaceCnt + "</b>");
+                facesVsEl.innerHTML = parts.join(", ") + ". Всего в прогоне: <b>" + totalRunFromTabs + "</b>. " +
+                  "Всего в отчёте шага 4: <b>" + step4Total + "</b>. " +
+                  (match ? "<span style=\"color:#059669;\">✓ совпадает — перед запуском шага 4 проверено.</span>" : "<span style=\"color:#b45309;\">Числа не совпадают.</span>");
+              } else {
+                facesVsEl.textContent = "Всего в отчёте шага 4: " + step4Total + ".";
+              }
+            }
+            reportByFolder = { ...byFolder };
+            if (unsorted.length) reportByFolder[UNSORTED_KEY] = unsorted;
+            reportTotal = total;
+            summaryEl.textContent = "С целевой папкой: " + total + ". Без целевой папки (неотсортировано): " + unsortedCount + ". Вкладки — по папкам назначения и «Неотсортировано».";
+            if (total === 0 && unsorted.length === 0) {
+              tabsWrap.style.display = "none";
+              tabPanels.innerHTML = "<span class=\"muted\">Нет файлов. Запустите шаг 4 с главной страницы.</span>";
+              return;
+            }
+            renderTabsAndPanels(byFolder, unsorted);
+          } catch (e) {
+            summaryEl.textContent = "";
+            if (facesVsEl) facesVsEl.textContent = "";
+            tabsWrap.style.display = "none";
+            tabPanels.innerHTML = "<span class=\"muted\" style=\"color:#991b1b;\">Ошибка: " + escapeHtml(e.message) + "</span>";
+          }
+        }
+
+        qs("#btnReload").onclick = loadReport;
+        function doMove(destination) {
+          if (pipelineRunId == null) { setToast("pipeline_run_id не задан", true); return; }
+          const label = destination === "local" ? "локально" : "в фотоархив";
+          if (!confirm("Переместить файлы " + label + "?")) return;
+          const btn = destination === "local" ? qs("#btnMoveLocal") : qs("#btnMoveArchive");
+          btn.disabled = true;
+          setToast("Перемещаю файлы " + label + "...");
+          postJson("/api/faces/sort-into-folders", { pipeline_run_id: pipelineRunId, dry_run: false, destination: destination })
+            .then(async (resp) => {
+              if (resp.ok) {
+                const moved = resp.moved_count || 0;
+                const errors = resp.errors || [];
+                if (errors.length > 0) setToast("Перенесено: " + moved + ", ошибок: " + errors.length, true);
+                else setToast("Успешно перенесено файлов: " + moved);
+                await loadReport();
+              } else {
+                const msg = resp.detail || "Ошибка при сортировке";
+                setToast(typeof msg === "string" ? msg : JSON.stringify(msg), true);
+              }
+            })
+            .catch((e) => setToast(e.message || String(e), true))
+            .finally(() => { btn.disabled = false; });
+        }
+        qs("#btnMoveLocal").onclick = () => doMove("local");
+        qs("#btnMoveArchive").onclick = () => doMove("archive");
+
+        loadReport();
+      })();
+    </script>
+  </body>
+</html>
