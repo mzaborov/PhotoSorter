@@ -1,0 +1,17 @@
+<map id="screens_map" name="screens_map">
+<area shape="rect" id="id1" href="http://127.0.0.1:8000/gold" title="http://127.0.0.1:8000/gold" alt="" coords="323,210,370,260"/>
+<area shape="rect" id="id2" href="http://127.0.0.1:8000/" title="http://127.0.0.1:8000/" alt="" coords="614,45,683,95"/>
+<area shape="rect" id="id3" href="http://127.0.0.1:8000/duplicates" title="http://127.0.0.1:8000/duplicates" alt="" coords="24,339,101,389"/>
+<area shape="rect" id="id4" href="http://127.0.0.1:8000/folders" title="http://127.0.0.1:8000/folders" alt="" coords="87,210,174,260"/>
+<area shape="rect" id="id5" href="http://127.0.0.1:8000/browse" title="http://127.0.0.1:8000/browse" alt="" coords="150,339,245,389"/>
+<area shape="rect" id="id6" href="http://127.0.0.1:8000/persons" title="http://127.0.0.1:8000/persons" alt="" coords="456,210,565,260"/>
+<area shape="rect" id="id7" href="http://127.0.0.1:8000/faces" title="http://127.0.0.1:8000/faces" alt="" coords="994,210,1109,260"/>
+<area shape="rect" id="id8" href="http://127.0.0.1:8000/debug/photo-card" title="http://127.0.0.1:8000/debug/photo-card" alt="" coords="756,847,873,897"/>
+<area shape="rect" id="id9" href="http://127.0.0.1:8000/sorting-folders" title="http://127.0.0.1:8000/sorting-folders" alt="" coords="1144,210,1273,260"/>
+<area shape="rect" id="id10" href="http://127.0.0.1:8000/persons" title="http://127.0.0.1:8000/persons" alt="" coords="621,466,752,516"/>
+<area shape="rect" id="id11" href="http://127.0.0.1:8000/persons" title="http://127.0.0.1:8000/persons" alt="" coords="578,593,712,643"/>
+<area shape="rect" id="id12" href="http://127.0.0.1:8000/dedup-results" title="http://127.0.0.1:8000/dedup-results" alt="" coords="822,210,959,260"/>
+<area shape="rect" id="id13" href="http://127.0.0.1:8000/preclean-results" title="http://127.0.0.1:8000/preclean-results" alt="" coords="642,210,786,260"/>
+<area shape="rect" id="id14" href="http://127.0.0.1:8000/face-clusters" title="http://127.0.0.1:8000/face-clusters" alt="" coords="497,720,642,770"/>
+<area shape="rect" id="id15" href="http://127.0.0.1:8000/face-clusters" title="http://127.0.0.1:8000/face-clusters" alt="" coords="396,339,571,389"/>
+</map>

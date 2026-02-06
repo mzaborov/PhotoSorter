@@ -905,6 +905,12 @@ def api_local_pipeline_status() -> dict[str, Any]:
         and pr.get("id") == _LOCAL_PIPELINE_RUN_ID
         and _LOCAL_PIPELINE_STATE.get("running") is True
     )
+    # Шаги 5/6: «Переместить локально» / «Перенести в архив» — прогресс из БД, статус done после успешного завершения
+    step4_phase = (str(pr.get("step4_phase") or "")).strip()
+    step5_running = step4_phase == "local"
+    step6_running = step4_phase == "archive"
+    step5_done = bool(int(pr.get("step5_done") or 0))
+    step6_done = bool(int(pr.get("step6_done") or 0))
 
     # Шаг 3 (лица): при failed прогоне считаем выполненным, если дошли до step_num >= 2; ошибку относим к шагу 4.
     if status == "completed":
@@ -966,8 +972,46 @@ def api_local_pipeline_status() -> dict[str, Any]:
         step3_status = "idle"
         step3_pct = 0
 
-    # Чтобы главная страница показывала «прогон идёт», возвращаем running=True и при только шаге 4.
-    if step4_only_running:
+    # Шаг 5 (переместить локально) и шаг 6 (перенести в архив): прогресс из step4_phase + step4_processed/step4_total
+    step5_processed = step5_total = step5_pct = None
+    step6_processed = step6_total = step6_pct = None
+    sp = pr.get("step4_processed")
+    st = pr.get("step4_total")
+    if step5_running or step6_running:
+        if st is not None and int(st) > 0 and sp is not None:
+            pct = int(round((int(sp) / int(st)) * 100))
+            pct = max(0, min(100, pct))
+            if step5_running:
+                step5_processed = int(sp)
+                step5_total = int(st)
+                step5_pct = pct
+            else:
+                step6_processed = int(sp)
+                step6_total = int(st)
+                step6_pct = pct
+    elif step5_done and st is not None and int(st) > 0:
+        # При «Выполнено» показываем total/total, чтобы не было «5/2476 · 100%» после прерванного прогона
+        step5_processed = int(st)
+        step5_total = int(st)
+        step5_pct = 100
+    elif step6_done and st is not None and int(st) > 0:
+        step6_processed = int(st)
+        step6_total = int(st)
+        step6_pct = 100
+    step5_status = "running" if step5_running else ("done" if step5_done else "idle")
+    step6_status = "running" if step6_running else ("done" if step6_done else "idle")
+    # Был прогресс, но не done и не running — значит прервано (например перезапуск uvicorn)
+    if step5_status == "idle" and sp is not None and int(sp) > 0 and not step5_done:
+        step5_status = "interrupted"
+    if step6_status == "idle" and sp is not None and int(sp) > 0 and not step6_done:
+        step6_status = "interrupted"
+    if step5_pct is None:
+        step5_pct = 100 if step5_done else 0
+    if step6_pct is None:
+        step6_pct = 100 if step6_done else 0
+
+    # Чтобы главная страница показывала «прогон идёт», возвращаем running=True и при только шаге 4, и при шагах 5/6.
+    if step4_only_running or step5_running or step6_running:
         running = True
 
     plan_total = 6
@@ -1001,6 +1045,9 @@ def api_local_pipeline_status() -> dict[str, Any]:
         "step1": {"status": step1_status, "pct": step1_pct, "processed": dedup_proc, "total": dedup_total},
         "step2": {"status": step2_status, "pct": step2_pct, "images": faces_img, "total": faces_total, "faces": faces_found},
         "step3": {"status": step3_status, "pct": step3_pct, "processed": step3_processed, "total": step3_total},
+        "step4_phase": step4_phase,
+        "step5": {"status": step5_status, "pct": step5_pct, "processed": step5_processed, "total": step5_total},
+        "step6": {"status": step6_status, "pct": step6_pct, "processed": step6_processed, "total": step6_total},
         "face_run_id": int(face_run_id) if face_run_id else None,
         "debug": {"video_samples_env": video_samples_env, "cmd_has_video_samples": cmd_has_video_samples, "cmd_video_samples": cmd_video_samples},
         "log_tail": log_tail,

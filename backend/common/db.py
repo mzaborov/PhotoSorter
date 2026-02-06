@@ -399,6 +399,9 @@ def init_db():
             "updated_at": "updated_at TEXT",
             "step4_processed": "step4_processed INTEGER",
             "step4_total": "step4_total INTEGER",
+            "step4_phase": "step4_phase TEXT",
+            "step5_done": "step5_done INTEGER",
+            "step6_done": "step6_done INTEGER",
         },
     )
 
@@ -1272,18 +1275,21 @@ class FaceStore:
 
     def update_file_path(self, *, old_file_path: str, new_file_path: str) -> None:
         """
-        Обновляет file_path для photo_rectangles (когда файл физически перенесли на диске/в YaDisk).
+        После переноса файла на диск/в архив: помечает photo_rectangles для этого файла как архивные.
 
-        Важно: это чисто "техническая" миграция ссылок. Семантика детекта не меняется.
+        В таблице photo_rectangles нет колонки file_path (только file_id). Путь хранится в files;
+        DedupStore.update_path уже обновил files.path. Здесь только выставляем archive_scope='archive'
+        для записей по file_id (файл определяется по new_file_path в files).
         """
         cur = self.conn.cursor()
+        cur.execute("SELECT id FROM files WHERE path = ? LIMIT 1", (new_file_path,))
+        row = cur.fetchone()
+        if not row:
+            return
+        file_id = row[0]
         cur.execute(
-            """
-            UPDATE photo_rectangles
-            SET file_path = ?
-            WHERE file_path = ?
-            """,
-            (new_file_path, old_file_path),
+            "UPDATE photo_rectangles SET archive_scope = ? WHERE file_id = ?",
+            ("archive", file_id),
         )
         self.conn.commit()
 
@@ -1776,6 +1782,73 @@ def get_outsider_person_id(conn, create_if_missing: bool = True) -> int | None:
     return created_id
 
 
+def list_person_groups_for_rule_constructor() -> list[dict[str, Any]]:
+    """
+    Группы персон с id и списком персон — для конструктора правил папок.
+    Используется API /api/folders/rule-metadata.
+    Если person_groups пуста — fallback на DISTINCT persons."group".
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                SELECT g.id, g.name, COALESCE(g.sort_order, 999) AS sort_order
+                FROM person_groups g
+                ORDER BY g.sort_order ASC, g.name ASC
+            """)
+            rows = cur.fetchall()
+        except Exception:
+            rows = []
+        if rows:
+            groups = []
+            for row in rows:
+                gid, name, order_val = row["id"], row["name"], row["sort_order"]
+                cur.execute(
+                    """SELECT p.id, p.name FROM persons p
+                       WHERE TRIM(COALESCE(p."group", '')) = TRIM(?)
+                       ORDER BY p.group_order ASC, p.id ASC""",
+                    (name or "",),
+                )
+                persons = [{"id": int(r["id"]), "name": (r["name"] or "").strip()} for r in cur.fetchall()]
+                groups.append({
+                    "id": int(gid),
+                    "name": (name or "").strip(),
+                    "sort_order": int(order_val) if order_val is not None else 999,
+                    "persons": persons,
+                })
+            return groups
+        cur.execute("""
+            SELECT TRIM("group") AS gname, MIN(COALESCE(group_order, 999)) AS ord
+            FROM persons
+            WHERE TRIM(COALESCE("group", '')) != ''
+            GROUP BY TRIM("group")
+            ORDER BY MIN(COALESCE(group_order, 999)) ASC, TRIM("group") ASC
+        """)
+        fallback = cur.fetchall()
+        groups = []
+        for idx, row in enumerate(fallback):
+            name = (row["gname"] or "").strip()
+            if not name:
+                continue
+            cur.execute(
+                """SELECT p.id, p.name FROM persons p
+                   WHERE TRIM(COALESCE(p."group", '')) = ?
+                   ORDER BY p.group_order ASC, p.id ASC""",
+                (name,),
+            )
+            persons = [{"id": int(r["id"]), "name": (r["name"] or "").strip()} for r in cur.fetchall()]
+            groups.append({
+                "id": idx + 1,  # Временный id (person_groups пуста)
+                "name": name,
+                "sort_order": int(row["ord"]) if row["ord"] is not None else 999,
+                "persons": persons,
+            })
+        return groups
+    finally:
+        conn.close()
+
+
 def update_folder_content_rule(folder_id: int, content_rule: str | None) -> bool:
     """
     Обновляет content_rule у папки по id. Возвращает True, если обновлена хотя бы одна строка.
@@ -2209,6 +2282,12 @@ class DedupStore:
         cur.execute(f"UPDATE files SET target_folder = NULL WHERE path IN ({q})", paths)
         self.conn.commit()
         return int(cur.rowcount or 0)
+
+    def set_inventory_scope_for_path(self, *, path: str, scope: str) -> None:
+        """Устанавливает inventory_scope для файла по пути (например 'archive' при переносе в фотоархив)."""
+        cur = self.conn.cursor()
+        cur.execute("UPDATE files SET inventory_scope = ? WHERE path = ?", (scope, path))
+        self.conn.commit()
 
     def set_faces_summary(self, *, path: str, faces_run_id: int, faces_count: int, faces_scanned_at: str | None = None) -> None:
         cur = self.conn.cursor()
@@ -3090,6 +3169,9 @@ class PipelineStore:
         finished_at: str | None = None,
         step4_processed: int | None = None,
         step4_total: int | None = None,
+        step4_phase: str | None = None,
+        step5_done: int | None = None,
+        step6_done: int | None = None,
     ) -> None:
         fields: list[str] = []
         params: list[Any] = []
@@ -3124,6 +3206,12 @@ class PipelineStore:
             _set("step4_processed", int(step4_processed))
         if step4_total is not None:
             _set("step4_total", int(step4_total))
+        if step4_phase is not None:
+            _set("step4_phase", str(step4_phase))
+        if step5_done is not None:
+            _set("step5_done", int(step5_done))
+        if step6_done is not None:
+            _set("step6_done", int(step6_done))
 
         # updated_at всегда двигаем при любом update
         _set("updated_at", _now_utc_iso())
@@ -3461,6 +3549,12 @@ class PipelineStore:
                 _time.sleep(0.05 * (attempt + 1))
         if last_err:
             raise last_err
+
+    def set_inventory_scope_for_path(self, *, path: str, scope: str) -> None:
+        """Устанавливает inventory_scope для файла по пути (например 'archive' при переносе в фотоархив)."""
+        cur = self.conn.cursor()
+        cur.execute("UPDATE files SET inventory_scope = ? WHERE path = ?", (scope, path))
+        self.conn.commit()
 
     def set_faces_summary(self, *, path: str, faces_run_id: int, faces_count: int, faces_scanned_at: str | None = None) -> None:
         cur = self.conn.cursor()

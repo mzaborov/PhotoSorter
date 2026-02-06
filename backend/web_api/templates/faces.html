@@ -3580,8 +3580,10 @@
             if (resp.ok) {
               const moved = resp.moved_count || 0;
               const errors = resp.errors || [];
-              if (errors.length > 0) setToast(`Перенесено: ${moved}, ошибок: ${errors.length}`, true);
-              else setToast(`Успешно перенесено файлов: ${moved}`);
+              if (errors.length > 0) {
+                const firstErr = (errors[0] && errors[0].error) ? errors[0].error : "неизвестная ошибка";
+                setToast(`Перенесено: ${moved}, ошибок: ${errors.length}. Первая: ${firstErr}`, true);
+              } else setToast(`Успешно перенесено файлов: ${moved}`);
               await refreshTabCounts();
               await load(true);
             } else setToast("Ошибка при сортировке", true);

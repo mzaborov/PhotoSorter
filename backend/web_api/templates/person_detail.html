@@ -32,6 +32,7 @@
       .thumb-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap:12px; margin-top:16px; }
       .thumb { width: 100%; aspect-ratio: 1; background:#fff; display:flex; align-items:center; justify-content:center; border:1px solid #e5e7eb; border-radius:8px; overflow:hidden; cursor: pointer; position:relative; }
       .thumb img { width: 100%; height: 100%; object-fit: cover; }
+      .thumb .thumb-img-lazy { background: #f3f4f6; min-height: 100%; }
       .thumb .noimg { color:#6b7280; font-size:11px; text-align:center; padding:8px; }
       .thumb:hover { border-color:#0b57d0; }
       .thumb .face-actions { position:absolute; bottom:4px; left:4px; right:4px; display:none; gap:4px; flex-wrap:wrap; }
@@ -595,6 +596,7 @@
         
         const html = await Promise.all(faces.map(async (face) => renderItemThumb(face))).then(h => h.join(''));
         grid.innerHTML = html || '<div class="muted">Нет элементов</div>';
+        setupLazyThumbnails(grid);
       }
       
       async function renderDetailedView(faces) {
@@ -653,6 +655,7 @@
         if (grid) {
           const html = await Promise.all(subtabFaces.map(async (face) => renderItemThumb(face))).then(h => h.join(''));
           grid.innerHTML = html || '<div class="muted">Нет элементов</div>';
+          setupLazyThumbnails(grid);
         }
       }
       
@@ -729,13 +732,39 @@
           </div>
         ` : '';
         
+        // Превью: есть в ответе — сразу; нет но есть face_id — ленивая подгрузка при появлении в viewport
+        const thumbHtml = thumbUrl
+          ? `<img src="${thumbUrl}" alt="Item ${itemId}" />`
+          : (item.face_id
+            ? `<img class="thumb-img-lazy" data-face-id="${item.face_id}" alt="Item ${itemId}" />`
+            : '<div class="noimg">Нет превью</div>');
         return `
           <div class="thumb${avatarClass}" ${dataAttrs} ${doubleClickHandler}>
-            ${thumbUrl ? `<img src="${thumbUrl}" alt="Item ${itemId}" />` : '<div class="noimg">Нет превью</div>'}
+            ${thumbHtml}
             ${typeBadgeHtml}
             ${actionsHtml}
           </div>
         `;
+      }
+      
+      function setupLazyThumbnails(container) {
+        const root = container || document;
+        const lazyImgs = root.querySelectorAll('.thumb-img-lazy');
+        if (!lazyImgs.length) return;
+        const observer = new IntersectionObserver((entries) => {
+          for (const ent of entries) {
+            if (!ent.isIntersecting) continue;
+            const img = ent.target;
+            const faceId = img.getAttribute('data-face-id');
+            if (!faceId || img.dataset.loaded) continue;
+            img.dataset.loaded = '1';
+            observer.unobserve(img);
+            getFaceThumbnail(parseInt(faceId, 10)).then(url => {
+              if (url && img.parentElement) img.src = url;
+            }).catch(() => {});
+          }
+        }, { rootMargin: '100px' });
+        lazyImgs.forEach(el => observer.observe(el));
       }
       
       function handleItemDoubleClick(element) {

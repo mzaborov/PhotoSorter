@@ -352,16 +352,17 @@
               tripsTree.forEach(rootNode => {
                 const rootFilesByKey = rootNode.filesByKey || {};
                 const rootKeys = Object.keys(rootFilesByKey);
+                const rootKey = rootKeys[0];
                 const rootTotal = rootNode.files ? rootNode.files.length : rootKeys.reduce((s, k) => s + (rootFilesByKey[k] || []).length, 0);
                 if (rootTotal > 0) {
-                  subtabItems.push({ label: rootNode.name, filesByKey: rootFilesByKey, total: rootTotal });
+                  subtabItems.push({ label: rootNode.name, filesByKey: rootFilesByKey, total: rootTotal, targetFolder: rootKey || rootNode.name });
                 }
                 (rootNode.children || []).forEach(child => {
                   const fbk = child.filesByKey || {};
                   const keys = Object.keys(fbk);
                   const flist = keys.length ? (fbk[keys[0]] || []) : (child.files || []);
                   const fk = keys[0] || child.key;
-                  subtabItems.push({ label: child.name, filesByKey: { [fk]: flist }, total: flist.length });
+                  subtabItems.push({ label: child.name, filesByKey: { [fk]: flist }, total: flist.length, targetFolder: fk });
                 });
               });
               let panelHtml = '<div class="trips-nested">';
@@ -369,7 +370,8 @@
                 panelHtml += '<div class="subtabs-wrap"><div class="subtabs" role="tablist">';
                 subtabItems.forEach((st, si) => {
                   const activeClass = si === 0 ? " tab active" : " tab";
-                  panelHtml += '<button type="button" class="tab' + activeClass + '" data-trips-subindex="' + si + '" role="tab">' + escapeHtml(st.label) + ' (' + st.total + ')</button>';
+                  const tooltip = (st.targetFolder || st.label || "").replace(/\\/g, "/");
+                  panelHtml += '<button type="button" class="tab' + activeClass + '" data-trips-subindex="' + si + '" role="tab" title="Целевая папка: ' + escapeHtml(tooltip) + '">' + escapeHtml(st.label) + ' (' + st.total + ')</button>';
                 });
                 panelHtml += '</div></div>';
                 panelHtml += '<div class="trips-subpanels">';
@@ -538,8 +540,10 @@
               if (resp.ok) {
                 const moved = resp.moved_count || 0;
                 const errors = resp.errors || [];
-                if (errors.length > 0) setToast("Перенесено: " + moved + ", ошибок: " + errors.length, true);
-                else setToast("Успешно перенесено файлов: " + moved);
+                if (errors.length > 0) {
+                  const firstErr = errors[0]?.error || "неизвестная ошибка";
+                  setToast("Перенесено: " + moved + ", ошибок: " + errors.length + ". Первая: " + firstErr, true);
+                } else setToast("Успешно перенесено файлов: " + moved);
                 await loadReport();
               } else {
                 const msg = resp.detail || "Ошибка при сортировке";

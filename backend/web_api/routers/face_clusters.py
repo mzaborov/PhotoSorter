@@ -338,14 +338,14 @@ async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: st
              WHERE fr2.cluster_id = fc.id AND COALESCE(fr2.ignore_flag, 0) = 0) as faces_count,
             COALESCE((SELECT COUNT(DISTINCT fr2.id)
              FROM photo_rectangles fr2
+             LEFT JOIN files f2 ON fr2.file_id = f2.id
              WHERE fr2.cluster_id = fc.id AND COALESCE(fr2.ignore_flag, 0) = 0 
-               AND (fr2.archive_scope = 'archive' 
-                    OR (fr2.archive_scope IS NULL AND fc.archive_scope = 'archive'))), 0) as faces_count_archive,
+               AND f2.inventory_scope = 'archive'), 0) as faces_count_archive,
             COALESCE((SELECT COUNT(DISTINCT fr2.id)
              FROM photo_rectangles fr2
+             LEFT JOIN files f2 ON fr2.file_id = f2.id
              WHERE fr2.cluster_id = fc.id AND COALESCE(fr2.ignore_flag, 0) = 0 
-               AND (fr2.archive_scope IS NULL OR fr2.archive_scope != 'archive') 
-               AND fr2.run_id IS NOT NULL), 0) as faces_count_run,
+               AND f2.inventory_scope = 'source'), 0) as faces_count_run,
             fc.person_id as person_id,
             p.name as person_name,
             p.avatar_face_id as avatar_face_id
@@ -1161,15 +1161,17 @@ async def api_persons_stats() -> dict[str, Any]:
                 "file_persons_files_count_run": 0,
             }
     
-        # Получаем статистику кластеров одним запросом
+        # Получаем статистику кластеров; архив/прогон только по files.inventory_scope
         step_start = time.time()
         cur.execute("""
         SELECT 
             fc.person_id,
-            COUNT(DISTINCT CASE WHEN fc.archive_scope = 'archive' THEN fc.id END) as clusters_archive,
-            COUNT(DISTINCT CASE WHEN (fc.archive_scope IS NULL OR fc.archive_scope = '') AND fc.run_id IS NOT NULL THEN fc.id END) as clusters_run,
+            COUNT(DISTINCT CASE WHEN f.inventory_scope = 'archive' THEN fc.id END) as clusters_archive,
+            COUNT(DISTINCT CASE WHEN f.inventory_scope = 'source' THEN fc.id END) as clusters_run,
             COUNT(DISTINCT fc.id) as clusters_total
         FROM face_clusters fc
+        LEFT JOIN photo_rectangles fr ON fr.cluster_id = fc.id
+        LEFT JOIN files f ON fr.file_id = f.id
         WHERE fc.person_id IS NOT NULL
         GROUP BY fc.person_id
     """)
@@ -1180,17 +1182,17 @@ async def api_persons_stats() -> dict[str, Any]:
                 persons_data[row["person_id"]]["clusters_count_run"] = row["clusters_run"] or 0
         metrics["step2_get_clusters_stats"] = time.time() - step_start
         
-        # Получаем статистику лиц через кластеры одним запросом
-        # Оптимизация: начинаем с face_clusters (есть индекс по person_id), затем JOIN
+        # Получаем статистику лиц через кластеры; архив/прогон только по files.inventory_scope
         step_start = time.time()
         cur.execute("""
         SELECT 
             fc.person_id,
-            COUNT(DISTINCT CASE WHEN fr.archive_scope = 'archive' THEN fr.id END) as faces_archive,
-            COUNT(DISTINCT CASE WHEN (fr.archive_scope IS NULL OR fr.archive_scope = '') AND fr.run_id IS NOT NULL THEN fr.id END) as faces_run,
+            COUNT(DISTINCT CASE WHEN f.inventory_scope = 'archive' THEN fr.id END) as faces_archive,
+            COUNT(DISTINCT CASE WHEN f.inventory_scope = 'source' THEN fr.id END) as faces_run,
             COUNT(DISTINCT fr.id) as faces_total
         FROM face_clusters fc
         JOIN photo_rectangles fr ON fr.cluster_id = fc.id
+        LEFT JOIN files f ON fr.file_id = f.id
         WHERE fc.person_id IS NOT NULL 
           AND fr.is_face = 1
           AND COALESCE(fr.ignore_flag, 0) = 0
@@ -1209,17 +1211,16 @@ async def api_persons_stats() -> dict[str, Any]:
                 persons_data[row["person_id"]]["faces_count_run"] = (persons_data[row["person_id"]]["faces_count_run"] or 0) + clusters_run
         metrics["step3_get_faces_via_clusters"] = time.time() - step_start
         
-        # Получаем статистику лиц через ручные привязки (исключая те, что уже в кластерах этой персоны)
-        # Используем LEFT JOIN вместо NOT EXISTS для лучшей производительности
-        # ВАЖНО: учитываем только лица (is_face=1), не персоны (is_face=0)
+        # Получаем статистику лиц через ручные привязки; архив/прогон только по files.inventory_scope
         step_start = time.time()
         cur.execute("""
         SELECT 
             fr.manual_person_id AS person_id,
-            COUNT(DISTINCT CASE WHEN fr.archive_scope = 'archive' AND fc_check.person_id IS NULL THEN fr.id END) as faces_archive,
-            COUNT(DISTINCT CASE WHEN (fr.archive_scope IS NULL OR fr.archive_scope = '') AND fr.run_id IS NOT NULL AND fc_check.person_id IS NULL THEN fr.id END) as faces_run,
+            COUNT(DISTINCT CASE WHEN f.inventory_scope = 'archive' AND fc_check.person_id IS NULL THEN fr.id END) as faces_archive,
+            COUNT(DISTINCT CASE WHEN f.inventory_scope = 'source' AND fc_check.person_id IS NULL THEN fr.id END) as faces_run,
             COUNT(DISTINCT CASE WHEN fc_check.person_id IS NULL THEN fr.id END) as faces_total
         FROM photo_rectangles fr
+        LEFT JOIN files f ON fr.file_id = f.id
         LEFT JOIN face_clusters fc_check ON fc_check.id = fr.cluster_id AND fc_check.person_id = fr.manual_person_id
         WHERE fr.manual_person_id IS NOT NULL AND fr.is_face = 1
           AND COALESCE(fr.ignore_flag, 0) = 0
@@ -1240,14 +1241,15 @@ async def api_persons_stats() -> dict[str, Any]:
     
         # Получаем статистику через прямоугольники без лица (ручные) и прямую привязку (person_rectangles удалена)
         step_start = time.time()
-        # 1. Через photo_rectangles.manual_person_id с is_face=0 (прямоугольники «без лица» для архивных файлов)
+        # 1. Через photo_rectangles.manual_person_id с is_face=0; архив/прогон только по files.inventory_scope
         cur.execute("""
             SELECT 
                 fr.manual_person_id AS person_id,
-                COUNT(DISTINCT CASE WHEN fr.archive_scope = 'archive' THEN fr.file_id END) as files_archive,
-                COUNT(DISTINCT CASE WHEN (fr.archive_scope IS NULL OR fr.archive_scope = '') AND fr.run_id IS NOT NULL THEN fr.file_id END) as files_run,
+                COUNT(DISTINCT CASE WHEN f.inventory_scope = 'archive' THEN fr.file_id END) as files_archive,
+                COUNT(DISTINCT CASE WHEN f.inventory_scope = 'source' THEN fr.file_id END) as files_run,
                 COUNT(DISTINCT fr.file_id) as files_total
             FROM photo_rectangles fr
+            LEFT JOIN files f ON fr.file_id = f.id
             WHERE fr.manual_person_id IS NOT NULL AND fr.is_face = 0
               AND COALESCE(fr.ignore_flag, 0) = 0
             GROUP BY fr.manual_person_id
@@ -1265,12 +1267,12 @@ async def api_persons_stats() -> dict[str, Any]:
         # Проверяем существование таблицы file_persons
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='file_persons'")
         if cur.fetchone():
-            # Определяем архив/прогон через JOIN с files по file_id
+            # Определяем архив/прогон только по files.inventory_scope
             cur.execute("""
             SELECT 
                 fp.person_id,
-                COUNT(DISTINCT CASE WHEN f.path LIKE 'disk:/Фото%' THEN fp.file_id END) as files_archive,
-                COUNT(DISTINCT CASE WHEN f.path NOT LIKE 'disk:/Фото%' AND fp.pipeline_run_id IS NOT NULL THEN fp.file_id END) as files_run,
+                COUNT(DISTINCT CASE WHEN f.inventory_scope = 'archive' THEN fp.file_id END) as files_archive,
+                COUNT(DISTINCT CASE WHEN f.inventory_scope = 'source' THEN fp.file_id END) as files_run,
                 COUNT(DISTINCT fp.file_id) as files_total
             FROM file_persons fp
             LEFT JOIN files f ON fp.file_id = f.id
@@ -1400,6 +1402,7 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 fr.archive_scope,
                 f.path as file_path,
                 f.id as file_id,
+                f.inventory_scope as file_inventory_scope,
                 f.faces_run_id as file_faces_run_id,
                 f.taken_at,
                 f.place_country,
@@ -1440,6 +1443,7 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 fr.archive_scope,
                 f.path as file_path,
                 f.id as file_id,
+                f.inventory_scope as file_inventory_scope,
                 f.faces_run_id as file_faces_run_id,
                 f.taken_at,
                 f.place_country,
@@ -1486,6 +1490,7 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                     fr.archive_scope,
                     f.path as file_path,
                     f.id as file_id,
+                    f.inventory_scope as file_inventory_scope,
                     f.faces_run_id as file_faces_run_id,
                     f.taken_at,
                     f.place_country,
@@ -1540,9 +1545,10 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
             SELECT DISTINCT
                 NULL as face_id,
                 NULL as run_id,
-                CASE WHEN f.path LIKE 'disk:/Фото%' THEN 'archive' ELSE NULL END as archive_scope,
+                f.inventory_scope as archive_scope,
                 f.path as file_path,
                 fp.file_id,
+                f.inventory_scope as file_inventory_scope,
                 f.faces_run_id as file_faces_run_id,
                 f.taken_at,
                 f.place_country,
@@ -1574,14 +1580,10 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 "assignment_type": "file_person",
             })
         
-        # Сортируем все элементы
+        # Сортируем все элементы (архив/прогон только по inventory_scope)
         all_items.sort(key=lambda x: (
-            # Сначала архивные, потом прогоны
-            0 if (x["row"].get("archive_scope") == 'archive' or 
-                  (x["row"].get("file_path") and x["row"]["file_path"].startswith("disk:/Фото"))) else 1,
-            # Затем по пути
+            0 if x["row"].get("file_inventory_scope") == 'archive' else 1,
             x["row"].get("file_path") or "",
-            # Затем по индексу лица
             x["row"].get("face_index") or 0,
         ))
         faces = []
@@ -1600,35 +1602,10 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 except (KeyError, TypeError):
                     thumb_jpeg_val = None
                 
-                # Если thumb_jpeg отсутствует, пытаемся сгенерировать превью на лету
+                # Не генерируем превью на лету в цикле: при большом числе лиц (сотни/тысячи) это
+                # блокирует сервер. Превью по запросу — через /api/face-rectangles/{face_id}/thumbnail.
                 if not thumb_base64:
-                    try:
-                        file_path_val = row.get("file_path")
-                        bbox_x_val = row.get("bbox_x")
-                        bbox_y_val = row.get("bbox_y")
-                        bbox_w_val = row.get("bbox_w")
-                        bbox_h_val = row.get("bbox_h")
-                        if assignment_type == "file_person" and file_path_val:
-                            try:
-                                thumb_base64 = _generate_full_file_thumbnail_on_fly(file_path=file_path_val)
-                            except Exception as e:
-                                logger.warning(f"Failed to generate full-file thumbnail for {file_path_val}: {e}")
-                                thumb_base64 = None
-                        elif file_path_val and bbox_x_val is not None and bbox_y_val is not None and bbox_w_val is not None and bbox_h_val is not None:
-                            try:
-                                thumb_base64 = _generate_face_thumbnail_on_fly(
-                                    file_path=file_path_val,
-                                    bbox=(bbox_x_val, bbox_y_val, bbox_w_val, bbox_h_val)
-                                )
-                            except Exception as e:
-                                try:
-                                    face_id_val = row["face_id"]
-                                except (KeyError, TypeError):
-                                    face_id_val = "unknown"
-                                logger.warning(f"Failed to generate thumbnail on fly for face_id={face_id_val}: {e}")
-                                thumb_base64 = None
-                    except (KeyError, TypeError):
-                        thumb_base64 = None
+                    thumb_base64 = None
                 
                 # Определяем, относится ли элемент к архиву или текущему прогону
                 try:
@@ -1667,9 +1644,10 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                 except (KeyError, TypeError):
                     file_faces_run_id_val = None
                 
-                # Архив / прогон берём из файла (files.faces_run_id): если у файла есть faces_run_id — прогон, иначе архив
-                is_run = file_faces_run_id_val is not None
-                is_archive = not is_run
+                file_inventory_scope_val = row.get("file_inventory_scope")
+                # Архив / прогон только по files.inventory_scope (без проверки пути)
+                is_archive = file_inventory_scope_val == "archive"
+                is_run = file_inventory_scope_val == "source"
             except Exception as e:
                 # Логируем ошибку для отладки
                 import traceback
@@ -1731,25 +1709,13 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
             except (KeyError, TypeError):
                 pipeline_run_id_val = None
             
-            # Определяем source (archive или run)
-            if assignment_type in ("cluster", "manual_face"):
-                # Для лиц определяем через archive_scope
-                source = "archive" if is_archive else ("run" if is_run else "unknown")
+            # Определяем source только по inventory_scope (без проверки пути)
+            if is_archive:
+                source = "archive"
+            elif is_run:
+                source = "run"
             else:
-                # Для file_persons определяем через file_path и pipeline_run_id (person_rectangles удалена)
-                # Используем уже вычисленные is_archive и is_run для консистентности
-                if is_archive:
-                    source = "archive"
-                elif is_run:
-                    source = "run"
-                else:
-                    # Fallback: проверяем напрямую, если is_archive/is_run не установлены
-                    if file_path_val and file_path_val.startswith("disk:/Фото"):
-                        source = "archive"
-                    elif pipeline_run_id_val is not None:
-                        source = "run"
-                    else:
-                        source = "unknown"
+                source = "unknown"
             # #region agent log
             if assignment_type == "person_rectangle":
                 try:

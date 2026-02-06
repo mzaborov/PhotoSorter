@@ -2,7 +2,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # Генерация PNG-диаграмм из PlantUML (*.puml) в docs/diagrams/.
-# Не требует Java: используется публичный PlantUML server (URL-encoding внутри scripts/render_diagrams.py).
+# Используется локальный plantuml.jar (путь: PLANTUML_JAR в secrets.env или backend/scripts/plantuml.jar).
 
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $py = Join-Path $root "python.exe"

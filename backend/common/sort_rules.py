@@ -252,17 +252,24 @@ def _get_target_path_for_folder(
     root_path: str,
 ) -> str:
     """
-    Возвращает целевой путь для папки: если в БД у папки задан path с disk: — используем его
-    (как в таблице folders и отладочном скрипте), иначе root_path + name.
+    Возвращает целевой путь для папки. target_folder в БД всегда под корнем прогона (local:root/...);
+    путь disk:/Фото/... используется только при «Перенести в архив», не пишется в target_folder.
+    При локальном корне (root_path startswith local:) — всегда local:base_path/folder_name.
+    При disk-корне — path из таблицы folders или base_path/folder_name.
     """
     folder_name = (folder_name or "").strip()
+    base_path = root_path.rstrip("/") if root_path.startswith("disk:") else (root_path[6:] if root_path.startswith("local:") else root_path)
+    # Корень прогона локальный (local: или путь без disk:) — target_folder всегда под корнем (без disk:). В прогоне root_path часто без префикса local:
+    is_local_root = root_path.startswith("local:") or (root_path and not root_path.startswith("disk:"))
+    if is_local_root:
+        return f"local:{os.path.join(base_path, *folder_name.split('/'))}"
+    # Корень на диске — можно брать path из таблицы folders
     for f in target_folders or []:
         if (f.get("name") or "").strip() == folder_name:
             path_val = (f.get("path") or "").strip()
             if path_val.startswith("disk:"):
                 return path_val
             break
-    base_path = root_path.rstrip("/") if root_path.startswith("disk:") else (root_path[6:] if root_path.startswith("local:") else root_path)
     if root_path.startswith("disk:"):
         return f"{base_path}/{folder_name}"
     return f"local:{os.path.join(base_path, folder_name)}"
@@ -321,8 +328,8 @@ def determine_target_folder(
     """
     Определяет целевую папку для файла. Имена папок для animals и fallback «лица»
     берутся из target_folders по content_rule (animals, any_people), без хардкода.
-    Для no_faces: при наличии group_path — поездки в Путешествия/..., остальное (Чеки и т.д.) прямо под корнем;
-    без группы — None (файл в «несортировано» на sorting-folders).
+    Для no_faces: при наличии group_path — поездки в Путешествия/... (path из folders, может быть disk:/Фото/...);
+    остальные группы (Технологии, Чеки, Мемы, Дом и ремонт и т.д.) — только локальная раскладка (local:root/группа), на ЯД не заливаются, из прогона убираются после локального перемещения; без группы — None.
     """
     if root_path.startswith("disk:"):
         base_path = root_path.rstrip("/")
@@ -350,9 +357,12 @@ def determine_target_folder(
     elif effective_tab == "people_no_face":
         folder_name = "_people_no_face"
     elif effective_tab == "no_faces":
-        # С группой: поездки — в Путешествия/... под корнем; остальное (Чеки, Здоровье) — прямо под корнем. Без группы — несортировано (None).
-        # В БД/UI группа может быть «Поездки» или «Путешествия» — в целевой пути всегда «Путешествия» (имя папки из folders).
+        # С группой: поездки — в Путешествия/... (path из folders, disk или local); остальные группы — только локальная раскладка (local:root/группа), на ЯД не заливаются.
+        # В БД/UI группа может быть «Поездки» или «Путешествия» — в целевой пути всегда «Путешествия».
+        # group_path из file_groups может приходить с префиксом _no_faces/ — убираем, чтобы target_folder в БД был правильным (без _no_faces)
         gp = (group_path or "").strip()
+        if gp.startswith("_no_faces/"):
+            gp = gp[len("_no_faces/") :].strip()
         if not gp:
             return None
         # Поездка: группа «Путешествия»/«Поездки» или «.../XXX» или название начинается с года (2025 Гончарка Москва)
@@ -371,12 +381,15 @@ def determine_target_folder(
                 parts = ["Путешествия"] + [p for p in gp[9:].split("/") if p.strip()]
             else:
                 parts = ["Путешествия", gp]
-        else:
-            parts = [p for p in gp.split("/") if p.strip()]
+            if not parts:
+                return None
+            if root_path.startswith("disk:"):
+                return base_path + "/" + "/".join(parts)
+            return "local:" + os.path.join(base_path, *parts)
+        # Не поездка: Технологии, Чеки, Мемы, Дом и ремонт, Здоровье и т.д. — только локальная раскладка (local:root/группа); на ЯД не заливаются, после перемещения локально убираются из прогона
+        parts = [p for p in gp.split("/") if p.strip()]
         if not parts:
             return None
-        if root_path.startswith("disk:"):
-            return base_path + "/" + "/".join(parts)
         return "local:" + os.path.join(base_path, *parts)
     else:
         return None

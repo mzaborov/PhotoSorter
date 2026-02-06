@@ -9,9 +9,9 @@
       body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
       a { color: #0b57d0; text-decoration: none; }
       a:hover { text-decoration: underline; }
-      .header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; max-width: 1200px; }
+      .header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; max-width: 1600px; }
       .muted { color: #6b7280; }
-      table { border-collapse: collapse; width: 100%; max-width: 1200px; margin-top: 14px; }
+      table { border-collapse: collapse; width: 100%; max-width: 1600px; margin-top: 14px; }
       th, td { border-bottom: 1px solid #e5e7eb; padding: 10px 8px; vertical-align: top; text-align: left; }
       th { font-weight: 600; color: #111827; background: #fafafa; position: sticky; top: 0; }
       code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
@@ -21,18 +21,29 @@
       .right { text-align: right; }
       .count-cell { font-variant-numeric: tabular-nums; }
       .err { color: #b91c1c; }
-      .topline { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; max-width: 1200px; }
+      .topline { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; max-width: 1600px; }
       .btn { display: inline-flex; align-items: center; gap: 8px; border: 1px solid #e5e7eb; background: #fff; padding: 6px 10px; border-radius: 10px; cursor: pointer; }
       .btn:hover { background: #fafafa; }
       .btn:disabled { opacity: 0.5; cursor: not-allowed; }
       .status { font-variant-numeric: tabular-nums; }
-      .section { max-width: 1200px; margin-top: 18px; border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px 14px; background: #fff; }
+      .section { max-width: 1600px; margin-top: 18px; border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px 14px; background: #fff; }
       .section-title { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
       .bar { height: 10px; background: #f3f4f6; border-radius: 999px; overflow: hidden; border: 1px solid #e5e7eb; }
       .bar > div { height: 100%; width: 0%; background: #0b57d0; transition: width 200ms linear; }
       .form-row { display: flex; flex-wrap: wrap; gap: 10px 12px; align-items: center; margin-top: 10px; }
       .field { display: flex; align-items: center; gap: 8px; }
       .field input { width: 96px; padding: 6px 8px; border: 1px solid #e5e7eb; border-radius: 10px; }
+      .rule-cell { min-width: 480px; }
+      .rule-constructor { display: flex; flex-direction: row; flex-wrap: nowrap; align-items: center; gap: 8px 12px; min-width: 460px; }
+      .rule-constructor .rule-line1 { display: contents; }
+      .rule-constructor .rule-line2 { display: inline-flex; align-items: center; gap: 6px; }
+      .rule-constructor .rule-line2.hidden { display: none; }
+      .rule-constructor .rule-row { display: inline-flex; align-items: center; gap: 4px 6px; }
+      .rule-constructor select { padding: 3px 5px; border: 1px solid #e5e7eb; border-radius: 5px; font-size: 11px; min-width: 90px; max-width: 130px; }
+      .rule-constructor label { font-size: 11px; color: #6b7280; white-space: nowrap; }
+      .rule-constructor .rule-custom-input, .rule-constructor .rule-grouppath-input { min-width: 120px; max-width: 180px; padding: 3px 5px; border: 1px solid #e5e7eb; border-radius: 5px; font-family: ui-monospace, monospace; font-size: 11px; }
+      .rule-constructor .btn { padding: 3px 6px; font-size: 11px; line-height: 1; }
+      .rule-constructor .rule-save { min-width: 28px; }
     </style>
   </head>
   <body>
@@ -81,8 +92,7 @@
           <td class="nowrap"><code>{{ f.code }}</code></td>
           <td class="nowrap"><span class="pill">{{ f.role }}</span></td>
           <td class="rule-cell">
-            <input type="text" class="rule-input" value="{{ f.content_rule or '' }}" placeholder="только:[Имя]; вместе:[A,B]; содержит:[A,B]" data-folder-id="{{ f.id }}" style="width: 100%; min-width: 180px; max-width: 320px; padding: 4px 8px; border: 1px solid #e5e7eb; border-radius: 8px; font-family: ui-monospace, monospace; font-size: 12px;" />
-            <button type="button" class="btn rule-save" data-folder-id="{{ f.id }}" style="margin-top: 4px;">Сохранить</button>
+            <div class="rule-constructor" data-folder-id="{{ f.id }}" data-content-rule="{{ (f.content_rule or '') | e }}"></div>
           </td>
         </tr>
         {% endfor %}
@@ -122,6 +132,9 @@
       </div>
     </div>
 
+    <script>
+      window.RULE_GROUPS = {{ groups_json | default('[]') | safe }};
+    </script>
     <script>
       const CONCURRENCY = 10;
       const DEDUP_POLL_MS = 2000;
@@ -391,6 +404,312 @@
         startReconcileArchive();
       });
 
+      // Конструктор правил папок (объявления до вызова initRuleConstructors)
+      const RULE_TYPES = [
+        { value: "animals", label: "Животные" },
+        { value: "any_people", label: "Любые люди" },
+        { value: "group_path", label: "По группе" },
+        { value: "contains_group", label: "≥1 из группы" },
+        { value: "only_one_from_group", label: "1 из группы" },
+        { value: "multiple_from_group", label: "≥2 из группы" },
+        { value: "custom", label: "Свой текст" },
+      ];
+
+      // Порядок и регулярки — как в sort_rules.py (_RULE_* и parse_content_rule)
+      function parseContentRule(rule, groups) {
+        const r = (rule || "").trim();
+        if (!r) return { type: "animals", groupId: "", personId: "", raw: "", groupPath: "" };
+        if (r.toLowerCase() === "animals") return { type: "animals", groupId: "", personId: "", raw: "", groupPath: "" };
+        if (r.toLowerCase() === "any_people") return { type: "any_people", groupId: "", personId: "", raw: "", groupPath: "" };
+
+        const mGroupPath = /^\s*group_path\s*:\s*(.+)\s*$/i.exec(r);
+        if (mGroupPath) return { type: "group_path", groupId: "", personId: "", raw: "", groupPath: mGroupPath[1].trim() };
+
+        // Порядок как в _match_content_rule: сначала _id, потом по имени
+        const mOnlyId = /^\s*only_one_from_group_id\s*:\s*(\d+)(?:\s*:\s*(\d+))?\s*$/i.exec(r);
+        if (mOnlyId) return { type: "only_one_from_group", groupId: mOnlyId[1], personId: mOnlyId[2] || "", raw: "", groupPath: "" };
+
+        const mMultId = /^\s*multiple_from_group_id\s*:\s*(\d+)\s*$/i.exec(r);
+        if (mMultId) return { type: "multiple_from_group", groupId: mMultId[1], personId: "", raw: "", groupPath: "" };
+
+        const mContainsId = /^\s*contains_group_id\s*:\s*(\d+)\s*$/i.exec(r);
+        if (mContainsId) return { type: "contains_group", groupId: mContainsId[1], personId: "", raw: "", groupPath: "" };
+
+        const mOnly = /^\s*only_one_from_group\s*:\s*([^:]+)(?:\s*:\s*(\d+))?\s*$/i.exec(r);
+        if (mOnly) {
+          const name = mOnly[1].trim();
+          const g = findGroupByName(groups, name);
+          if (!g) return { type: "custom", groupId: "", personId: "", raw: r, groupPath: "" };
+          return { type: "only_one_from_group", groupId: String(g.id), personId: mOnly[2] || "", raw: "", groupPath: "" };
+        }
+
+        const mMult = /^\s*multiple_from_group\s*:\s*(.+)\s*$/i.exec(r);
+        if (mMult) {
+          const name = mMult[1].trim();
+          const g = findGroupByName(groups, name);
+          if (!g) return { type: "custom", groupId: "", personId: "", raw: r, groupPath: "" };
+          return { type: "multiple_from_group", groupId: String(g.id), personId: "", raw: "", groupPath: "" };
+        }
+
+        const mContains = /^\s*contains_group\s*:\s*(.+)\s*$/i.exec(r);
+        if (mContains) {
+          const name = mContains[1].trim();
+          const g = findGroupByName(groups, name);
+          if (!g) return { type: "custom", groupId: "", personId: "", raw: r, groupPath: "" };
+          return { type: "contains_group", groupId: String(g.id), personId: "", raw: "", groupPath: "" };
+        }
+
+        // Legacy: только:[X], вместе:[A,B], содержит:[A,B] — показываем как custom
+        return { type: "custom", groupId: "", personId: "", raw: r, groupPath: "" };
+      }
+
+      function findGroupByName(groups, name) {
+        const n = (name || "").trim();
+        if (!n) return null;
+        return groups.find(gr => (gr.name || "").trim() === n) || null;
+      }
+
+      function serializeRule(type, groupId, personId, raw, groupPath) {
+        if (type === "animals") return "animals";
+        if (type === "any_people") return "any_people";
+        if (type === "group_path") return (groupPath || "").trim() ? "group_path:" + (groupPath || "").trim() : null;
+        if (type === "custom") return (raw || "").trim() || null;
+        if (!groupId) return null;
+        const gid = String(groupId).trim();
+        if (type === "contains_group") return "contains_group_id:" + gid;
+        if (type === "multiple_from_group") return "multiple_from_group_id:" + gid;
+        if (type === "only_one_from_group") {
+          const pid = String(personId || "").trim();
+          return pid ? "only_one_from_group_id:" + gid + ":" + pid : "only_one_from_group_id:" + gid;
+        }
+        return null;
+      }
+
+      function buildRuleConstructor(container, folderId, contentRule, groups) {
+        const parsed = parseContentRule(contentRule, groups);
+        const needGroup = ["contains_group", "only_one_from_group", "multiple_from_group"].includes(parsed.type);
+        const needPerson = parsed.type === "only_one_from_group";
+        const needLine2 = parsed.type === "custom" || parsed.type === "group_path";
+        const selectedGroup = groups.find(g => String(g.id) === parsed.groupId);
+        const persons = selectedGroup ? (selectedGroup.persons || []) : [];
+
+        let html = '<div class="rule-line1">';
+        html += '<div class="rule-row"><label>Тип:</label><select class="rule-type-select" data-folder-id="' + (folderId || "") + '">';
+        RULE_TYPES.forEach(rt => {
+          const sel = rt.value === parsed.type ? " selected" : "";
+          html += '<option value="' + (rt.value || "") + '"' + sel + '>' + (rt.label || rt.value) + '</option>';
+        });
+        html += '</select></div>';
+
+        if (needGroup) {
+          html += '<div class="rule-row rule-group-row"><label>Группа:</label><select class="rule-group-select" data-folder-id="' + (folderId || "") + '">';
+          html += '<option value="">—</option>';
+          groups.forEach(g => {
+            const sel = String(g.id) === parsed.groupId ? " selected" : "";
+            html += '<option value="' + (g.id || "") + '"' + sel + '>' + (g.name || "") + '</option>';
+          });
+          html += '</select></div>';
+        }
+
+        if (needPerson) {
+          html += '<div class="rule-row rule-person-row"><label>Персона:</label><select class="rule-person-select" data-folder-id="' + (folderId || "") + '">';
+          html += '<option value="">—</option>';
+          persons.forEach(p => {
+            const sel = String(p.id) === parsed.personId ? " selected" : "";
+            html += '<option value="' + (p.id || "") + '"' + sel + '>' + (p.name || "") + '</option>';
+          });
+          html += '</select></div>';
+        }
+
+        const saveBtn = '<button type="button" class="btn rule-save" data-folder-id="' + (folderId || "") + '" title="Сохранить">&#x2713;</button>';
+        if (!needLine2) {
+          html += '<div class="rule-row rule-save-row">' + saveBtn + '</div>';
+        }
+        html += '</div>';
+
+        if (needLine2) {
+          const line2Class = 'rule-line2' + (needLine2 ? '' : ' hidden');
+          html += '<div class="' + line2Class + '">';
+          if (parsed.type === "group_path") {
+            const escaped = (parsed.groupPath || "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            html += '<label>Путь:</label><input type="text" class="rule-grouppath-input" value="' + escaped + '" placeholder="Поездки" />';
+          } else {
+            const escaped = (parsed.raw || "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            html += '<label>Текст:</label><input type="text" class="rule-custom-input" value="' + escaped + '" placeholder="только:[X]; вместе:[A,B]" />';
+          }
+          html += '<div class="rule-row rule-save-row">' + saveBtn + '</div></div>';
+        }
+        container.innerHTML = html;
+      }
+
+      function getRuleState(container) {
+        const typeSelect = container.querySelector(".rule-type-select");
+        const groupSelect = container.querySelector(".rule-group-select");
+        const personSelect = container.querySelector(".rule-person-select");
+        const customInput = container.querySelector(".rule-custom-input");
+        const groupPathInput = container.querySelector(".rule-grouppath-input");
+        const type = typeSelect ? typeSelect.value : "animals";
+        const groupId = groupSelect ? groupSelect.value : "";
+        const personId = personSelect ? personSelect.value : "";
+        const raw = customInput ? customInput.value : "";
+        const groupPath = groupPathInput ? groupPathInput.value : "";
+        return { type, groupId, personId, raw, groupPath };
+      }
+
+      function updatePersonOptions(container, groups) {
+        const groupSelect = container.querySelector(".rule-group-select");
+        const personSelect = container.querySelector(".rule-person-select");
+        if (!groupSelect || !personSelect) return;
+        const gid = groupSelect.value;
+        const g = groups.find(gr => String(gr.id) === gid);
+        const persons = g ? (g.persons || []) : [];
+        const curVal = personSelect.value;
+        personSelect.innerHTML = '<option value="">— любая из группы</option>';
+        persons.forEach(p => {
+          const opt = document.createElement("option");
+          opt.value = p.id;
+          opt.textContent = p.name || "";
+          personSelect.appendChild(opt);
+        });
+        personSelect.value = persons.some(p => String(p.id) === curVal) ? curVal : "";
+      }
+
+      function initRuleConstructors() {
+        const groups = window.RULE_GROUPS || [];
+
+        document.querySelectorAll(".rule-constructor").forEach((container) => {
+          const folderId = container.getAttribute("data-folder-id");
+          const contentRule = container.getAttribute("data-content-rule") || "";
+          buildRuleConstructor(container, folderId, contentRule, groups);
+
+          const typeSelect = container.querySelector(".rule-type-select");
+          const groupSelect = container.querySelector(".rule-group-select");
+          if (typeSelect) {
+            typeSelect.addEventListener("change", () => {
+              const type = typeSelect.value;
+              const needGroup = ["contains_group", "only_one_from_group", "multiple_from_group"].includes(type);
+              const needPerson = type === "only_one_from_group";
+              const needLine2 = type === "custom" || type === "group_path";
+              const groupRow = container.querySelector(".rule-group-row");
+              const personRow = container.querySelector(".rule-person-row");
+              const line2 = container.querySelector(".rule-line2");
+              if (groupRow) groupRow.style.display = needGroup ? "" : "none";
+              if (personRow) personRow.style.display = needPerson ? "" : "none";
+              if (line2) {
+                if (!needLine2) {
+                  const saveRow = line2.querySelector(".rule-save-row");
+                  const saveBtnEl = saveRow ? saveRow.querySelector(".rule-save") : null;
+                  const line1 = container.querySelector(".rule-line1");
+                  if (saveBtnEl && line1) {
+                    if (saveRow) saveRow.remove();
+                    const wrap = document.createElement("div");
+                    wrap.className = "rule-row rule-save-row";
+                    wrap.appendChild(saveBtnEl);
+                    line1.appendChild(wrap);
+                  }
+                }
+                line2.classList.toggle("hidden", !needLine2);
+                if (needLine2) {
+                  const hasGrouppath = line2.querySelector(".rule-grouppath-input");
+                  const hasCustom = line2.querySelector(".rule-custom-input");
+                  if (type === "group_path" && !hasGrouppath) {
+                    if (hasCustom) hasCustom.remove();
+                    const lbl = line2.querySelector("label");
+                    if (lbl) lbl.textContent = "Путь:";
+                    const inp = document.createElement("input");
+                    inp.type = "text";
+                    inp.className = "rule-grouppath-input";
+                    inp.placeholder = "Поездки";
+                    const saveRow = line2.querySelector(".rule-save-row");
+                    if (saveRow) line2.insertBefore(inp, saveRow);
+                    else line2.appendChild(inp);
+                  } else if (type === "custom" && !hasCustom) {
+                    if (hasGrouppath) hasGrouppath.remove();
+                    const lbl = line2.querySelector("label");
+                    if (lbl) lbl.textContent = "Текст:";
+                    const inp = document.createElement("input");
+                    inp.type = "text";
+                    inp.className = "rule-custom-input";
+                    inp.placeholder = "только:[X]; вместе:[A,B]";
+                    const saveRow = line2.querySelector(".rule-save-row");
+                    if (saveRow) line2.insertBefore(inp, saveRow);
+                    else line2.appendChild(inp);
+                  }
+                }
+              } else if (needLine2) {
+                const saveRow = container.querySelector(".rule-save-row");
+                const saveBtnEl = saveRow ? saveRow.querySelector(".rule-save") : null;
+                const html = type === "group_path"
+                  ? '<div class="rule-line2"><label>Путь:</label><input type="text" class="rule-grouppath-input" placeholder="Поездки" /><div class="rule-row rule-save-row"></div></div>'
+                  : '<div class="rule-line2"><label>Текст:</label><input type="text" class="rule-custom-input" placeholder="только:[X]; вместе:[A,B]" /><div class="rule-row rule-save-row"></div></div>';
+                container.insertAdjacentHTML("beforeend", html);
+                const newSaveRow = container.querySelector(".rule-line2 .rule-save-row");
+                if (saveBtnEl && newSaveRow && saveRow) {
+                  saveRow.remove();
+                  newSaveRow.appendChild(saveBtnEl);
+                }
+              }
+              if (needGroup && !groupRow) {
+                const insertAfter = typeSelect.closest(".rule-row");
+                let html = '<div class="rule-row rule-group-row"><label>Группа:</label><select class="rule-group-select" data-folder-id="' + (folderId || "") + '">';
+                html += '<option value="">—</option>';
+                groups.forEach(g => html += '<option value="' + (g.id || "") + '">' + (g.name || "") + '</option>');
+                html += '</select></div>';
+                insertAfter.insertAdjacentHTML("afterend", html);
+                const newGroupSelect = container.querySelector(".rule-group-select");
+                if (newGroupSelect) newGroupSelect.addEventListener("change", () => updatePersonOptions(container, groups));
+              }
+              if (needPerson && !personRow) {
+                const gr = container.querySelector(".rule-group-row");
+                let html = '<div class="rule-row rule-person-row"><label>Персона:</label><select class="rule-person-select" data-folder-id="' + (folderId || "") + '">';
+                html += '<option value="">—</option>';
+                html += '</select></div>';
+                if (gr) gr.insertAdjacentHTML("afterend", html);
+                updatePersonOptions(container, groups);
+              }
+              if (needGroup) updatePersonOptions(container, groups);
+            });
+          }
+          if (groupSelect) {
+            groupSelect.addEventListener("change", () => updatePersonOptions(container, groups));
+          }
+
+          const saveBtn = container.querySelector(".rule-save");
+          if (saveBtn) {
+            saveBtn.addEventListener("click", async () => {
+              const state = getRuleState(container);
+              const value = serializeRule(state.type, state.groupId, state.personId, state.raw, state.groupPath);
+              saveBtn.disabled = true;
+              saveBtn.textContent = "\u2026";
+              try {
+                const resp = await fetch(`/api/folders/${folderId}`, {
+                  method: "PATCH",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ content_rule: value }),
+                });
+                const data = await resp.json().catch(() => ({}));
+                if (!resp.ok) throw new Error(data.detail || "HTTP " + resp.status);
+                container.setAttribute("data-content-rule", value || "");
+                saveBtn.textContent = "\u2713";
+                saveBtn.style.color = "#059669";
+                setTimeout(() => { saveBtn.textContent = "\u2713"; saveBtn.style.color = ""; }, 1500);
+              } catch (err) {
+                saveBtn.textContent = "\u2717";
+                saveBtn.style.color = "#dc2626";
+                setTimeout(() => { saveBtn.textContent = "\u2713"; saveBtn.style.color = ""; }, 2000);
+                setHint("Правило не сохранено: " + String(err));
+              } finally {
+                saveBtn.disabled = false;
+              }
+            });
+          }
+        });
+      }
+
+      // Сначала отрисовываем конструкторы правил (данные уже в странице, без fetch)
+      initRuleConstructors();
+
+      // Подсчёт файлов — отдельный async-процесс, не блокирует правила
       loadCountsRowByRow();
       pollDedupArchiveStatusOnce();
       pollArchiveReconcileStatusOnce();
@@ -398,36 +717,6 @@
         pollDedupArchiveStatusOnce();
         pollArchiveReconcileStatusOnce();
       }, DEDUP_POLL_MS);
-
-      // Сохранение правила папки (content_rule)
-      document.querySelectorAll(".rule-save").forEach((btn) => {
-        btn.addEventListener("click", async (e) => {
-          const folderId = btn.getAttribute("data-folder-id");
-          const row = btn.closest("tr");
-          const input = row?.querySelector(".rule-input");
-          if (!folderId || !input) return;
-          const value = (input.value || "").trim() || null;
-          btn.disabled = true;
-          btn.textContent = "…";
-          try {
-            const resp = await fetch(`/api/folders/${folderId}`, {
-              method: "PATCH",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ content_rule: value }),
-            });
-            const data = await resp.json().catch(() => ({}));
-            if (!resp.ok) throw new Error(data.detail || "HTTP " + resp.status);
-            btn.textContent = "Сохранено";
-            setTimeout(() => { btn.textContent = "Сохранить"; }, 1500);
-          } catch (err) {
-            btn.textContent = "Ошибка";
-            setTimeout(() => { btn.textContent = "Сохранить"; }, 2000);
-            setHint("Правило не сохранено: " + String(err));
-          } finally {
-            btn.disabled = false;
-          }
-        });
-      });
     </script>
   </body>
 </html>

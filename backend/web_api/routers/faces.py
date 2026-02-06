@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import traceback
 import urllib.parse
@@ -32,6 +33,10 @@ from common.sort_rules import (
     resolve_target_folder_for_faces as _resolve_target_folder_for_faces,
 )
 from common.yadisk_client import get_disk
+try:
+    from yadisk import exceptions as yadisk_exceptions
+except ImportError:
+    yadisk_exceptions = None  # type: ignore[assignment]
 from logic.gold.store import gold_expected_tab_by_path, gold_file_map, gold_read_lines, gold_write_lines, gold_read_ndjson_by_path, gold_write_ndjson_by_path, gold_faces_manual_rects_path, gold_faces_video_frames_path
 
 router = APIRouter()
@@ -3854,6 +3859,31 @@ def _normalize_yadisk_path(path: str) -> str:
     return p.replace("\\", "/")
 
 
+def _ensure_yadisk_parent_dirs(disk: Any, remote_file_path: str) -> None:
+    """
+    Создаёт на Яндекс.Диске цепочку родительских папок для remote_file_path (полный путь к файлу).
+    Игнорирует PathExistsError (папка уже есть).
+    """
+    p = (remote_file_path or "").replace("\\", "/").strip()
+    if not p or p.count("/") < 2:
+        return
+    parent = p.rsplit("/", 1)[0]
+    if not parent or parent in ("disk:", "disk:/"):
+        return
+    parts = parent.split("/")
+    for i in range(2, len(parts) + 1):
+        dir_path = "/".join(parts[:i])
+        try:
+            disk.mkdir(dir_path)
+        except Exception as e:
+            if yadisk_exceptions and isinstance(e, yadisk_exceptions.PathExistsError):
+                pass
+            elif "PathExistsError" in type(e).__name__ or "already exists" in str(e).lower():
+                pass
+            else:
+                raise
+
+
 def _parent_segment_starts_with_underscore(path: str) -> bool:
     """True, если родительская папка пути начинается с '_' (файл уже в отсортированной папке)."""
     p = (path or "").replace("\\", "/").strip("/")
@@ -3870,8 +3900,8 @@ def _parent_segment_starts_with_underscore(path: str) -> bool:
 def api_faces_step4_report(pipeline_run_id: int) -> dict[str, Any]:
     """
     Отчёт шага 4 «разложить по правилам»:
-    - by_folder: файлы прогона с заполненным target_folder в БД (после fill — те же папки, что new_target_folder в скрипте).
-    - unsorted: файлы прогона без target_folder в БД.
+    - by_folder: файлы прогона с заполненным target_folder в БД (только source — без local_done, чтобы «Всего в отчёте» совпадало с «Всего в прогоне» tab-counts).
+    - unsorted: файлы прогона без target_folder в БД (только source).
     Возвращает: pipeline_run_id, root_path, by_folder, total, unsorted, unsorted_count.
     """
     ps = PipelineStore()
@@ -3897,7 +3927,7 @@ def api_faces_step4_report(pipeline_run_id: int) -> dict[str, Any]:
     conn = get_connection()
     try:
         cur = conn.cursor()
-        # Сортируемые файлы = inventory_scope='source' и last_run_id прогона (не path под корнем).
+        # Только source — без local_done, чтобы «Всего в отчёте» совпадало с «Всего в прогоне» (tab-counts считает только source).
         scope_run = (int(dedup_run_id),)
         cur.execute(
             """
@@ -4286,14 +4316,52 @@ def api_faces_fill_target_folders(payload: dict[str, Any] = Body(...)) -> dict[s
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
+def _remove_empty_dirs_up_to(dir_path: str, stop_at: str) -> None:
+    """
+    Удаляет каталог dir_path и его пустых родителей вверх по дереву, пока не дойдём до stop_at.
+    Не удаляет stop_at и ничего выше. Игнорирует ошибки (права, непустой каталог и т.д.).
+    На Windows сравнение путей без учёта регистра (иначе path.startswith(stop) может дать False).
+    """
+    if not dir_path or not stop_at:
+        return
+    path = os.path.normpath(os.path.abspath(dir_path))
+    stop = os.path.normpath(os.path.abspath(stop_at))
+    # На Windows пути case-insensitive — иначе пустые папки могут не удаляться
+    if os.name == "nt":
+        path_lower = path.lower()
+        stop_lower = stop.lower()
+        if not path_lower.startswith(stop_lower):
+            return
+        while path and path.lower() != stop_lower and os.path.isdir(path):
+            try:
+                if os.listdir(path):
+                    break
+                os.rmdir(path)
+                path = os.path.dirname(path)
+            except OSError:
+                break
+    else:
+        if not path.startswith(stop):
+            return
+        while path and path != stop and os.path.isdir(path):
+            try:
+                if os.listdir(path):
+                    break
+                os.rmdir(path)
+                path = os.path.dirname(path)
+            except OSError:
+                break
+
+
 def sort_into_folders_impl(
     pipeline_run_id: int,
     dry_run: bool = False,
     destination: str | None = None,
+    limit_file_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Перемещает файлы с заполненным target_folder.
-    Вызывается из API и из local_pipeline напрямую (без HTTP), чтобы избежать дедлока.
+    limit_file_paths: при destination='archive' — переносить только файлы с path из списка (для теста по подмножеству).
     Возвращает: {"ok": True, "moved_count": N, "errors": [...]} или raises ValueError.
     """
     ps = PipelineStore()
@@ -4330,31 +4398,60 @@ def sort_into_folders_impl(
         ds.close()
 
     if destination == "local":
-        files_to_move = [
-            r for r in files_to_move
-            if not (str(r.get("target_folder") or "").strip().startswith("disk:"))
-        ]
+        # Только файлы на локальном диске — переносим в целевые папки под корнем (target_folder всегда local:root/...)
+        files_to_move = [r for r in files_to_move if (str(r.get("path") or "")).strip().startswith("local:")]
     elif destination == "archive":
-        files_to_move = [
-            r for r in files_to_move
-            if (str(r.get("target_folder") or "").strip().startswith("disk:/Фото"))
-        ]
+        # В архив — только файлы на локальном диске (target_folder в БД всегда local:root/..., disk-путь для загрузки вычисляем ниже)
+        files_to_move = [r for r in files_to_move if (str(r.get("path") or "")).strip().startswith("local:")]
+        if limit_file_paths:
+            path_set = set(limit_file_paths)
+            files_to_move = [r for r in files_to_move if (r.get("path") or "") in path_set]
+            if not files_to_move:
+                raise ValueError("Нет файлов из списка limit_file_paths среди кандидатов на перенос в архив")
 
     if not files_to_move:
         msg = "Нет файлов с заполненным target_folder. Сначала нажмите «Заполнить целевые папки»."
         if destination == "local":
             msg = "Нет файлов для перемещения локально (целевая папка под корнем прогона)."
         elif destination == "archive":
-            msg = "Нет файлов для перемещения в фотоархив (целевая папка disk:/Фото/...)."
+            msg = "Нет файлов для перемещения в фотоархив (нет локальных файлов с целевой папкой)."
         raise ValueError(msg)
+
+    # При dry_run + archive собираем список запланированных операций для отчёта
+    planned: list[dict[str, Any]] = [] if (destination == "archive" and dry_run) else []
+
+    # Прогресс для шагов «Переместить локально» / «Перенести в архив»: фаза и счётчики в БД (только при реальном переносе, не при dry_run)
+    if destination in ("local", "archive") and not limit_file_paths and not dry_run:
+        ps_phase = PipelineStore()
+        try:
+            ps_phase.update_run(
+                run_id=pipeline_run_id,
+                step4_phase=destination,
+                step4_total=len(files_to_move),
+                step4_processed=0,
+            )
+        finally:
+            ps_phase.close()
 
     moved_count = 0
     errors: list[dict[str, str]] = []
     disk = None
+    root_path_clean = root_path[6:] if root_path.startswith("local:") else root_path
+    # Имена папок, которые идут в архив (лица, животные, поездки) — файлы в этих папках не помечаем local_done; остальные (Технологии, Чеки и т.д.) — local_done
+    _folders_target = list_folders(role="target")
+    archive_folder_names = {"Путешествия"}
+    for f in _folders_target:
+        name = (f.get("name") or "").strip()
+        rule = (f.get("content_rule") or "").strip().lower()
+        if not name:
+            continue
+        if rule in ("animals", "any_people") or rule.startswith("only_one") or rule.startswith("multiple_from") or rule.startswith("contains_group"):
+            archive_folder_names.add(name)
     # Прогресс шага 4: 50–100% = move; step4_total в БД = 2*кол-во файлов, fill_total = step4_total//2
     step4_total_db = int(pr.get("step4_total") or 0)
     fill_total = (step4_total_db // 2) if step4_total_db >= 2 else 0
-    _step4_move_progress_interval = 20  # обновлять прогресс в БД каждые N перемещённых файлов
+    _step4_move_progress_interval = 5  # обновлять прогресс в БД каждые N перемещённых файлов (чаще — счётчик на UI обновляется чаще)
+    _step4_phase = destination in ("local", "archive") and not limit_file_paths and not dry_run  # прогресс для шагов 5/6 (не при dry_run)
 
     for row in files_to_move:
         path = str(row["path"] or "")
@@ -4392,24 +4489,226 @@ def sort_into_folders_impl(
                         ds.close()
                     _update_gold_file_paths(old_path=path, new_path=dst_path)
                 moved_count += 1
-                if fill_total > 0 and (moved_count % _step4_move_progress_interval == 0 or moved_count == len(files_to_move)):
+                if (fill_total > 0 or _step4_phase) and (moved_count % _step4_move_progress_interval == 0 or moved_count == len(files_to_move)):
                     ps_move = PipelineStore()
                     try:
-                        ps_move.update_run(run_id=pipeline_run_id, step4_processed=fill_total + moved_count)
+                        val = moved_count if _step4_phase else (fill_total + moved_count)
+                        ps_move.update_run(run_id=pipeline_run_id, step4_processed=val)
                     finally:
                         ps_move.close()
             except Exception as e:  # noqa: BLE001
                 errors.append({"path": path, "error": f"{type(e).__name__}: {e}"})
         elif path.startswith("local:"):
-            local_path = path[6:]
-            if not os.path.exists(local_path):
-                errors.append({"path": path, "error": "File not found"})
+            # Нормализуем путь под ОС (слэши, абсолютный путь) — иначе os.path.exists может не найти файл (напр. local:C:/tmp/Photo/Агата/... на Windows)
+            local_path_raw = path[6:].strip()
+            local_path = os.path.normpath(local_path_raw)
+            if os.path.isabs(local_path_raw):
+                local_path = os.path.abspath(local_path)
+            # Перенос в архив: target_folder в БД всегда local:root/... — вычисляем disk-путь для загрузки: disk:/Фото/ + относительный путь после корня
+            if destination == "archive":
+                root_path_clean = os.path.normpath(root_path[6:] if root_path.startswith("local:") else root_path)
+                if target_folder.strip().startswith("local:"):
+                    tf_local = os.path.normpath(target_folder.strip()[6:].replace("/", os.sep))
+                    rel = tf_local[len(root_path_clean):].lstrip(os.sep) if (tf_local == root_path_clean or tf_local.startswith(root_path_clean + os.sep)) else os.path.basename(tf_local)
+                    if os.sep in rel:
+                        rel = rel.replace(os.sep, "/")
+                    disk_path = "disk:/Фото/" + rel
+                else:
+                    disk_path = target_folder.strip()
+                archive_dst_path = (disk_path.rstrip("/") + "/" + file_name) if disk_path else dst_path
+                root_path_clean_arch = root_path[6:] if root_path.startswith("local:") else root_path
+                _sorted_dir = os.path.join(root_path_clean_arch, "_sorted") if root_path_clean_arch else None
+                dest_local = os.path.join(_sorted_dir, file_name) if _sorted_dir else ""
+                # Файл по исходному пути отсутствует — возможно уже перенесён в _sorted (предыдущий перенос обновил диск, но не БД)
+                if not os.path.exists(local_path) and _sorted_dir and os.path.isdir(_sorted_dir):
+                    found_in_sorted = os.path.join(_sorted_dir, file_name)
+                    if not os.path.exists(found_in_sorted):
+                        base, ext = os.path.splitext(file_name)
+                        n = 1
+                        while n < 100:
+                            found_in_sorted = os.path.join(_sorted_dir, f"{base}_{n}{ext}")
+                            if os.path.exists(found_in_sorted):
+                                break
+                            n += 1
+                        else:
+                            found_in_sorted = None
+                    if found_in_sorted and not dry_run:
+                        try:
+                            ds = DedupStore()
+                            try:
+                                ds.update_path(
+                                    old_path=path,
+                                    new_path=archive_dst_path,
+                                    new_name=file_name,
+                                    new_parent_path=disk_path.rstrip("/"),
+                                )
+                                ds.set_inventory_scope_for_path(path=archive_dst_path, scope="archive")
+                                ds.update_run_manual_labels_path(
+                                    pipeline_run_id=int(pipeline_run_id),
+                                    old_path=path,
+                                    new_path=archive_dst_path,
+                                )
+                            finally:
+                                ds.close()
+                            fs = FaceStore()
+                            try:
+                                fs.update_file_path(old_file_path=path, new_file_path=archive_dst_path)
+                            finally:
+                                fs.close()
+                            _update_gold_file_paths(old_path=path, new_path=archive_dst_path)
+                            moved_count += 1
+                            if (fill_total > 0 or _step4_phase) and (moved_count % _step4_move_progress_interval == 0 or moved_count == len(files_to_move)):
+                                ps_move = PipelineStore()
+                                try:
+                                    val = moved_count if _step4_phase else (fill_total + moved_count)
+                                    ps_move.update_run(run_id=pipeline_run_id, step4_processed=val)
+                                finally:
+                                    ps_move.close()
+                        except Exception as e:  # noqa: BLE001
+                            errors.append({"path": path, "error": f"Уже в _sorted, но обновление БД: {type(e).__name__}: {e}"})
+                    elif found_in_sorted and dry_run:
+                        moved_count += 1
+                    elif not found_in_sorted:
+                        errors.append({"path": path, "error": "File not found"})
+                    continue
+                elif not os.path.exists(local_path):
+                    errors.append({"path": path, "error": "File not found"})
+                    continue
+                if dry_run:
+                    planned.append({
+                        "path": path,
+                        "file_name": file_name,
+                        "target_folder": target_folder.strip(),
+                        "disk_path": archive_dst_path,
+                        "local_sorted_path": dest_local,
+                    })
+                    continue
+                if disk is None:
+                    disk = get_disk()
+                try:
+                    if not dry_run:
+                        root_path_clean = root_path[6:] if root_path.startswith("local:") else root_path
+                        _sorted_dir = os.path.join(root_path_clean, "_sorted") if root_path_clean else None
+                        try:
+                            remote_norm = _normalize_yadisk_path(archive_dst_path)
+                            _ensure_yadisk_parent_dirs(disk, remote_norm)
+                            disk.upload(local_path, remote_norm)
+                        except Exception as upload_err:  # noqa: BLE001
+                            # Файл уже на ЯД (409 PathExistsError / DiskResourceAlreadyExistsError) — предыдущая загрузка не обновила БД; синхронизируем БД и локально переносим в _sorted
+                            _is_already_exists = (
+                                "PathExistsError" in type(upload_err).__name__
+                                or "already exists" in str(upload_err).lower()
+                                or "409" in str(upload_err)
+                                or "DiskResourceAlreadyExistsError" in str(upload_err)
+                            )
+                            if not _is_already_exists:
+                                raise
+                            # Уже в архиве: обновляем БД и переносим локальный файл в _sorted
+                            if _sorted_dir and os.path.exists(local_path):
+                                os.makedirs(_sorted_dir, exist_ok=True)
+                                dest_local = os.path.join(_sorted_dir, file_name)
+                                if os.path.exists(dest_local):
+                                    base, ext = os.path.splitext(file_name)
+                                    n = 1
+                                    while os.path.exists(dest_local):
+                                        dest_local = os.path.join(_sorted_dir, f"{base}_{n}{ext}")
+                                        n += 1
+                                os.rename(local_path, dest_local)
+                            ds = DedupStore()
+                            try:
+                                ds.update_path(
+                                    old_path=path,
+                                    new_path=archive_dst_path,
+                                    new_name=file_name,
+                                    new_parent_path=disk_path.rstrip("/"),
+                                )
+                                ds.set_inventory_scope_for_path(path=archive_dst_path, scope="archive")
+                                ds.update_run_manual_labels_path(
+                                    pipeline_run_id=int(pipeline_run_id),
+                                    old_path=path,
+                                    new_path=archive_dst_path,
+                                )
+                            finally:
+                                ds.close()
+                            fs = FaceStore()
+                            try:
+                                fs.update_file_path(old_file_path=path, new_file_path=archive_dst_path)
+                            finally:
+                                fs.close()
+                            _update_gold_file_paths(old_path=path, new_path=archive_dst_path)
+                            if root_path_clean:
+                                try:
+                                    _remove_empty_dirs_up_to(os.path.dirname(local_path), root_path_clean)
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            moved_count += 1
+                            if (fill_total > 0 or _step4_phase) and (moved_count % _step4_move_progress_interval == 0 or moved_count == len(files_to_move)):
+                                ps_move = PipelineStore()
+                                try:
+                                    val = moved_count if _step4_phase else (fill_total + moved_count)
+                                    ps_move.update_run(run_id=pipeline_run_id, step4_processed=val)
+                                finally:
+                                    ps_move.close()
+                            continue
+                        if _sorted_dir:
+                            os.makedirs(_sorted_dir, exist_ok=True)
+                            dest_local = os.path.join(_sorted_dir, file_name)
+                            if os.path.exists(dest_local):
+                                base, ext = os.path.splitext(file_name)
+                                n = 1
+                                while os.path.exists(dest_local):
+                                    dest_local = os.path.join(_sorted_dir, f"{base}_{n}{ext}")
+                                    n += 1
+                            os.rename(local_path, dest_local)
+                        ds = DedupStore()
+                        try:
+                            ds.update_path(
+                                old_path=path,
+                                new_path=archive_dst_path,
+                                new_name=file_name,
+                                new_parent_path=disk_path.rstrip("/"),
+                            )
+                            ds.set_inventory_scope_for_path(path=archive_dst_path, scope="archive")
+                            ds.update_run_manual_labels_path(
+                                pipeline_run_id=int(pipeline_run_id),
+                                old_path=path,
+                                new_path=archive_dst_path,
+                            )
+                        finally:
+                            ds.close()
+                        fs = FaceStore()
+                        try:
+                            fs.update_file_path(old_file_path=path, new_file_path=archive_dst_path)
+                        finally:
+                            fs.close()
+                        _update_gold_file_paths(old_path=path, new_path=archive_dst_path)
+                        # После успешного переноса в архив удаляем пустые папки источника (как при «Переместить локально»)
+                        if root_path_clean:
+                            try:
+                                _remove_empty_dirs_up_to(os.path.dirname(local_path), root_path_clean)
+                            except Exception:  # noqa: BLE001
+                                pass
+                    moved_count += 1
+                    if (fill_total > 0 or _step4_phase) and (moved_count % _step4_move_progress_interval == 0 or moved_count == len(files_to_move)):
+                        ps_move = PipelineStore()
+                        try:
+                            val = moved_count if _step4_phase else (fill_total + moved_count)
+                            ps_move.update_run(run_id=pipeline_run_id, step4_processed=val)
+                        finally:
+                            ps_move.close()
+                except Exception as e:  # noqa: BLE001
+                    errors.append({"path": path, "error": f"{type(e).__name__}: {e}"})
                 continue
+            # Перемещение локально в target-folder (destination=local или без archive). Для disk:/Фото/... строим локальный аналог под root_path (сохраняем структуру: Путешествия/2024 Турция)
+            root_path_clean = root_path[6:] if root_path.startswith("local:") else root_path
             if target_folder.startswith("local:"):
                 dst_local = os.path.join(target_folder[6:], file_name)
+            elif target_folder.strip().startswith("disk:/Фото/"):
+                rel = target_folder.strip()[len("disk:/Фото/"):].lstrip("/").replace("/", os.sep)
+                base = root_path_clean if root_path_clean else os.path.dirname(local_path)
+                dst_local = os.path.join(base, rel, file_name)
             elif target_folder.startswith("disk:"):
                 folder_name = os.path.basename(target_folder)
-                root_path_clean = root_path[6:] if root_path.startswith("local:") else root_path
                 if root_path_clean and not root_path_clean.startswith("disk:"):
                     dst_local = os.path.join(root_path_clean, folder_name, file_name)
                 else:
@@ -4444,7 +4743,13 @@ def sort_into_folders_impl(
                             old_path=path,
                             new_path=new_db_path,
                         )
-                        # Не очищаем target_folder после перемещения — отчёт шага 4 показывает распределение по папкам
+                        # local_done только для папок, которые остаются локально (Технологии, Чеки и т.д.). Путешествия и папки лиц/животных — в архив, для них local_done не выставляем.
+                        tf = (str(row.get("target_folder") or "").strip())
+                        if tf.startswith("local:") and root_path_clean:
+                            rel = tf[6:][len(root_path_clean):].lstrip("/\\").replace("\\", "/")
+                            rel_first = (rel.split("/")[0] or "").strip()
+                            if rel_first and rel_first != "Путешествия" and rel_first not in archive_folder_names:
+                                ds.set_inventory_scope_for_path(path=new_db_path, scope="local_done")
                     finally:
                         ds.close()
                     fs = FaceStore()
@@ -4453,24 +4758,120 @@ def sort_into_folders_impl(
                     finally:
                         fs.close()
                     _update_gold_file_paths(old_path=path, new_path=new_db_path)
+                    # После успешного переноса удаляем пустые папки источника (только при «Переместить локально»)
+                    if destination == "local" and root_path_clean:
+                        try:
+                            _remove_empty_dirs_up_to(os.path.dirname(local_path), root_path_clean)
+                        except Exception:  # noqa: BLE001
+                            pass
                 except Exception as e:  # noqa: BLE001
                     errors.append({"path": path, "error": f"{type(e).__name__}: {e}"})
                     continue
             moved_count += 1
-            if fill_total > 0 and (moved_count % _step4_move_progress_interval == 0 or moved_count == len(files_to_move)):
+            if (fill_total > 0 or _step4_phase) and (moved_count % _step4_move_progress_interval == 0 or moved_count == len(files_to_move)):
                 ps_move = PipelineStore()
                 try:
-                    ps_move.update_run(run_id=pipeline_run_id, step4_processed=fill_total + moved_count)
+                    val = moved_count if _step4_phase else (fill_total + moved_count)
+                    ps_move.update_run(run_id=pipeline_run_id, step4_processed=val)
                 finally:
                     ps_move.close()
 
-    return {
+    # Сброс фазы прогресса и отметка «выполнено» для шагов 5/6 только при реальном переносе (не при dry_run — иначе шаг показывался бы выполненным при 0 перенесённых файлах)
+    if destination in ("local", "archive") and not limit_file_paths and not dry_run:
+        ps_clear = PipelineStore()
+        try:
+            kwargs_clear: dict[str, Any] = {"run_id": pipeline_run_id, "step4_phase": ""}
+            if destination == "local":
+                kwargs_clear["step5_done"] = 1
+            elif destination == "archive":
+                kwargs_clear["step6_done"] = 1
+            ps_clear.update_run(**kwargs_clear)
+        finally:
+            ps_clear.close()
+
+    out: dict[str, Any] = {
         "ok": True,
         "pipeline_run_id": int(pipeline_run_id),
         "dry_run": bool(dry_run),
         "moved_count": moved_count,
         "errors": errors,
     }
+    if destination == "archive":
+        out["planned"] = planned
+    return out
+
+
+def _run_sort_into_folders_background(pipeline_run_id: int, destination: str) -> None:
+    """Выполняет sort_into_folders_impl в фоне; при ошибке пишет только last_error (без step4_phase, чтобы не падать на старых БД без этой колонки)."""
+    try:
+        sort_into_folders_impl(pipeline_run_id=pipeline_run_id, dry_run=False, destination=destination)
+    except Exception as e:
+        logger.exception("sort_into_folders (background) failed: %s", e)
+        try:
+            ps = PipelineStore()
+            try:
+                ps.update_run(run_id=pipeline_run_id, last_error=str(e))
+            finally:
+                ps.close()
+        except Exception:
+            pass
+
+
+@router.post("/api/faces/sort-into-folders-start")
+def api_faces_sort_into_folders_start(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Запускает перенос файлов в фоне (локально или в архив).
+    Параметры: pipeline_run_id (int), destination ("local" | "archive").
+    Возвращает сразу; прогресс отдаётся через GET /api/local-pipeline/status (step5/step6).
+    """
+    pipeline_run_id = payload.get("pipeline_run_id")
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required")
+    destination = payload.get("destination")
+    if destination not in ("local", "archive"):
+        raise HTTPException(status_code=400, detail="destination must be 'local' or 'archive'")
+    ps = PipelineStore()
+    try:
+        pr = ps.get_run_by_id(run_id=pipeline_run_id)
+    finally:
+        ps.close()
+    if not pr:
+        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+    th = threading.Thread(
+        target=_run_sort_into_folders_background,
+        args=(pipeline_run_id, destination),
+        name=f"sort_into_folders_{destination}_{pipeline_run_id}",
+        daemon=True,
+    )
+    th.start()
+    return {"ok": True, "message": "started", "destination": destination}
+
+
+@router.post("/api/faces/sort-into-folders-archive-limit")
+def api_faces_sort_into_folders_archive_limit(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Перенос в архив только для файлов из списка paths (для теста по подмножеству).
+    Параметры: pipeline_run_id (int), paths (list[str] — пути local:...).
+    Выполняется синхронно, возвращает moved_count и errors.
+    """
+    pipeline_run_id = payload.get("pipeline_run_id")
+    if not isinstance(pipeline_run_id, int):
+        raise HTTPException(status_code=400, detail="pipeline_run_id is required")
+    paths = payload.get("paths")
+    if not isinstance(paths, list) or not paths:
+        raise HTTPException(status_code=400, detail="paths must be a non-empty list of file paths")
+    paths = [str(p).strip() for p in paths if p]
+    if not paths:
+        raise HTTPException(status_code=400, detail="paths must contain at least one path")
+    try:
+        return sort_into_folders_impl(
+            pipeline_run_id=pipeline_run_id,
+            dry_run=False,
+            destination="archive",
+            limit_file_paths=paths,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.post("/api/faces/sort-into-folders")

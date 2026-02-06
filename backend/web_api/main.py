@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from common.db import DedupStore, FaceStore, PipelineStore, list_folders, init_db
+from common.db import DedupStore, FaceStore, PipelineStore, get_connection, list_folders, init_db
 from common.yadisk_client import get_disk
 from web_api.routers.gold import router as gold_router
 from web_api.routers.preclean import router as preclean_router
@@ -51,6 +51,28 @@ except Exception:
     pass
 
 app = FastAPI(title="PhotoSorter")
+
+
+@app.on_event("startup")
+def _startup_init_db() -> None:
+    """
+    Инициализация БД при старте сервера: создаёт таблицы, если их нет (подъём системы с нуля).
+    Для существующей БД только проверяет наличие files и выходит — новые колонки только через миграции.
+    """
+    init_db()
+    # Сброс «зависшего» статуса шагов 5/6: после перезапуска uvicorn фоновый перенос убит,
+    # но в БД мог остаться step4_phase=local|archive — сбрасываем, чтобы UI показывал idle и можно было нажать «Перенести в архив» снова (resume).
+    try:
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("UPDATE pipeline_runs SET step4_phase = '' WHERE step4_phase IN ('local', 'archive')")
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass  # колонка step4_phase может отсутствовать в старых БД
+
 
 # Favicon должен быть ДО mount static, чтобы не конфликтовать
 @app.get("/favicon.ico")

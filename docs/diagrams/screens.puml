@@ -1,0 +1,79 @@
+@startuml
+skinparam backgroundColor #fafafa
+skinparam defaultFontSize 12
+skinparam rectangle {
+  roundCorner 10
+  borderColor #374151
+  backgroundColor #fff
+}
+skinparam arrow {
+  color #0b57d0
+  fontColor #374151
+}
+
+title Ключевые экраны Web UI (PhotoSorter)
+
+!$base = "http://127.0.0.1:8000"
+rectangle "**Главная**\n/" as index [[$base/]]
+rectangle "**Фотоархив**\n/folders" as folders [[$base/folders]]
+rectangle "**Обзор папки**\n/browse" as browse [[$base/browse]]
+rectangle "**Дубли**\n/duplicates" as duplicates [[$base/duplicates]]
+
+rectangle "**Gold**\n/gold" as gold [[$base/gold]]
+rectangle "**Список персон**\n/persons" as persons [[$base/persons]]
+rectangle "**Карточка персоны**\n/persons/{id}" as person_detail [[$base/persons]]
+rectangle "**Кластеры персоны**\n/persons/{id}/clusters" as person_clusters [[$base/persons]]
+rectangle "**Неназначенные кластеры**\n/face-clusters" as face_clusters [[$base/face-clusters]]
+rectangle "**Деталь кластера лиц**\n/face-clusters/{id}" as cluster_detail [[$base/face-clusters]]
+rectangle "**Карточка фото**\n/debug/photo-card" as photo_card [[$base/debug/photo-card]]
+
+package "Результаты сортировки" as results_group {
+  rectangle "**Лица (разметка)**\n/faces" as faces [[$base/faces]]
+  rectangle "**Папки сортировки**\n/sorting-folders" as sorting_folders [[$base/sorting-folders]]
+  rectangle "**Результаты preclean**\n/preclean-results" as preclean [[$base/preclean-results]]
+  rectangle "**Результаты дедупа**\n/dedup-results" as dedup_results [[$base/dedup-results]]
+}
+
+' === Навигация из главной и меню ===
+index --> folders : меню
+index --> gold : меню
+index --> persons : меню
+index --> faces : результаты шага 3
+index --> sorting_folders : результаты шага 4
+index --> preclean : результаты шага 1
+index --> dedup_results : результаты шага 2
+
+' === Фотоархив и дубли ===
+folders --> browse : обзор папки
+folders --> duplicates : дубли
+browse --> folders : назад
+duplicates --> folders : назад
+
+' === Персоны и лица ===
+persons --> person_detail : карточка персоны
+persons --> face_clusters : неназначенные
+person_detail --> persons : к списку
+person_detail --> person_clusters : кластеры персоны
+person_clusters --> person_detail : назад
+person_clusters --> cluster_detail : просмотр
+face_clusters --> persons : к списку
+face_clusters --> cluster_detail : просмотр
+face_clusters --> person_detail : назначить персоне
+cluster_detail --> face_clusters : назад
+gold --> faces : по run_id
+faces --> photo_card : карточка (debug)
+person_detail --> photo_card : карточка
+face_clusters --> photo_card : карточка
+cluster_detail --> photo_card : карточка
+sorting_folders --> photo_card : карточка
+
+' === Возврат на главную ===
+folders --> index : главная
+gold --> index : главная
+persons --> index : главная
+faces --> index : главная
+sorting_folders --> index : на главную
+preclean --> index : на главную
+dedup_results --> index : на главную
+
+@enduml

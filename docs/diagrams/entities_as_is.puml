@@ -63,7 +63,7 @@ class files <<table>> {
   +id: INTEGER <<PK>>
   path: TEXT <<UNIQUE>>         ' disk:/... or local:...
   resource_id: TEXT             ' YaDisk stable id (optional)
-  inventory_scope: TEXT         ' archive|source
+  inventory_scope: TEXT         ' source | local_done | archive (см. docs/README.md)
   name: TEXT
   parent_path: TEXT
   size: INTEGER
@@ -102,6 +102,16 @@ class files <<table>> {
   image_width: INTEGER
   image_height: INTEGER
 }
+
+note right of files::inventory_scope
+  **inventory_scope**
+  • source — в прогоне, сортируемые
+    (ещё не перенесены или папка «архивного» типа: лица, животные, Путешествия)
+  • local_done — перенесены локально в папки,
+    которые остаются только на диске (Технологии, Чеки и т.д.); в фотоархив не едут
+  • archive — в фотоархиве (Яндекс).
+  Путешествия едут в архив, для них local_done не выставляется.
+end note
 
 class geocode_cache <<table>> {
   +key: TEXT <<PK>>             ' "55.7558,37.6173" (rounded)
