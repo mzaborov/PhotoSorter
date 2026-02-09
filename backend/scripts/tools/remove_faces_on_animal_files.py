@@ -55,11 +55,12 @@ def main() -> None:
         # 2. Прямоугольники run-scope для этих файлов
         cur.execute(
             f"""
-            SELECT id, file_id, run_id
-            FROM photo_rectangles
-            WHERE file_id IN ({placeholders})
-              AND run_id IS NOT NULL
-              AND (archive_scope IS NULL OR archive_scope != 'archive')
+            SELECT pr.id, pr.file_id, pr.run_id
+            FROM photo_rectangles pr
+            JOIN files f ON f.id = pr.file_id
+            WHERE pr.file_id IN ({placeholders})
+              AND pr.run_id IS NOT NULL
+              AND (f.inventory_scope IS NULL OR f.inventory_scope != 'archive')
             """,
             tuple(animal_file_ids),
         )

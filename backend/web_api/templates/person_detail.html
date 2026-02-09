@@ -599,6 +599,21 @@
         setupLazyThumbnails(grid);
       }
       
+      function getFilteredFacesForCurrentTab() {
+        const faces = personData?.faces || [];
+        const filtered = faces.filter(f => {
+          const source = f.source || (f.is_archive ? 'archive' : (f.is_run ? 'run' : 'unknown'));
+          return source === mainTab;
+        });
+        const assignmentTypeMap = { 'faces': ['cluster', 'manual_face'], 'rectangles': ['person_rectangle'], 'direct': ['file_person'] };
+        let result = filtered.filter(f => (assignmentTypeMap[subtab] || []).includes(f.assignment_type));
+        if (mainTab === 'run' && subtab === 'faces') {
+          if (manualFilterMode === 'manual_only') result = result.filter(f => f.assignment_type === 'manual_face');
+          else if (manualFilterMode === 'no_manual') result = result.filter(f => f.assignment_type !== 'manual_face');
+        }
+        return result;
+      }
+      
       async function renderDetailedView(faces) {
         // Фильтруем элементы по основной вкладке (archive/run)
         const filteredFaces = faces.filter(f => {
@@ -732,12 +747,14 @@
           </div>
         ` : '';
         
-        // Превью: есть в ответе — сразу; нет но есть face_id — ленивая подгрузка при появлении в viewport
+        // Превью: есть в ответе — сразу; face_id — ленивая подгрузка; file_person с path — ленивая подгрузка по path
         const thumbHtml = thumbUrl
           ? `<img src="${thumbUrl}" alt="Item ${itemId}" />`
           : (item.face_id
             ? `<img class="thumb-img-lazy" data-face-id="${item.face_id}" alt="Item ${itemId}" />`
-            : '<div class="noimg">Нет превью</div>');
+            : (item.assignment_type === 'file_person' && (item.file_path || '').match(/^(disk:|local:)/)
+              ? `<img class="thumb-img-lazy" data-file-path="${escapedPath}" alt="Item ${itemId}" />`
+              : '<div class="noimg">Нет превью</div>'));
         return `
           <div class="thumb${avatarClass}" ${dataAttrs} ${doubleClickHandler}>
             ${thumbHtml}
@@ -755,13 +772,27 @@
           for (const ent of entries) {
             if (!ent.isIntersecting) continue;
             const img = ent.target;
+            if (img.dataset.loaded) continue;
             const faceId = img.getAttribute('data-face-id');
-            if (!faceId || img.dataset.loaded) continue;
-            img.dataset.loaded = '1';
-            observer.unobserve(img);
-            getFaceThumbnail(parseInt(faceId, 10)).then(url => {
-              if (url && img.parentElement) img.src = url;
-            }).catch(() => {});
+            const filePath = img.getAttribute('data-file-path');
+            if (faceId) {
+              img.dataset.loaded = '1';
+              observer.unobserve(img);
+              getFaceThumbnail(parseInt(faceId, 10)).then(url => {
+                if (url && img.parentElement) img.src = url;
+              }).catch(() => {});
+            } else if (filePath) {
+              img.dataset.loaded = '1';
+              observer.unobserve(img);
+              const path = filePath.replace(/&quot;/g, '"').replace(/&#039;/g, "'");
+              let previewUrl = '';
+              if (path.startsWith('disk:')) {
+                previewUrl = `/api/yadisk/preview-image?size=M&path=${encodeURIComponent(path)}`;
+              } else if (path.startsWith('local:')) {
+                previewUrl = `/api/local/preview?path=${encodeURIComponent(path)}`;
+              }
+              if (previewUrl && img.parentElement) img.src = previewUrl;
+            }
           }
         }, { rootMargin: '100px' });
         lazyImgs.forEach(el => observer.observe(el));
@@ -924,15 +955,24 @@
         
         // Используем новую карточку фотографий, если доступна
         if (window.openPhotoCard) {
-          // Формируем list_context из всех лиц персоны
-          const allFaces = personData?.faces || [];
-          const currentIndex = allFaces.findIndex(f => f.face_id === currentFaceId);
+          // Формируем list_context только из элементов ТЕКУЩЕЙ вкладки (как на экране)
+          const tabFaces = getFilteredFacesForCurrentTab();
+          let currentIndex = tabFaces.findIndex(f => f.face_id === currentFaceId);
+          if (currentIndex < 0 && path) {
+            currentIndex = tabFaces.findIndex(f => f.file_path === path && f.assignment_type === 'file_person');
+          }
+          if (currentIndex < 0 && face?.file_id) {
+            currentIndex = tabFaces.findIndex(f => f.file_id === face.file_id);
+          }
+          if (currentIndex < 0 && path) {
+            currentIndex = tabFaces.findIndex(f => f.file_path === path);
+          }
           
-          const items = allFaces.map(f => ({
+          const items = tabFaces.map(f => ({
             file_id: f.file_id || null,
             file_path: f.file_path || null,
             face_rectangle_id: f.face_id || null,
-            person_rectangle_id: null,
+            person_rectangle_id: f.person_rectangle_id || null,
             pipeline_run_id: f.pipeline_run_id || null,
             run_id: f.run_id || null,
             taken_at: f.taken_at ?? null,
@@ -943,15 +983,15 @@
           const listContext = {
             source_page: "person_detail",
             items: items,
-            current_index: currentIndex >= 0 ? currentIndex : 0,
+            current_index: Math.max(0, currentIndex),
             total_count: items.length,
             api_fallback: null,
             tab: mainTab,
+            subtab: subtab,
             person_id: personId
           };
           
-          // Определяем pipeline_run_id из данных текущего лица (если есть)
-          const faceData = allFaces.find(f => f.face_id === currentFaceId);
+          const faceData = currentIndex >= 0 ? tabFaces[currentIndex] : face;
           const pipelineRunId = faceData?.pipeline_run_id || null;
           
           window.openPhotoCard({

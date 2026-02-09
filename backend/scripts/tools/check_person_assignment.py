@@ -93,9 +93,10 @@ def check_person_assignment(file_path: str, person_name: str | None = None):
                 pr.is_face,
                 pr.bbox_x, pr.bbox_y, pr.bbox_w, pr.bbox_h,
                 pr.run_id,
-                pr.archive_scope,
+                f.inventory_scope as archive_scope,
                 pr.ignore_flag
             FROM photo_rectangles pr
+            LEFT JOIN files f ON f.id = pr.file_id
             WHERE pr.file_id = ?
             ORDER BY pr.face_index, pr.id
         """, (file_id,))
@@ -105,7 +106,7 @@ def check_person_assignment(file_path: str, person_name: str | None = None):
         for rect in rectangles:
             print(f"  - rectangle_id={rect['id']}, is_face={rect['is_face']}, "
                   f"bbox=({rect['bbox_x']}, {rect['bbox_y']}, {rect['bbox_w']}, {rect['bbox_h']}), "
-                  f"run_id={rect['run_id']}, archive_scope={rect['archive_scope']}, "
+                  f"run_id={rect['run_id']}, file_inventory_scope={rect['archive_scope']}, "
                   f"ignore_flag={rect['ignore_flag']}")
         
         print("\n" + "=" * 80)

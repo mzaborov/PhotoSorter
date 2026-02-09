@@ -97,7 +97,7 @@ def _get_person_names_and_groups_for_file(
         SELECT DISTINCT COALESCE(fr.manual_person_id, fc.person_id) AS pid
         FROM photo_rectangles fr
         LEFT JOIN face_clusters fc ON fc.id = fr.cluster_id
-        WHERE fr.file_id = ? AND (fr.run_id = ? OR COALESCE(TRIM(COALESCE(fr.archive_scope, '')), '') = 'archive')
+        WHERE fr.file_id = ? AND (fr.run_id = ? OR (SELECT COALESCE(TRIM(f2.inventory_scope), '') FROM files f2 WHERE f2.id = fr.file_id) = 'archive')
           AND (fr.manual_person_id IS NOT NULL OR fc.person_id IS NOT NULL)
         """,
         (file_id, face_run_id),
@@ -146,7 +146,7 @@ def _get_person_ids_for_file(
         SELECT DISTINCT COALESCE(fr.manual_person_id, fc.person_id) AS pid
         FROM photo_rectangles fr
         LEFT JOIN face_clusters fc ON fc.id = fr.cluster_id
-        WHERE fr.file_id = ? AND (fr.run_id = ? OR COALESCE(TRIM(COALESCE(fr.archive_scope, '')), '') = 'archive')
+        WHERE fr.file_id = ? AND (fr.run_id = ? OR (SELECT COALESCE(TRIM(f2.inventory_scope), '') FROM files f2 WHERE f2.id = fr.file_id) = 'archive')
           AND (fr.manual_person_id IS NOT NULL OR fc.person_id IS NOT NULL)
         """,
         (file_id, face_run_id),

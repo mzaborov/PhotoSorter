@@ -68,12 +68,13 @@ def test_persons_stats():
     cur.execute("""
         SELECT 
             fc.person_id,
-            COUNT(DISTINCT CASE WHEN fr.archive_scope = 'archive' THEN fr.id END) as faces_archive,
-            COUNT(DISTINCT CASE WHEN (fr.archive_scope IS NULL OR fr.archive_scope = '') AND fr.run_id IS NOT NULL THEN fr.id END) as faces_run,
+            COUNT(DISTINCT CASE WHEN f.inventory_scope = 'archive' THEN fr.id END) as faces_archive,
+            COUNT(DISTINCT CASE WHEN (f.inventory_scope IS NULL OR f.inventory_scope = '') AND fr.run_id IS NOT NULL THEN fr.id END) as faces_run,
             COUNT(DISTINCT fr.id) as faces_total
         FROM face_clusters fc
         JOIN face_cluster_members fcm ON fcm.cluster_id = fc.id
         JOIN photo_rectangles fr ON fcm.rectangle_id = fr.id
+        LEFT JOIN files f ON f.id = fr.file_id
         WHERE fc.person_id IS NOT NULL 
           AND fr.is_face = 1
           AND COALESCE(fr.ignore_flag, 0) = 0
@@ -109,7 +110,7 @@ def test_person_detail(person_id: int):
     cur.execute("""
         SELECT DISTINCT
             fr.id as face_id,
-            fr.archive_scope,
+            f.inventory_scope as archive_scope,
             f.path as file_path,
             f.id as file_id,
             'cluster' as assignment_type
@@ -131,7 +132,7 @@ def test_person_detail(person_id: int):
     cur.execute("""
         SELECT DISTINCT
             fr.id as face_id,
-            fr.archive_scope,
+            f.inventory_scope as archive_scope,
             f.path as file_path,
             f.id as file_id,
             'manual_face' as assignment_type

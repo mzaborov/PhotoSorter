@@ -187,9 +187,9 @@
 
         <!-- 2-й уровень: подзакладки для "Люди" -->
         <div class="subtabs" id="subtabsFaces" style="display:none;">
-          <button class="subtab active" id="subFacesUnsorted" type="button" title="К разбору">К разбору</button>
-          <button class="subtab" id="subFacesMany" type="button" title="Много лиц">Много лиц</button>
-          <button class="subtab" id="subFacesAllFaces" type="button" title="Лица">Лица</button>
+          <button class="subtab active" id="subFacesUnsorted" type="button" data-subtab="unsorted" title="К разбору">К разбору</button>
+          <button class="subtab" id="subFacesMany" type="button" data-subtab="many_faces" title="Много лиц">Много лиц</button>
+          <button class="subtab" id="subFacesAllFaces" type="button" data-subtab="all_faces" title="Лица">Лица</button>
           <span id="outsiderFilterWrap" style="display:none; margin-left:auto; align-items:center;">
             <span class="muted" style="margin-right:8px;">Фильтр:</span>
             <select id="outsiderManualFilter" style="padding:6px 12px; border:1px solid #d1d5db; border-radius:6px; background:#fff; font-size:13px; color:#374151; cursor:pointer;">
@@ -203,8 +203,8 @@
         
         <!-- 2-й уровень: подзакладки для "Нет людей" -->
         <div class="subtabs" id="subtabsNoFaces" style="display:none;">
-          <button class="subtab active" id="subNoFacesUnsortedPhotos" type="button" title="Фото к разбору">Фото к разбору</button>
-          <button class="subtab" id="subNoFacesUnsortedVideos" type="button" title="Видео к разбору">Видео к разбору</button>
+          <button class="subtab active" id="subNoFacesUnsortedPhotos" type="button" data-subtab="unsorted_photos" title="Фото к разбору">Фото к разбору</button>
+          <button class="subtab" id="subNoFacesUnsortedVideos" type="button" data-subtab="unsorted_videos" title="Видео к разбору">Видео к разбору</button>
           <!-- Динамические подзакладки по группам будут добавлены через JS -->
         </div>
 
@@ -337,6 +337,9 @@
     <!-- Подключение единой карточки фотографий (должно быть до основного скрипта) -->
     {% include "photo_card.html" %}
     <script src="/static/photo_card.js?v=48"></script>
+    <!-- Подключение карточки видео (вкладки Видео / Кадр 1–3, разметка) -->
+    {% include "video_card.html" %}
+    <script src="/static/video_card.js?v=1"></script>
 
     <script>
       // Глобальная обработка ошибок для предотвращения перезагрузки страницы
@@ -646,6 +649,7 @@
             btn.className = "subtab";
             btn.id = `subPerson_${person.id}`;
             btn.setAttribute("data-person-id", String(person.id));
+            btn.setAttribute("data-subtab", `person_${person.id}`);
             btn.type = "button";
             const label = person.is_ignored ? "Посторонние" : (person.name || `Персона ${person.id}`);
             const fullText = `${label} (${person.files_count || 0})`;
@@ -718,6 +722,7 @@
             btn.className = "subtab";
             btn.id = `subGroup_${encodeURIComponent(groupPath)}`;
             btn.setAttribute("data-group-path", String(groupPath));
+            btn.setAttribute("data-subtab", `group_${encodeURIComponent(groupPath)}`);
             btn.type = "button";
             const fullText = `${groupPath} (${group.files_count || 0})`;
             btn.textContent = fullText;
@@ -816,29 +821,32 @@
           const currentValue = select.value;
           select.innerHTML = '<option value="">Назначить группу...</option>';
           
-          // Добавляем группы "Поездки"
+          // Всегда добавляем блок "Поездки" (даже если поездок пока нет — будет "+ Создать новую поездку...")
+          const tripsOptgroup = document.createElement("optgroup");
+          tripsOptgroup.label = "Поездки";
           if (categoryMap["Поездки"] && categoryMap["Поездки"].length > 0) {
-            const optgroup = document.createElement("optgroup");
-            optgroup.label = "Поездки";
-            // Сортируем поездки по дате добавления (последние добавленные - выше)
             categoryMap["Поездки"].sort((a, b) => {
               const dateA = a.last_created_at || "";
               const dateB = b.last_created_at || "";
               if (dateA && dateB) {
-                const dateCompare = dateB.localeCompare(dateA); // Новые выше (по убыванию)
+                const dateCompare = dateB.localeCompare(dateA);
                 if (dateCompare !== 0) return dateCompare;
               }
-              // Если даты одинаковые или отсутствуют, сортируем по алфавиту
               return a.name.localeCompare(b.name);
             });
             categoryMap["Поездки"].forEach(trip => {
               const opt = document.createElement("option");
-              opt.value = trip.name; // Храним просто название без префикса
+              opt.value = trip.name;
               opt.textContent = trip.name;
-              optgroup.appendChild(opt);
+              tripsOptgroup.appendChild(opt);
             });
-            select.appendChild(optgroup);
           }
+          const createOptInGroup = document.createElement("option");
+          createOptInGroup.value = "__create_new_Поездки__";
+          createOptInGroup.textContent = "+ Создать новую поездку...";
+          createOptInGroup.style.fontStyle = "italic";
+          tripsOptgroup.appendChild(createOptInGroup);
+          select.appendChild(tripsOptgroup);
           
           // Добавляем остальные группы
           otherGroups.sort();
@@ -848,19 +856,6 @@
             opt.textContent = groupPath;
             select.appendChild(opt);
           });
-          
-          // Добавляем опцию для создания новой группы в категории "Поездки"
-          if (categoryMap["Поездки"] && categoryMap["Поездки"].length > 0) {
-            const createOptInGroup = document.createElement("option");
-            createOptInGroup.value = "__create_new_Поездки__";
-            createOptInGroup.textContent = "+ Создать новую поездку...";
-            createOptInGroup.style.fontStyle = "italic";
-            // Находим optgroup "Поездки" и добавляем опцию в него
-            const tripsOptgroup = select.querySelector('optgroup[label="Поездки"]');
-            if (tripsOptgroup) {
-              tripsOptgroup.appendChild(createOptInGroup);
-            }
-          }
           
           // Добавляем опцию для создания новой группы (общая)
           const createOpt = document.createElement("option");
@@ -1595,29 +1590,32 @@
             }
           });
           
-          // Добавляем группы "Поездки"
+          // Всегда добавляем блок "Поездки" (даже если поездок пока нет — будет "+ Создать новую поездку...")
+          const tripsOptgroup = document.createElement("optgroup");
+          tripsOptgroup.label = "Поездки";
           if (categoryMap["Поездки"] && categoryMap["Поездки"].length > 0) {
-            const optgroup = document.createElement("optgroup");
-            optgroup.label = "Поездки";
-            // Сортируем поездки по дате добавления (последние добавленные - выше)
             categoryMap["Поездки"].sort((a, b) => {
               const dateA = a.last_created_at || "";
               const dateB = b.last_created_at || "";
               if (dateA && dateB) {
-                const dateCompare = dateB.localeCompare(dateA); // Новые выше
+                const dateCompare = dateB.localeCompare(dateA);
                 if (dateCompare !== 0) return dateCompare;
               }
-              // Если даты одинаковые или отсутствуют, сортируем по алфавиту
               return (a.group_path || "").localeCompare(b.group_path || "");
             });
             for (const group of categoryMap["Поездки"]) {
               const opt = document.createElement("option");
-              opt.value = group.group_path; // Храним просто название без префикса
+              opt.value = group.group_path;
               opt.textContent = `${group.group_path} (${group.files_count || 0})`;
-              optgroup.appendChild(opt);
+              tripsOptgroup.appendChild(opt);
             }
-            select.appendChild(optgroup);
           }
+          const createTripOpt = document.createElement("option");
+          createTripOpt.value = "__create_new_Поездки__";
+          createTripOpt.textContent = "+ Создать новую поездку...";
+          createTripOpt.style.fontStyle = "italic";
+          tripsOptgroup.appendChild(createTripOpt);
+          select.appendChild(tripsOptgroup);
           
           // Добавляем остальные группы
           if (otherGroups.length > 0) {
@@ -1725,6 +1723,42 @@
         }
       }
 
+      /** Возвращает значение data-subtab первой видимой подзакладки в строке текущей вкладки. */
+      function getFirstVisibleSubtabValue() {
+        const row = tab === "faces" ? qs("#subtabsFaces") : tab === "no_faces" ? qs("#subtabsNoFaces") : null;
+        if (!row) return null;
+        const buttons = row.querySelectorAll(".subtab");
+        for (const btn of buttons) {
+          if (btn.style.display !== "none") {
+            const v = btn.getAttribute("data-subtab");
+            if (v) return v;
+          }
+        }
+        return null;
+      }
+
+      /** Переключает на первую видимую подзакладку, если текущая скрыта. Возвращает true, если подзакладка изменилась (вызывающий может вызвать load(true)). */
+      function selectFirstVisibleSubtab() {
+        const first = getFirstVisibleSubtabValue();
+        if (!first) return false;
+        const row = tab === "faces" ? qs("#subtabsFaces") : tab === "no_faces" ? qs("#subtabsNoFaces") : null;
+        if (row) {
+          const buttons = row.querySelectorAll(".subtab[data-subtab]");
+          for (const btn of buttons) {
+            if (btn.getAttribute("data-subtab") === subtab) {
+              if (btn.style.display !== "none") return false;
+              break;
+            }
+          }
+        }
+        if (first === subtab) return false;
+        subtab = first;
+        updateSubtabsVisibility();
+        updateUrlParams();
+        page = 1;
+        return true;
+      }
+
       function setTab(t) {
         tab = t;
         // Карантин теперь показывается в "Нет людей"
@@ -1735,19 +1769,20 @@
             subtab = "unsorted";
           }
           // Валидируем subtab для faces
-          if (!["unsorted","many_faces"].includes(subtab) && !subtab.startsWith("person_")) {
+          if (!["unsorted","many_faces","all_faces"].includes(subtab) && !subtab.startsWith("person_")) {
             subtab = "unsorted";
           }
           // Сбрасываем флаг при смене вкладки, чтобы список перезагрузился
           personsSubtabsLoaded = false;
           loadPersonsSubtabs();
         } else if (tab === "no_faces") {
-          subtab = "unsorted";
+          subtab = "unsorted_photos";
           loadGroupsSubtabs();
         } else {
           subtab = "unsorted";
         }
         applyTabUI();
+        selectFirstVisibleSubtab();
         updateUrlParams();
         page = 1;
         load(true);
@@ -1815,13 +1850,17 @@
           // qs("#tabPeopleNoFace").textContent = `Есть люди (без лиц) (${Number(c.people_no_face ?? 0)})`;
           qs("#tabNoFaces").textContent = `Нет людей (${Number(c.no_faces ?? 0)})`;
           const bMany = qs("#subFacesMany");
-          if (bMany) { const t = `Много лиц (${manyCnt})`; bMany.textContent = t; bMany.title = t; }
+          if (bMany) { const t = `Много лиц (${manyCnt})`; bMany.textContent = t; bMany.title = t; bMany.style.display = manyCnt === 0 ? "none" : ""; }
           const bUnsorted = qs("#subFacesUnsorted");
-          if (bUnsorted) { const t = `К разбору (${unsortedCnt})`; bUnsorted.textContent = t; bUnsorted.title = t; }
+          if (bUnsorted) { const t = `К разбору (${unsortedCnt})`; bUnsorted.textContent = t; bUnsorted.title = t; bUnsorted.style.display = unsortedCnt === 0 ? "none" : ""; }
           const bNoFacesUnsortedPhotos = qs("#subNoFacesUnsortedPhotos");
-          if (bNoFacesUnsortedPhotos) { const t = `Фото к разбору (${noFacesUnsortedPhotosCnt})`; bNoFacesUnsortedPhotos.textContent = t; bNoFacesUnsortedPhotos.title = t; }
+          if (bNoFacesUnsortedPhotos) { const t = `Фото к разбору (${noFacesUnsortedPhotosCnt})`; bNoFacesUnsortedPhotos.textContent = t; bNoFacesUnsortedPhotos.title = t; bNoFacesUnsortedPhotos.style.display = noFacesUnsortedPhotosCnt === 0 ? "none" : ""; }
           const bNoFacesUnsortedVideos = qs("#subNoFacesUnsortedVideos");
-          if (bNoFacesUnsortedVideos) { const t = `Видео к разбору (${noFacesUnsortedVideosCnt})`; bNoFacesUnsortedVideos.textContent = t; bNoFacesUnsortedVideos.title = t; }
+          if (bNoFacesUnsortedVideos) { const t = `Видео к разбору (${noFacesUnsortedVideosCnt})`; bNoFacesUnsortedVideos.textContent = t; bNoFacesUnsortedVideos.title = t; bNoFacesUnsortedVideos.style.display = noFacesUnsortedVideosCnt === 0 ? "none" : ""; }
+          
+          if ((tab === "faces" || tab === "no_faces") && selectFirstVisibleSubtab()) {
+            load(true);
+          }
           
           // Не вызываем loadPersonsSubtabs() здесь - обновление списка подзакладок персон
           // происходит явно после действий, которые изменяют привязки (через loadPersonsSubtabs(true))
@@ -2024,13 +2063,17 @@
         const takenDate = (takenAt && takenAt.length >= 10) ? takenAt.slice(0, 10) : "";
         const placePill = placeLabel ? `<span class="pill">место: ${escapeHtml(placeLabel)}</span>` : ``;
         const datePill = takenDate ? `<span class="pill">дата: ${escapeHtml(takenDate)}</span>` : ``;
-        const framesBtn = (kind === "video" && pv)
+        const framesBtn = (kind === "video" && (pv || path))
           ? `<button class="vfbtn" type="button" data-act="frames" data-path="${escapeHtml(path)}" data-src="${escapeHtml(pv)}">Кадры</button>`
           : ``;
+        const videoFrameIdx = (kind === "video" && typeof it.video_frame_idx === "number" && it.video_frame_idx >= 1 && it.video_frame_idx <= 3) ? it.video_frame_idx : 1;
+        const videoFrameUrl = (kind === "video" && path && path.startsWith("local:") && pipelineRunId != null)
+          ? `/api/faces/video-frame?pipeline_run_id=${encodeURIComponent(pipelineRunId)}&path=${encodeURIComponent(path)}&frame_idx=${encodeURIComponent(String(videoFrameIdx))}`
+          : pv;
         const thumb = (kind === "image" && pv)
           ? `<img loading="lazy" alt="preview" referrerpolicy="no-referrer" src="${escapeHtml(pv)}" />`
-          : (kind === "video" && pv)
-            ? `<video controls muted preload="metadata" src="${escapeHtml(pv)}"></video>`
+          : (kind === "video" && videoFrameUrl)
+            ? `<img loading="lazy" alt="кадр" referrerpolicy="no-referrer" src="${escapeHtml(videoFrameUrl)}" />`
             : `<div class="noimg">нет превью</div>`;
         
         // Определяем, находимся ли мы на подзакладке персоны (нужно для всех вкладок)
@@ -2926,9 +2969,19 @@
       try {
         const ovp = getParam("open_video_path");
         if (ovp && pipelineRunId != null && String(ovp).startsWith("local:")) {
-          const src = `/api/local/preview?path=${encodeURIComponent(String(ovp))}&pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}`;
-          // small delay so modal elements are ready
-          setTimeout(() => { openVideoViewer(String(ovp), src).catch(() => {}); }, 50);
+          if (window.openVideoCard) {
+            setTimeout(() => {
+              window.openVideoCard({
+                file_path: String(ovp),
+                pipeline_run_id: pipelineRunId,
+                list_context: null,
+                on_close: () => { load(true); refreshTabCounts(); loadPersonsSubtabs(true); }
+              });
+            }, 50);
+          } else {
+            const src = `/api/local/preview?path=${encodeURIComponent(String(ovp))}&pipeline_run_id=${encodeURIComponent(String(pipelineRunId))}`;
+            setTimeout(() => { openVideoViewer(String(ovp), src).catch(() => {}); }, 50);
+          }
         }
       } catch (e) {}
       // wire no_faces filters
@@ -3272,7 +3325,16 @@
               }
             });
           };
-          if (window.openPhotoCard) {
+          const isVideo = /\.(mp4|mov|avi|mkv|webm)$/i.test(p || "");
+          if (isVideo && window.openVideoCard) {
+            window.openVideoCard({
+              file_id: fileId,
+              file_path: p,
+              pipeline_run_id: pipelineRunId,
+              list_context: listContext,
+              on_close: onClose
+            });
+          } else if (window.openPhotoCard) {
             window.openPhotoCard({
               file_id: fileId,
               file_path: p,
@@ -3284,13 +3346,13 @@
           }
           return;
         }
-        const thumb = e.target.closest(".thumb[data-kind='image'][data-src]");
+        const thumb = e.target.closest(".thumb[data-src]");
         if (!thumb) return;
         const p = thumb.getAttribute("data-path") || "";
         const src = thumb.getAttribute("data-src") || "";
         if (!p || !src) return;
-        
-        // Формируем list_context из текущих данных
+        const kind = thumb.getAttribute("data-kind") || "image";
+        // Формируем list_context из текущих данных (общий для фото и видео — листание переключает тип карточки)
         const cards = Array.from(qs("#grid").querySelectorAll(".card[data-path]"));
         const currentCard = cards.find(card => card.getAttribute("data-path") === p);
         const currentIndex = currentCard ? cards.indexOf(currentCard) : 0;
@@ -3324,8 +3386,14 @@
         const currentFrom = (tab === "no_faces") ? nfFrom : null;
         const currentTo = (tab === "no_faces") ? nfTo : null;
         
-        // Получаем общее количество элементов (totalCount может быть null)
-        const totalItemsCount = (typeof totalCount === "number" && totalCount > 0) ? totalCount : items.length;
+        // Получаем общее количество (totalCount, иначе из DOM #total, иначе items.length)
+        let totalItemsCount = (typeof totalCount === "number" && totalCount > 0) ? totalCount : items.length;
+        if (totalItemsCount === items.length) {
+          const totalEl = qs("#total");
+          if (totalEl && totalEl.textContent && /^\d+$/.test(totalEl.textContent.trim())) {
+            totalItemsCount = parseInt(totalEl.textContent.trim(), 10);
+          }
+        }
         
         const listContext = {
           source_page: "faces",
@@ -3362,8 +3430,16 @@
           loadPersonsSubtabs(true);
         };
         
-        // Открываем карточку фотографий
-        if (window.openPhotoCard) {
+        // Для видео — карточка видео; для изображений — карточка фото (общий list_context для листания)
+        if (kind === "video" && window.openVideoCard) {
+          window.openVideoCard({
+            file_id: fileId,
+            file_path: p,
+            pipeline_run_id: pipelineRunId,
+            list_context: listContext,
+            on_close: onClose
+          });
+        } else if (window.openPhotoCard) {
           window.openPhotoCard({
             file_id: fileId,
             file_path: p,
@@ -3373,11 +3449,10 @@
             on_close: onClose
           });
         } else {
-          // Fallback на старый viewer, если новый модуль не загружен
           await openViewer(p, src, { mode: "view" });
         }
       });
-      // Делегирование для кнопки кадров видео
+      // Делегирование для кнопки кадров видео — открываем универсальную карточку видео
       qs("#grid").addEventListener("click", async (e) => {
         const btn = e.target.closest("button.vfbtn[data-act='frames']");
         if (!btn) return;
@@ -3385,7 +3460,67 @@
         const p = btn.getAttribute("data-path") || "";
         const src = btn.getAttribute("data-src") || "";
         if (!p || !src) return;
-        await openVideoViewer(p, src);
+        if (window.openVideoCard) {
+          const cards = Array.from(qs("#grid").querySelectorAll(".card[data-path]"));
+          const currentCard = cards.find(card => card.getAttribute("data-path") === p);
+          const currentIndex = currentCard ? cards.indexOf(currentCard) : 0;
+          const items = cards.map((card) => {
+            const cardPath = card.getAttribute("data-path") || "";
+            const cardFileId = card.getAttribute("data-file-id");
+            const takenAt = card.getAttribute("data-taken-at") || null;
+            const placeCountry = card.getAttribute("data-place-country") || null;
+            const placeCity = card.getAttribute("data-place-city") || null;
+            return {
+              file_id: cardFileId ? parseInt(cardFileId) : null,
+              file_path: cardPath,
+              path: cardPath,
+              taken_at: takenAt,
+              place_country: placeCountry,
+              place_city: placeCity
+            };
+          });
+          let totalItemsCount = (typeof totalCount === "number" && totalCount > 0) ? totalCount : items.length;
+          if (totalItemsCount === items.length) {
+            const totalEl = qs("#total");
+            if (totalEl && totalEl.textContent && /^\d+$/.test(totalEl.textContent.trim())) {
+              totalItemsCount = parseInt(totalEl.textContent.trim(), 10);
+            }
+          }
+          const currentSort = (tab === "no_faces") ? nfSort : null;
+          const currentFrom = (tab === "no_faces") ? nfFrom : null;
+          const currentTo = (tab === "no_faces") ? nfTo : null;
+          const listContext = {
+            source_page: "faces",
+            tab: tab,
+            subtab: subtab,
+            items: items,
+            current_index: currentIndex,
+            total_count: totalItemsCount,
+            api_fallback: {
+              endpoint: "/api/faces/results",
+              params: {
+                pipeline_run_id: pipelineRunId,
+                tab: tab,
+                subtab: subtab,
+                sort: currentSort,
+                from: currentFrom,
+                to: currentTo,
+                page_size: 60
+              }
+            }
+          };
+          const fileIdAttr = currentCard?.getAttribute("data-file-id");
+          const fileId = fileIdAttr ? parseInt(fileIdAttr) : null;
+          window.openVideoCard({
+            file_path: p,
+            file_id: fileId,
+            pipeline_run_id: pipelineRunId,
+            list_context: listContext,
+            on_close: () => { load(true); refreshTabCounts(); loadPersonsSubtabs(true); }
+          });
+        } else {
+          await openVideoViewer(p, src);
+        }
       });
 
       // Инициализация обработчиков модального окна персон

@@ -67,12 +67,21 @@ def _now_utc_iso() -> str:
 def _get_file_id_from_path(conn: sqlite3.Connection, file_path: str) -> int | None:
     """
     Получает file_id из таблицы files по file_path.
+    Пробует точное совпадение и вариант с другим разделителем (Windows: \\ и /).
     Возвращает None, если файл не найден.
     """
     cur = conn.cursor()
     cur.execute("SELECT id FROM files WHERE path = ? LIMIT 1", (file_path,))
     row = cur.fetchone()
-    return row[0] if row else None
+    if row is not None:
+        return row[0]
+    alt = file_path.replace("\\", "/") if "\\" in file_path else file_path.replace("/", "\\")
+    if alt != file_path:
+        cur.execute("SELECT id FROM files WHERE path = ? LIMIT 1", (alt,))
+        row = cur.fetchone()
+        if row is not None:
+            return row[0]
+    return None
 
 
 def _get_file_id(conn: sqlite3.Connection, *, file_id: int | None = None, file_path: str | None = None) -> int | None:
@@ -323,6 +332,10 @@ def init_db():
             # (см. migrate_archive_faces.py или API для перемещения в архив).
             "people_no_face_person": "people_no_face_person TEXT",  # ТОЛЬКО для архивных файлов
 
+            # --- Video keyframe positions (для photo_rectangles с frame_idx) ---
+            "video_frame1_t_sec": "video_frame1_t_sec REAL",
+            "video_frame2_t_sec": "video_frame2_t_sec REAL",
+            "video_frame3_t_sec": "video_frame3_t_sec REAL",
             # --- Photo geo/time metadata for UI sorting (No Faces) ---
             # taken_at: ISO string (best-effort, from EXIF DateTimeOriginal; fallback: mtime in UTC)
             "taken_at": "taken_at TEXT",
@@ -499,34 +512,8 @@ def init_db():
     )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_files_manual_labels_file_id ON files_manual_labels(file_id);")
 
-        # --- Run-scoped manual rectangles for VIDEO frames (3 frames per video) ---
-        # ВАЖНО: для видео нам нужны прямоугольники с привязкой к кадру/таймкоду.
-        # Храним отдельной таблицей, чтобы не смешивать с photo_rectangles (она про фото/одно изображение).
-        cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS video_manual_frames (
-            pipeline_run_id   INTEGER NOT NULL,
-            file_id           INTEGER NOT NULL,
-            frame_idx         INTEGER NOT NULL, -- 1..3
-            t_sec             REAL,             -- таймкод кадра (секунды), best-effort
-            rects_json        TEXT,             -- JSON: [{"x":..,"y":..,"w":..,"h":..}, ...]
-            updated_at        TEXT NOT NULL,
-            PRIMARY KEY (pipeline_run_id, file_id, frame_idx),
-            FOREIGN KEY (file_id) REFERENCES files(id)
-        );
-        """
-    )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_video_manual_frames_file_id ON video_manual_frames(file_id);")
-        
-        # Миграция file_path → file_id: добавляем колонку file_id (пока NULL)
-        _ensure_columns(
-            conn,
-            "video_manual_frames",
-        {
-            "file_id": "file_id INTEGER",  # FOREIGN KEY на files.id, пока NULL (заполним миграцией)
-        },
-    )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_video_manual_frames_file_id ON video_manual_frames(file_id);")
+        # video_manual_frames удалена: ручные кадры видео хранятся в photo_rectangles (frame_idx 1..3) и files.video_frame*_t_sec.
+        # Миграция: migrate_video_manual_to_photo_rectangles.py.
 
         # Индексы для быстрых группировок дублей.
         cur.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash_alg, hash_value);")
@@ -657,15 +644,7 @@ class FaceStore:
             },
         )
         
-        # Archive scope для поддержки архива без привязки к прогонам
-        # NULL или '' = для прогонов (сортируемые папки), 'archive' = для архива (текущий статус)
-        _ensure_columns(
-            self.conn,
-            "photo_rectangles",
-            {
-                "archive_scope": "archive_scope TEXT",  # NULL|'' для прогонов, 'archive' для архива
-            },
-        )
+        # archive_scope удалён из photo_rectangles (3NF: статус архива в files.inventory_scope)
         
         # Кластер: принадлежность прямоугольника кластеру (вместо таблицы face_cluster_members)
         _ensure_columns(
@@ -681,6 +660,15 @@ class FaceStore:
             "photo_rectangles",
             {
                 "manual_person_id": "manual_person_id INTEGER REFERENCES persons(id)",  # NULL = не назначено вручную
+            },
+        )
+        # Видео: rect на кадре — frame_idx 1..3, frame_t_sec (таймкод), NULL для фото
+        _ensure_columns(
+            self.conn,
+            "photo_rectangles",
+            {
+                "frame_idx": "frame_idx INTEGER",
+                "frame_t_sec": "frame_t_sec REAL",
             },
         )
         
@@ -782,7 +770,7 @@ class FaceStore:
         # Индексы
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_clusters_run ON face_clusters(run_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_clusters_person ON face_clusters(person_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_photo_rect_archive_scope ON photo_rectangles(archive_scope);")
+        # idx_photo_rect_archive_scope удалён — archive_scope в photo_rectangles удалён (3NF)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_clusters_archive_scope ON face_clusters(archive_scope);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photo_rect_cluster_id ON photo_rectangles(cluster_id);")
         # Старые индексы для face_labels (для обратной совместимости, будут удалены после миграции)
@@ -1061,6 +1049,8 @@ class FaceStore:
         embedding: bytes | None = None,
         image_width: int | None = None,
         image_height: int | None = None,
+        frame_idx: int | None = None,
+        frame_t_sec: float | None = None,
     ) -> bool:
         """
         Вставляет детекцию лица. Для архивного режима (archive_scope='archive') 
@@ -1078,16 +1068,17 @@ class FaceStore:
         
         # Для архивного режима проверяем дубликаты (append без дублирования)
         if archive_scope == 'archive':
-            # Проверяем существование по file_id + bbox
+            # Проверяем существование по file_id + bbox (файл архивный если files.inventory_scope='archive')
             cur.execute(
                 """
-                SELECT id FROM photo_rectangles
-                WHERE archive_scope = 'archive'
-                  AND file_id = ?
-                  AND bbox_x = ?
-                  AND bbox_y = ?
-                  AND bbox_w = ?
-                  AND bbox_h = ?
+                SELECT fr.id FROM photo_rectangles fr
+                JOIN files f ON f.id = fr.file_id
+                WHERE f.inventory_scope = 'archive'
+                  AND fr.file_id = ?
+                  AND fr.bbox_x = ?
+                  AND fr.bbox_y = ?
+                  AND fr.bbox_w = ?
+                  AND fr.bbox_h = ?
                 LIMIT 1
                 """,
                 (resolved_file_id, int(bbox_x), int(bbox_y), int(bbox_w), int(bbox_h)),
@@ -1097,24 +1088,28 @@ class FaceStore:
                 # Дубликат найден - пропускаем вставку
                 return False
         
+        has_video_frame = frame_idx is not None and frame_idx in (1, 2, 3)
+        extra_cols = ", frame_idx, frame_t_sec" if has_video_frame else ""
+        extra_vals = ", ?, ?" if has_video_frame else ""
+        extra_params = (int(frame_idx), float(frame_t_sec)) if has_video_frame else ()
+
         # Определяем колонки для INSERT в зависимости от наличия run_id и archive_scope
         if archive_scope == 'archive':
-            # Для архива run_id может быть NULL
+            # Для архива run_id может быть NULL. archive_scope не храним — статус берётся из files.inventory_scope
             cur.execute(
-                """
+                f"""
                 INSERT INTO photo_rectangles(
-                  run_id, archive_scope, file_id, face_index,
+                  run_id, file_id, face_index,
                   bbox_x, bbox_y, bbox_w, bbox_h,
                   confidence, presence_score, thumb_jpeg,
                   embedding, manual_person, ignore_flag, created_at,
                   is_manual, manual_created_at,
-                  is_face
+                  is_face{extra_cols}
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, 0, NULL, 1)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, 0, NULL, 1{extra_vals})
                 """,
                 (
                     run_id,  # может быть NULL для архива
-                    archive_scope,
                     resolved_file_id,
                     int(face_index),
                     int(bbox_x),
@@ -1126,23 +1121,23 @@ class FaceStore:
                     thumb_jpeg,
                     embedding,  # может быть NULL
                     _now_utc_iso(),
-                ),
+                ) + extra_params,
             )
         else:
-            # Для прогонов run_id обязателен, archive_scope NULL
+            # Для прогонов run_id обязателен
             if run_id is None:
                 raise ValueError("run_id обязателен для неархивных записей")
             cur.execute(
-                """
+                f"""
                 INSERT INTO photo_rectangles(
-                  run_id, archive_scope, file_id, face_index,
+                  run_id, file_id, face_index,
                   bbox_x, bbox_y, bbox_w, bbox_h,
                   confidence, presence_score, thumb_jpeg,
                   embedding, manual_person, ignore_flag, created_at,
                   is_manual, manual_created_at,
-                  is_face
+                  is_face{extra_cols}
                 )
-                VALUES(?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, 0, NULL, 1)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, 0, NULL, 1{extra_vals})
                 """,
                 (
                     run_id,
@@ -1157,7 +1152,14 @@ class FaceStore:
                     thumb_jpeg,
                     embedding,  # может быть NULL
                     _now_utc_iso(),
-                ),
+                ) + extra_params,
+            )
+
+        # Для видео: обновляем позицию кадра в files
+        if has_video_frame and frame_t_sec is not None:
+            cur.execute(
+                f"UPDATE files SET video_frame{int(frame_idx)}_t_sec = ? WHERE id = ?",
+                (float(frame_t_sec), resolved_file_id),
             )
         
         # Обновляем размеры изображения в таблице files (если они указаны)
@@ -1275,23 +1277,13 @@ class FaceStore:
 
     def update_file_path(self, *, old_file_path: str, new_file_path: str) -> None:
         """
-        После переноса файла на диск/в архив: помечает photo_rectangles для этого файла как архивные.
-
-        В таблице photo_rectangles нет колонки file_path (только file_id). Путь хранится в files;
-        DedupStore.update_path уже обновил files.path. Здесь только выставляем archive_scope='archive'
-        для записей по file_id (файл определяется по new_file_path в files).
+        После переноса файла на диск/в архив: обновляет путь в files.
+        Статус архива берётся из files.inventory_scope (устанавливается DedupStore.set_inventory_scope_for_path).
+        photo_rectangles.archive_scope удалён (3NF).
         """
-        cur = self.conn.cursor()
-        cur.execute("SELECT id FROM files WHERE path = ? LIMIT 1", (new_file_path,))
-        row = cur.fetchone()
-        if not row:
-            return
-        file_id = row[0]
-        cur.execute(
-            "UPDATE photo_rectangles SET archive_scope = ? WHERE file_id = ?",
-            ("archive", file_id),
-        )
-        self.conn.commit()
+        # Обновление file_path выполняется в DedupStore.update_path.
+        # FaceStore ничего не обновляет в photo_rectangles — статус архива в files.inventory_scope.
+        pass
 
     def insert_file_person(
         self,
@@ -1549,25 +1541,47 @@ class FaceStore:
         self,
         *,
         pipeline_run_id: int,
+        dedup_run_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """
         Возвращает список групп с количеством файлов в каждой для прогона.
         Используется для отображения подзакладок в UI.
+        Если передан dedup_run_id, учитываются только файлы с inventory_scope='source'
+        и last_run_id=dedup_run_id (пустые группы не возвращаются).
         """
         cur = self.conn.cursor()
-        cur.execute(
-            """
-            SELECT 
-                group_path,
-                COUNT(DISTINCT file_id) AS files_count,
-                MAX(created_at) AS last_created_at
-            FROM file_groups
-            WHERE pipeline_run_id = ?
-            GROUP BY group_path
-            ORDER BY group_path ASC
-            """,
-            (int(pipeline_run_id),),
-        )
+        if dedup_run_id is not None:
+            cur.execute(
+                """
+                SELECT
+                    fg.group_path,
+                    COUNT(DISTINCT fg.file_id) AS files_count,
+                    MAX(fg.created_at) AS last_created_at
+                FROM file_groups fg
+                JOIN files f ON f.id = fg.file_id
+                WHERE fg.pipeline_run_id = ?
+                  AND COALESCE(f.inventory_scope, '') = 'source'
+                  AND f.last_run_id = ?
+                GROUP BY fg.group_path
+                HAVING COUNT(DISTINCT fg.file_id) > 0
+                ORDER BY fg.group_path ASC
+                """,
+                (int(pipeline_run_id), int(dedup_run_id)),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT
+                    group_path,
+                    COUNT(DISTINCT file_id) AS files_count,
+                    MAX(created_at) AS last_created_at
+                FROM file_groups
+                WHERE pipeline_run_id = ?
+                GROUP BY group_path
+                ORDER BY group_path ASC
+                """,
+                (int(pipeline_run_id),),
+            )
         return [dict(r) for r in cur.fetchall()]
 
     def get_file_all_assignments(
@@ -2505,53 +2519,78 @@ class DedupStore:
         cur.execute("DELETE FROM files_manual_labels WHERE pipeline_run_id = ? AND file_id = ?", (rid, old_file_id))
         self.conn.commit()
 
-    # --- video manual frames (run-scoped) ---
+    # --- video manual frames: photo_rectangles с frame_idx 1..3 + files.video_frame*_t_sec ---
     def get_video_manual_frames(self, *, pipeline_run_id: int, path: str) -> dict[int, dict[str, Any]]:
         """
         Returns mapping: frame_idx -> {frame_idx, t_sec, rects:[...], updated_at}
+        Данные из photo_rectangles (frame_idx 1..3) и files.video_frame*_t_sec.
         """
-        # Получаем file_id из path
         resolved_file_id = _get_file_id_from_path(self.conn, path)
         if resolved_file_id is None:
             raise ValueError(f"File not found in files table: {path}")
-        
         cur = self.conn.cursor()
+        cur.execute("SELECT face_run_id FROM pipeline_runs WHERE id = ?", (int(pipeline_run_id),))
+        pr_row = cur.fetchone()
+        face_run_id = int(pr_row["face_run_id"]) if pr_row and pr_row["face_run_id"] is not None else None
+        cur.execute(
+            "SELECT video_frame1_t_sec, video_frame2_t_sec, video_frame3_t_sec FROM files WHERE id = ?",
+            (resolved_file_id,),
+        )
+        f_row = cur.fetchone()
+        t_sec_by_frame: dict[int, float | None] = {}
+        if f_row:
+            dr = dict(f_row)
+            for i in (1, 2, 3):
+                v = dr.get(f"video_frame{i}_t_sec")
+                t_sec_by_frame[i] = float(v) if v is not None else None
         cur.execute(
             """
-            SELECT frame_idx, t_sec, rects_json, updated_at
-            FROM video_manual_frames
-            WHERE pipeline_run_id = ? AND file_id = ?
-            ORDER BY frame_idx ASC
+            SELECT fr.frame_idx, fr.frame_t_sec, fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
+                   COALESCE(fr.manual_person_id, fc.person_id) AS person_id,
+                   fr.manual_person_id, fr.created_at,
+                   COALESCE(p_manual.name, p_cluster.name) AS person_name,
+                   COALESCE(fr.is_manual, 0) AS is_manual,
+                   COALESCE(fr.is_face, 1) AS is_face
+            FROM photo_rectangles fr
+            LEFT JOIN persons p_manual ON p_manual.id = fr.manual_person_id
+            LEFT JOIN face_clusters fc ON fc.id = fr.cluster_id
+            LEFT JOIN persons p_cluster ON p_cluster.id = fc.person_id
+            WHERE fr.file_id = ? AND fr.frame_idx IN (1, 2, 3) AND COALESCE(fr.ignore_flag, 0) = 0
+              AND (fr.run_id = ? OR (? IS NULL AND fr.run_id IS NULL)
+                   OR fr.run_id = (SELECT faces_run_id FROM files WHERE id = fr.file_id))
+            ORDER BY fr.frame_idx, COALESCE(fr.is_manual, 0) DESC, fr.face_index, fr.id
             """,
-            (int(pipeline_run_id), resolved_file_id),
+            (resolved_file_id, face_run_id, face_run_id),
         )
-        out: dict[int, dict[str, Any]] = {}
-        for r in cur.fetchall():
+        # По кадру: отдаём все rect (и ручные, и авто), чтобы дубликаты были видны и их можно было удалить
+        rects_by_frame: dict[int, list[dict[str, Any]]] = {1: [], 2: [], 3: []}
+        updated_by_frame: dict[int, str] = {1: "", 2: "", 3: ""}
+        rows = cur.fetchall()
+        for r in rows:
             idx = int(r["frame_idx"] or 0)
-            if idx <= 0:
+            if idx not in (1, 2, 3):
                 continue
-            rects: list[dict[str, int]] = []
-            try:
-                raw = r["rects_json"]
-                if raw:
-                    obj = json.loads(raw)
-                    if isinstance(obj, list):
-                        for it in obj:
-                            if not isinstance(it, dict):
-                                continue
-                            x = int(it.get("x") or 0)
-                            y = int(it.get("y") or 0)
-                            w = int(it.get("w") or 0)
-                            h = int(it.get("h") or 0)
-                            if w > 0 and h > 0:
-                                rects.append({"x": x, "y": y, "w": w, "h": h})
-            except Exception:
-                rects = []
+            rects_by_frame[idx].append({
+                "x": int(r["bbox_x"] or 0),
+                "y": int(r["bbox_y"] or 0),
+                "w": int(r["bbox_w"] or 0),
+                "h": int(r["bbox_h"] or 0),
+                "manual_person_id": int(r["manual_person_id"]) if r["manual_person_id"] is not None else None,
+                "person_name": str(r["person_name"]) if r["person_name"] else None,
+                "is_face": 0 if dict(r).get("is_face") == 0 else 1,
+            })
+            created = str(r["created_at"] or "")
+            if created and (not updated_by_frame[idx] or created > updated_by_frame[idx]):
+                updated_by_frame[idx] = created
+            if r["frame_t_sec"] is not None and t_sec_by_frame.get(idx) is None:
+                t_sec_by_frame[idx] = float(r["frame_t_sec"])
+        out: dict[int, dict[str, Any]] = {}
+        for idx in (1, 2, 3):
             out[idx] = {
                 "frame_idx": idx,
-                "t_sec": (float(r["t_sec"]) if r["t_sec"] is not None else None),
-                "rects": rects,
-                "updated_at": str(r["updated_at"] or ""),
+                "t_sec": t_sec_by_frame.get(idx),
+                "rects": rects_by_frame[idx],
+                "updated_at": updated_by_frame[idx],
             }
         return out
 
@@ -2562,15 +2601,37 @@ class DedupStore:
         path: str,
         frame_idx: int,
         t_sec: float | None,
-        rects: list[dict[str, int]],
+        rects: list[dict[str, Any]],
     ) -> None:
         """
         Upsert one frame's manual rectangles for a video.
+        Пишет в photo_rectangles (frame_idx, frame_t_sec) и files.video_frameN_t_sec.
         """
         idx = int(frame_idx)
         if idx not in (1, 2, 3):
             raise ValueError("frame_idx must be 1..3")
-        clean: list[dict[str, int]] = []
+        resolved_file_id = _get_file_id_from_path(self.conn, path)
+        if resolved_file_id is None:
+            raise ValueError(f"File not found in files table: {path}")
+        cur = self.conn.cursor()
+        cur.execute("SELECT face_run_id FROM pipeline_runs WHERE id = ?", (int(pipeline_run_id),))
+        pr_row = cur.fetchone()
+        face_run_id = int(pr_row["face_run_id"]) if pr_row and pr_row["face_run_id"] is not None else None
+        if face_run_id is None:
+            raise ValueError(f"pipeline_run_id={pipeline_run_id} has no face_run_id")
+
+        t_val = float(t_sec) if t_sec is not None else None
+        now = _now_utc_iso()
+
+        # Удаляем все rects этого кадра (и ручные, и авто) — payload = полное состояние кадра.
+        # Иначе при перепривязке авто-rect (из кластера) создавался бы дубликат: старый оставался, новый вставлялся.
+        cur.execute(
+            "DELETE FROM photo_rectangles WHERE file_id = ? AND frame_idx = ?",
+            (resolved_file_id, idx),
+        )
+
+        # Вставляем новые rects
+        face_index = 0
         for r in rects or []:
             if not isinstance(r, dict):
                 continue
@@ -2578,33 +2639,88 @@ class DedupStore:
             y = int(r.get("y") or 0)
             w = int(r.get("w") or 0)
             h = int(r.get("h") or 0)
-            if w > 0 and h > 0:
-                clean.append({"x": x, "y": y, "w": w, "h": h})
-        # Получаем file_id из path
+            if w <= 0 or h <= 0:
+                continue
+            face_index += 1
+            manual_person_id = int(r["manual_person_id"]) if r.get("manual_person_id") is not None else None
+            is_face_val = 1 if (r.get("is_face") is None or int(r.get("is_face", 1))) else 0
+            cur.execute(
+                """
+                INSERT INTO photo_rectangles(
+                  run_id, file_id, face_index,
+                  bbox_x, bbox_y, bbox_w, bbox_h,
+                  confidence, presence_score, thumb_jpeg,
+                  embedding, manual_person, ignore_flag, created_at,
+                  is_manual, manual_created_at, is_face,
+                  frame_idx, frame_t_sec, manual_person_id
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, ?, 1, ?, ?, ?, ?, ?)
+                """,
+                (face_run_id, resolved_file_id, face_index, x, y, w, h, now, now, is_face_val, idx, t_val, manual_person_id),
+            )
+
+        # Обновляем позицию кадра в files
+        cur.execute(f"UPDATE files SET video_frame{idx}_t_sec = ? WHERE id = ?", (t_val, resolved_file_id))
+        self.conn.commit()
+
+    def set_video_keyframe(
+        self,
+        *,
+        path: str,
+        frame_idx: int,
+        t_sec: float,
+    ) -> None:
+        """
+        Устанавливает позицию ключевого кадра (1..3) для видео и сбрасывает все привязки
+        (прямоугольники) для этого кадра — при замене кадра старые rect не имеют смысла.
+        """
+        idx = int(frame_idx)
+        if idx not in (1, 2, 3):
+            raise ValueError("frame_idx must be 1..3")
         resolved_file_id = _get_file_id_from_path(self.conn, path)
         if resolved_file_id is None:
             raise ValueError(f"File not found in files table: {path}")
-        
+        t_val = float(t_sec)
         cur = self.conn.cursor()
         cur.execute(
-            """
-            INSERT INTO video_manual_frames(pipeline_run_id, file_id, frame_idx, t_sec, rects_json, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?)
-            ON CONFLICT(pipeline_run_id, file_id, frame_idx) DO UPDATE SET
-              t_sec = excluded.t_sec,
-              rects_json = excluded.rects_json,
-              updated_at = excluded.updated_at
-            """,
-            (
-                int(pipeline_run_id),
-                resolved_file_id,
-                idx,
-                float(t_sec) if t_sec is not None else None,
-                json.dumps(clean, ensure_ascii=False),
-                _now_utc_iso(),
-            ),
+            "DELETE FROM photo_rectangles WHERE file_id = ? AND frame_idx = ?",
+            (resolved_file_id, idx),
         )
+        cur.execute(f"UPDATE files SET video_frame{idx}_t_sec = ? WHERE id = ?", (t_val, resolved_file_id))
         self.conn.commit()
+
+    def get_video_frames_with_markup(self, *, pipeline_run_id: int, file_ids: list[int]) -> dict[int, int]:
+        """
+        Returns mapping: file_id -> frame_idx (1, 2, or 3) for the first frame that has rects.
+        Ищет в photo_rectangles (frame_idx 1..3).
+        """
+        if not file_ids:
+            return {}
+        cur = self.conn.cursor()
+        cur.execute("SELECT face_run_id FROM pipeline_runs WHERE id = ?", (int(pipeline_run_id),))
+        pr_row = cur.fetchone()
+        face_run_id = int(pr_row["face_run_id"]) if pr_row and pr_row["face_run_id"] is not None else None
+        if face_run_id is None:
+            return {}
+        placeholders = ",".join("?" * len(file_ids))
+        cur.execute(
+            """
+            SELECT file_id, frame_idx
+            FROM photo_rectangles
+            WHERE run_id = ? AND file_id IN (""" + placeholders + """) AND frame_idx IN (1, 2, 3)
+            ORDER BY file_id, frame_idx ASC
+            """,
+            [face_run_id] + list(file_ids),
+        )
+        out: dict[int, int] = {}
+        for r in cur.fetchall():
+            fid = int(r["file_id"] or 0)
+            if fid in out:
+                continue
+            idx = int(r["frame_idx"] or 0)
+            if idx in (1, 2, 3):
+                out[fid] = idx
+        return out
 
     def set_run_people_no_face_manual(self, *, pipeline_run_id: int, path: str, is_people_no_face: bool, person: str | None = None) -> None:
         """

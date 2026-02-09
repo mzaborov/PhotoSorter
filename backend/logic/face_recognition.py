@@ -3,7 +3,7 @@
 """
 
 import json
-from typing import Any
+from typing import Any, Callable
 from pathlib import Path
 
 # Опциональные импорты для ML (могут быть недоступны в окружении веб-сервера)
@@ -112,6 +112,7 @@ def cluster_face_embeddings(
     eps: float = 0.4,
     min_samples: int = 2,
     use_folder_context: bool = True,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """
     Кластеризует face embeddings из БД используя DBSCAN.
@@ -148,38 +149,42 @@ def cluster_face_embeddings(
     
     # Формируем SQL-запрос в зависимости от режима
     if archive_scope == 'archive':
-        # Для архива фильтруем по archive_scope
+        # Для архива фильтруем по files.inventory_scope (3NF: archive_scope удалён из photo_rectangles)
         cur.execute(
             """
             SELECT 
-                id, file_path, embedding
-            FROM photo_rectangles
-            WHERE archive_scope = 'archive'
-              AND embedding IS NOT NULL 
-              AND COALESCE(ignore_flag, 0) = 0
-              AND is_face = 1
-            ORDER BY id
+                pr.id, f.path AS file_path, pr.embedding
+            FROM photo_rectangles pr
+            JOIN files f ON f.id = pr.file_id
+            WHERE f.inventory_scope = 'archive'
+              AND pr.embedding IS NOT NULL 
+              AND COALESCE(pr.ignore_flag, 0) = 0
+              AND pr.is_face = 1
+            ORDER BY pr.id
             """
         )
     else:
-        # Для прогонов фильтруем по run_id
+        # Для прогонов фильтруем по run_id (JOIN files для file_path — use_folder_context)
         if run_id is None:
             raise ValueError("run_id обязателен для неархивных записей")
         cur.execute(
             """
             SELECT 
-                id, file_path, embedding
-            FROM photo_rectangles
-            WHERE run_id = ? 
-              AND embedding IS NOT NULL 
-              AND COALESCE(ignore_flag, 0) = 0
-              AND is_face = 1
-            ORDER BY id
+                pr.id, f.path AS file_path, pr.embedding
+            FROM photo_rectangles pr
+            JOIN files f ON f.id = pr.file_id
+            WHERE pr.run_id = ? 
+              AND pr.embedding IS NOT NULL 
+              AND COALESCE(pr.ignore_flag, 0) = 0
+              AND pr.is_face = 1
+            ORDER BY pr.id
             """,
             (run_id,),
         )
     
     rows = cur.fetchall()
+    if progress_callback:
+        progress_callback(f"Загружено {len(rows)} лиц из БД")
     
     if len(rows) == 0:
         return {
@@ -207,10 +212,12 @@ def cluster_face_embeddings(
             INNER JOIN face_clusters fc ON fr.cluster_id = fc.id
         """)
     
-    clustered_face_ids = {row['rectangle_id'] for row in cur.fetchall()}
+    clustered_face_ids = {row['id'] for row in cur.fetchall()}
     
     # Фильтруем rows - оставляем только лица, которых ещё нет в кластерах
     new_face_rows = [row for row in rows if row['id'] not in clustered_face_ids]
+    if progress_callback:
+        progress_callback(f"Новых для кластеризации: {len(new_face_rows)} (уже в кластерах: {len(clustered_face_ids)})")
     
     if len(new_face_rows) == 0:
         # Все лица уже в кластерах - нечего кластеризовать
@@ -226,11 +233,15 @@ def cluster_face_embeddings(
     # (приоритет поиска существующих кластеров перед созданием новых)
     faces_added_to_existing = 0
     if run_id is not None and archive_scope != 'archive':
+        if progress_callback:
+            progress_callback("Сопоставление с существующими кластерами...")
         faces_added_to_existing, new_face_rows = _try_add_to_existing_clusters(
             conn=conn,
             new_face_rows=new_face_rows,
             eps=eps,
         )
+        if progress_callback:
+            progress_callback(f"В существующие кластеры добавлено: {faces_added_to_existing}, осталось для DBSCAN: {len(new_face_rows)}")
     
     # Используем отфильтрованный список для кластеризации
     rows = new_face_rows
@@ -283,6 +294,8 @@ def cluster_face_embeddings(
     
     # Кластеризация DBSCAN с косинусным расстоянием
     # DBSCAN использует метрику 'cosine' для косинусного расстояния
+    if progress_callback:
+        progress_callback(f"Запуск DBSCAN ({len(face_ids)} точек, eps={eps})...")
     clustering = DBSCAN(eps=eps, min_samples=min_samples, metric="cosine")
     labels = clustering.fit_predict(X_normalized)
     
@@ -300,6 +313,9 @@ def cluster_face_embeddings(
                 clusters[label] = []
             clusters[label].append(face_id)
     
+    if progress_callback:
+        progress_callback(f"DBSCAN готово. Кластеров: {len(clusters)}, шум: {len(noise)}")
+    
     # Используем контекст папок для улучшения кластеризации
     if use_folder_context:
         folder_weights = get_folder_context_weights(conn=conn, file_paths=file_paths)
@@ -308,18 +324,19 @@ def cluster_face_embeddings(
     
     # Для run_id удаляем только старые кластеры, созданные для этого run_id
     # (чтобы избежать дубликатов при повторном запуске, но сохранить кластеры из других run_id)
+    # НЕ удаляем: method='manual' (якоря), person_id IS NOT NULL (привязаны к персонам)
     if run_id is not None and archive_scope != 'archive':
-        # Удаляем старые кластеры для этого run_id
-        # Сначала обнуляем cluster_id у прямоугольников (ранее face_cluster_members)
         cur.execute("""
             UPDATE photo_rectangles SET cluster_id = NULL
             WHERE cluster_id IN (
-                SELECT id FROM face_clusters WHERE run_id = ?
+                SELECT id FROM face_clusters
+                WHERE run_id = ? AND COALESCE(method, '') != 'manual' AND person_id IS NULL
             )
         """, (run_id,))
         
         cur.execute("""
-            DELETE FROM face_clusters WHERE run_id = ?
+            DELETE FROM face_clusters
+            WHERE run_id = ? AND COALESCE(method, '') != 'manual' AND person_id IS NULL
         """, (run_id,))
         
         conn.commit()
@@ -327,6 +344,8 @@ def cluster_face_embeddings(
     # Сохраняем кластеры в БД (только если есть хотя бы один кластер с лицами)
     cluster_id = None
     if len(clusters) > 0:
+        if progress_callback:
+            progress_callback("Сохранение кластеров в БД...")
         cluster_id = _save_clusters_to_db(
             conn=conn,
             run_id=run_id,
@@ -601,6 +620,393 @@ def _save_clusters_to_db(
     return first_cluster_id
 
 
+def create_manual_cluster_for_face(
+    *,
+    conn: Any,
+    rectangle_id: int,
+    person_id: int,
+) -> int | None:
+    """
+    Создаёт кластер из одного лица (ручная привязка) и назначает персону.
+    Используется как «якорь» для _try_add_to_existing_clusters — похожие лица
+    будут автоматически добавляться в этот кластер при следующей кластеризации.
+
+    Требуется embedding у лица. Если embedding нет — возвращает None.
+
+    Returns:
+        cluster_id или None (если embedding отсутствует)
+    """
+    from datetime import datetime, timezone
+
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT pr.run_id, pr.file_id, pr.embedding, f.inventory_scope
+        FROM photo_rectangles pr
+        LEFT JOIN files f ON f.id = pr.file_id
+        WHERE pr.id = ?
+        """,
+        (rectangle_id,),
+    )
+    row = cur.fetchone()
+    if not row or row["embedding"] is None:
+        return None
+
+    run_id = row["run_id"]
+    inventory_scope = (row["inventory_scope"] or "").strip()
+    is_archive = inventory_scope == "archive"
+
+    if is_archive:
+        run_id_val = None
+        archive_scope = "archive"
+    else:
+        if run_id is None and row["file_id"]:
+            cur.execute("SELECT faces_run_id FROM files WHERE id = ?", (row["file_id"],))
+            fr = cur.fetchone()
+            run_id_val = int(fr["faces_run_id"]) if fr and fr.get("faces_run_id") else None
+        else:
+            run_id_val = int(run_id) if run_id is not None else None
+        if run_id_val is None:
+            return None
+        archive_scope = None
+
+    now = datetime.now(timezone.utc).isoformat()
+    params_json = json.dumps({"source": "manual_assign"})
+
+    if is_archive:
+        cur.execute(
+            """
+            INSERT INTO face_clusters (run_id, archive_scope, method, params_json, created_at, person_id)
+            VALUES (NULL, ?, 'manual', ?, ?, ?)
+            """,
+            (archive_scope, params_json, now, person_id),
+        )
+    else:
+        cur.execute(
+            """
+            INSERT INTO face_clusters (run_id, archive_scope, method, params_json, created_at, person_id)
+            VALUES (?, NULL, 'manual', ?, ?, ?)
+            """,
+            (run_id_val, params_json, now, person_id),
+        )
+
+    cluster_id = cur.lastrowid
+    cur.execute(
+        "UPDATE photo_rectangles SET cluster_id = ?, manual_person_id = NULL WHERE id = ?",
+        (cluster_id, rectangle_id),
+    )
+    conn.commit()
+    return cluster_id
+
+
+def process_manual_faces_for_archived_file(
+    *,
+    conn: Any,
+    file_id: int,
+    local_file_path: str,
+    model: dict | None = None,
+    eps: float = 0.4,
+    error_samples: list | None = None,
+) -> tuple[int, int]:
+    """
+    Обрабатывает ручные привязки лиц для архивированного файла:
+    извлекает embeddings, добавляет в существующие кластеры персоны (если расстояние ≤ eps)
+    или создаёт новый кластер.
+
+    Args:
+        conn: соединение с БД
+        file_id: ID файла в files
+        local_file_path: локальный путь к файлу на диске (для чтения изображения/видео)
+        model: предзагруженная модель ArcFace (опционально, для кэширования)
+        eps: порог косинусного расстояния для подливки в существующий кластер
+
+    Returns:
+        (обработано успешно, ошибок)
+    """
+    import os
+    from datetime import datetime, timezone
+
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT pr.id, pr.manual_person_id, pr.embedding, pr.cluster_id,
+               pr.bbox_x, pr.bbox_y, pr.bbox_w, pr.bbox_h, pr.frame_t_sec
+        FROM photo_rectangles pr
+        JOIN files f ON f.id = pr.file_id
+        WHERE pr.file_id = ? AND (f.inventory_scope = 'archive' OR TRIM(COALESCE(f.inventory_scope, '')) = 'archive')
+          AND pr.manual_person_id IS NOT NULL
+          AND (pr.embedding IS NULL OR pr.cluster_id IS NULL)
+          AND COALESCE(pr.ignore_flag, 0) = 0
+        ORDER BY pr.id
+        """,
+        (file_id,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return 0, 0
+
+    if not os.path.isfile(local_file_path):
+        return 0, len(rows)
+
+    # Загружаем модель при необходимости (с кэшированием)
+    _model = model
+    if _model is None:
+        _model = getattr(process_manual_faces_for_archived_file, "_model_cache", None)
+        if _model is None:
+            _model = _load_embedding_model()
+            if _model is not None:
+                process_manual_faces_for_archived_file._model_cache = _model  # type: ignore[attr-defined]
+    if _model is None:
+        return 0, len(rows)
+
+    processed = 0
+    errors = 0
+    is_video = (
+        local_file_path.lower().endswith((".mp4", ".mov", ".mkv", ".avi", ".wmv", ".m4v", ".webm", ".3gp"))
+    )
+
+    try:
+        import cv2  # type: ignore[import-untyped]
+    except ImportError:
+        return 0, len(rows)
+
+    cap = None
+    if is_video:
+        cap = cv2.VideoCapture(local_file_path)
+        if not cap or not cap.isOpened():
+            return 0, len(rows)
+
+    for row in rows:
+        rect_id = row["id"]
+        person_id = row["manual_person_id"]
+        bbox = (row["bbox_x"], row["bbox_y"], row["bbox_w"], row["bbox_h"])
+        frame_t_sec = row["frame_t_sec"]
+
+        try:
+            if is_video:
+                t_sec = float(frame_t_sec or 0)
+                cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, t_sec) * 1000.0)
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    errors += 1
+                    continue
+                h, w = frame.shape[:2]
+            else:
+                frame = cv2.imread(local_file_path)
+                if frame is None:
+                    errors += 1
+                    continue
+                h, w = frame.shape[:2]
+
+            x, y, bw, bh = bbox
+            pad = int(round(max(bw, bh) * 0.18))
+            x0 = max(0, x - pad)
+            y0 = max(0, y - pad)
+            x1 = min(w, x + bw + pad)
+            y1 = min(h, y + bh + pad)
+            crop = frame[y0:y1, x0:x1]
+            if crop.size == 0:
+                errors += 1
+                continue
+
+            emb_bytes = _extract_embedding_from_crop(crop, _model)
+            if emb_bytes is None:
+                errors += 1
+                continue
+
+            cur.execute("UPDATE photo_rectangles SET embedding = ? WHERE id = ?", (emb_bytes, rect_id))
+            conn.commit()
+
+            # Пытаемся добавить в существующий кластер персоны или создать новый
+            cluster_id = _add_to_existing_or_create_cluster_archive(
+                conn=conn,
+                rectangle_id=rect_id,
+                person_id=int(person_id),
+                embedding_bytes=emb_bytes,
+                eps=eps,
+            )
+            if cluster_id is not None:
+                cur.execute(
+                    "UPDATE photo_rectangles SET cluster_id = ?, manual_person_id = NULL WHERE id = ?",
+                    (cluster_id, rect_id),
+                )
+                conn.commit()
+            processed += 1
+        except Exception as e:
+            errors += 1
+            if error_samples is not None and len(error_samples) < 3:
+                error_samples.append((rect_id, type(e).__name__, str(e)))
+
+    if cap is not None:
+        cap.release()
+
+    return processed, errors
+
+
+def _load_embedding_model() -> dict | None:
+    """Загружает модель ArcFace для извлечения embeddings."""
+    try:
+        import onnxruntime as ort  # type: ignore[import-untyped]
+    except ImportError:
+        return None
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+        candidates = [
+            repo_root / "models" / "face_recognition" / "w600k_r50.onnx",
+            repo_root / "models" / "face_recognition" / "arcface_r50_v1.onnx",
+            repo_root.parent / "models" / "face_recognition" / "w600k_r50.onnx",
+        ]
+        onnx_path = None
+        for p in candidates:
+            if p.exists():
+                onnx_path = p
+                break
+        if onnx_path is None:
+            try:
+                home = Path.home()
+                for sub in (".insightface/models/buffalo_l", ".insightface/models/buffalo_s"):
+                    cand = home / sub / "w600k_r50.onnx"
+                    if cand.exists():
+                        onnx_path = cand
+                        break
+            except Exception:
+                pass
+        if onnx_path is None:
+            return None
+        sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        inp = sess.get_inputs()[0]
+        return {
+            "session": sess,
+            "input_name": inp.name,
+            "output_name": sess.get_outputs()[0].name,
+            "input_shape": inp.shape,
+        }
+    except Exception:
+        return None
+
+
+def _extract_embedding_from_crop(face_bgr: Any, model: dict) -> bytes | None:
+    """Извлекает embedding из кропа лица (BGR)."""
+    if not ML_AVAILABLE or np is None:
+        return None
+    try:
+        import cv2  # type: ignore[import-untyped]
+
+        sess = model["session"]
+        inp_name = model["input_name"]
+        out_name = model["output_name"]
+        shape = model["input_shape"]
+        target = (int(shape[3]), int(shape[2])) if len(shape) == 4 else (112, 112)
+
+        rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb, target)
+        norm = (resized.astype(np.float32) - 127.5) / 128.0
+        batch = np.expand_dims(np.transpose(norm, (2, 0, 1)), axis=0)
+
+        out = sess.run([out_name], {inp_name: batch})
+        emb = out[0][0]
+        if emb is None or emb.size == 0:
+            return None
+        norm_val = np.linalg.norm(emb)
+        if norm_val > 0:
+            emb = emb / norm_val
+        return json.dumps(emb.tolist()).encode("utf-8")
+    except Exception:
+        return None
+
+
+def _add_to_existing_or_create_cluster_archive(
+    *,
+    conn: Any,
+    rectangle_id: int,
+    person_id: int,
+    embedding_bytes: bytes,
+    eps: float,
+) -> int | None:
+    """
+    Добавляет лицо в существующий кластер персоны (архив) или создаёт новый.
+    Возвращает cluster_id или None при ошибке.
+    """
+    if not ML_AVAILABLE or np is None:
+        return None
+    cur = conn.cursor()
+
+    try:
+        emb_list = json.loads(embedding_bytes.decode("utf-8"))
+        emb_array = np.array(emb_list, dtype=np.float32)
+    except Exception:
+        return None
+    if emb_array.size == 0 or np.isnan(emb_array).any():
+        return None
+    norm = np.linalg.norm(emb_array)
+    if norm <= 0:
+        return None
+    emb_norm = emb_array / norm
+
+    cur.execute(
+        """
+        SELECT fc.id, fr.embedding
+        FROM face_clusters fc
+        JOIN photo_rectangles fr ON fr.cluster_id = fc.id
+        WHERE fc.archive_scope = 'archive'
+          AND fc.person_id = ?
+          AND fr.embedding IS NOT NULL
+          AND COALESCE(fr.ignore_flag, 0) = 0
+        """,
+        (person_id,),
+    )
+    cluster_rows = cur.fetchall()
+
+    cluster_centroids: dict[int, Any] = {}
+    for row in cluster_rows:
+        cid = row["id"]
+        try:
+            emb_json = row["embedding"]
+            arr = np.array(json.loads(emb_json.decode("utf-8")), dtype=np.float32)
+            if arr.size > 0 and not np.isnan(arr).any():
+                n = np.linalg.norm(arr)
+                if n > 0:
+                    if cid not in cluster_centroids:
+                        cluster_centroids[cid] = []
+                    cluster_centroids[cid].append(arr / n)
+        except Exception:
+            continue
+
+    for cid in list(cluster_centroids.keys()):
+        lst = cluster_centroids[cid]
+        centroid = np.mean(lst, axis=0)
+        n = np.linalg.norm(centroid)
+        if n > 0:
+            cluster_centroids[cid] = centroid / n
+        else:
+            del cluster_centroids[cid]
+
+    best_cluster_id = None
+    best_sim = -1.0
+    for cid, centroid in cluster_centroids.items():
+        sim = float(np.dot(emb_norm, centroid))
+        if sim >= (1.0 - eps) and sim > best_sim:
+            best_sim = sim
+            best_cluster_id = cid
+
+    if best_cluster_id is not None:
+        return best_cluster_id
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    params_json = json.dumps({"source": "manual_archive"})
+    cur.execute(
+        """
+        INSERT INTO face_clusters (run_id, archive_scope, method, params_json, created_at, person_id)
+        VALUES (NULL, 'archive', 'manual', ?, ?, ?)
+        """,
+        (params_json, now, person_id),
+    )
+    cluster_id = cur.lastrowid
+    conn.commit()
+    return cluster_id
+
+
 def assign_cluster_to_person(*, cluster_id: int, person_id: int | None) -> None:
     """
     Назначает кластер персоне (устанавливает face_clusters.person_id).
@@ -649,7 +1055,7 @@ def get_cluster_info(*, cluster_id: int, limit: int | None = None) -> dict[str, 
             fc.id, fc.run_id, fc.method, fc.params_json, fc.created_at,
             fr.id as rectangle_id, f.path as file_path, fr.face_index, 
             fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
-            fr.archive_scope, fr.run_id as face_run_id,
+            f.inventory_scope as archive_scope, fr.run_id as face_run_id,
             f.image_width, f.image_height, f.exif_orientation,
             fr.thumb_jpeg, fr.confidence,
             (fr.bbox_w * fr.bbox_h) as bbox_area
@@ -658,7 +1064,7 @@ def get_cluster_info(*, cluster_id: int, limit: int | None = None) -> dict[str, 
         LEFT JOIN files f ON f.id = fr.file_id
         WHERE fc.id = ? AND COALESCE(fr.ignore_flag, 0) = 0
         ORDER BY 
-            CASE WHEN fr.archive_scope = 'archive' THEN 0 ELSE 1 END,
+            CASE WHEN f.inventory_scope = 'archive' THEN 0 ELSE 1 END,
             bbox_area DESC, fr.confidence DESC
     """
     params = [cluster_id]

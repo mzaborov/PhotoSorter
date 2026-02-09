@@ -47,7 +47,7 @@
       .cards { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
       .card2 { border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; background: #fff; }
       .thumb { height: 140px; background: #fff; display: flex; align-items: center; justify-content: center; position: relative; cursor: pointer; }
-      .thumb img { width: 100%; height: 100%; object-fit: contain; display: block; background: #fff; }
+      .thumb img, .thumb video { width: 100%; height: 100%; object-fit: contain; display: block; background: #fff; }
       .thumb .noimg { color: #6b7280; font-size: 12px; padding: 10px; text-align: center; }
       .card2-body { padding: 10px; font-size: 12px; color: #374151; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     </style>
@@ -84,6 +84,8 @@
 
     {% include "photo_card.html" %}
     <script src="/static/photo_card.js?v=48"></script>
+    {% include "video_card.html" %}
+    <script src="/static/video_card.js?v=1"></script>
     <script>
       (function () {
         function qs(s) { return document.querySelector(s); }
@@ -128,6 +130,12 @@
           }
           if (path.startsWith("disk:")) return "/api/yadisk/preview-image?size=M&path=" + encodeURIComponent(path);
           return "/api/local/preview?" + pathQ + (runId != null ? "&pipeline_run_id=" + encodeURIComponent(String(runId)) : "");
+        }
+        function videoFramePreviewUrl(path, runId, frameIdx) {
+          if (!path || runId == null) return "";
+          const pathQ = "path=" + encodeURIComponent(path.startsWith("local:") ? path : "local:" + path);
+          const idx = (frameIdx >= 1 && frameIdx <= 3) ? frameIdx : 1;
+          return "/api/faces/video-frame?pipeline_run_id=" + encodeURIComponent(String(runId)) + "&" + pathQ + "&frame_idx=" + idx;
         }
 
         let pipelineRunId = null;
@@ -221,6 +229,9 @@
           return n;
         }
 
+        function isVideoPath(path) {
+          return /\.(mp4|mov|avi|mkv|webm)$/i.test((path || "").toString());
+        }
         function cardsHtmlForFiles(files, folderKey) {
           let html = "";
           for (const f of files || []) {
@@ -228,11 +239,16 @@
             const name = f.name || path || "";
             const fileId = f.id != null ? f.id : "";
             const src = previewUrl(path, pipelineRunId);
-            const thumbHtml = src
-              ? '<img src="' + escapeHtml(src) + '" alt="" loading="lazy" />'
+            const kind = isVideoPath(path) ? "video" : "image";
+            const frameIdx = (kind === "video" && f.video_frame_idx) ? f.video_frame_idx : 1;
+            const thumbSrc = (kind === "video" && pipelineRunId != null) ? videoFramePreviewUrl(path, pipelineRunId, frameIdx) : src;
+            const thumbHtml = thumbSrc
+              ? (kind === "video"
+                  ? '<img src="' + escapeHtml(thumbSrc) + '" alt="" loading="lazy" />'
+                  : '<img src="' + escapeHtml(thumbSrc) + '" alt="" loading="lazy" />')
               : '<span class="noimg">превью</span>';
-            html += '<div class="card2" data-path="' + escapeHtml(path) + '" data-file-id="' + escapeHtml(String(fileId)) + '" data-folder="' + escapeHtml(folderKey) + '">' +
-              '<div class="thumb" data-kind="image">' + thumbHtml + '</div>' +
+            html += '<div class="card2" data-path="' + escapeHtml(path) + '" data-file-id="' + escapeHtml(String(fileId)) + '" data-folder="' + escapeHtml(folderKey) + '" data-kind="' + kind + '">' +
+              '<div class="thumb" data-kind="' + kind + '" data-src="' + escapeHtml(src || "") + '">' + thumbHtml + '</div>' +
               '<div class="card2-body">' + escapeHtml(name) + '</div></div>';
           }
           return html;
@@ -430,10 +446,11 @@
               const path = card.getAttribute("data-path");
               const fileIdAttr = card.getAttribute("data-file-id");
               const fileId = fileIdAttr ? parseInt(fileIdAttr, 10) : null;
+              const kind = card.getAttribute("data-kind") || "image";
               if (!path) return;
               const folderKey = card.getAttribute("data-folder") || (card.closest(".tab-panel") && card.closest(".tab-panel").dataset.folder) || "";
               const files = reportByFolder[folderKey] || [];
-              const items = files.map((f, idx) => ({
+              const items = files.map((f) => ({
                 file_id: f.id != null ? f.id : null,
                 file_path: f.path || "",
                 path: f.path || "",
@@ -450,7 +467,15 @@
                 current_index: currentIndex >= 0 ? currentIndex : 0,
                 total_count: items.length
               };
-              if (window.openPhotoCard) {
+              if (kind === "video" && window.openVideoCard) {
+                window.openVideoCard({
+                  file_id: fileId,
+                  file_path: path,
+                  pipeline_run_id: pipelineRunId,
+                  list_context: listContext,
+                  on_close: () => loadReport()
+                });
+              } else if (window.openPhotoCard) {
                 window.openPhotoCard({
                   file_id: fileId,
                   file_path: path,

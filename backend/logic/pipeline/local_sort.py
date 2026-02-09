@@ -1433,6 +1433,7 @@ def scan_faces_local(
     model_url: str,
     exclude_dir_names: tuple[str, ...],
     exclude_paths: set[str] | None = None,
+    only_paths: list[str] | None = None,
     enable_qr: bool = False,
     video_samples: int = 0,
     video_max_dim: int = 640,
@@ -1568,18 +1569,26 @@ def scan_faces_local(
         if v_samples > 3:
             v_samples = 3
         media_files: list[str] = []
-        for p in _iter_files(root, exclude_dir_names=exclude_dir_names):
-            if not (_is_image(p) or (v_samples > 0 and _is_video(p))):
-                continue
-            if exclude_paths is not None:
-                try:
-                    key = _as_local_path(os.path.normcase(p))
-                    if key in exclude_paths:
-                        continue
-                except Exception:
-                    # best-effort: если не смогли нормализовать путь — не исключаем
-                    pass
-            media_files.append(p)
+        if only_paths is not None:
+            for p in only_paths:
+                p_abs = os.path.abspath(p) if p else ""
+                if not p_abs or not os.path.isfile(p_abs):
+                    continue
+                if not (_is_image(p_abs) or (v_samples > 0 and _is_video(p_abs))):
+                    continue
+                media_files.append(p_abs)
+        else:
+            for p in _iter_files(root, exclude_dir_names=exclude_dir_names):
+                if not (_is_image(p) or (v_samples > 0 and _is_video(p))):
+                    continue
+                if exclude_paths is not None:
+                    try:
+                        key = _as_local_path(os.path.normcase(p))
+                        if key in exclude_paths:
+                            continue
+                    except Exception:
+                        pass
+                media_files.append(p)
         if run_id is None:
             run_id = store.create_run(scope="local", root_path=_as_local_path(root), total_files=len(media_files))
         run_id_i = int(run_id)
@@ -1694,7 +1703,7 @@ def scan_faces_local(
 
             # В самом начале прогресс обновляем ДО тяжёлой обработки изображения,
             # иначе UI может долго показывать 0/.. и выглядеть как "зависло" (особенно если первый файл проблемный).
-            if stats.images_scanned <= 20:
+            if stats.images_scanned <= 50:
                 try:
                     stage = "early_progress_count"
                     faces_found_db0 = _rectangles_count_db()
@@ -1779,48 +1788,45 @@ def scan_faces_local(
                             raise RuntimeError("video_open_failed")
                         dur = _video_duration_seconds_from_cap(cap) or 0.0
                         times = _pick_video_times(float(dur), samples=int(v_samples))
-                        best_frame: np.ndarray | None = None
-                        # pick first non-bad frame among candidates
-                        for t in times:
+                        # Читаем все кадры и детектим лица на каждом; выбираем кадр с максимумом лиц
+                        candidates: list[tuple[np.ndarray, float, int, list[tuple[int, int, int, int, float | None]]]] = []
+                        for frame_idx_1based, t in enumerate(times, start=1):
                             fr = _read_video_frame_at(cap, float(t), max_dim_px=int(video_max_dim))
                             if fr is None:
                                 continue
                             stats.video_frames_scanned += 1
-                            if not _is_bad_frame_bgr(fr):
-                                best_frame = fr
-                                break
-                            # keep the first frame as fallback
-                            if best_frame is None:
-                                best_frame = fr
-                        if best_frame is None:
+                            if _is_bad_frame_bgr(fr):
+                                continue
+                            stage = "video_detect_faces"
+                            faces_here = _detect_faces(detector, fr)
+                            if not faces_here:
+                                try:
+                                    detector2v = _create_face_detector(str(model), score_threshold=0.65)
+                                    faces2 = _detect_faces(detector2v, fr)
+                                    hh, ww = fr.shape[:2]
+                                    img_area = float(max(1, int(ww) * int(hh)))
+                                    faces2 = [
+                                        (x, y, w, h, s)
+                                        for (x, y, w, h, s) in faces2
+                                        if max(int(w), int(h)) >= 60 and (float(int(w) * int(h)) / img_area) >= 0.005
+                                    ]
+                                    if faces2:
+                                        faces_here = faces2
+                                except Exception:
+                                    pass
+                            candidates.append((fr, float(t), frame_idx_1based, faces_here))
+                        if not candidates:
                             raise RuntimeError("no_video_frames")
+                        # Берём кадр с максимальным количеством лиц
+                        best_frame, best_t_sec, best_frame_idx, faces_det_v = max(
+                            candidates, key=lambda c: len(c[3])
+                        )
+                        faces_count_v = int(len(faces_det_v or []))
                     finally:
                         try:
                             cap.release()
                         except Exception:
                             pass
-
-                    # run detectors on chosen frame
-                    stage = "video_detect_faces"
-                    faces_det_v = _detect_faces(detector, best_frame)
-                    # best-effort: second pass (so we don't miss obvious faces in video)
-                    if not faces_det_v:
-                        try:
-                            detector2v = _create_face_detector(str(model), score_threshold=0.65)
-                            faces_det_v2 = _detect_faces(detector2v, best_frame)
-                            hv, wv = best_frame.shape[:2]
-                            img_area_v = float(max(1, int(wv) * int(hv)))
-                            faces_det_v2 = [
-                                (x, y, w, h, s)
-                                for (x, y, w, h, s) in faces_det_v2
-                                if max(int(w), int(h)) >= 60 and (float(int(w) * int(h)) / img_area_v) >= 0.005
-                            ]
-                            if faces_det_v2:
-                                faces_det_v = faces_det_v2
-                        except Exception:
-                            pass
-
-                    faces_count_v = int(len(faces_det_v or []))
 
                     # For video we do NOT use screen_like quarantine.
                     is_quarantine = False
@@ -1851,12 +1857,38 @@ def scan_faces_local(
                         except Exception:
                             pass
 
-                    # update per-file aggregates in DB (no rectangles for video yet)
+                    # update per-file aggregates in DB; записываем rects в photo_rectangles для видео
                     stage = "video_db_write"
                     try:
                         store.clear_run_auto_rectangles_for_file(run_id=run_id_i, file_path=db_path)
                     except Exception:
                         pass
+                    # Записываем bbox лиц в photo_rectangles (frame_idx = кадр с максимумом лиц)
+                    if faces_count_v > 0:
+                        h_v, w_v = best_frame.shape[:2]
+                        areas_v = [float(max(0, int(w) * int(h))) for (_, _, w, h, _) in (faces_det_v or [])]
+                        denom_v = sum(areas_v) or 1.0
+                        for i, (x, y, w, h, score) in enumerate(faces_det_v or []):
+                            pres_v = (areas_v[i] / denom_v) if (i < len(areas_v)) else None
+                            try:
+                                store.insert_detection(
+                                    run_id=run_id_i,
+                                    file_path=db_path,
+                                    face_index=i + 1,
+                                    bbox_x=int(x),
+                                    bbox_y=int(y),
+                                    bbox_w=int(w),
+                                    bbox_h=int(h),
+                                    confidence=float(score) if score is not None else None,
+                                    presence_score=pres_v,
+                                    thumb_jpeg=None,
+                                    embedding=None,
+                                    frame_idx=best_frame_idx,
+                                    frame_t_sec=best_t_sec,
+                                )
+                                stats.faces_found += 1
+                            except Exception:
+                                pass
                     try:
                         dedup.set_faces_summary(path=db_path, faces_run_id=run_id_i, faces_count=int(faces_count_v))
                         dedup.set_faces_auto_group(path=db_path, group=("many_faces" if int(faces_count_v) >= int(many_faces_min) else None))
@@ -1867,8 +1899,32 @@ def scan_faces_local(
 
                     if faces_count_v > 0:
                         stats.faces_files += 1
+                        _pipe_log(
+                            pipeline,
+                            pipeline_run_id,
+                            f"video: {os.path.basename(db_path)} — найдено {faces_count_v} лиц\n",
+                        )
                     else:
                         stats.no_faces_files += 1
+
+                    # Прогресс для видео: каждые 5 файлов (после первых 50 — ранний прогресс) (после первых 50 — ранний прогресс)
+                    if stats.images_scanned > 50 and stats.images_scanned % 5 == 0:
+                        try:
+                            faces_found_db = _rectangles_count_db()
+                            store.update_run_progress(
+                                run_id=run_id_i,
+                                processed_files=stats.images_scanned,
+                                faces_found=faces_found_db,
+                                last_path=db_path,
+                            )
+                            _pipe_log(
+                                pipeline,
+                                pipeline_run_id,
+                                f"faces_progress images={stats.images_scanned} total={total_items} "
+                                f"faces={faces_found_db} errors={stats.errors}\n",
+                            )
+                        except Exception:
+                            pass
                     continue
 
                 # Важно: браузер показывает JPEG с учётом EXIF orientation.
@@ -2296,7 +2352,7 @@ def scan_faces_local(
                     pass
 
                 # Прогресс: после первых 20 (которые апдейтим до обработки) продолжаем апдейты пачками.
-                step = 10 if stats.images_scanned <= 200 else 50
+                step = 5 if stats.images_scanned <= 200 else 10
                 if stats.images_scanned > 20 and stats.images_scanned % step == 0:
                     # Важно для resume: не затираем счётчик лиц нулём, если файлы были пропущены как уже просканированные.
                     faces_found_db = _rectangles_count_db()

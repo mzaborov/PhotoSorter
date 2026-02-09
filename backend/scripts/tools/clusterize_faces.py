@@ -25,12 +25,16 @@ def main() -> int:
     print(f"Параметры: eps={args.eps}, min_samples={args.min_samples}")
     print()
 
+    def progress(msg: str) -> None:
+        print(f"  {msg}", flush=True)
+
     try:
         result = cluster_face_embeddings(
             run_id=args.run_id,
             eps=args.eps,
             min_samples=args.min_samples,
             use_folder_context=True,
+            progress_callback=progress,
         )
 
         print("=" * 60)

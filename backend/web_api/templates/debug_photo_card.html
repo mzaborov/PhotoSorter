@@ -30,12 +30,14 @@
           <div class="pill">path: <code>{{ path or "—" }}</code></div>
           <div class="pill">file_id: <code>{{ file_id if file_id is not none else "—" }}</code></div>
           <div class="pill">pipeline_run_id: <code>{{ pipeline_run_id if pipeline_run_id is not none else "—" }}</code></div>
+          {% if is_video %}<div class="pill" style="background:#dbeafe; color:#1e40af;">видео</div>{% endif %}
         </div>
 
         {% if inferred %}
           <div class="muted" style="margin-bottom:12px;">
             pipeline_run_id выведен автоматически: <code>{{ inferred.pipeline_run_id }}</code>
-            (face_run_id: <code>{{ inferred.face_run_id }}</code>)
+            {% if inferred.face_run_id %}(face_run_id: <code>{{ inferred.face_run_id }}</code>){% endif %}
+            {% if inferred.source %}(источник: <code>{{ inferred.source }}</code>){% endif %}
           </div>
         {% endif %}
 
@@ -55,9 +57,11 @@
       </div>
     </div>
 
-    <!-- Подключение единой карточки фотографий -->
+    <!-- Подключение карточек фото и видео -->
     {% include "photo_card.html" %}
+    {% if is_video %}{% include "video_card.html" %}{% endif %}
     <script src="/static/photo_card.js?v=49"></script>
+    {% if is_video %}<script src="/static/video_card.js?v=1"></script>{% endif %}
     <script>
       (function() {
         // Не отправляем пустые поля как query-параметры (FastAPI ругается на file_id=).
@@ -75,29 +79,37 @@
         const filePath = {{ (path or '') | tojson }};
         const fileId = {{ (file_id if file_id is not none else 'null') }};
         const pipelineRunId = {{ (pipeline_run_id if pipeline_run_id is not none else 'null') }};
+        const isVideo = {{ 'true' if is_video else 'false' }};
 
         if (!autoOpen) return;
-        // Открываем карточку после загрузки скрипта.
-        // Передаём single-item list_context, чтобы показывались навигация (1 из 1) и кнопки,
-        // layout не «съезжал» из-за скрытых элементов.
         window.addEventListener('load', function() {
-          if (!window.openPhotoCard) return;
           const fid = (fileId !== null && !Number.isNaN(Number(fileId))) ? Number(fileId) : null;
           const path = (typeof filePath === 'string' && filePath) ? filePath : null;
           const prId = (pipelineRunId !== null && !Number.isNaN(Number(pipelineRunId))) ? Number(pipelineRunId) : null;
           const listContext = (path || fid != null) ? {
             source_page: 'debug',
-            items: [{ file_id: fid, file_path: path, face_rectangle_id: null, person_rectangle_id: null, pipeline_run_id: prId }],
+            items: [{ file_id: fid, file_path: path, pipeline_run_id: prId }],
             current_index: 0,
             total_count: 1
           } : null;
-          window.openPhotoCard({
-            file_id: fid,
-            file_path: path,
-            pipeline_run_id: prId,
-            list_context: listContext,
-            highlight_rectangle: null
-          });
+
+          if (isVideo && window.openVideoCard) {
+            window.openVideoCard({
+              file_id: fid,
+              file_path: path,
+              pipeline_run_id: prId,
+              list_context: listContext
+            });
+          } else if (window.openPhotoCard) {
+            const ctx = listContext ? { ...listContext, items: listContext.items.map(i => ({ ...i, face_rectangle_id: null, person_rectangle_id: null })) } : null;
+            window.openPhotoCard({
+              file_id: fid,
+              file_path: path,
+              pipeline_run_id: prId,
+              list_context: ctx,
+              highlight_rectangle: null
+            });
+          }
         });
       })();
     </script>

@@ -206,6 +206,67 @@ def _venv_face_python() -> Path:
     rr = _repo_root()
     return rr / ".venv-face" / "Scripts" / "python.exe"
 
+
+def _video_keyframes_script() -> Path:
+    """Скрипт извлечения кадров из видео."""
+    return _repo_root() / "backend" / "scripts" / "tools" / "video_keyframes.py"
+
+
+def _extract_video_frame_to_path(abs_path: str, frame_idx: int, max_dim: int = 960, t_sec: float | None = None) -> Path | None:
+    """Извлекает один кадр из видео во временный/кэш файл. Возвращает Path к jpg или None."""
+    import hashlib
+    import tempfile
+    rr = _repo_root()
+    py = _venv_face_python()
+    script = _video_keyframes_script()
+    if not py.exists() or not script.exists():
+        return None
+    t_sec_str = f"{round(t_sec, 2):.2f}" if t_sec is not None else "auto"
+    try:
+        st = os.stat(abs_path)
+        h = hashlib.sha1(f"{os.path.normcase(abs_path)}|{int(st.st_size)}|{int(st.st_mtime)}|{frame_idx}|{t_sec_str}|{max_dim}".encode("utf-8", errors="ignore")).hexdigest()
+    except Exception:
+        h = hashlib.sha1(f"{os.path.normcase(abs_path)}|{frame_idx}|{t_sec_str}|{max_dim}".encode("utf-8", errors="ignore")).hexdigest()
+    cache_dir = rr / "data" / "cache" / "video_frames"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    out_path = cache_dir / f"{h}.jpg"
+    if out_path.exists():
+        return out_path
+    with tempfile.NamedTemporaryFile(prefix="ps_vf_", suffix=".jpg", delete=False) as tmp:
+        tmp_path = tmp.name
+    cmd = [
+        str(py),
+        str(script.relative_to(rr)),
+        "--mode", "extract",
+        "--path", str(abs_path),
+        "--samples", "3",
+        "--frame-idx", str(frame_idx),
+        "--max-dim", str(max_dim),
+        "--out", str(tmp_path),
+    ]
+    if t_sec is not None:
+        cmd.extend(["--t-sec", str(t_sec)])
+    try:
+        prc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(rr), timeout=45)  # noqa: S603,S607
+    except subprocess.TimeoutExpired:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        return None
+    if prc.returncode != 0 or not os.path.isfile(tmp_path):
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        return None
+    try:
+        os.replace(tmp_path, str(out_path))
+    except Exception:
+        out_path = Path(tmp_path)
+    return out_path
+
+
 router = APIRouter()
 APP_DIR = Path(__file__).resolve().parents[1]
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
@@ -377,9 +438,10 @@ async def api_face_clusters_list(*, run_id: int | None = None, archive_scope: st
             """
             SELECT fr.id
             FROM photo_rectangles fr
+            JOIN files f ON f.id = fr.file_id
             WHERE fr.cluster_id = ? 
               AND COALESCE(fr.ignore_flag, 0) = 0
-              AND fr.archive_scope = 'archive'
+              AND f.inventory_scope = 'archive'
               AND fr.is_face = 1
             ORDER BY (fr.bbox_w * fr.bbox_h) DESC, fr.confidence DESC
             LIMIT 1
@@ -929,44 +991,81 @@ async def page_face_cluster_detail(request: Request, cluster_id: int) -> Any:
 
 @router.get("/api/face-rectangles/{rectangle_id}/thumbnail")
 async def api_face_rectangle_thumbnail(*, rectangle_id: int) -> dict[str, Any]:
-    """Получает thumbnail лица для отображения аватара."""
+    """Получает thumbnail лица для отображения аватара. Для видео (frame_idx) извлекает кадр и кроп по bbox."""
     import base64
-    import logging
+    from PIL import Image
+    from io import BytesIO
     logger = logging.getLogger(__name__)
-    
+
     conn = get_connection()
     cur = conn.cursor()
-    
     cur.execute(
         """
-        SELECT fr.thumb_jpeg, f.path as file_path, fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
+        SELECT fr.thumb_jpeg, fr.file_id, f.path AS file_path, fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
+               fr.frame_idx, fr.frame_t_sec
         FROM photo_rectangles fr
         LEFT JOIN files f ON fr.file_id = f.id
         WHERE fr.id = ?
         """,
         (rectangle_id,),
     )
-    
     row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Face rectangle not found")
-    
+
     thumb_base64 = None
     if row["thumb_jpeg"]:
         thumb_base64 = base64.b64encode(row["thumb_jpeg"]).decode("utf-8")
     elif row["file_path"] and row["bbox_x"] is not None and row["bbox_y"] is not None and row["bbox_w"] is not None and row["bbox_h"] is not None:
-        # Генерируем превью на лету, если thumb_jpeg отсутствует
-        try:
-            thumb_base64 = _generate_face_thumbnail_on_fly(
-                file_path=row["file_path"],
-                bbox=(row["bbox_x"], row["bbox_y"], row["bbox_w"], row["bbox_h"])
-            )
-        except Exception as e:
-            logger.warning(f"Failed to generate thumbnail on fly for face_id={rectangle_id}: {e}")
-    
+        frame_idx_val = row["frame_idx"]
+        if frame_idx_val is not None and int(frame_idx_val) in (1, 2, 3) and (str(row["file_path"] or "").startswith("local:")):
+            # Прямоугольник с видео-кадра: извлекаем кадр, кроп по bbox
+            try:
+                abs_path = (row["file_path"] or "").replace("local:", "").strip()
+                if abs_path and os.path.isfile(abs_path):
+                    t_sec = None
+                    if row["frame_t_sec"] is not None:
+                        t_sec = float(row["frame_t_sec"])
+                    if t_sec is None and row["file_id"] is not None:
+                        cur2 = conn.cursor()
+                        cur2.execute(
+                            f"SELECT video_frame{int(frame_idx_val)}_t_sec FROM files WHERE id = ?",
+                            (int(row["file_id"]),),
+                        )
+                        r2 = cur2.fetchone()
+                        if r2 is not None and r2[0] is not None:
+                            t_sec = float(r2[0])
+                    frame_path = _extract_video_frame_to_path(abs_path, int(frame_idx_val), max_dim=960, t_sec=t_sec)
+                    if frame_path and frame_path.exists():
+                        img = Image.open(frame_path).convert("RGB")
+                        x, y, w, h = int(row["bbox_x"]), int(row["bbox_y"]), int(row["bbox_w"]), int(row["bbox_h"])
+                        iw, ih = img.size
+                        pad_ratio = 0.18
+                        pad = int(round(max(w, h) * pad_ratio))
+                        x0 = max(0, x - pad)
+                        y0 = max(0, y - pad)
+                        x1 = min(iw, x + w + pad)
+                        y1 = min(ih, y + h + pad)
+                        crop = img.crop((x0, y0, x1, y1))
+                        crop.thumbnail((200, 200), Image.Resampling.LANCZOS)
+                        buf = BytesIO()
+                        crop.save(buf, format="JPEG", quality=78, optimize=True)
+                        thumb_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                        img.close()
+            except Exception as e:
+                logger.warning(f"Failed to generate video frame thumbnail for face_id={rectangle_id}: {e}")
+        if not thumb_base64:
+            try:
+                thumb_base64 = _generate_face_thumbnail_on_fly(
+                    file_path=row["file_path"],
+                    bbox=(row["bbox_x"], row["bbox_y"], row["bbox_w"], row["bbox_h"])
+                )
+            except Exception as e:
+                logger.warning(f"Failed to generate thumbnail on fly for face_id={rectangle_id}: {e}")
+
     if not thumb_base64:
         raise HTTPException(status_code=404, detail="Face rectangle has no thumbnail and cannot generate one")
-    
+
     return {"thumb_jpeg_base64": thumb_base64}
 
 
@@ -1399,7 +1498,7 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
             SELECT DISTINCT
                 fr.id as face_id,
                 fr.run_id,
-                fr.archive_scope,
+                f.inventory_scope as archive_scope,
                 f.path as file_path,
                 f.id as file_id,
                 f.inventory_scope as file_inventory_scope,
@@ -1440,7 +1539,7 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
             SELECT DISTINCT
                 fr.id as face_id,
                 fr.run_id,
-                fr.archive_scope,
+                f.inventory_scope as archive_scope,
                 f.path as file_path,
                 f.id as file_id,
                 f.inventory_scope as file_inventory_scope,
@@ -1487,7 +1586,7 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
                     NULL as person_rectangle_id,
                     fr.id as face_id,
                     fr.run_id,
-                    fr.archive_scope,
+                    f.inventory_scope as archive_scope,
                     f.path as file_path,
                     f.id as file_id,
                     f.inventory_scope as file_inventory_scope,
@@ -1574,9 +1673,17 @@ async def api_person_detail(*, person_id: int) -> dict[str, Any]:
             (person_id,),
         )
         
+        # Дедупликация по file_id — один файл показываем один раз (может быть привязан в нескольких прогонах)
+        seen_file_ids: set[int] = set()
         for row in cur.fetchall():
+            r = dict(row)
+            fid = r.get("file_id")
+            if fid is not None and fid in seen_file_ids:
+                continue
+            if fid is not None:
+                seen_file_ids.add(fid)
             all_items.append({
-                "row": dict(row),
+                "row": r,
                 "assignment_type": "file_person",
             })
         
@@ -2907,7 +3014,7 @@ async def api_file_faces(file_id: int | None = None, file_path: str | None = Non
                 fr.face_index,
                 fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
                 fr.run_id,
-                fr.archive_scope,
+                f.inventory_scope as archive_scope,
                 COALESCE(fr.manual_person_id, fc.person_id) as person_id,
                 COALESCE(p_manual.name, p_cluster.name) as person_name,
                 COALESCE(p_manual.is_me, p_cluster.is_me, 0) as is_me,
@@ -2916,11 +3023,12 @@ async def api_file_faces(file_id: int | None = None, file_path: str | None = Non
                     PARTITION BY fr.file_id, fr.face_index, fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h
                     ORDER BY 
                         CASE WHEN fr.cluster_id IS NOT NULL THEN 0 ELSE 1 END,
-                        CASE WHEN fr.archive_scope = 'archive' THEN 0 ELSE 1 END,
+                        CASE WHEN f.inventory_scope = 'archive' THEN 0 ELSE 1 END,
                         CASE WHEN fr.run_id IS NULL THEN 1 ELSE 0 END,
                         fr.run_id DESC
                 ) as rn
             FROM photo_rectangles fr
+            LEFT JOIN files f ON f.id = fr.file_id
             LEFT JOIN face_clusters fc ON fc.id = fr.cluster_id
             LEFT JOIN persons p_cluster ON fc.person_id = p_cluster.id
             LEFT JOIN persons p_manual ON fr.manual_person_id = p_manual.id
@@ -3035,8 +3143,8 @@ async def api_assign_person_to_face(*, rectangle_id: int, payload: dict[str, Any
         if f_row and f_row["faces_run_id"] is not None:
             run_id_to_set = int(f_row["faces_run_id"])
     
-    # Назначаем ручную привязку в photo_rectangles.manual_person_id (и снимаем кластер).
-    # run_id выставляем, чтобы фильтр «К разбору» (fr.run_id = ? OR archive) видел привязку.
+    # Кластер создаётся при загрузке в архив (process_manual_faces_for_archived_file).
+    # Здесь — только ручная привязка (manual_person_id).
     if run_id_to_set is not None:
         cur.execute(
             """
@@ -3051,8 +3159,8 @@ async def api_assign_person_to_face(*, rectangle_id: int, payload: dict[str, Any
             """,
             (person_id, rectangle_id),
         )
-    set_file_processed(conn, file_id=file_id)
     conn.commit()
+    set_file_processed(conn, file_id=file_id)
     
     # Получаем информацию о персоне для ответа
     cur.execute(
@@ -3064,14 +3172,14 @@ async def api_assign_person_to_face(*, rectangle_id: int, payload: dict[str, Any
     person_row = cur.fetchone()
     person_name = person_row["name"] if person_row else None
     
+    msg = f"Персона '{person_name}' назначена на лицо. Кластер создастся при загрузке в архив."
     return {
         "status": "ok",
         "rectangle_id": rectangle_id,
         "person_id": person_id,
         "person_name": person_name,
-        "cluster_id": cluster_id,
-        "message": f"Персона '{person_name}' назначена на лицо. " + 
-                   (f"Лицо в кластере #{cluster_id}" if cluster_id else "Лицо не в кластере (cluster_id = None)")
+        "cluster_id": None,
+        "message": msg,
     }
 
 

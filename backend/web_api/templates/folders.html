@@ -129,6 +129,17 @@
         <div class="muted" style="margin-top: 8px;">
           <a href="/duplicates">Посмотреть дубли</a>
         </div>
+
+        <div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid #e5e7eb;">
+          <div style="font-weight: 600;">Ручные привязки в архиве</div>
+          <div class="muted" style="margin-top: 4px;">Досчитать embeddings и кластеры для новых ручных прямоугольников (нарисованных вручную на фото в архиве).</div>
+          <div style="margin-top: 8px;">
+            <button class="btn" id="backfillManualEmbeddingsBtn" type="button" title="Обработать manual-лица без embedding/cluster">
+              Досчитать embeddings и кластеры
+            </button>
+            <span class="muted status" id="backfillManualText" style="margin-left: 8px;"></span>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -402,6 +413,35 @@
       document.getElementById("reconcileArchiveStart")?.addEventListener("click", (e) => {
         e.preventDefault();
         startReconcileArchive();
+      });
+
+      async function startBackfillManualEmbeddings() {
+        const btn = document.getElementById("backfillManualEmbeddingsBtn");
+        const txt = document.getElementById("backfillManualText");
+        if (!btn || !txt) return;
+        btn.disabled = true;
+        txt.textContent = "Идёт…";
+        try {
+          const resp = await fetch("/api/archive/backfill-manual-embeddings", { method: "POST" });
+          const data = await resp.json().catch(() => ({}));
+          if (data.ok) {
+            txt.textContent = "Готово. " + (data.message || "");
+          } else {
+            txt.textContent = "Ошибка: " + (data.message || resp.status);
+            txt.classList.add("err");
+          }
+        } catch (e) {
+          txt.textContent = "Ошибка: " + String(e);
+          txt.classList.add("err");
+        } finally {
+          btn.disabled = false;
+          setTimeout(() => { txt.textContent = ""; txt.classList.remove("err"); }, 8000);
+        }
+      }
+
+      document.getElementById("backfillManualEmbeddingsBtn")?.addEventListener("click", (e) => {
+        e.preventDefault();
+        startBackfillManualEmbeddings();
       });
 
       // Конструктор правил папок (объявления до вызова initRuleConstructors)

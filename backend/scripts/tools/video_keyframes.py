@@ -77,6 +77,7 @@ def main() -> int:
     ap.add_argument("--samples", type=int, default=3, help="1..3")
     ap.add_argument("--mode", choices=("meta", "extract"), default="meta")
     ap.add_argument("--frame-idx", type=int, default=1, help="1..3 (for extract)")
+    ap.add_argument("--t-sec", type=float, default=None, help="Override: exact t_sec for frame (for extract)")
     ap.add_argument("--max-dim", type=int, default=960)
     ap.add_argument("--out", default="", help="Output image path (for extract)")
     args = ap.parse_args()
@@ -110,12 +111,15 @@ def main() -> int:
     idx = int(args.frame_idx or 0)
     if idx <= 0:
         raise SystemExit("bad --frame-idx")
-    if idx > len(times):
-        # for safety: clamp to last available time
-        idx = len(times)
+    if args.t_sec is not None:
+        t = float(args.t_sec)
+        t = max(0.0, min(t, dur)) if dur > 0 else t
+    else:
+        if idx > len(times):
+            idx = len(times)
+        t = float(times[idx - 1])
     if not args.out:
         raise SystemExit("missing --out")
-    t = float(times[idx - 1])
     _extract_frame(path=p, t_sec=t, out_path=str(args.out), max_dim=int(args.max_dim or 0))
     print(json.dumps({"ok": True, "frame_idx": int(idx), "t_sec": float(t), "out": str(args.out)}, ensure_ascii=False))
     return 0

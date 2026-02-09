@@ -100,14 +100,15 @@ def main():
         conn = get_connection()
         cur = conn.cursor()
         
-        # Проверяем архивные прогоны
+        # Проверяем архивные прогоны (лица в файлах с inventory_scope='archive')
         cur.execute("""
             SELECT 
                 COUNT(*) AS total_faces,
-                COUNT(embedding) AS faces_with_embedding
-            FROM face_rectangles
-            WHERE archive_scope = 'archive'
-              AND COALESCE(ignore_flag, 0) = 0
+                COUNT(pr.embedding) AS faces_with_embedding
+            FROM photo_rectangles pr
+            JOIN files f ON f.id = pr.file_id
+            WHERE f.inventory_scope = 'archive'
+              AND COALESCE(pr.ignore_flag, 0) = 0
         """)
         
         archive_stats = cur.fetchone()

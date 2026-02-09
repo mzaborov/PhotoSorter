@@ -3,10 +3,11 @@
 Миграция архивных лиц из прогонов в архивный режим (без привязки к run_id).
 
 Находит все face_runs с scope='yadisk' и root_path начинающимся с 'disk:/Фото',
-и перемещает связанные photo_rectangles и face_clusters в архивный режим
-(archive_scope='archive', run_id=NULL для кластеров).
+и перемещает связанные face_clusters в архивный режим (archive_scope='archive').
+Для photo_rectangles: статус архива берётся из files.inventory_scope (3NF).
 
-Сохраняет все связи: face_cluster_members, person_rectangle_manual_assignments.
+ПРИМЕЧАНИЕ: photo_rectangles.archive_scope удалён (миграция drop_photo_rectangles_archive_scope).
+Вместо UPDATE photo_rectangles — обновляем files.inventory_scope='archive' для файлов.
 
 TODO: При переезде файлов в архив нужно копировать people_no_face_person
 из files_manual_labels в files.people_no_face_person, чтобы привязка сохранилась.
@@ -61,18 +62,19 @@ def main() -> int:
         print(f"  - run_id={run['id']}, root_path={run['root_path']}, faces={run['faces_found']}")
     print()
     
-    # Проверяем, есть ли уже лица с archive_scope='archive'
+    # Проверяем, есть ли уже лица с файлами в архиве (files.inventory_scope='archive')
     cur.execute(
         """
         SELECT COUNT(*) as cnt
-        FROM photo_rectangles
-        WHERE archive_scope = 'archive'
+        FROM photo_rectangles pr
+        JOIN files f ON f.id = pr.file_id
+        WHERE f.inventory_scope = 'archive'
         """
     )
     existing_archive = cur.fetchone()["cnt"]
     
     if existing_archive > 0:
-        print(f"ВНИМАНИЕ: Найдено {existing_archive} лиц с archive_scope='archive'.")
+        print(f"ВНИМАНИЕ: Найдено {existing_archive} лиц в файлах с inventory_scope='archive'.")
         print("Миграция может создать дубликаты. Рекомендуется сначала очистить архивные данные.")
         response = input("Продолжить миграцию? (yes/no): ")
         if response.lower() != "yes":
@@ -139,66 +141,55 @@ def main() -> int:
         
         print(f"Обработка run_id={run_id} ({root_path})...")
         
-        # 1. Мигрируем photo_rectangles
-        # Проверяем дубликаты перед миграцией (по file_id + bbox)
+        # 1. Обновляем files.inventory_scope='archive' для файлов с лицами из этого run
+        # (photo_rectangles.archive_scope удалён — статус в files.inventory_scope)
         cur.execute(
             """
-            UPDATE photo_rectangles
-            SET archive_scope = 'archive'
-            WHERE run_id = ?
-              AND is_face = 1
-              AND NOT EXISTS (
-                  SELECT 1 FROM photo_rectangles pr2
-                  WHERE pr2.archive_scope = 'archive'
-                    AND pr2.is_face = 1
-                    AND pr2.file_id = photo_rectangles.file_id
-                    AND pr2.bbox_x = photo_rectangles.bbox_x
-                    AND pr2.bbox_y = photo_rectangles.bbox_y
-                    AND pr2.bbox_w = photo_rectangles.bbox_w
-                    AND pr2.bbox_h = photo_rectangles.bbox_h
-              )
+            UPDATE files
+            SET inventory_scope = 'archive'
+            WHERE id IN (
+                SELECT DISTINCT file_id FROM photo_rectangles
+                WHERE run_id = ? AND is_face = 1
+            )
+            AND (inventory_scope IS NULL OR inventory_scope != 'archive')
             """,
             (run_id,),
         )
-        migrated_in_run = cur.rowcount
+        migrated_files = cur.rowcount
+        cur.execute(
+            "SELECT COUNT(*) as cnt FROM photo_rectangles WHERE run_id = ? AND is_face = 1",
+            (run_id,),
+        )
+        migrated_in_run = cur.fetchone()["cnt"]
         migrated_faces += migrated_in_run
         
-        # Подсчитываем дубликаты (которые не были мигрированы из-за EXISTS)
+        # Подсчитываем дубликаты (файлы уже в архиве)
         cur.execute(
             """
             SELECT COUNT(*) as cnt
-            FROM photo_rectangles
-            WHERE run_id = ?
-              AND is_face = 1
-              AND archive_scope IS NULL
-              AND EXISTS (
-                  SELECT 1 FROM photo_rectangles pr2
-                  WHERE pr2.archive_scope = 'archive'
-                    AND pr2.is_face = 1
-                    AND pr2.file_id = photo_rectangles.file_id
-                    AND pr2.bbox_x = photo_rectangles.bbox_x
-                    AND pr2.bbox_y = photo_rectangles.bbox_y
-                    AND pr2.bbox_w = photo_rectangles.bbox_w
-                    AND pr2.bbox_h = photo_rectangles.bbox_h
-              )
+            FROM photo_rectangles pr
+            JOIN files f ON f.id = pr.file_id
+            WHERE pr.run_id = ? AND pr.is_face = 1
+              AND f.inventory_scope = 'archive'
             """,
             (run_id,),
         )
         duplicates_count = cur.fetchone()["cnt"]
         
         if duplicates_count > 0:
-            print(f"  - Мигрировано лиц: {migrated_in_run}, пропущено дубликатов: {duplicates_count}")
+            print(f"  - Обновлено файлов: {migrated_files}, лиц в run: {migrated_in_run}, уже в архиве: {duplicates_count}")
             deduplicated_faces += duplicates_count
             
             # Обновляем face_cluster_members для дубликатов:
-            # находим архивные лица-дубликаты и переназначаем связи
+            # находим архивные лица (файл с inventory_scope='archive') и переназначаем связи
             cur.execute(
                 """
                 UPDATE face_cluster_members
                 SET rectangle_id = (
                     SELECT pr2.id
                     FROM photo_rectangles pr2
-                    WHERE pr2.archive_scope = 'archive'
+                    JOIN files f2 ON f2.id = pr2.file_id
+                    WHERE f2.inventory_scope = 'archive'
                       AND pr2.file_id = (
                           SELECT file_id FROM photo_rectangles WHERE id = face_cluster_members.rectangle_id
                       )
@@ -222,11 +213,13 @@ def main() -> int:
                 )
                 AND EXISTS (
                     SELECT 1 FROM photo_rectangles pr3
+                    LEFT JOIN files f3 ON f3.id = pr3.file_id
                     WHERE pr3.id = face_cluster_members.rectangle_id
-                      AND pr3.archive_scope IS NULL
+                      AND (f3.inventory_scope IS NULL OR f3.inventory_scope != 'archive')
                       AND EXISTS (
                           SELECT 1 FROM photo_rectangles pr4
-                          WHERE pr4.archive_scope = 'archive'
+                          JOIN files f4 ON f4.id = pr4.file_id
+                          WHERE f4.inventory_scope = 'archive'
                             AND pr4.file_id = pr3.file_id
                             AND pr4.bbox_x = pr3.bbox_x
                             AND pr4.bbox_y = pr3.bbox_y
@@ -245,7 +238,8 @@ def main() -> int:
                 SET rectangle_id = (
                     SELECT pr2.id
                     FROM photo_rectangles pr2
-                    WHERE pr2.archive_scope = 'archive'
+                    JOIN files f2 ON f2.id = pr2.file_id
+                    WHERE f2.inventory_scope = 'archive'
                       AND pr2.file_id = (
                           SELECT file_id FROM photo_rectangles WHERE id = person_rectangle_manual_assignments.rectangle_id
                       )
@@ -264,16 +258,19 @@ def main() -> int:
                     LIMIT 1
                 )
                 WHERE rectangle_id IN (
-                    SELECT id FROM photo_rectangles
-                    WHERE run_id = ? AND archive_scope IS NULL
+                    SELECT pr.id FROM photo_rectangles pr
+                    LEFT JOIN files f ON f.id = pr.file_id
+                    WHERE pr.run_id = ? AND (f.inventory_scope IS NULL OR f.inventory_scope != 'archive')
                 )
                 AND EXISTS (
                     SELECT 1 FROM photo_rectangles pr3
+                    LEFT JOIN files f3 ON f3.id = pr3.file_id
                     WHERE pr3.id = person_rectangle_manual_assignments.rectangle_id
-                      AND pr3.archive_scope IS NULL
+                      AND (f3.inventory_scope IS NULL OR f3.inventory_scope != 'archive')
                       AND EXISTS (
                           SELECT 1 FROM photo_rectangles pr4
-                          WHERE pr4.archive_scope = 'archive'
+                          JOIN files f4 ON f4.id = pr4.file_id
+                          WHERE f4.inventory_scope = 'archive'
                             AND pr4.file_id = pr3.file_id
                             AND pr4.bbox_x = pr3.bbox_x
                             AND pr4.bbox_y = pr3.bbox_y
@@ -303,12 +300,13 @@ def main() -> int:
         conn.commit()
         print()
     
-    # Финальная статистика
+    # Финальная статистика (лица в файлах с inventory_scope='archive')
     cur.execute(
         """
         SELECT COUNT(*) as cnt
-        FROM photo_rectangles
-        WHERE archive_scope = 'archive' AND is_face = 1
+        FROM photo_rectangles pr
+        JOIN files f ON f.id = pr.file_id
+        WHERE f.inventory_scope = 'archive' AND pr.is_face = 1
         """
     )
     final_faces = cur.fetchone()["cnt"]

@@ -92,6 +92,9 @@ class files <<table>> {
   animals_auto: INTEGER
   animals_kind: TEXT
   people_no_face_person: TEXT  ' ТОЛЬКО для архивных файлов (глобальная привязка персоны)
+  video_frame1_t_sec: REAL
+  video_frame2_t_sec: REAL
+  video_frame3_t_sec: REAL
   taken_at: TEXT
   gps_lat: REAL
   gps_lon: REAL
@@ -176,15 +179,6 @@ class files_manual_labels <<table>> {
   quarantine_manual_at: TEXT
 }
 
-class video_manual_frames <<table>> {
-  +pipeline_run_id: INTEGER <<PK>>
-  +file_id: INTEGER <<PK,FK>> <<NOT NULL>>  ' FOREIGN KEY на files.id (путь через JOIN к files.path)
-  +frame_idx: INTEGER <<PK>>    ' 1..3
-  t_sec: REAL
-  rects_json: TEXT
-  updated_at: TEXT
-}
-
 folders "0..1" -- "*" files : файлы в папке (parent_path, логически)
 dedup_runs "1" -- "*" files : прогон дедупа
 pipeline_runs "0..1" -- "0..1" dedup_runs : шаг 1 (дедуп)
@@ -192,9 +186,7 @@ pipeline_runs "1" -- "0..1" pipeline_run_metrics : метрики прогона
 pipeline_runs "1" -- "0..1" preclean_state : состояние предочистки
 pipeline_runs "1" -- "*" preclean_moves : перемещения предочистки
 files "1" -- "*" files_manual_labels : файл (file_id)
-files "1" -- "*" video_manual_frames : файл (file_id)
 pipeline_runs "1" -- "*" files_manual_labels : ручные метки файлов
-pipeline_runs "1" -- "*" video_manual_frames : ручные кадры видео
 files "*" -- "0..1" geocode_cache : геокодирование (gps_lat, gps_lon, логически)
 
 class face_runs <<table>> {
@@ -213,9 +205,8 @@ class face_runs <<table>> {
 
 class photo_rectangles <<table>> {
   +id: INTEGER <<PK>>
-  run_id: INTEGER <<FK>>         ' NULL для архива (archive_scope='archive')
-  archive_scope: TEXT             ' NULL|'' для прогонов, 'archive' для архива
-  +file_id: INTEGER <<FK>> <<NOT NULL>>  ' FOREIGN KEY на files.id (путь через JOIN к files.path)
+  run_id: INTEGER <<FK>>         ' NULL для архива
+  +file_id: INTEGER <<FK>> <<NOT NULL>>  ' FOREIGN KEY на files.id (статус архива в files.inventory_scope, 3NF)
   cluster_id: INTEGER <<FK>>        ' принадлежность кластеру (вместо face_cluster_members)
   manual_person_id: INTEGER <<FK>>  ' ручная привязка к персоне (вместо person_rectangle_manual_assignments); CHECK: только один из cluster_id/manual_person_id
   face_index: INTEGER
@@ -232,6 +223,8 @@ class photo_rectangles <<table>> {
   is_manual: INTEGER
   manual_created_at: TEXT
   is_face: INTEGER <<NOT NULL>> <<DEFAULT 1>>  ' 1=лицо, 0=персона
+  frame_idx: INTEGER  ' 1..3 для кадров видео, NULL для фото
+  frame_t_sec: REAL   ' таймкод кадра (сек), NULL для фото
   created_at: TEXT
 }
 

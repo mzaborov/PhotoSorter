@@ -1065,25 +1065,46 @@ def api_gold_update_from_db(payload: dict[str, Any] = Body(...)) -> dict[str, An
         )
         rect_rows = [dict(r) for r in cur.fetchall()]
 
-        # --- video manual frames export (NDJSON, overwrite by path) ---
+        # --- video manual frames export (NDJSON, overwrite by path) — данные из photo_rectangles ---
         if isinstance(pipeline_run_id, int):
             cur.execute(
                 f"""
                 SELECT
                   f.path AS path,
-                  v.frame_idx AS frame_idx,
-                  v.t_sec AS t_sec,
-                  v.rects_json AS rects_json,
-                  v.updated_at AS updated_at
-                FROM video_manual_frames v
-                JOIN files f ON f.id = v.file_id
+                  fr.frame_idx AS frame_idx,
+                  fr.frame_t_sec AS t_sec,
+                  fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
+                  fr.manual_created_at AS updated_at
+                FROM photo_rectangles fr
+                JOIN files f ON f.id = fr.file_id
+                JOIN pipeline_runs pr ON pr.face_run_id = fr.run_id
                 WHERE {base_where_sql_f}
-                  AND v.pipeline_run_id = ?
-                ORDER BY f.path ASC, v.frame_idx ASC
+                  AND pr.id = ? AND fr.frame_idx IN (1, 2, 3)
+                ORDER BY f.path ASC, fr.frame_idx ASC, fr.face_index ASC
                 """,
                 list(base_params) + [int(pipeline_run_id)],
             )
-            video_rows = [dict(r) for r in cur.fetchall()]
+            raw_rows = [dict(r) for r in cur.fetchall()]
+            # группируем по (path, frame_idx), собираем rects_json
+            by_key: dict[tuple[str, int], list[dict[str, Any]]] = {}
+            for r in raw_rows:
+                p = str(r.get("path") or "")
+                idx = int(r.get("frame_idx") or 0)
+                if not p or idx not in (1, 2, 3):
+                    continue
+                k = (p, idx)
+                if k not in by_key:
+                    by_key[k] = []
+                by_key[k].append(r)
+            video_rows = []
+            for (p, idx), grp in sorted(by_key.items()):
+                t_sec = grp[0].get("t_sec") if grp else None
+                updated_at = max((g.get("updated_at") or "") for g in grp) if grp else None
+                rects = [
+                    {"x": int(g.get("bbox_x") or 0), "y": int(g.get("bbox_y") or 0), "w": int(g.get("bbox_w") or 0), "h": int(g.get("bbox_h") or 0)}
+                    for g in grp
+                ]
+                video_rows.append({"path": p, "frame_idx": idx, "t_sec": t_sec, "rects_json": json.dumps(rects, ensure_ascii=False), "updated_at": updated_at})
         else:
             video_rows = []
     finally:
@@ -1434,7 +1455,7 @@ def api_gold_apply_to_db(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
                     except Exception:
                         t_sec = None
                     rects = fr.get("rects")
-                    rects_clean: list[dict[str, int]] = []
+                    rects_clean: list[dict[str, Any]] = []
                     if isinstance(rects, list):
                         for r in rects:
                             if not isinstance(r, dict):
@@ -1448,25 +1469,17 @@ def api_gold_apply_to_db(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
                                 continue
                             if w > 0 and h > 0:
                                 rects_clean.append({"x": x, "y": y, "w": w, "h": h})
-                    cur.execute(
-                        """
-                        INSERT INTO video_manual_frames(pipeline_run_id, file_id, frame_idx, t_sec, rects_json, updated_at)
-                        VALUES(?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(pipeline_run_id, file_id, frame_idx) DO UPDATE SET
-                          t_sec = excluded.t_sec,
-                          rects_json = excluded.rects_json,
-                          updated_at = excluded.updated_at
-                        """,
-                        (
-                            int(pipeline_run_id),
-                            file_id,
-                            int(idx),
-                            float(t_sec) if t_sec is not None else None,
-                            json.dumps(rects_clean, ensure_ascii=False),
-                            _now_utc_iso(),
-                        ),
-                    )
-                    applied_v += 1
+                    try:
+                        ds.upsert_video_manual_frame(
+                            pipeline_run_id=int(pipeline_run_id),
+                            path=str(p),
+                            frame_idx=int(idx),
+                            t_sec=float(t_sec) if t_sec is not None else None,
+                            rects=rects_clean,
+                        )
+                        applied_v += 1
+                    except Exception:
+                        bad_v += 1
 
             ds.conn.commit()
             out["faces_video_frames_gold"] = {

@@ -1386,6 +1386,43 @@ def api_archive_reconcile_status() -> dict[str, Any]:
     return {"running": running, "active_run_id": _RECONCILE_RUN_ID, "latest": latest}
 
 
+@app.post("/api/archive/backfill-manual-embeddings")
+def api_archive_backfill_manual_embeddings() -> dict[str, Any]:
+    """
+    Запускает backfill embeddings и кластеров для ручных привязок в архиве.
+    Обрабатывает photo_rectangles с manual_person_id и без embedding/cluster_id
+    (например, нарисованные вручную после предыдущего backfill).
+    Запускает скрипт в .venv-face (ML-окружение). Блокирует до 5 минут.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    script_path = repo_root / "backend" / "scripts" / "tools" / "backfill_archive_manual_embeddings.py"
+    venv_python = repo_root / ".venv-face" / "Scripts" / "python.exe"
+    python_exe = str(venv_python) if venv_python.exists() else sys.executable
+
+    if not script_path.exists():
+        return {"ok": False, "message": "Скрипт backfill не найден"}
+
+    try:
+        result = subprocess.run(
+            [python_exe, str(script_path)],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        out = (result.stdout or "").strip()
+        err = (result.stderr or "").strip()
+        last_lines = "\n".join(out.splitlines()[-5:]) if out else ""
+
+        if result.returncode == 0:
+            return {"ok": True, "message": last_lines or "Готово"}
+        return {"ok": False, "message": err or last_lines or f"Код выхода {result.returncode}"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "message": "Превышено время ожидания (5 мин)"}
+    except Exception as e:
+        return {"ok": False, "message": f"{type(e).__name__}: {e}"}
+
+
 @app.get("/api/dedup/archive/status")
 def api_dedup_archive_status() -> dict[str, Any]:
     global _DEDUP_FUTURES, _DEDUP_RUN_IDS  # noqa: PLW0603

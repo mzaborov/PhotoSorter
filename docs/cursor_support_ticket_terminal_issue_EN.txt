@@ -8,7 +8,7 @@
 
 ## Problem Description
 
-After the latest Cursor update, the integrated terminal in my project stopped executing **any** commands (PowerShell). Previously, clearing `%APPDATA%\Cursor\User\workspaceStorage\` helped temporarily, but now **it doesn't help** — terminals break immediately after the update/launch.
+After the latest Cursor update, the integrated terminal in my project stopped working correctly with the Agent (PowerShell). **Current behaviour:** the command is executed (sometimes the IDE retries it up to 3 times), but the **IDE does not receive the command output** — see "Update (current behaviour)" at the end of this document. Previously, clearing `%APPDATA%\Cursor\User\workspaceStorage\` helped temporarily, but now **it doesn't help** — terminals break immediately after the update/launch.
 
 In parallel, an **Internal Error** popup appears in the chat UI, and I see an error in the logs/stack:
 `[internal] serialize binary: invalid int 32: 3221226505`
@@ -30,10 +30,9 @@ In parallel, an **Internal Error** popup appears in the chat UI, and I see an er
 
 ## Actual Result
 
-- Commands in terminal don't execute / terminal becomes unresponsive
-- **Internal Error** popup appears
-- Error in stack trace (see below)
-- Clearing `%APPDATA%\Cursor\User\workspaceStorage\` no longer restores functionality
+- **(Initially)** Commands in terminal didn't execute / terminal became unresponsive; **Internal Error** popup; stack trace (see below).
+- **(Current)** Command **does** execute (IDE may retry it up to 3 times), but **IDE/Agent does not see the command output** — feedback from terminal to Cursor is broken.
+- Clearing `%APPDATA%\Cursor\User\workspaceStorage\` no longer restores functionality.
 
 ## Expected Result
 
@@ -94,12 +93,25 @@ The error value `3221226505` is different from the one mentioned in the forum th
 
 ## Request to Support
 
-1. Confirm if the issue with `serialize binary: invalid int 32: 3221226505` and integrated terminal failure after update is known
-2. Suggest which **additional logs** to collect and where to attach them (e.g., from `%APPDATA%\Cursor\logs\`) to help quickly identify the root cause
-3. If there's a temporary workaround (terminal/PTY/shell integration settings) — provide exact steps
+1. Confirm if the issue with `serialize binary: invalid int 32: 3221226505` and integrated terminal / Agent behaviour after update is known.
+2. **Current symptom:** command runs in terminal but **output is not passed back to the IDE/Agent** (Agent retries ~3 times, never sees result). Please check serialization/pipe of terminal output to Agent.
+3. Suggest which **additional logs** to collect and where to attach them (e.g., from `%APPDATA%\Cursor\logs\`) to help quickly identify the root cause.
+4. If there's a temporary workaround (terminal/PTY/shell integration settings) — provide exact steps.
 
 I can provide a screenshot of the **Internal Error** popup and any logs/dumps you specify.
 
 ---
 
 **Note:** The problem appeared after the latest Cursor update. Previously, clearing workspaceStorage temporarily solved the issue, but now it doesn't help.
+
+---
+
+## Update (current behaviour)
+
+**As of now**, the behaviour has changed:
+
+- The **command does execute** (e.g. in the real terminal/process).
+- The **IDE / Agent tries to run the command about 3 times** (retries).
+- The **IDE does not see the result** — output from the terminal is not passed back to the chat/agent, so the agent thinks the command failed or didn't run, and may retry.
+
+So the failure is no longer "terminal doesn't run commands" but **"terminal runs the command, yet the IDE/agent does not receive the command output"** (broken feedback from terminal to Cursor). The `serialize binary: invalid int 32` (or related) error likely happens when Cursor tries to read/serialize the terminal output to send to the agent.

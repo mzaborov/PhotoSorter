@@ -474,6 +474,10 @@
     await navigateToIndex(newIndex);
   }
   
+  function isVideoPath(p) {
+    return typeof p === 'string' && /\.(mp4|mov|avi|mkv|webm)$/i.test(p);
+  }
+
   /**
    * Переходит к файлу по индексу
    */
@@ -483,12 +487,29 @@
     const items = currentState.list_context.items || [];
     const totalCount = currentState.list_context.total_count || 0;
     
+    function switchToVideoCard(item) {
+      const path = item.file_path || item.path || null;
+      if (!path || !isVideoPath(path) || typeof window.openVideoCard !== 'function') return false;
+      currentState.list_context.current_index = newIndex;
+      closePhotoCard();
+      window.openVideoCard({
+        file_path: path,
+        file_id: item.file_id ?? null,
+        pipeline_run_id: currentState.pipeline_run_id,
+        list_context: currentState.list_context,
+        on_close: currentState.on_close || null
+      });
+      return true;
+    }
+
     // Если индекс в пределах загруженных items
     if (newIndex >= 0 && newIndex < items.length) {
       const item = items[newIndex];
+      const path = item.file_path || item.path || '';
+      if (isVideoPath(path) && switchToVideoCard(item)) return;
       currentState.list_context.current_index = newIndex;
       currentState.file_id = item.file_id || currentState.file_id;
-      currentState.file_path = item.file_path || currentState.file_path;
+      currentState.file_path = path || currentState.file_path;
       
       updateNavigationPosition();
       await loadPhotoCardData();
@@ -516,9 +537,11 @@
         const data = await response.json();
         if (data.ok && data.items && data.items[indexInPage]) {
           const item = data.items[indexInPage];
+          const path = item.path || item.file_path || '';
+          if (isVideoPath(path) && switchToVideoCard(item)) return;
           currentState.list_context.current_index = newIndex;
           currentState.file_id = item.file_id || (item.path ? null : currentState.file_id);
-          currentState.file_path = item.path || item.file_path || currentState.file_path;
+          currentState.file_path = path || currentState.file_path;
           
           // Обновляем items в контексте (можно добавить кэширование)
           currentState.list_context.items = data.items;
@@ -538,10 +561,18 @@
    */
   async function loadPhotoCardData() {
     try {
-      // Обновляем путь в заголовке
+      // Обновляем путь в заголовке (если путь начинается с disk — делаем кликабельной ссылкой на Яндекс.Диск)
       const pathElement = document.getElementById('photoCardPath');
       if (pathElement) {
-        pathElement.textContent = currentState.file_path || `file_id: ${currentState.file_id}`;
+        const path = currentState.file_path || `file_id: ${currentState.file_id}`;
+        const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        if (/^disk/i.test(path)) {
+          const diskPath = path.replace(/^disk:?[/\\]?/i, 'disk:/').replace(/\\/g, '/').replace(/^disk:\/+/, 'disk:/');
+          const yadiskUrl = 'https://disk.yandex.ru/client/disk?path=' + encodeURIComponent(diskPath);
+          pathElement.innerHTML = '<a href="' + esc(yadiskUrl) + '" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline;">' + esc(path) + '</a>';
+        } else {
+          pathElement.textContent = path;
+        }
       }
       // Дата и место справа от пути — плашками в стиле таблицы faces
       const datePlaceEl = document.getElementById('photoCardDatePlace');
@@ -635,6 +666,67 @@
     }
   }
 
+  /** Заполняет select групп как на faces (Поездки, остальные, + Создать новую группу). */
+  function fillGroupSelectForAssign(sel, groups) {
+    const predefined = ['Здоровье', 'Чеки', 'Дом и ремонт', 'Артефакты людей'];
+    const tripsKeywords = ['Турция', 'Минск', 'Италия', 'Испания', 'Греция', 'Франция', 'Польша', 'Чехия', 'Германия', 'Тургояк'];
+    const groupsWithData = [];
+    const allGroups = new Set();
+    (groups || []).forEach(g => {
+      const name = g.group_path || '';
+      if (!name) return;
+      allGroups.add(name);
+      const hasYear = /\d{4}/.test(name);
+      const hasPlace = tripsKeywords.some(kw => name.includes(kw));
+      const startsWithYear = /^\d{4}\s/.test(name);
+      const isTrip = (hasYear && hasPlace) || (startsWithYear && name.length > 5);
+      groupsWithData.push({ name, isTrip, last_created_at: g.last_created_at || '' });
+    });
+    predefined.forEach(p => {
+      if (!allGroups.has(p)) groupsWithData.push({ name: p, isTrip: false, last_created_at: '' });
+    });
+    const categoryMap = {};
+    const otherGroups = [];
+    groupsWithData.forEach(gd => {
+      if (gd.isTrip) {
+        if (!categoryMap['Поездки']) categoryMap['Поездки'] = [];
+        categoryMap['Поездки'].push({ name: gd.name, last_created_at: gd.last_created_at });
+      } else {
+        otherGroups.push(gd.name);
+      }
+    });
+    sel.innerHTML = '<option value="">Назначить группу...</option>';
+    const tripsOptgroup = document.createElement('optgroup');
+    tripsOptgroup.label = 'Поездки';
+    if (categoryMap['Поездки'] && categoryMap['Поездки'].length > 0) {
+      categoryMap['Поездки'].sort((a, b) => (b.last_created_at || '').localeCompare(a.last_created_at || ''));
+      categoryMap['Поездки'].forEach(t => {
+        const opt = document.createElement('option');
+        opt.value = t.name;
+        opt.textContent = t.name;
+        tripsOptgroup.appendChild(opt);
+      });
+    }
+    const createTrip = document.createElement('option');
+    createTrip.value = '__create_new_Поездки__';
+    createTrip.textContent = '+ Создать новую поездку...';
+    createTrip.style.fontStyle = 'italic';
+    tripsOptgroup.appendChild(createTrip);
+    sel.appendChild(tripsOptgroup);
+    otherGroups.sort();
+    otherGroups.forEach(path => {
+      const opt = document.createElement('option');
+      opt.value = path;
+      opt.textContent = path;
+      sel.appendChild(opt);
+    });
+    const createOpt = document.createElement('option');
+    createOpt.value = '__create_new__';
+    createOpt.textContent = '+ Создать новую группу...';
+    createOpt.style.fontStyle = 'italic';
+    sel.appendChild(createOpt);
+  }
+
   /**
    * Заполняет выпадающий список групп для блока «Назначить группу» (tab=no_faces)
    */
@@ -645,16 +737,7 @@
       const res = await fetch(`/api/faces/groups-with-files?pipeline_run_id=${encodeURIComponent(currentState.pipeline_run_id)}`);
       const data = res.ok ? await res.json() : {};
       const groups = data.groups || [];
-      sel.innerHTML = '<option value="">Назначить группу...</option>';
-      const sorted = [...groups].sort((a, b) => (a.group_path || '').localeCompare(b.group_path || '', 'ru', { sensitivity: 'base' }));
-      sorted.forEach(g => {
-        const path = g.group_path || '';
-        if (!path) return;
-        const opt = document.createElement('option');
-        opt.value = path;
-        opt.textContent = path;
-        sel.appendChild(opt);
-      });
+      fillGroupSelectForAssign(sel, groups);
     } catch (e) {
       console.warn('[photo_card] loadGroupsForAssignBlock failed:', e);
     }
@@ -665,11 +748,21 @@
    */
   async function handleAssignGroupFromCard() {
     const sel = document.getElementById('photoCardGroupSelect');
-    const groupPath = sel?.value?.trim();
-    if (!groupPath || groupPath.startsWith('__create_new')) {
+    let groupPath = sel?.value?.trim();
+    if (!groupPath) {
       if (typeof window.setToast === 'function') window.setToast('Выберите группу', true);
       else alert('Выберите группу');
       return;
+    }
+    if (groupPath === '__create_new__' || groupPath === '__create_new_Поездки__') {
+      const isTrips = groupPath === '__create_new_Поездки__';
+      const promptText = isTrips ? 'Введите название поездки (например: 2025 Италия):' : 'Введите название новой группы:';
+      const newName = prompt(promptText);
+      if (!newName || !newName.trim()) {
+        if (sel) sel.value = '';
+        return;
+      }
+      groupPath = newName.trim();
     }
     if (!currentState.pipeline_run_id || !currentState.file_path) return;
     try {
