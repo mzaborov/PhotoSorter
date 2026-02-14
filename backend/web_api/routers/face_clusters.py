@@ -1035,7 +1035,8 @@ async def api_face_rectangle_thumbnail(*, rectangle_id: int) -> dict[str, Any]:
                         r2 = cur2.fetchone()
                         if r2 is not None and r2[0] is not None:
                             t_sec = float(r2[0])
-                    frame_path = _extract_video_frame_to_path(abs_path, int(frame_idx_val), max_dim=960, t_sec=t_sec)
+                    # max_dim=640 — совпадает с video_max_dim пайплайна; bbox в координатах кадра 640px
+                    frame_path = _extract_video_frame_to_path(abs_path, int(frame_idx_val), max_dim=640, t_sec=t_sec)
                     if frame_path and frame_path.exists():
                         img = Image.open(frame_path).convert("RGB")
                         x, y, w, h = int(row["bbox_x"]), int(row["bbox_y"]), int(row["bbox_w"]), int(row["bbox_h"])

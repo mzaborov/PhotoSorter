@@ -1072,6 +1072,42 @@
   const undoBtn = qs('#videoCardUndo');
   if (undoBtn) undoBtn.onclick = undoLastAction;
 
+  const markAsCatBtn = qs('#videoCardMarkAsCat');
+  if (markAsCatBtn) {
+    markAsCatBtn.onclick = async () => {
+      const path = getPath();
+      const runId = getPipelineRunId();
+      if (!path || runId == null) {
+        alert('Нет пути или прогона');
+        return;
+      }
+      try {
+        const payload = { pipeline_run_id: Number(runId), path };
+        if (state.file_id) payload.file_id = state.file_id;
+        await postJson('/api/faces/file/mark-as-cat', payload);
+        showToast('Помечено как кот');
+        await loadFrames();
+        if (state.activeTab >= 1 && state.activeTab <= 3) {
+          const fr = frameObj(state.activeTab);
+          state.curManualRects = Array.isArray(fr.rects) ? fr.rects.map(r => ({
+            x: Number(r.x||0), y: Number(r.y||0), w: Number(r.w||0), h: Number(r.h||0),
+            manual_person_id: r.manual_person_id != null ? Number(r.manual_person_id) : undefined,
+            person_name: r.person_name ? String(r.person_name) : '',
+            is_face: (r.is_face === 0) ? 0 : 1
+          })) : [];
+        }
+        renderRectList();
+        drawOverlay();
+        if (typeof state.on_assign_success === 'function') {
+          try { await state.on_assign_success(path); } catch (err) { console.warn('[video_card] on_assign_success:', err); }
+        }
+        if (typeof state.on_close === 'function') state.on_close();
+      } catch (e) {
+        alert(e?.message || String(e));
+      }
+    };
+  }
+
   const assignOutsiderBtn = qs('#videoCardAssignOutsider');
   if (assignOutsiderBtn) {
     assignOutsiderBtn.onclick = async () => {
@@ -1085,6 +1121,20 @@
         const res = await postJson('/api/faces/rectangles/assign-outsider', payload);
         showToast(res.assigned_count != null ? `Назначено посторонними: ${res.assigned_count}` : 'Готово');
         await loadFrames();
+        if (state.activeTab >= 1 && state.activeTab <= 3) {
+          const fr = frameObj(state.activeTab);
+          state.curManualRects = Array.isArray(fr.rects) ? fr.rects.map(r => ({
+            x: Number(r.x||0), y: Number(r.y||0), w: Number(r.w||0), h: Number(r.h||0),
+            manual_person_id: r.manual_person_id != null ? Number(r.manual_person_id) : undefined,
+            person_name: r.person_name ? String(r.person_name) : '',
+            is_face: (r.is_face === 0) ? 0 : 1
+          })) : [];
+        }
+        renderRectList();
+        drawOverlay();
+        if (typeof state.on_assign_success === 'function') {
+          try { await state.on_assign_success(path); } catch (err) { console.warn('[video_card] on_assign_success:', err); }
+        }
         if (typeof state.on_close === 'function') state.on_close();
       } catch (e) {
         alert(e?.message || String(e));
@@ -1259,6 +1309,47 @@
       toggleRectBtn.textContent = rectsVisible ? 'Скрыть прямоугольники' : 'Показать прямоугольники';
       if (canvas) canvas.style.visibility = rectsVisible ? '' : 'hidden';
     };
+  }
+
+  const deleteAllRectsBtn = qs('#videoCardDeleteAllRects');
+  if (deleteAllRectsBtn) {
+    deleteAllRectsBtn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!confirm('Удалить все прямоугольники на всех кадрах? Файл вернётся в «К разбору».')) return;
+      const path = getPath();
+      const runId = getPipelineRunId();
+      if (!path || runId == null) {
+        showToast('Нет пути или прогона');
+        return;
+      }
+      if (!path.startsWith('local:')) {
+        showToast('Доступно только для локальных файлов');
+        return;
+      }
+      try {
+        for (const idx of [1, 2, 3]) {
+          const fr = frameObj(idx);
+          await postJson('/api/faces/video-manual-frame', {
+            pipeline_run_id: Number(runId),
+            path,
+            frame_idx: idx,
+            t_sec: fr?.t_sec ?? null,
+            rects: []
+          });
+        }
+        showToast('Все прямоугольники удалены');
+        await loadFrames();
+        if (state.activeTab >= 1 && state.activeTab <= 3) state.curManualRects = [];
+        renderRectList();
+        drawOverlay();
+        if (typeof state.on_assign_success === 'function') {
+          try { await state.on_assign_success(path); } catch (err) { console.warn('[video_card] on_assign_success:', err); }
+        }
+      } catch (err) {
+        alert(err?.message || String(err));
+      }
+    });
   }
 
   const personOkBtn = qs('#videoCardPersonOk');

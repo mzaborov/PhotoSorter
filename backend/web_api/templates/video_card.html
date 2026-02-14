@@ -230,6 +230,10 @@
     font-weight: 600;
   }
   .video-card-bottom .muted { color: #6b7280; }
+  .video-card-rectlist-header { display: flex; align-items: center; gap: 8px; }
+  .video-card-bottom .btn.btn-small { padding: 2px 8px; font-size: 11px; min-height: 22px; height: 22px; line-height: 1; }
+  .video-card-bottom .btn.danger { color: #dc2626; border-color: #fca5a5; }
+  .video-card-bottom .btn.danger:hover { background: #fee2e2; border-color: #dc2626; }
   .video-card-person-modal {
     position: fixed;
     inset: 0;
@@ -451,6 +455,7 @@
       <div style="position: absolute; left: 12px; display: flex; gap: 8px; align-items: center;" id="videoCardAssignPersonContainer">
         <button class="btn" id="videoCardAssignPerson" type="button">Привязать персону ▶</button>
         <button class="btn danger" id="videoCardDelete" type="button" title="Удалить файл (в _delete)">Удалить</button>
+        <button class="btn" id="videoCardMarkAsCat" type="button" title="Пометить файл как «кот» (удаляет прямоугольники, переводит в Животные)">Кот</button>
       </div>
       <div style="display: flex; align-items: center; gap: 12px;">
         <button class="btn" id="videoCardPrev" type="button" style="display:none;">←</button>
@@ -467,7 +472,10 @@
 
     <!-- Привязки и прямоугольники (как в photo_card) -->
     <div class="video-card-bottom">
-      <span class="muted" id="videoCardRectListLabel">Привязки:</span>
+      <div class="video-card-rectlist-header">
+        <span class="muted" id="videoCardRectListLabel">Привязки:</span>
+        <button class="btn btn-small danger" id="videoCardDeleteAllRects" type="button" title="Удалить все прямоугольники на всех кадрах">Удалить все</button>
+      </div>
       <div class="rectlist" id="videoCardRectList"></div>
     </div>
   </div>
