@@ -114,7 +114,8 @@
     
     // Режим (archive/sorting) всегда берём из файла, не из переданного контекста
     if (currentState.file_path) {
-      currentState.mode = currentState.file_path.startsWith('disk:/Фото') ? 'archive' : 'sorting';
+      const pathLower = currentState.file_path.trim().toLowerCase();
+      currentState.mode = pathLower.startsWith('disk:/фото') || pathLower.startsWith('disk:/photo') ? 'archive' : 'sorting';
       if (currentState.mode === 'archive') {
         currentState.pipeline_run_id = null;
       }
@@ -224,8 +225,8 @@
       menus.forEach(el => el.remove());
     }
     
-    // Уведомляем открывший контекст (faces): обновить таблицу при любом закрытии карточки
-    if (currentState.list_context?.source_page === 'faces' && typeof currentState.on_close === 'function') {
+    // Уведомляем открывший контекст (faces / trip): обновить таблицу при закрытии карточки
+    if ((currentState.list_context?.source_page === 'faces' || currentState.list_context?.source_page === 'trip') && typeof currentState.on_close === 'function') {
       try {
         currentState.on_close();
       } catch (e) {
@@ -637,10 +638,15 @@
         specialActions.style.display = currentState.mode === 'sorting' ? 'block' : 'none';
       }
       
-      // Кнопка «Удалить» — только в режиме сортировки, рядом с «Привязать персону»
+      // Кнопка «Удалить» — режим сортировки (в _delete), архив (физическое удаление) или из поездки (если есть прогон/архив)
       const deleteFileBtn = document.getElementById('photoCardDeleteFile');
+      const isArchiveFile = (currentState.file_path || '').toLowerCase().startsWith('disk:');
+      const fromTrip = currentState.list_context && currentState.list_context.source_page === 'trip';
+      const runIdForDelete = currentState.pipeline_run_id || (currentState.list_context && currentState.list_context.items && currentState.list_context.items[currentState.list_context.current_index || 0]?.pipeline_run_id);
+      const showDelete = isArchiveFile || currentState.mode === 'sorting' || (fromTrip && (isArchiveFile || runIdForDelete));
       if (deleteFileBtn) {
-        deleteFileBtn.style.display = currentState.mode === 'sorting' ? '' : 'none';
+        deleteFileBtn.style.display = showDelete ? '' : 'none';
+        deleteFileBtn.title = isArchiveFile ? 'Физически удалить файл из архива' : 'Удалить файл (в _delete)';
       }
 
       // Блок «Назначить группу» — только при mode=sorting и tab=no_faces
@@ -648,7 +654,7 @@
       const tabParam = currentState.list_context?.api_fallback?.params?.tab;
       if (assignGroupBlock) {
         if (currentState.mode === 'sorting' && tabParam === 'no_faces') {
-          assignGroupBlock.style.display = 'block';
+          assignGroupBlock.style.display = 'flex';
           await loadGroupsForAssignBlock();
           const assignGroupBtn = document.getElementById('photoCardAssignGroupBtn');
           if (assignGroupBtn) {
@@ -658,7 +664,10 @@
           assignGroupBlock.style.display = 'none';
         }
       }
-      
+
+      // Блок «Поездка»: привязка файла и предложенные по дате (±1 день)
+      await loadTripBlock();
+
       // Добавляем обработчики рисования
       attachDrawingHandlers();
     } catch (error) {
@@ -666,8 +675,8 @@
     }
   }
 
-  /** Заполняет select групп как на faces (Поездки, остальные, + Создать новую группу). */
-  function fillGroupSelectForAssign(sel, groups) {
+  /** Заполняет select групп как на faces (Близкие по дате, Поездки, остальные, + Создать группу/поездку). */
+  function fillGroupSelectForAssign(sel, groups, suggestedTrips) {
     const predefined = ['Здоровье', 'Чеки', 'Дом и ремонт', 'Артефакты людей'];
     const tripsKeywords = ['Турция', 'Минск', 'Италия', 'Испания', 'Греция', 'Франция', 'Польша', 'Чехия', 'Германия', 'Тургояк'];
     const groupsWithData = [];
@@ -696,11 +705,27 @@
       }
     });
     sel.innerHTML = '<option value="">Назначить группу...</option>';
+    const suggestedNames = new Set((suggestedTrips || []).map(t => (t.name || '').trim()).filter(Boolean));
+    if (!window._tripIdToName) window._tripIdToName = {};
+    if (suggestedTrips && suggestedTrips.length > 0) {
+      const closeOptgroup = document.createElement('optgroup');
+      closeOptgroup.label = 'Близкие по дате (группа + поездка)';
+      suggestedTrips.forEach(t => {
+        const name = (t.name || '').trim() || 'Поездка';
+        window._tripIdToName[t.id] = name;
+        const opt = document.createElement('option');
+        opt.value = '__trip_' + t.id;
+        opt.textContent = name + (t.start_date ? ' (' + t.start_date + (t.end_date && t.end_date !== t.start_date ? ' – ' + t.end_date : '') + ')' : '');
+        closeOptgroup.appendChild(opt);
+      });
+      sel.appendChild(closeOptgroup);
+    }
     const tripsOptgroup = document.createElement('optgroup');
     tripsOptgroup.label = 'Поездки';
     if (categoryMap['Поездки'] && categoryMap['Поездки'].length > 0) {
       categoryMap['Поездки'].sort((a, b) => (b.last_created_at || '').localeCompare(a.last_created_at || ''));
       categoryMap['Поездки'].forEach(t => {
+        if (suggestedNames.has(t.name)) return;
         const opt = document.createElement('option');
         opt.value = t.name;
         opt.textContent = t.name;
@@ -728,16 +753,90 @@
   }
 
   /**
-   * Заполняет выпадающий список групп для блока «Назначить группу» (tab=no_faces)
+   * Проверяет, попадает ли дата fileDate (YYYY-MM-DD) в диапазон поездки ±1 день.
+   */
+  function tripDateWithinPlusMinusOneDay(fileDate, startDate, endDate) {
+    if (!fileDate || fileDate.length !== 10) return false;
+    const d = new Date(fileDate);
+    if (isNaN(d.getTime())) return false;
+    const addDays = (date, days) => {
+      const r = new Date(date);
+      r.setDate(r.getDate() + days);
+      return r.toISOString().slice(0, 10);
+    };
+    const lo = addDays(d, -1);
+    const hi = addDays(d, 1);
+    const start = (startDate || '').toString().trim().slice(0, 10);
+    const end = (endDate || start).toString().trim().slice(0, 10);
+    if (!start) return false;
+    return start <= hi && (end || start) >= lo;
+  }
+
+  /**
+   * Блок «Поездка»: поездки файла + предложенные по дате (±1 день) с кнопкой «Привязать».
+   */
+  async function loadTripBlock() {
+    const pill = document.getElementById('photoCardTripPill');
+    if (!pill) return;
+    const hasFileId = currentState.file_id != null;
+    const hasPath = (currentState.file_path || '').trim().length > 0;
+    if (!hasFileId && !hasPath) {
+      pill.style.display = 'none';
+      return;
+    }
+    try {
+      const q = hasFileId
+        ? ('file_id=' + encodeURIComponent(currentState.file_id))
+        : ('path=' + encodeURIComponent(currentState.file_path));
+      const forFileRes = await fetch('/api/trips/for-file?' + q);
+      const forFileData = forFileRes.ok ? await forFileRes.json() : { trips: [] };
+      const fileTrips = forFileData.trips || [];
+      if (fileTrips.length > 0) {
+        const t = fileTrips[0];
+        const name = (t.name || 'Поездка ' + t.id).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        pill.innerHTML = '<a href="/trips/' + t.id + '">' + name + '</a>';
+        pill.style.display = 'inline-flex';
+      } else {
+        pill.innerHTML = '';
+        pill.style.display = 'none';
+      }
+    } catch (e) {
+      console.warn('[photo_card] loadTripBlock failed:', e);
+      pill.style.display = 'none';
+    }
+  }
+
+  /**
+   * Заполняет выпадающий список групп для блока «Назначить группу» (tab=no_faces).
+   * Если есть дата файла — подтягивает поездки «близкие по дате». При открытии по path без даты в контексте — дату берём из API for-file.
    */
   async function loadGroupsForAssignBlock() {
     const sel = document.getElementById('photoCardGroupSelect');
     if (!sel || !currentState.pipeline_run_id) return;
     try {
-      const res = await fetch(`/api/faces/groups-with-files?pipeline_run_id=${encodeURIComponent(currentState.pipeline_run_id)}`);
-      const data = res.ok ? await res.json() : {};
-      const groups = data.groups || [];
-      fillGroupSelectForAssign(sel, groups);
+      let takenAt = (currentState.list_context && currentState.list_context.items && currentState.list_context.items[currentState.list_context.current_index || 0])
+        ? (currentState.list_context.items[currentState.list_context.current_index || 0].taken_at || '')
+        : (currentState.file_taken_at || '');
+      let dateStr = (takenAt || '').toString().trim().slice(0, 10);
+      if ((dateStr.length !== 10 || dateStr[4] !== '-' || dateStr[7] !== '-') && (currentState.file_id != null || (currentState.file_path || '').trim())) {
+        const q = currentState.file_id != null ? ('file_id=' + encodeURIComponent(currentState.file_id)) : ('path=' + encodeURIComponent(currentState.file_path));
+        const forFileRes = await fetch('/api/trips/for-file?' + q);
+        if (forFileRes.ok) {
+          const forFileData = await forFileRes.json().catch(() => ({}));
+          takenAt = (forFileData.file_taken_at || '').toString().trim();
+          dateStr = takenAt.slice(0, 10);
+          if (dateStr.length === 10 && dateStr[4] === '-' && dateStr[7] === '-') currentState.file_taken_at = takenAt;
+        }
+      }
+      const [groupsData, suggestedRes] = await Promise.all([
+        fetch(`/api/faces/groups-with-files?pipeline_run_id=${encodeURIComponent(currentState.pipeline_run_id)}`).then(r => r.ok ? r.json() : {}),
+        (dateStr.length === 10 && dateStr[4] === '-' && dateStr[7] === '-')
+          ? fetch(`/api/trips/suggest-by-date?date=${encodeURIComponent(dateStr)}&limit=15`).then(r => r.ok ? r.json() : null)
+          : Promise.resolve(null)
+      ]);
+      const groups = (groupsData && groupsData.groups) ? groupsData.groups : [];
+      const suggestedTrips = Array.isArray(suggestedRes) ? suggestedRes : (suggestedRes && suggestedRes.trips) ? suggestedRes.trips : null;
+      fillGroupSelectForAssign(sel, groups, suggestedTrips);
     } catch (e) {
       console.warn('[photo_card] loadGroupsForAssignBlock failed:', e);
     }
@@ -749,11 +848,19 @@
   async function handleAssignGroupFromCard() {
     const sel = document.getElementById('photoCardGroupSelect');
     let groupPath = sel?.value?.trim();
+    let attachOk = true;
     if (!groupPath) {
       if (typeof window.setToast === 'function') window.setToast('Выберите группу', true);
       else alert('Выберите группу');
       return;
     }
+    const isTripOption = groupPath.startsWith('__trip_');
+    let tripId = null;
+    if (isTripOption) {
+      tripId = parseInt(groupPath.slice(7), 10);
+      groupPath = (window._tripIdToName && window._tripIdToName[tripId]) || groupPath;
+    }
+    let createdNewTripInThisAction = false;
     if (groupPath === '__create_new__' || groupPath === '__create_new_Поездки__') {
       const isTrips = groupPath === '__create_new_Поездки__';
       const promptText = isTrips ? 'Введите название поездки (например: 2025 Италия):' : 'Введите название новой группы:';
@@ -763,6 +870,44 @@
         return;
       }
       groupPath = newName.trim();
+      if (isTrips) {
+        try {
+          const createBody = { name: groupPath };
+          if (currentState.file_id != null) createBody.file_id = currentState.file_id;
+          else if (currentState.file_path) createBody.path = currentState.file_path;
+          const createRes = await fetch('/api/trips', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(createBody)
+          });
+          if (!createRes.ok) {
+            const err = await createRes.json().catch(() => ({}));
+            throw new Error(err.detail || 'Не удалось создать поездку');
+          }
+          const created = await createRes.json();
+          let attachOk = false;
+          if (created && created.id && (currentState.file_id != null || (currentState.file_path || '').trim())) {
+            const attachBody = currentState.file_id != null ? { file_id: currentState.file_id } : { path: currentState.file_path };
+            const attachRes = await fetch('/api/trips/' + created.id + '/attach', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(attachBody)
+            });
+            attachOk = attachRes.ok;
+            if (!attachOk) {
+              const err = await attachRes.json().catch(() => ({}));
+              const msg = (err && err.detail) ? err.detail : 'файл не найден в базе';
+              if (typeof window.setToast === 'function') window.setToast('Поездка создана, но файл не добавлен: ' + msg, true);
+              else alert('Поездка создана, но файл не добавлен: ' + msg);
+            }
+          }
+          createdNewTripInThisAction = true;
+        } catch (e) {
+          if (typeof window.setToast === 'function') window.setToast('Ошибка: ' + (e.message || 'не удалось создать поездку'), true);
+          else alert('Ошибка: ' + (e.message || 'не удалось создать поездку'));
+          return;
+        }
+      }
     }
     if (!currentState.pipeline_run_id || !currentState.file_path) return;
     try {
@@ -779,8 +924,25 @@
         const err = await res.json();
         throw new Error(err.detail || 'Ошибка назначения группы');
       }
-      if (typeof window.setToast === 'function') window.setToast(`Файл назначен в группу «${groupPath}».`);
-      closePhotoCard();
+      if (tripId && (currentState.file_id != null || (currentState.file_path || '').trim())) {
+        const attachBody = currentState.file_id != null ? { file_id: currentState.file_id } : { path: currentState.file_path };
+        await fetch('/api/trips/' + tripId + '/attach', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(attachBody)
+        });
+      }
+      if (typeof window.setToast === 'function') {
+        window.setToast(tripId ? `Добавлено в группу и поездку «${groupPath}».` : (createdNewTripInThisAction ? (attachOk ? `Поездка «${groupPath}» создана, файл добавлен.` : `Поездка «${groupPath}» создана (файл не добавлен — см. сообщение выше).`) : `Файл назначен в группу «${groupPath}».`));
+      }
+      if (createdNewTripInThisAction) {
+        if (typeof loadTripBlock === 'function') loadTripBlock();
+        if (typeof loadGroupsForAssignBlock === 'function') loadGroupsForAssignBlock();
+        if (sel) sel.value = '';
+      } else {
+        if (tripId && typeof loadTripBlock === 'function') loadTripBlock();
+        closePhotoCard();
+      }
     } catch (e) {
       console.error('[photo_card] handleAssignGroupFromCard:', e);
       if (typeof window.setToast === 'function') window.setToast('Ошибка: ' + (e.message || 'не удалось назначить группу'), true);
@@ -3770,8 +3932,51 @@
     const deleteFileBtn = document.getElementById('photoCardDeleteFile');
     if (deleteFileBtn) {
       deleteFileBtn.addEventListener('click', async function() {
-        if (currentState.mode !== 'sorting' || !currentState.pipeline_run_id || !currentState.file_path) {
-          alert('Удаление доступно только в режиме сортировки при открытом прогоне.');
+        const path = currentState.file_path;
+        if (!path) return;
+        const pathNorm = (path || '').trim();
+        const isArchiveFile = pathNorm.toLowerCase().startsWith('disk:');
+        const fromTrip = currentState.list_context && currentState.list_context.source_page === 'trip';
+        if (isArchiveFile) {
+          if (!confirm('Вы уверены, что хотите физически удалить этот файл из архива? Действие необратимо.')) return;
+          try {
+            const response = await fetch('/api/archive/delete', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: pathNorm })
+            });
+            if (response.ok) {
+              if (fromTrip && typeof currentState.on_close === 'function') {
+                try { currentState.on_close(); } catch (e) { console.warn('[photo_card] on_close after archive delete:', e); }
+              } else {
+                navigateNext();
+              }
+            } else {
+              const errorData = await response.json().catch(() => ({ detail: response.statusText }));
+              alert('Ошибка: ' + (errorData.detail || response.statusText));
+            }
+          } catch (error) {
+            console.error('[photo_card] Error deleting archive file:', error);
+            alert('Ошибка: ' + error.message);
+          }
+          return;
+        }
+        let runId = currentState.pipeline_run_id || (currentState.list_context && currentState.list_context.items && currentState.list_context.items[currentState.list_context.current_index || 0]?.pipeline_run_id);
+        if (!runId && pathNorm.startsWith('local:')) {
+          try {
+            const res = await fetch('/api/faces/pipeline-run-for-path?path=' + encodeURIComponent(pathNorm));
+            if (res && res.ok) {
+              const data = await res.json().catch(() => ({}));
+              if (data.pipeline_run_id != null) runId = data.pipeline_run_id;
+            }
+          } catch (_) { /* ignore */ }
+        }
+        if (!runId) {
+          if (fromTrip) {
+            alert('Удаление в _delete доступно только для файлов с прогоном (или из архива — кнопка выше). Для этого файла прогон по пути не найден.');
+          } else {
+            alert('Удаление доступно только в режиме сортировки при открытом прогоне.');
+          }
           return;
         }
         try {
@@ -3779,8 +3984,8 @@
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              pipeline_run_id: currentState.pipeline_run_id,
-              path: currentState.file_path
+              pipeline_run_id: runId,
+              path
             })
           });
           if (response.ok) {
@@ -3789,11 +3994,15 @@
               pushUndoAction({
                 type: 'delete_file',
                 undo_data: data.undo_data,
-                pipeline_run_id: currentState.pipeline_run_id
+                pipeline_run_id: runId
               });
               updateUndoButton();
             }
-            navigateNext();
+            if (fromTrip && typeof currentState.on_close === 'function') {
+              try { currentState.on_close(); } catch (e) { console.warn('[photo_card] on_close after delete:', e); }
+            } else {
+              navigateNext();
+            }
           } else {
             const errorData = await response.json().catch(() => ({ detail: response.statusText }));
             alert('Ошибка: ' + (errorData.detail || response.statusText));

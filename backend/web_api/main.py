@@ -27,10 +27,11 @@ from common.yadisk_client import get_disk
 from web_api.routers.gold import router as gold_router
 from web_api.routers.preclean import router as preclean_router
 from web_api.routers.dedup_results import router as dedup_results_router
-from web_api.routers.faces import router as faces_router
+from web_api.routers.faces import _delete_from_all_gold_files, router as faces_router
 from web_api.routers.local_pipeline import router as local_pipeline_router
 from web_api.routers.folders import router as folders_router
 from web_api.routers.face_clusters import router as face_clusters_router
+from web_api.routers.trips import router as trips_router
 from web_api.routers import gold as gold_api
 from logic.gold.store import gold_expected_tab_by_path
 
@@ -116,6 +117,7 @@ app.include_router(faces_router)
 app.include_router(local_pipeline_router)
 app.include_router(folders_router)
 app.include_router(face_clusters_router)
+app.include_router(trips_router)
 
 _T = TypeVar("_T")
 
@@ -2667,6 +2669,36 @@ def api_duplicates_delete(payload: dict[str, Any] = Body(...)) -> dict[str, Any]
     return {"ok": True, "deleted": len(ok_paths), "errors": errors}
 
 
+@app.post("/api/archive/delete")
+def api_archive_delete(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Физически удаляет файл из архива (YaDisk): permanently=True, помечает deleted в БД.
+    Требуется подтверждение на клиенте.
+    """
+    path = payload.get("path")
+    if not isinstance(path, str) or not path.startswith("disk:"):
+        raise HTTPException(status_code=400, detail="path (disk:) is required for archive delete")
+
+    disk = get_disk()
+    p_norm = _normalize_yadisk_path(path)
+    try:
+        _yd_call_retry(lambda: disk.remove(p_norm, permanently=True))
+    except TypeError:
+        _yd_call_retry(lambda: disk.remove(p_norm))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"YaDisk delete failed: {type(e).__name__}: {e}") from e
+
+    store = DedupStore()
+    try:
+        store.mark_deleted(paths=[path])
+    finally:
+        store.close()
+
+    removed_from_gold = _delete_from_all_gold_files(path)
+
+    return {"ok": True, "path": path, "removed_from_gold": removed_from_gold}
+
+
 @app.post("/api/duplicates/move-to-kids")
 def api_duplicates_move_to_kids(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """
@@ -2947,8 +2979,8 @@ def api_yadisk_preview_image(path: str, size: str = "M") -> Response:
     if cached_url:
         return RedirectResponse(url=cached_url, status_code=307, headers={"Cache-Control": "private, max-age=300"})
 
-    # Ограничиваем параллелизм, чтобы /duplicates не "вешал" весь сервер.
-    acquired = _PREVIEW_SEM.acquire(timeout=0.2)
+    # Ограничиваем параллелизм; при перегрузке ждём слот до 2 сек, чтобы реже отдавать 429.
+    acquired = _PREVIEW_SEM.acquire(timeout=2.0)
     if not acquired:
         return Response(
             status_code=429,
@@ -2998,6 +3030,120 @@ def api_yadisk_preview_image(path: str, size: str = "M") -> Response:
             _PREVIEW_SEM.release()
         except ValueError:
             pass
+
+
+# Максимальный размер видео (байт) для превью-кадра из YaDisk — не скачивать огромные файлы
+_YD_VIDEO_FRAME_MAX_BYTES = int(os.getenv("PHOTOSORTER_YD_VIDEO_FRAME_MAX_BYTES") or str(150 * 1024 * 1024))
+
+
+@app.get("/api/yadisk/video-frame")
+def api_yadisk_video_frame(path: str, frame_idx: int = 1, max_dim: int = 960) -> FileResponse:
+    """
+    Извлекает кадр из видео на YaDisk: скачивает во временный файл, вызывает video_keyframes.py.
+    Для больших видео (>150MB) возвращает 413.
+    """
+    if not isinstance(path, str) or not path.startswith("disk:"):
+        raise HTTPException(status_code=400, detail="path must start with disk:")
+
+    idx = int(frame_idx or 0)
+    if idx not in (1, 2, 3):
+        raise HTTPException(status_code=400, detail="frame_idx must be 1..3")
+
+    md = int(max_dim or 0)
+    md = max(128, min(2048, md))
+
+    rr = APP_DIR.parent.parent
+    py = rr / ".venv-face" / "Scripts" / "python.exe"
+    script = rr / "backend" / "scripts" / "tools" / "video_keyframes.py"
+    if not py.exists():
+        raise HTTPException(status_code=500, detail=f"Missing .venv-face python: {py}")
+    if not script.exists():
+        raise HTTPException(status_code=500, detail=f"Missing script: {script}")
+
+    disk = get_disk()
+    p_norm = _normalize_yadisk_path(path)
+    try:
+        md_meta = _yd_call_retry(lambda: disk.get_meta(p_norm, limit=0))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=404, detail=f"File not found on YaDisk: {e}") from e
+
+    size_val = getattr(md_meta, "size", None)
+    size_i = int(size_val) if size_val is not None else None
+    if size_i is not None and size_i > _YD_VIDEO_FRAME_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Video too large for preview (>{_YD_VIDEO_FRAME_MAX_BYTES // (1024 * 1024)}MB)",
+        )
+
+    cache_dir = rr / "data" / "cache" / "video_frames"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_key = hashlib.sha1(f"yd|{path}|{idx}|{md}".encode("utf-8", errors="ignore")).hexdigest()
+    out_path = cache_dir / f"yd_{cache_key}.jpg"
+    if out_path.exists():
+        return FileResponse(path=str(out_path), media_type="image/jpeg", filename=out_path.name, headers={"Cache-Control": "private, max-age=3600"})
+
+    with tempfile.NamedTemporaryFile(prefix="ps_ydvf_", suffix=".mp4", delete=False) as tmp_video:
+        tmp_video_path = tmp_video.name
+    with tempfile.NamedTemporaryFile(prefix="ps_ydvf_", suffix=".jpg", delete=False) as tmp_jpg:
+        tmp_jpg_path = tmp_jpg.name
+
+    try:
+        _yd_call_retry_timeout(lambda: disk.download(p_norm, tmp_video_path), timeout_sec=120)
+    except Exception as e:  # noqa: BLE001
+        try:
+            os.remove(tmp_video_path)
+        except Exception:
+            pass
+        try:
+            os.remove(tmp_jpg_path)
+        except Exception:
+            pass
+        raise HTTPException(status_code=502, detail=f"YaDisk download failed: {type(e).__name__}: {e}") from e
+
+    try:
+        prc = subprocess.run(
+            [
+                str(py),
+                str(script.relative_to(rr)),
+                "--mode", "extract",
+                "--path", tmp_video_path,
+                "--samples", "3",
+                "--frame-idx", str(idx),
+                "--max-dim", str(md),
+                "--out", tmp_jpg_path,
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(rr),
+            timeout=60,  # noqa: S603
+        )
+    except subprocess.TimeoutExpired:
+        try:
+            os.remove(tmp_video_path)
+            os.remove(tmp_jpg_path)
+        except Exception:
+            pass
+        raise HTTPException(status_code=504, detail="frame_extract_timeout") from None
+    finally:
+        try:
+            os.remove(tmp_video_path)
+        except Exception:
+            pass
+
+    if prc.returncode != 0 or not os.path.isfile(tmp_jpg_path):
+        try:
+            os.remove(tmp_jpg_path)
+        except Exception:
+            pass
+        msg = (prc.stderr or prc.stdout or "").strip()[:400]
+        raise HTTPException(status_code=500, detail=f"frame_extract_failed: {msg or prc.returncode}")
+
+    try:
+        os.replace(tmp_jpg_path, str(out_path))
+    except Exception:
+        out_path = Path(tmp_jpg_path)
+
+    return FileResponse(path=str(out_path), media_type="image/jpeg", filename=out_path.name, headers={"Cache-Control": "private, max-age=3600"})
 
 
 @app.get("/api/local/preview")

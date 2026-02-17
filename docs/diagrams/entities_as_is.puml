@@ -256,7 +256,6 @@ class face_clusters <<table>> {
 ' face_cluster_members удалена: принадлежность кластеру в photo_rectangles.cluster_id
 ' person_rectangle_manual_assignments удалена: ручная привязка в photo_rectangles.manual_person_id
 
-files "1" -- "*" photo_rectangles : файл (file_id)
 photo_rectangles "0..1" -- "0..1" persons : avatar (avatar_face_id)
 photo_rectangles "0..1" -- "0..1" face_clusters : кластер (cluster_id)
 face_clusters "0..1" -- "0..1" persons : привязка кластера к персоне (person_id)
@@ -291,6 +290,27 @@ class file_group_persons <<table>> {
   created_at: TEXT
 }
 
+class trips <<table>> {
+  +id: INTEGER <<PK>>
+  name: TEXT
+  start_date: TEXT
+  end_date: TEXT
+  place_country: TEXT
+  place_city: TEXT
+  yd_folder_path: TEXT
+  cover_file_id: INTEGER <<FK>>      ' files.id
+  created_at: TEXT
+  updated_at: TEXT
+}
+
+class trip_files <<table>> {
+  +trip_id: INTEGER <<PK,FK>>
+  +file_id: INTEGER <<PK,FK>>
+  status: TEXT                       ' included | excluded
+  source: TEXT                       ' manual | folder
+  created_at: TEXT
+}
+
 files "1" -- "*" file_persons : файл (file_id)
 files "1" -- "*" file_groups : файл (file_id)
 files "1" -- "*" file_group_persons : файл (file_id)
@@ -299,6 +319,9 @@ persons "1" -- "*" file_group_persons : привязка через группу
 pipeline_runs "1" -- "*" file_persons : прогон
 pipeline_runs "1" -- "*" file_groups : прогон
 pipeline_runs "1" -- "*" file_group_persons : прогон
+trips "1" -- "*" trip_files : поездка
+files "1" -- "*" trip_files : файл (file_id)
+files "1" -- "0..1" trips : обложка (cover_file_id)
 
 note right of face_clusters
   person_id: прямая привязка кластера к персоне

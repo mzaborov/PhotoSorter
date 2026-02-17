@@ -159,6 +159,44 @@ def init_db():
         try:
             cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='files'")
             if cur.fetchone():
+                # Для уже инициализированной БД обеспечиваем наличие таблиц поездок (CREATE IF NOT EXISTS)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS trips (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name            TEXT NOT NULL,
+                        start_date      TEXT,
+                        end_date        TEXT,
+                        place_country   TEXT,
+                        place_city      TEXT,
+                        yd_folder_path  TEXT,
+                        cover_file_id   INTEGER REFERENCES files(id),
+                        created_at      TEXT NOT NULL,
+                        updated_at      TEXT
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_trips_dates ON trips(start_date, end_date);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_trips_yd_folder ON trips(yd_folder_path);")
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS trip_files (
+                        trip_id     INTEGER NOT NULL REFERENCES trips(id),
+                        file_id     INTEGER NOT NULL REFERENCES files(id),
+                        status      TEXT NOT NULL DEFAULT 'included',
+                        source      TEXT NOT NULL,
+                        created_at  TEXT NOT NULL,
+                        PRIMARY KEY (trip_id, file_id)
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_trip_files_trip ON trip_files(trip_id);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_trip_files_file ON trip_files(file_id);")
+                _ensure_columns(conn, "trip_files", {"status": "status TEXT NOT NULL DEFAULT 'included'"})
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trip_file_excluded'")
+                if cur.fetchone():
+                    cur.execute("""
+                        INSERT OR REPLACE INTO trip_files (trip_id, file_id, status, source, created_at)
+                        SELECT trip_id, file_id, 'excluded', 'manual', created_at FROM trip_file_excluded
+                    """)
+                    cur.execute("DROP TABLE trip_file_excluded")
+                conn.commit()
                 conn.close()
                 _db_initialized = True
                 return
@@ -860,6 +898,36 @@ class FaceStore:
             },
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_file_group_persons_file_id ON file_group_persons(file_id);")
+
+        # Поездки: таблица поездок и связь файл–поездка
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trips (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                name            TEXT NOT NULL,
+                start_date      TEXT,
+                end_date        TEXT,
+                place_country   TEXT,
+                place_city      TEXT,
+                yd_folder_path  TEXT,
+                cover_file_id   INTEGER REFERENCES files(id),
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trips_dates ON trips(start_date, end_date);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trips_yd_folder ON trips(yd_folder_path);")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trip_files (
+                trip_id     INTEGER NOT NULL REFERENCES trips(id),
+                file_id     INTEGER NOT NULL REFERENCES files(id),
+                status      TEXT NOT NULL DEFAULT 'included',
+                source      TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                PRIMARY KEY (trip_id, file_id)
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trip_files_trip ON trip_files(trip_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trip_files_file ON trip_files(file_id);")
 
         self.conn.commit()
 
@@ -1734,6 +1802,477 @@ def list_folders(*, location: str | None = None, role: str | None = None) -> lis
         conn.close()
 
 
+def _normalize_path_prefix(p: str) -> str:
+    """Нормализует путь для сравнения префикса (убирает local:/disk:, единые слэши)."""
+    if not p:
+        return ""
+    s = str(p).strip()
+    for prefix in ("local:", "disk:"):
+        if s.lower().startswith(prefix):
+            s = s[len(prefix) :].lstrip("/\\")
+            break
+    return s.replace("\\", "/").rstrip("/")
+
+
+def get_pipeline_run_id_for_path(file_path: str) -> int | None:
+    """
+    Возвращает pipeline_run_id для файла по пути.
+    1) Ищет в file_groups (если файлу назначали группу).
+    2) Иначе ищет прогон, у которого root_path — префикс пути файла (local:).
+    Нужен для удаления в карточке при открытии из поездки.
+    """
+    path_s = (file_path or "").strip()
+    if not path_s or not (path_s.startswith("local:") or path_s.startswith("disk:")):
+        return None
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT fg.pipeline_run_id
+            FROM file_groups fg
+            JOIN files f ON f.id = fg.file_id
+            WHERE f.path = ?
+            ORDER BY fg.pipeline_run_id DESC
+            LIMIT 1
+            """,
+            (path_s,),
+        )
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            return int(row[0])
+        alt = path_s.replace("\\", "/") if "\\" in path_s else path_s.replace("/", "\\")
+        if alt != path_s:
+            cur.execute(
+                """
+                SELECT fg.pipeline_run_id
+                FROM file_groups fg
+                JOIN files f ON f.id = fg.file_id
+                WHERE f.path = ?
+                ORDER BY fg.pipeline_run_id DESC
+                LIMIT 1
+                """,
+                (alt,),
+            )
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                return int(row[0])
+        if not path_s.startswith("local:"):
+            return None
+        path_prefix = _normalize_path_prefix(path_s)
+        if not path_prefix:
+            return None
+        cur.execute(
+            """
+            SELECT id, root_path
+            FROM pipeline_runs
+            WHERE root_path IS NOT NULL AND trim(root_path) != ''
+            ORDER BY id DESC
+            """
+        )
+        for row in cur.fetchall():
+            run_id, root = row[0], (row[1] or "").strip()
+            if not root:
+                continue
+            root_norm = _normalize_path_prefix("local:" + root)
+            if path_prefix.startswith(root_norm):
+                return int(run_id)
+        return None
+    finally:
+        conn.close()
+
+
+def list_trips() -> list[dict[str, Any]]:
+    """Список поездок: от новых к старым по дате начала (start_date DESC), без даты — в конце; при равной дате — по названию."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, name, start_date, end_date, place_country, place_city, yd_folder_path, cover_file_id, created_at, updated_at
+            FROM trips
+            ORDER BY
+              start_date DESC NULLS LAST,
+              COALESCE(NULLIF(trim(name), ''), 'Поездка') COLLATE NOCASE ASC,
+              id DESC
+            """
+        )
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def list_trips_suggest_by_date(date_str: str, limit: int = 15) -> list[dict[str, Any]]:
+    """
+    Поездки, близкие по дате к date_str (YYYY-MM-DD).
+    Сортировка: сначала поездки, в диапазон которых попадает date_str, затем по минимальной разнице дней.
+    """
+    date_s = (date_str or "").strip()[:10]
+    if len(date_s) != 10 or date_s[4] != "-" or date_s[7] != "-":
+        return []
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, name, start_date, end_date, place_country, place_city, yd_folder_path, cover_file_id, created_at, updated_at
+            FROM trips
+            WHERE ((start_date IS NOT NULL AND start_date != '') OR (end_date IS NOT NULL AND end_date != ''))
+              AND (start_date IS NULL OR start_date = '' OR (julianday(?) - julianday(start_date)) <= 90)
+            ORDER BY
+              CASE
+                WHEN start_date IS NOT NULL AND end_date IS NOT NULL AND ? >= start_date AND ? <= end_date THEN 0
+                WHEN start_date IS NOT NULL AND end_date IS NOT NULL AND ? >= start_date AND (end_date = '' OR end_date IS NULL) THEN 0
+                WHEN start_date IS NOT NULL AND (end_date IS NULL OR end_date = '') AND ? = start_date THEN 0
+                ELSE 1
+              END,
+              ABS(
+                CASE
+                  WHEN start_date IS NOT NULL AND end_date IS NOT NULL AND ? >= start_date AND ? <= end_date THEN 0
+                  WHEN start_date IS NOT NULL AND ? < start_date THEN (julianday(start_date) - julianday(?)) * 86400
+                  WHEN end_date IS NOT NULL AND end_date != '' AND ? > end_date THEN (julianday(?) - julianday(end_date)) * 86400
+                  WHEN start_date IS NOT NULL AND (end_date IS NULL OR end_date = '') AND ? > start_date THEN (julianday(?) - julianday(start_date)) * 86400
+                  WHEN start_date IS NOT NULL THEN ABS((julianday(?) - julianday(start_date)) * 86400)
+                  ELSE 999999999
+                END
+              ),
+              start_date DESC NULLS LAST,
+              id DESC
+            LIMIT ?
+            """,
+            (date_s,) * 14 + (max(1, min(limit, 50)),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_trip(trip_id: int) -> dict[str, Any] | None:
+    """Одна поездка по id."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, name, start_date, end_date, place_country, place_city, yd_folder_path, cover_file_id, created_at, updated_at
+            FROM trips WHERE id = ?
+            """,
+            (int(trip_id),),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_trips_for_file(file_id: int) -> list[dict[str, Any]]:
+    """Поездки, к которым привязан файл (trip_files, status=included)."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT t.id, t.name, t.start_date, t.end_date, t.place_country, t.place_city, t.yd_folder_path, t.cover_file_id, t.created_at, t.updated_at
+            FROM trips t
+            JOIN trip_files tf ON tf.trip_id = t.id AND tf.file_id = ? AND tf.status = 'included'
+            ORDER BY t.start_date DESC NULLS LAST, t.id DESC
+            """,
+            (int(file_id),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_trip_by_yd_folder_path(yd_folder_path: str) -> dict[str, Any] | None:
+    """Поездка по пути папки на Я.Диске (нормализованное совпадение: без концевых пробелов и слэшей)."""
+    if not (yd_folder_path or "").strip():
+        return None
+    p = (yd_folder_path or "").strip().rstrip("/")
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, name, start_date, end_date, place_country, place_city, yd_folder_path, cover_file_id, created_at, updated_at
+            FROM trips WHERE trim(rtrim(yd_folder_path, '/')) = ?
+            """,
+            (p,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def trip_create_from_folder(name: str, yd_folder_path: str) -> int:
+    """
+    Создаёт поездку с заданными именем и путём папки на ЯД.
+    Возвращает id созданной поездки. Не проверяет дубликаты — вызывающий должен проверить get_trip_by_yd_folder_path.
+    """
+    return trip_create(
+        name=(name or "").strip() or "Поездка",
+        yd_folder_path=(yd_folder_path or "").strip().rstrip("/") or None,
+    )
+
+
+def trip_create(name: str, yd_folder_path: str | None = None) -> int:
+    """
+    Создаёт поездку с именем и опционально путём папки на ЯД.
+    Возвращает id созданной поездки.
+    """
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO trips (name, start_date, end_date, place_country, place_city, yd_folder_path, cover_file_id, created_at, updated_at)
+            VALUES (?, NULL, NULL, NULL, NULL, ?, NULL, ?, ?)
+            """,
+            ((name or "").strip() or "Поездка", (yd_folder_path or "").strip().rstrip("/") or None, now, now),
+        )
+        conn.commit()
+        return cur.lastrowid or 0
+    finally:
+        conn.close()
+
+
+def _is_media_file(media_type: str | None) -> bool:
+    """Только фото и видео показываем в поездках; скрываем .ini, .txt и прочие не-медиа."""
+    mt = (media_type or "").strip().lower()
+    return mt in ("image", "video")
+
+
+def list_trip_files_included(trip_id: int) -> list[dict[str, Any]]:
+    """
+    Файлы, привязанные к поездке (included): только записи в trip_files со status='included'.
+    Файлы из yd_folder_path инициализируются скриптом init_trip_folder_files.py в trip_files.
+    Показываются только фото и видео (media_type image/video); .ini, .txt и т.п. скрыты.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT f.id AS file_id, f.path, f.name, f.taken_at, f.media_type, tf.source,
+                   (SELECT pipeline_run_id FROM file_groups WHERE file_id = f.id LIMIT 1) AS pipeline_run_id
+            FROM trip_files tf
+            JOIN files f ON f.id = tf.file_id
+            WHERE tf.trip_id = ? AND tf.status = 'included'
+              AND (f.status IS NULL OR f.status != 'deleted')
+            ORDER BY f.taken_at ASC NULLS LAST, f.path ASC
+            """,
+            (int(trip_id),),
+        )
+        from_tf = [dict(r) for r in cur.fetchall()]
+        return [x for x in from_tf if _is_media_file(x.get("media_type"))]
+    finally:
+        conn.close()
+
+
+def trip_dates_from_files(trip_id: int) -> tuple[str | None, str | None]:
+    """
+    Вычисляет диапазон дат поездки по датам съёмки фото (taken_at).
+    Возвращает (start_date_iso, end_date_iso) или (None, None), если нет файлов с датой.
+    """
+    files = list_trip_files_included(trip_id)
+    dates: list[str] = []
+    for f in files:
+        t = f.get("taken_at")
+        if not t or not str(t).strip():
+            continue
+        s = str(t).strip()[:10]
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            dates.append(s)
+    if not dates:
+        return None, None
+    return min(dates), max(dates)
+
+
+def list_trip_suggestions(trip_id: int) -> list[dict[str, Any]]:
+    """
+    Предложения: файлы с taken_at в [start_date-1d, end_date+1d],
+    которых нет в trip_files.
+    Если у поездки не заданы даты — берём диапазон по датам съёмки фото поездки.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT start_date, end_date FROM trips WHERE id = ?", (int(trip_id),))
+        row = cur.fetchone()
+        if not row:
+            return []
+        start_s = (row["start_date"] or "").strip()
+        end_s = (row["end_date"] or "").strip()
+        if not start_s:
+            start_s, end_s = trip_dates_from_files(trip_id) or (None, None)
+            if not start_s:
+                return []
+            end_s = end_s or start_s
+        from datetime import datetime, timedelta
+
+        try:
+            start_d = datetime.strptime(start_s, "%Y-%m-%d").date()
+        except ValueError:
+            return []
+        end_d = datetime.strptime(end_s, "%Y-%m-%d").date() if end_s else start_d
+        lo = (start_d - timedelta(days=1)).isoformat()
+        hi = (end_d + timedelta(days=1)).isoformat()
+
+        cur.execute(
+            """
+            SELECT f.id AS file_id, f.path, f.name, f.taken_at, f.media_type,
+                   (SELECT pipeline_run_id FROM file_groups WHERE file_id = f.id LIMIT 1) AS pipeline_run_id
+            FROM files f
+            WHERE f.taken_at IS NOT NULL AND f.taken_at != ''
+              AND date(f.taken_at) >= date(?) AND date(f.taken_at) <= date(?)
+              AND (f.status IS NULL OR f.status != 'deleted')
+              AND f.id NOT IN (SELECT file_id FROM trip_files WHERE status = 'included')
+            ORDER BY f.taken_at ASC, f.path ASC
+            """,
+            (lo, hi),
+        )
+        return [d for r in cur.fetchall() if _is_media_file((d := dict(r)).get("media_type"))]
+    finally:
+        conn.close()
+
+
+def list_trip_files_excluded_in_range(trip_id: int) -> list[dict[str, Any]]:
+    """
+    Исключённые файлы поездки, чья дата съёмки (taken_at) попадает в диапазон дат поездки.
+    Для блока «В это время в другом месте» — можно снова привязать.
+    """
+    trip = get_trip(trip_id)
+    if not trip:
+        return []
+    start_s = (trip.get("start_date") or "").strip()
+    end_s = (trip.get("end_date") or "").strip()
+    if not start_s:
+        start_s, end_s = trip_dates_from_files(trip_id) or (None, None)
+        if not start_s:
+            return []
+        end_s = end_s or start_s
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT f.id AS file_id, f.path, f.name, f.taken_at, f.media_type,
+                   (SELECT pipeline_run_id FROM file_groups WHERE file_id = f.id LIMIT 1) AS pipeline_run_id
+            FROM trip_files tf
+            JOIN files f ON f.id = tf.file_id
+            WHERE tf.trip_id = ? AND tf.status = 'excluded'
+              AND (f.status IS NULL OR f.status != 'deleted')
+              AND f.taken_at IS NOT NULL AND f.taken_at != ''
+              AND date(f.taken_at) >= date(?) AND date(f.taken_at) <= date(?)
+            ORDER BY f.taken_at ASC, f.path ASC
+            """,
+            (int(trip_id), start_s, end_s),
+        )
+        return [d for r in cur.fetchall() if _is_media_file((d := dict(r)).get("media_type"))]
+    finally:
+        conn.close()
+
+
+def get_file_taken_at_date(file_id: int) -> str | None:
+    """Дата съёмки файла (YYYY-MM-DD) или None."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT taken_at FROM files WHERE id = ?", (int(file_id),))
+        row = cur.fetchone()
+        if not row:
+            return None
+        t = row["taken_at"]
+        if not t or not str(t).strip():
+            return None
+        s = str(t).strip()[:10]
+        return s if len(s) == 10 and s[4] == "-" and s[7] == "-" else None
+    finally:
+        conn.close()
+
+
+def trip_file_attach(trip_id: int, file_id: int) -> bool:
+    """Привязать файл к поездке (status=included, source=manual)."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        now = _now_utc_iso()
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO trip_files (trip_id, file_id, status, source, created_at)
+            VALUES (?, ?, 'included', 'manual', ?)
+            """,
+            (int(trip_id), int(file_id), now),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def trip_file_exclude(trip_id: int, file_id: int) -> bool:
+    """Исключить файл из поездки (status=excluded, source=manual)."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        now = _now_utc_iso()
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO trip_files (trip_id, file_id, status, source, created_at)
+            VALUES (?, ?, 'excluded', 'manual', ?)
+            """,
+            (int(trip_id), int(file_id), now),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def trip_update(
+    trip_id: int,
+    *,
+    name: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    cover_file_id: int | None = None,
+) -> bool:
+    """
+    Обновить поля поездки. Передавать только те поля, которые нужно изменить.
+    cover_file_id можно передать 0 или None, чтобы сбросить обложку.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        updates: list[str] = []
+        params: list[Any] = []
+        if name is not None:
+            updates.append("name = ?")
+            params.append((name or "").strip() or None)
+        if start_date is not None:
+            updates.append("start_date = ?")
+            params.append((start_date or "").strip() or None)
+        if end_date is not None:
+            updates.append("end_date = ?")
+            params.append((end_date or "").strip() or None)
+        if cover_file_id is not None:
+            updates.append("cover_file_id = ?")
+            params.append(int(cover_file_id) if cover_file_id else None)
+        if not updates:
+            return True
+        updates.append("updated_at = ?")
+        params.append(_now_utc_iso())
+        params.append(int(trip_id))
+        cur.execute("UPDATE trips SET " + ", ".join(updates) + " WHERE id = ?", params)
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def get_person_ids_by_group(group_name: str) -> list[int]:
     """
     Возвращает список person_id персон с persons."group" = group_name (для правил папок по группам).
@@ -2543,21 +3082,27 @@ class DedupStore:
             for i in (1, 2, 3):
                 v = dr.get(f"video_frame{i}_t_sec")
                 t_sec_by_frame[i] = float(v) if v is not None else None
+        # Ручные и авто rects: по run_id (face_run_id или files.faces_run_id) ИЛИ любые ручные (is_manual=1)
+        # чтобы привязки показывались и для файлов в _no_faces, и при смене прогона
         cur.execute(
             """
             SELECT fr.frame_idx, fr.frame_t_sec, fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
                    COALESCE(fr.manual_person_id, fc.person_id) AS person_id,
                    fr.manual_person_id, fr.created_at,
-                   COALESCE(p_manual.name, p_cluster.name) AS person_name,
+                   COALESCE(p_manual.name, p_cluster.name, p_fallback.name) AS person_name,
                    COALESCE(fr.is_manual, 0) AS is_manual,
                    COALESCE(fr.is_face, 1) AS is_face
             FROM photo_rectangles fr
             LEFT JOIN persons p_manual ON p_manual.id = fr.manual_person_id
             LEFT JOIN face_clusters fc ON fc.id = fr.cluster_id
             LEFT JOIN persons p_cluster ON p_cluster.id = fc.person_id
+            LEFT JOIN persons p_fallback ON p_fallback.id = COALESCE(fr.manual_person_id, fc.person_id)
             WHERE fr.file_id = ? AND fr.frame_idx IN (1, 2, 3) AND COALESCE(fr.ignore_flag, 0) = 0
-              AND (fr.run_id = ? OR (? IS NULL AND fr.run_id IS NULL)
-                   OR fr.run_id = (SELECT faces_run_id FROM files WHERE id = fr.file_id))
+              AND (
+                fr.run_id = ? OR (? IS NULL AND fr.run_id IS NULL)
+                OR fr.run_id = (SELECT faces_run_id FROM files WHERE id = fr.file_id)
+                OR (COALESCE(fr.is_manual, 0) = 1)
+              )
             ORDER BY fr.frame_idx, COALESCE(fr.is_manual, 0) DESC, fr.face_index, fr.id
             """,
             (resolved_file_id, face_run_id, face_run_id),
@@ -2570,15 +3115,20 @@ class DedupStore:
             idx = int(r["frame_idx"] or 0)
             if idx not in (1, 2, 3):
                 continue
-            rects_by_frame[idx].append({
+            pid = r["person_id"]
+            pname = str(r["person_name"]) if r["person_name"] else None
+            rect_data: dict[str, Any] = {
                 "x": int(r["bbox_x"] or 0),
                 "y": int(r["bbox_y"] or 0),
                 "w": int(r["bbox_w"] or 0),
                 "h": int(r["bbox_h"] or 0),
                 "manual_person_id": int(r["manual_person_id"]) if r["manual_person_id"] is not None else None,
-                "person_name": str(r["person_name"]) if r["person_name"] else None,
+                "person_name": pname,
                 "is_face": 0 if dict(r).get("is_face") == 0 else 1,
-            })
+            }
+            if pid is not None:
+                rect_data["person_id"] = int(pid)
+            rects_by_frame[idx].append(rect_data)
             created = str(r["created_at"] or "")
             if created and (not updated_by_frame[idx] or created > updated_by_frame[idx]):
                 updated_by_frame[idx] = created

@@ -13,11 +13,16 @@ skinparam arrow {
 
 title Ключевые экраны Web UI (PhotoSorter)
 
+top to bottom direction
+
 !$base = "http://127.0.0.1:8000"
 rectangle "**Главная**\n/" as index [[$base/]]
 rectangle "**Фотоархив**\n/folders" as folders [[$base/folders]]
 rectangle "**Обзор папки**\n/browse" as browse [[$base/browse]]
 rectangle "**Дубли**\n/duplicates" as duplicates [[$base/duplicates]]
+
+rectangle "**Поездки**\n/trips" as trips [[$base/trips]]
+rectangle "**Карточка поездки**\n/trips/{id}" as trip_detail [[$base/trips]]
 
 rectangle "**Gold**\n/gold" as gold [[$base/gold]]
 rectangle "**Список персон**\n/persons" as persons [[$base/persons]]
@@ -34,8 +39,24 @@ package "Результаты сортировки" as results_group {
   rectangle "**Результаты дедупа**\n/dedup-results" as dedup_results [[$base/dedup-results]]
 }
 
+' Скрытые связи для порядка узлов (меньше пересечений стрелок)
+index -[hidden]right- folders
+folders -[hidden]right- trips
+trips -[hidden]right- gold
+gold -[hidden]right- persons
+persons -[hidden]right- results_group
+browse -[hidden]down- duplicates
+trip_detail -[hidden]right- person_detail
+person_detail -[hidden]right- person_clusters
+person_clusters -[hidden]right- face_clusters
+face_clusters -[hidden]right- cluster_detail
+faces -[hidden]right- sorting_folders
+sorting_folders -[hidden]right- preclean
+preclean -[hidden]right- dedup_results
+
 ' === Навигация из главной и меню ===
 index --> folders : меню
+index --> trips : меню
 index --> gold : меню
 index --> persons : меню
 index --> faces : результаты шага 3
@@ -48,6 +69,10 @@ folders --> browse : обзор папки
 folders --> duplicates : дубли
 browse --> folders : назад
 duplicates --> folders : назад
+
+' === Поездки ===
+trips --> trip_detail : карточка поездки
+trip_detail --> trips : к списку
 
 ' === Персоны и лица ===
 persons --> person_detail : карточка персоны
@@ -69,6 +94,8 @@ sorting_folders --> photo_card : карточка
 
 ' === Возврат на главную ===
 folders --> index : главная
+trips --> index : главная
+trip_detail --> index : главная
 gold --> index : главная
 persons --> index : главная
 faces --> index : главная

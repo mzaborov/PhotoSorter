@@ -447,13 +447,27 @@
   /* Плашки дата/место в заголовке карточки (как в таблице faces) */
   .photo-card-date-place { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .photo-card-date-place .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f3f4f6; color: #374151; font-size: 12px; }
+  .photo-card-trip-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: #e0f2fe;
+    color: #0369a1;
+    font-size: 12px;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .photo-card-trip-pill a { color: inherit; text-decoration: underline; }
+  .photo-card-trip-pill a:hover { opacity: 0.9; }
 </style>
 
 <div class="photo-card-modal" id="photoCardModal" aria-hidden="true" style="display: none;">
   <div class="photo-card-panel" role="dialog" aria-modal="true">
     <!-- Заголовок -->
     <div class="photo-card-top">
-      <div style="display: flex; align-items: center; gap: 4px; flex: 1; min-width: 0;">
+      <div style="display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;">
         <code class="photo-card-path" id="photoCardPath" style="flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">—</code>
         <button class="btn" id="photoCardCopyPath" type="button" style="padding: 2px 4px; font-size: 12px; flex-shrink: 0; line-height: 1; min-width: 20px; height: 20px; display: inline-flex !important; align-items: center; justify-content: center; visibility: visible !important; opacity: 1 !important; color: #374151 !important; border: none !important; background: transparent !important;" title="Скопировать путь в буфер обмена">
           <span role="img" style="display: inline-flex; align-items: center; justify-content: center;">
@@ -462,6 +476,7 @@
             </svg>
           </span>
         </button>
+        <span id="photoCardTripPill" class="photo-card-trip-pill" style="display:none;"></span>
         <div id="photoCardDatePlace" class="photo-card-date-place" style="flex-shrink: 0; margin-left: 8px;">—</div>
       </div>
       <div class="photo-card-actions">
@@ -526,10 +541,10 @@
       <span class="muted" id="photoCardRectListLabel">Привязки:</span>
       <div class="rectlist" id="photoCardRectList"></div>
     </div>
-    <!-- Назначить группу (только при tab=no_faces в режиме sorting) -->
-    <div id="photoCardAssignGroupBlock" style="display:none; margin-top:12px; padding-top:12px; border-top:1px solid #e5e7eb;">
-      <span class="muted" style="margin-right:8px;">Назначить группу:</span>
-      <select id="photoCardGroupSelect" style="min-width:180px; border:1px solid #d1d5db; border-radius:6px; padding:6px 10px; font-size:14px; margin-right:8px;">
+    <!-- Назначить группу / поездку (только при tab=no_faces в режиме sorting) -->
+    <div id="photoCardAssignGroupBlock" style="display:none; margin-top:12px; padding-top:12px; border-top:1px solid #e5e7eb; align-items: center; gap: 8px; flex-wrap: wrap;">
+      <span class="muted" style="margin-right:4px;">Назначить группу:</span>
+      <select id="photoCardGroupSelect" style="min-width:180px; border:1px solid #d1d5db; border-radius:6px; padding:6px 10px; font-size:14px;">
         <option value="">Назначить группу...</option>
       </select>
       <button class="btn" id="photoCardAssignGroupBtn" type="button">Назначить</button>

@@ -2756,46 +2756,46 @@ def sort_faces_into_named_folders(
                 rel_inside = os.path.relpath(src_abs, faces_root)
                 db_path = _as_local_path(src_abs)
                 people = _people_for_file(db_path)
-            if len(people) == 1:
-                person = _sanitize_segment(people[0])
-                desired_prefix = person
-                stats.moved_faces_named += 1
-            elif len(people) == 0:
-                desired_prefix = "_unassigned"
-                stats.moved_faces_unassigned += 1
-            else:
-                desired_prefix = "_mixed"
-                stats.moved_faces_unassigned += 1
+                if len(people) == 1:
+                    person = _sanitize_segment(people[0])
+                    desired_prefix = person
+                    stats.moved_faces_named += 1
+                elif len(people) == 0:
+                    desired_prefix = "_unassigned"
+                    stats.moved_faces_unassigned += 1
+                else:
+                    desired_prefix = "_mixed"
+                    stats.moved_faces_unassigned += 1
 
-            # Идемпотентность: если файл уже лежит в нужной подпапке — ничего не делаем (не создаём вложенность).
-            if rel_inside == desired_prefix or rel_inside.startswith(desired_prefix + os.sep):
-                continue
+                # Идемпотентность: если файл уже лежит в нужной подпапке — ничего не делаем (не создаём вложенность).
+                if rel_inside == desired_prefix or rel_inside.startswith(desired_prefix + os.sep):
+                    continue
 
-            dst_abs = os.path.join(faces_root, desired_prefix, rel_inside)
-            if pipeline is not None and pipeline_run_id is not None:
-                pipeline.update_run(run_id=int(pipeline_run_id), last_src_path=src_abs, last_dst_path=dst_abs)
-            _move_file(src=src_abs, dst=dst_abs, dry_run=dry_run)
+                dst_abs = os.path.join(faces_root, desired_prefix, rel_inside)
+                if pipeline is not None and pipeline_run_id is not None:
+                    pipeline.update_run(run_id=int(pipeline_run_id), last_src_path=src_abs, last_dst_path=dst_abs)
+                _move_file(src=src_abs, dst=dst_abs, dry_run=dry_run)
 
-            if not dry_run:
-                new_db_path = _as_local_path(dst_abs)
-                dedup.update_path(
-                    old_path=db_path,
-                    new_path=new_db_path,
-                    new_name=os.path.basename(dst_abs),
-                    new_parent_path=_as_local_path(os.path.dirname(dst_abs)),
-                )
-                if pipeline_run_id is not None:
-                    try:
-                        dedup.update_run_manual_labels_path(
-                            pipeline_run_id=int(pipeline_run_id),
-                            old_path=db_path,
-                            new_path=new_db_path,
-                        )
-                    except Exception:
-                        pass
-                store.update_file_path(old_file_path=db_path, new_file_path=new_db_path)
-            if pipeline is not None and pipeline_run_id is not None:
-                pipeline.update_run(run_id=int(pipeline_run_id), last_src_path="", last_dst_path="")
+                if not dry_run:
+                    new_db_path = _as_local_path(dst_abs)
+                    dedup.update_path(
+                        old_path=db_path,
+                        new_path=new_db_path,
+                        new_name=os.path.basename(dst_abs),
+                        new_parent_path=_as_local_path(os.path.dirname(dst_abs)),
+                    )
+                    if pipeline_run_id is not None:
+                        try:
+                            dedup.update_run_manual_labels_path(
+                                pipeline_run_id=int(pipeline_run_id),
+                                old_path=db_path,
+                                new_path=new_db_path,
+                            )
+                        except Exception:
+                            pass
+                    store.update_file_path(old_file_path=db_path, new_file_path=new_db_path)
+                if pipeline is not None and pipeline_run_id is not None:
+                    pipeline.update_run(run_id=int(pipeline_run_id), last_src_path="", last_dst_path="")
     finally:
         dedup.close()
         store.close()

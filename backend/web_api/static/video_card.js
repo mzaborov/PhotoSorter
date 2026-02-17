@@ -34,6 +34,7 @@
     on_close: null,
     on_assign_success: null,
     frames: [], // [{frame_idx, t_sec, rects}, ...]
+    file_person: null, // {person_id, person_name} — привязка на уровне файла (file_persons)
     activeTab: 'video', // 'video' | 1 | 2 | 3
     currentIndex: 0,
     drawEnabled: false,
@@ -65,12 +66,136 @@
   const positionEl = qs('#videoCardPosition');
   const rectList = qs('#videoCardRectList');
 
+  let zoomState = { open: false, scale: 1, translateX: 0, translateY: 0, panStart: null };
+
+  function onVideoZoomKeydown(e) {
+    if (e.key === 'Escape') { closeVideoFrameZoom(); document.removeEventListener('keydown', onVideoZoomKeydown); }
+  }
+
+  function openVideoFrameZoom() {
+    const zoomOverlay = qs('#videoCardZoomOverlay');
+    const zoomImg = qs('#videoCardZoomImg');
+    const zoomInner = qs('#videoCardZoomInner');
+    if (!zoomOverlay || !zoomImg || !zoomInner) return;
+    let src = '';
+    if (state.activeTab >= 1 && state.activeTab <= 3 && img && img.style.display !== 'none' && img.src) {
+      src = img.src;
+    } else if (state.activeTab === 'video' && video && video.style.display !== 'none' && video.readyState >= 2) {
+      const c = document.createElement('canvas');
+      c.width = video.videoWidth;
+      c.height = video.videoHeight;
+      const ctx = c.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(video, 0, 0);
+        src = c.toDataURL('image/jpeg', 0.9);
+      }
+    }
+    if (!src) return;
+    zoomImg.src = src;
+    zoomImg.alt = 'Кадр видео';
+    zoomState.open = true;
+    zoomState.scale = 1;
+    zoomState.translateX = 0;
+    zoomState.translateY = 0;
+    zoomState.panStart = null;
+    zoomOverlay.setAttribute('aria-hidden', 'false');
+    applyVideoZoomTransform();
+    zoomImg.style.cursor = 'grab';
+    document.addEventListener('wheel', onVideoZoomWheel, { passive: false });
+    document.addEventListener('mousedown', onVideoZoomPanStart);
+    document.addEventListener('keydown', onVideoZoomKeydown);
+    zoomOverlay.onclick = (e) => { if (e.target === zoomOverlay || e.target === zoomInner) closeVideoFrameZoom(); };
+  }
+
+  function closeVideoFrameZoom() {
+    const zoomOverlay = qs('#videoCardZoomOverlay');
+    const zoomImg = qs('#videoCardZoomImg');
+    if (!zoomOverlay) return;
+    zoomState.open = false;
+    zoomState.panStart = null;
+    zoomOverlay.setAttribute('aria-hidden', 'true');
+    if (zoomImg) {
+      zoomImg.src = '';
+      zoomImg.style.transform = '';
+      zoomImg.style.cursor = 'grab';
+    }
+    document.removeEventListener('wheel', onVideoZoomWheel);
+    document.removeEventListener('mousedown', onVideoZoomPanStart);
+    document.removeEventListener('mousemove', onVideoZoomPanMove);
+    document.removeEventListener('mouseup', onVideoZoomPanEnd);
+    document.removeEventListener('keydown', onVideoZoomKeydown);
+    if (zoomOverlay) zoomOverlay.onclick = null;
+  }
+
+  function applyVideoZoomTransform() {
+    const zoomImg = qs('#videoCardZoomImg');
+    if (!zoomImg) return;
+    zoomImg.style.transformOrigin = 'center center';
+    zoomImg.style.transform = `translate(${zoomState.translateX}px, ${zoomState.translateY}px) scale(${zoomState.scale})`;
+  }
+
+  function onVideoZoomWheel(e) {
+    if (!zoomState.open) return;
+    const zoomOverlay = qs('#videoCardZoomOverlay');
+    const zoomImg = qs('#videoCardZoomImg');
+    if (!zoomOverlay || !zoomImg || zoomOverlay.getAttribute('aria-hidden') === 'true') return;
+    e.preventDefault();
+    const rect = zoomImg.getBoundingClientRect();
+    const nw = zoomImg.naturalWidth;
+    const nh = zoomImg.naturalHeight;
+    if (!nw || !nh) return;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const baseScale = Math.min(vw / nw, vh / nh);
+    const cursorX = e.clientX;
+    const cursorY = e.clientY;
+    const imgX = (cursorX - rect.left - rect.width / 2) / (zoomState.scale * baseScale) + nw / 2;
+    const imgY = (cursorY - rect.top - rect.height / 2) / (zoomState.scale * baseScale) + nh / 2;
+    const factor = e.deltaY > 0 ? 1 / 1.15 : 1.15;
+    let newScale = zoomState.scale * factor;
+    newScale = Math.max(0.3, Math.min(8, newScale));
+    zoomState.translateX = cursorX - vw / 2 + (nw / 2 - imgX) * baseScale * newScale;
+    zoomState.translateY = cursorY - vh / 2 + (nh / 2 - imgY) * baseScale * newScale;
+    zoomState.scale = newScale;
+    applyVideoZoomTransform();
+  }
+
+  function onVideoZoomPanStart(e) {
+    if (!zoomState.open) return;
+    const zoomImg = qs('#videoCardZoomImg');
+    if (!zoomImg || e.target !== zoomImg) return;
+    e.preventDefault();
+    zoomState.panStart = { x: e.clientX, y: e.clientY, startTranslateX: zoomState.translateX, startTranslateY: zoomState.translateY };
+    zoomImg.style.cursor = 'grabbing';
+    document.addEventListener('mousemove', onVideoZoomPanMove);
+    document.addEventListener('mouseup', onVideoZoomPanEnd);
+  }
+
+  function onVideoZoomPanMove(e) {
+    if (!zoomState.panStart) return;
+    zoomState.translateX = zoomState.panStart.startTranslateX + (e.clientX - zoomState.panStart.x);
+    zoomState.translateY = zoomState.panStart.startTranslateY + (e.clientY - zoomState.panStart.y);
+    applyVideoZoomTransform();
+  }
+
+  function onVideoZoomPanEnd() {
+    const zoomImg = qs('#videoCardZoomImg');
+    if (zoomImg) zoomImg.style.cursor = 'grab';
+    zoomState.panStart = null;
+    document.removeEventListener('mousemove', onVideoZoomPanMove);
+    document.removeEventListener('mouseup', onVideoZoomPanEnd);
+  }
+
   function getPath() {
     return state.file_path || (state.list_context?.items?.[state.currentIndex]?.file_path) || '';
   }
 
   function getPipelineRunId() {
-    return state.pipeline_run_id || state.list_context?.api_fallback?.params?.pipeline_run_id || window.pipelineRunId || null;
+    return state.pipeline_run_id
+      || state.list_context?.items?.[state.currentIndex]?.pipeline_run_id
+      || state.list_context?.api_fallback?.params?.pipeline_run_id
+      || window.pipelineRunId
+      || null;
   }
 
   function frameObj(idx) {
@@ -87,23 +212,36 @@
     const path = getPath();
     if (!path) return '';
     const runId = getPipelineRunId();
-    if (runId == null) return '';
-    // max_dim=640 — совпадает с video_max_dim пайплайна, иначе прямоугольники смещены
-    let url = '/api/faces/video-frame?pipeline_run_id=' + encodeURIComponent(String(runId)) + '&path=' + encodeURIComponent(path) + '&frame_idx=' + encodeURIComponent(String(frameIdx)) + '&max_dim=640';
+    // video-frame API поддерживает отсутствие pipeline_run_id (берёт root_path из source/pipeline run)
+    let url = '/api/faces/video-frame?';
+    if (runId != null) url += 'pipeline_run_id=' + encodeURIComponent(String(runId)) + '&';
+    url += 'path=' + encodeURIComponent(path) + '&frame_idx=' + encodeURIComponent(String(frameIdx)) + '&max_dim=640';
     if (bustCache) url += '&_=' + Date.now();
     return url;
   }
 
   async function loadFrames() {
     const path = getPath();
-    const runId = getPipelineRunId();
-    if (!path || runId == null) return { frames: [] };
+    let runId = getPipelineRunId();
+    if (!path) return { frames: [] };
+    if (runId == null && path.startsWith('local:')) {
+      try {
+        const res = await fetchJson('/api/faces/pipeline-run-for-path?path=' + encodeURIComponent(path));
+        if (res && res.pipeline_run_id != null) {
+          state.pipeline_run_id = res.pipeline_run_id;
+          runId = res.pipeline_run_id;
+        }
+      } catch (_) { /* ignore */ }
+    }
+    if (runId == null) return { frames: [] };
     try {
       const data = await fetchJson('/api/faces/video-manual-frames?pipeline_run_id=' + encodeURIComponent(String(runId)) + '&path=' + encodeURIComponent(path));
       state.frames = data?.frames || [];
+      state.file_person = data?.file_person || null;
       return data || { frames: [] };
     } catch (e) {
       state.frames = [];
+      state.file_person = null;
       return { frames: [] };
     }
   }
@@ -136,6 +274,15 @@
       rects.forEach((rect, i) => allItems.push({ frame_idx: idx, rectIndex: i, rect }));
     }
     if (allItems.length === 0) {
+      const fp = state.file_person;
+      if (fp && fp.person_name) {
+        const pill = document.createElement('div');
+        pill.className = 'rectpill';
+        pill.title = 'Привязка на уровне файла (без областей на кадрах)';
+        pill.innerHTML = '<span class="rectpill-frame">файл</span><span>' + escapeHtml(fp.person_name) + '</span>';
+        rectList.appendChild(pill);
+        return;
+      }
       rectList.innerHTML = '<span class="muted">нет</span>';
       return;
     }
@@ -144,7 +291,15 @@
       pill.className = 'rectpill';
       pill.dataset.frameIdx = String(frame_idx);
       pill.dataset.rectIndex = String(rectIndex);
-      const label = rect.person_name ? escapeHtml(rect.person_name) : String(rectIndex + 1);
+      // Для активного кадра используем curManualRects — там актуальные имена (после назначения)
+      const isActiveFrame = Number(state.activeTab) === Number(frame_idx);
+      const liveRect = isActiveFrame && state.curManualRects?.[rectIndex] ? state.curManualRects[rectIndex] : null;
+      let label = (liveRect?.person_name || rect.person_name) ? escapeHtml(String(liveRect?.person_name || rect.person_name)) : null;
+      const pid = rect.manual_person_id ?? rect.person_id ?? liveRect?.manual_person_id;
+      if (!label && pid != null && typeof window.currentPersonName === 'object' && window.currentPersonName[pid]) {
+        label = escapeHtml(window.currentPersonName[pid]);
+      }
+      if (!label) label = String(rectIndex + 1);
       pill.innerHTML = '<span class="rectpill-frame">' + frame_idx + '</span><span>' + label + '</span>';
       const actionsBtn = document.createElement('button');
       actionsBtn.className = 'rectpill-action';
@@ -384,18 +539,37 @@
   async function saveCurrentFrameRects() {
     const idx = state.activeTab;
     if (idx !== 1 && idx !== 2 && idx !== 3) return;
+    const path = getPath();
+    let runId = getPipelineRunId();
+    if (runId == null && path && path.startsWith('local:')) {
+      try {
+        const res = await fetchJson('/api/faces/pipeline-run-for-path?path=' + encodeURIComponent(path));
+        if (res && res.pipeline_run_id != null) {
+          state.pipeline_run_id = res.pipeline_run_id;
+          runId = res.pipeline_run_id;
+        }
+      } catch (_) { /* ignore */ }
+    }
+    if (runId == null) {
+      alert('Не найден прогон (pipeline_run_id) для этого файла. Разметка доступна при открытии со страницы сортировки или если файл есть в базе по пути.');
+      return;
+    }
     const fr = frameObj(idx);
     try {
       await postJson('/api/faces/video-manual-frame', {
-        pipeline_run_id: Number(getPipelineRunId()),
-        path: getPath(),
+        pipeline_run_id: Number(runId),
+        path,
         frame_idx: Number(idx),
         t_sec: fr?.t_sec ?? null,
         rects: state.curManualRects
       });
       showToast('Сохранено');
       loadFrames();
-    } catch (e) { alert(e?.message || String(e)); }
+    } catch (e) {
+      const msg = (e && e.message) ? e.message : (typeof e === 'string' ? e : 'Ошибка сохранения');
+      const detail = (e && e.detail) ? e.detail : (e && e.body && typeof e.body === 'object' && e.body.detail) ? e.body.detail : null;
+      alert(detail ? msg + ': ' + detail : msg);
+    }
   }
 
   function showRectActionsMenu(rectIndex, buttonEl) {
@@ -617,6 +791,8 @@
     if (img) img.style.pointerEvents = '';
     renderRectList();
     drawOverlay();
+    const zoomBtn = qs('#videoCardZoomTrigger');
+    if (zoomBtn) zoomBtn.style.display = 'inline-flex';
   }
 
   async function showFrameTab(idx, bustCache) {
@@ -652,9 +828,12 @@
     await new Promise((res) => { if (img.complete) res(); else { img.onload = res; img.onerror = res; } });
     renderRectList();
     requestAnimationFrame(() => drawOverlay());
+    const zoomBtn = qs('#videoCardZoomTrigger');
+    if (zoomBtn) zoomBtn.style.display = 'inline-flex';
   }
 
   function closeVideoCard() {
+    closeVideoFrameZoom();
     if (modal) {
       modal.setAttribute('aria-hidden', 'true');
       modal.style.display = 'none';
@@ -839,6 +1018,7 @@
     updateNavigation();
     updateUndoButton();
     loadGroupsAndPersons();
+    loadTripBlock();
     const tb = qs('#videoCardToggleRectangles');
     if (tb) tb.textContent = 'Скрыть прямоугольники';
     rectsVisible = true;
@@ -874,8 +1054,8 @@
     setTimeout(() => t.remove(), 2000);
   }
 
-  /** Заполняет select групп как на faces (Поездки, остальные, + Создать новую группу). */
-  function fillGroupSelect(groupSelect, groups) {
+  /** Заполняет select групп как на faces (Близкие по дате, Поездки, остальные, + Создать группу/поездку). */
+  function fillGroupSelect(groupSelect, groups, suggestedTrips) {
     const predefined = ['Здоровье', 'Чеки', 'Дом и ремонт', 'Артефакты людей'];
     const tripsKeywords = ['Турция', 'Минск', 'Италия', 'Испания', 'Греция', 'Франция', 'Польша', 'Чехия', 'Германия', 'Тургояк'];
     const allGroups = new Set();
@@ -904,11 +1084,27 @@
       }
     });
     groupSelect.innerHTML = '<option value="">Назначить группу...</option>';
+    const suggestedNames = new Set((suggestedTrips || []).map(t => (t.name || '').trim()).filter(Boolean));
+    if (!window._tripIdToName) window._tripIdToName = {};
+    if (suggestedTrips && suggestedTrips.length > 0) {
+      const closeOptgroup = document.createElement('optgroup');
+      closeOptgroup.label = 'Близкие по дате (группа + поездка)';
+      suggestedTrips.forEach(t => {
+        const name = (t.name || '').trim() || 'Поездка';
+        window._tripIdToName[t.id] = name;
+        const opt = document.createElement('option');
+        opt.value = '__trip_' + t.id;
+        opt.textContent = name + (t.start_date ? ' (' + t.start_date + (t.end_date && t.end_date !== t.start_date ? ' – ' + t.end_date : '') + ')' : '');
+        closeOptgroup.appendChild(opt);
+      });
+      groupSelect.appendChild(closeOptgroup);
+    }
     const tripsOptgroup = document.createElement('optgroup');
     tripsOptgroup.label = 'Поездки';
     if (categoryMap['Поездки'] && categoryMap['Поездки'].length > 0) {
       categoryMap['Поездки'].sort((a, b) => (b.last_created_at || '').localeCompare(a.last_created_at || ''));
       categoryMap['Поездки'].forEach(t => {
+        if (suggestedNames.has(t.name)) return;
         const opt = document.createElement('option');
         opt.value = t.name;
         opt.textContent = t.name;
@@ -935,6 +1131,53 @@
     groupSelect.appendChild(createOpt);
   }
 
+  function tripDateWithinPlusMinusOneDay(fileDate, startDate, endDate) {
+    if (!fileDate || fileDate.length !== 10) return false;
+    const d = new Date(fileDate);
+    if (isNaN(d.getTime())) return false;
+    const addDays = (date, days) => {
+      const r = new Date(date);
+      r.setDate(r.getDate() + days);
+      return r.toISOString().slice(0, 10);
+    };
+    const lo = addDays(d, -1);
+    const hi = addDays(d, 1);
+    const start = (startDate || '').toString().trim().slice(0, 10);
+    const end = (endDate || start).toString().trim().slice(0, 10);
+    if (!start) return false;
+    return start <= hi && (end || start) >= lo;
+  }
+
+  async function loadTripBlock() {
+    const pill = qs('#videoCardTripPill');
+    if (!pill) return;
+    const hasFileId = state.file_id != null;
+    const hasPath = (state.file_path || '').trim().length > 0;
+    if (!hasFileId && !hasPath) {
+      pill.style.display = 'none';
+      return;
+    }
+    try {
+      const q = hasFileId
+        ? ('file_id=' + encodeURIComponent(state.file_id))
+        : ('path=' + encodeURIComponent(state.file_path));
+      const forFileData = await fetchJson('/api/trips/for-file?' + q);
+      const fileTrips = forFileData.trips || [];
+      if (fileTrips.length > 0) {
+        const t = fileTrips[0];
+        const name = (t.name || 'Поездка ' + t.id).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        pill.innerHTML = '<a href="/trips/' + t.id + '">' + name + '</a>';
+        pill.style.display = 'inline-flex';
+      } else {
+        pill.innerHTML = '';
+        pill.style.display = 'none';
+      }
+    } catch (e) {
+      console.warn('[video_card] loadTripBlock failed:', e);
+      pill.style.display = 'none';
+    }
+  }
+
   async function loadGroupsAndPersons() {
     const runId = getPipelineRunId();
     if (runId == null) return;
@@ -942,15 +1185,34 @@
     const personDropdown = qs('#videoCardPersonDropdown');
     if (groupSelect) {
       try {
-        const data = await fetchJson('/api/faces/groups-with-files?pipeline_run_id=' + encodeURIComponent(String(runId)));
-        const groups = data?.groups || [];
-        fillGroupSelect(groupSelect, groups);
+        const item = state.list_context?.items?.[state.currentIndex];
+        let takenAt = (item && item.taken_at) ? String(item.taken_at).trim().slice(0, 10) : '';
+        if ((takenAt.length !== 10 || takenAt[4] !== '-' || takenAt[7] !== '-') && (state.file_id != null || (state.file_path || '').trim())) {
+          const q = state.file_id != null ? ('file_id=' + encodeURIComponent(state.file_id)) : ('path=' + encodeURIComponent(state.file_path));
+          try {
+            const forFileData = await fetchJson('/api/trips/for-file?' + q);
+            const ft = (forFileData && forFileData.file_taken_at) ? String(forFileData.file_taken_at).trim().slice(0, 10) : '';
+            if (ft.length === 10 && ft[4] === '-' && ft[7] === '-') takenAt = ft;
+          } catch (_) { /* ignore */ }
+        }
+        const dateOk = takenAt.length === 10 && takenAt[4] === '-' && takenAt[7] === '-';
+        const [groupsData, suggestedTrips] = await Promise.all([
+          fetchJson('/api/faces/groups-with-files?pipeline_run_id=' + encodeURIComponent(String(runId))),
+          dateOk ? fetchJson('/api/trips/suggest-by-date?date=' + encodeURIComponent(takenAt) + '&limit=15').catch(() => null) : Promise.resolve(null)
+        ]);
+        const groups = groupsData?.groups || [];
+        const suggested = Array.isArray(suggestedTrips) ? suggestedTrips : null;
+        fillGroupSelect(groupSelect, groups, suggested);
       } catch (e) { console.error('[video_card] load groups:', e); }
     }
-    if (personDropdown) {
-      try {
-        const data = await fetchJson('/api/persons/list');
-        const persons = data?.persons || [];
+    try {
+      const data = await fetchJson('/api/persons/list');
+      const persons = data?.persons || [];
+      if (!window.currentPersonName) window.currentPersonName = {};
+      persons.forEach(p => {
+        if (p.id != null) window.currentPersonName[p.id] = p.name || ('Персона ' + p.id);
+      });
+      if (personDropdown) {
         personDropdown.innerHTML = '<option value="">— Выберите персону —</option>';
         persons.forEach(p => {
           const opt = document.createElement('option');
@@ -958,8 +1220,10 @@
           opt.textContent = (p.name || '') + (p.is_me ? ' (я)' : '');
           personDropdown.appendChild(opt);
         });
-      } catch (e) { console.error('[video_card] load persons:', e); }
-    }
+      }
+      renderRectList();
+    } catch (e) { console.error('[video_card] load persons:', e); }
+    await loadTripBlock();
   }
 
   if (copyPathBtn) {
@@ -1048,8 +1312,36 @@
   if (deleteBtn) {
     deleteBtn.onclick = async () => {
       const path = getPath();
-      const runId = getPipelineRunId();
-      if (!path || runId == null) return;
+      if (!path) return;
+      const isArchiveFile = path.startsWith('disk:');
+      if (isArchiveFile) {
+        if (!confirm('Вы уверены, что хотите физически удалить этот файл из архива? Действие необратимо.')) return;
+        try {
+          await postJson('/api/archive/delete', { path });
+          showToast('Файл удалён');
+          if (state.list_context?.source_page === 'trip' && typeof state.on_close === 'function') {
+            state.on_close();
+            return;
+          }
+          const lc = state.list_context;
+          if (lc?.items && state.currentIndex < lc.items.length - 1) goNext();
+          else closeVideoCard();
+        } catch (e) {
+          alert(e?.message || String(e));
+        }
+        return;
+      }
+      let runId = getPipelineRunId();
+      if (runId == null && path.startsWith('local:')) {
+        try {
+          const res = await fetchJson('/api/faces/pipeline-run-for-path?path=' + encodeURIComponent(path));
+          if (res && res.pipeline_run_id != null) runId = res.pipeline_run_id;
+        } catch (_) { /* ignore */ }
+      }
+      if (runId == null) {
+        alert('Нет прогона (pipeline_run_id). Удаление в _delete доступно при открытии со страницы сортировки или из поездки; для этого файла прогон по пути не найден.');
+        return;
+      }
       try {
         const data = await postJson('/api/faces/delete', { pipeline_run_id: Number(runId), path });
         if (data?.undo_data) {
@@ -1057,6 +1349,11 @@
           updateUndoButton();
         }
         showToast('Файл удалён');
+        const fromTrip = state.list_context?.source_page === 'trip';
+        if (fromTrip && typeof state.on_close === 'function') {
+          state.on_close();
+          return;
+        }
         const lc = state.list_context;
         if (lc?.items && state.currentIndex < lc.items.length - 1) {
           goNext();
@@ -1151,6 +1448,14 @@
       const runId = getPipelineRunId();
       if (!path || runId == null) return;
       const origVal = groupSelectEl.value;
+      const isTripOption = groupPath.startsWith('__trip_');
+      let tripId = null;
+      if (isTripOption) {
+        tripId = parseInt(groupPath.slice(7), 10);
+        groupPath = (window._tripIdToName && window._tripIdToName[tripId]) || groupPath;
+      }
+      let createdNewTripInThisAction = false;
+      let attachOk = true;
       if (groupPath === '__create_new__' || groupPath === '__create_new_Поездки__') {
         const isTrips = groupPath === '__create_new_Поездки__';
         const promptText = isTrips ? 'Введите название поездки (например: 2025 Италия):' : 'Введите название новой группы:';
@@ -1160,12 +1465,44 @@
           return;
         }
         groupPath = newName.trim();
+        if (isTrips) {
+          try {
+            const createBody = { name: groupPath };
+            if (state.file_id != null) createBody.file_id = state.file_id;
+            else if (state.file_path) createBody.path = state.file_path;
+            const created = await postJson('/api/trips', createBody);
+            if (created && created.id && (state.file_id != null || (state.file_path || '').trim())) {
+              const attachBody = state.file_id != null ? { file_id: state.file_id } : { path: state.file_path };
+              try {
+                await postJson('/api/trips/' + created.id + '/attach', attachBody);
+              } catch (attachErr) {
+                attachOk = false;
+                showToast('Поездка создана, но файл не добавлен: ' + (attachErr?.message || 'файл не найден в базе'));
+              }
+            }
+            createdNewTripInThisAction = true;
+          } catch (e) {
+            alert(e?.message || 'Не удалось создать поездку');
+            groupSelectEl.value = origVal;
+            return;
+          }
+        }
       }
       try {
         await postJson('/api/faces/assign-group', { pipeline_run_id: Number(runId), path, group_path: groupPath });
-        showToast('Группа назначена');
+        if (tripId && (state.file_id != null || (state.file_path || '').trim())) {
+          const attachBody = state.file_id != null ? { file_id: state.file_id } : { path: state.file_path };
+          await postJson('/api/trips/' + tripId + '/attach', attachBody);
+        }
+        showToast(tripId ? 'Добавлено в группу и поездку' : (createdNewTripInThisAction ? (attachOk ? 'Поездка «' + groupPath + '» создана, файл добавлен.' : 'Поездка «' + groupPath + '» создана (файл не добавлен).') : 'Группа назначена'));
         groupSelectEl.value = '';
-        if (typeof state.on_close === 'function') state.on_close();
+        if (createdNewTripInThisAction) {
+          loadTripBlock();
+          loadGroupsAndPersons();
+        } else {
+          if (tripId) loadTripBlock();
+          if (typeof state.on_close === 'function') state.on_close();
+        }
       } catch (e) {
         alert(e?.message || String(e));
         groupSelectEl.value = origVal;
@@ -1300,6 +1637,11 @@
       e.stopPropagation();
     };
   }
+
+  const zoomTriggerBtn = qs('#videoCardZoomTrigger');
+  if (zoomTriggerBtn) zoomTriggerBtn.onclick = () => openVideoFrameZoom();
+  const zoomCloseBtn = qs('#videoCardZoomClose');
+  if (zoomCloseBtn) zoomCloseBtn.onclick = () => closeVideoFrameZoom();
 
   const toggleRectBtn = qs('#videoCardToggleRectangles');
   let rectsVisible = true;
@@ -1461,8 +1803,7 @@
       });
       showToast(`Кадр ${idx} установлен`);
       await loadFrames();
-      showFrameTab(idx, true);
-      if (typeof state.on_close === 'function') state.on_close();
+      await showFrameTab(idx, true);
     } catch (e) {
       showToast(e?.message || 'Ошибка');
     }

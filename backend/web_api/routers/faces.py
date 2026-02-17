@@ -24,7 +24,7 @@ from fastapi.templating import Jinja2Templates
 
 logger = logging.getLogger(__name__)
 
-from common.db import DedupStore, FaceStore, PipelineStore, get_connection, get_outsider_person_id, list_folders, set_file_processed, _get_file_id_from_path
+from common.db import DedupStore, FaceStore, PipelineStore, get_connection, get_outsider_person_id, get_pipeline_run_id_for_path, list_folders, set_file_processed, _get_file_id_from_path
 from common.sort_rules import (
     determine_target_folder as _determine_target_folder,
     folder_rules_match as _folder_rules_match,
@@ -239,6 +239,16 @@ def _strip_local_prefix(p: str) -> str:
     return p[len("local:") :] if (p or "").startswith("local:") else p
 
 
+def _abs_path_for_local(path: str) -> str | None:
+    """Путь для проверки файла на диске: убирает local:, нормализует слэши (Windows)."""
+    if not path or not path.startswith("local:"):
+        return None
+    s = _strip_local_prefix(path).strip()
+    if not s:
+        return None
+    return os.path.normpath(s)
+
+
 def _local_is_under_root(*, file_path: str, root_dir: str) -> bool:
     try:
         rp = os.path.abspath(str(root_dir))
@@ -376,7 +386,7 @@ def api_faces_video_manual_frames(pipeline_run_id: int, path: str) -> dict[str, 
             raise HTTPException(status_code=404, detail="pipeline_run_id not found")
 
         root_path = str(pr.get("root_path") or "")
-        abs_path = _strip_local_prefix(path)
+        abs_path = _abs_path_for_local(path)
         if not abs_path or not os.path.isfile(abs_path):
             raise HTTPException(status_code=404, detail="file not found")
         if root_path and not _local_is_under_root(file_path=abs_path, root_dir=root_path):
@@ -402,6 +412,23 @@ def api_faces_video_manual_frames(pipeline_run_id: int, path: str) -> dict[str, 
         finally:
             ds.close()
 
+        # Привязка на уровне файла (file_persons) — если нет rects, но есть персона
+        file_person: dict[str, Any] | None = None
+        fs = FaceStore()
+        try:
+            current = fs.list_file_persons(pipeline_run_id=int(pipeline_run_id), file_path=str(path))
+            for fp in current:
+                pid = fp.get("person_id")
+                if pid is not None:
+                    pname = fp.get("person_name") or ""
+                    outsider_id = get_outsider_person_id(get_connection())
+                    if outsider_id is not None and int(pid) == int(outsider_id):
+                        continue
+                    file_person = {"person_id": int(pid), "person_name": str(pname)}
+                    break
+        finally:
+            fs.close()
+
         frames: list[dict[str, Any]] = []
         for i in (1, 2, 3):
             obj = mf.get(i) or {}
@@ -414,7 +441,7 @@ def api_faces_video_manual_frames(pipeline_run_id: int, path: str) -> dict[str, 
                 }
             )
 
-        return {"ok": True, "pipeline_run_id": int(pipeline_run_id), "path": str(path), "frames": frames}
+        return {"ok": True, "pipeline_run_id": int(pipeline_run_id), "path": str(path), "frames": frames, "file_person": file_person}
 
     except HTTPException:
         raise
@@ -458,7 +485,7 @@ def api_faces_video_keyframe_position(payload: dict[str, Any] = Body(...)) -> di
     if not pr:
         raise HTTPException(status_code=404, detail="pipeline_run_id not found")
     root_path = str(pr.get("root_path") or "")
-    abs_path = _strip_local_prefix(path)
+    abs_path = _abs_path_for_local(path)
     if not abs_path or not os.path.isfile(abs_path):
         raise HTTPException(status_code=404, detail="file not found")
     if root_path and not _local_is_under_root(file_path=abs_path, root_dir=root_path):
@@ -509,7 +536,7 @@ def api_faces_video_manual_frame(payload: dict[str, Any] = Body(...)) -> dict[st
         face_run_id = None
 
     root_path = str(pr.get("root_path") or "")
-    abs_path = _strip_local_prefix(path)
+    abs_path = _abs_path_for_local(path)
     if not abs_path or not os.path.isfile(abs_path):
         raise HTTPException(status_code=404, detail="file not found")
     if root_path and not _local_is_under_root(file_path=abs_path, root_dir=root_path):
@@ -595,22 +622,43 @@ def api_faces_video_manual_frame(payload: dict[str, Any] = Body(...)) -> dict[st
 
 
 @router.get("/api/faces/video-frame")
-def api_faces_video_frame(pipeline_run_id: int, path: str, frame_idx: int = 1, max_dim: int = 960) -> FileResponse:
+def api_faces_video_frame(pipeline_run_id: int | None = None, path: str = "", frame_idx: int = 1, max_dim: int = 960) -> FileResponse:
     if not isinstance(path, str) or not path.startswith("local:"):
         raise HTTPException(status_code=400, detail="path must start with local:")
     idx = int(frame_idx or 0)
     if idx not in (1, 2, 3):
         raise HTTPException(status_code=400, detail="frame_idx must be 1..3")
 
-    ps = PipelineStore()
-    try:
-        pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
-    finally:
-        ps.close()
-    if not pr:
-        raise HTTPException(status_code=404, detail="pipeline_run_id not found")
-
-    root_path = str(pr.get("root_path") or "")
+    root_path = ""
+    if pipeline_run_id is not None:
+        ps = PipelineStore()
+        try:
+            pr = ps.get_run_by_id(run_id=int(pipeline_run_id))
+        finally:
+            ps.close()
+        if not pr:
+            raise HTTPException(status_code=404, detail="pipeline_run_id not found")
+        root_path = str(pr.get("root_path") or "")
+    else:
+        ds = DedupStore()
+        try:
+            src_latest = ds.get_latest_run(scope="source")
+        finally:
+            ds.close()
+        if src_latest:
+            root_path = str(src_latest.get("root_path") or "")
+        if not root_path:
+            ps2 = PipelineStore()
+            try:
+                pr_any = ps2.get_latest_any(kind="local_sort")
+            finally:
+                ps2.close()
+            if pr_any:
+                root_path = str(pr_any.get("root_path") or "")
+        if not root_path:
+            raise HTTPException(status_code=400, detail="Нет активного source/pipeline run. Укажите pipeline_run_id.")
+    if root_path and root_path.startswith("local:"):
+        root_path = _strip_local_prefix(root_path)
     abs_path = _strip_local_prefix(path)
     if not abs_path or not os.path.isfile(abs_path):
         raise HTTPException(status_code=404, detail="file not found")
@@ -633,6 +681,20 @@ def api_faces_video_frame(pipeline_run_id: int, path: str, frame_idx: int = 1, m
             row = cur.fetchone()
             if row is not None and row[0] is not None:
                 t_sec = float(row[0])
+            # Fallback: если в files пусто, берём frame_t_sec из photo_rectangles (ручные rect'ы)
+            if t_sec is None:
+                cur.execute(
+                    """
+                    SELECT frame_t_sec FROM photo_rectangles
+                    WHERE file_id = ? AND frame_idx = ? AND frame_t_sec IS NOT NULL
+                    ORDER BY COALESCE(is_manual, 0) DESC, id ASC
+                    LIMIT 1
+                    """,
+                    (file_id, idx),
+                )
+                fr = cur.fetchone()
+                if fr is not None and fr[0] is not None:
+                    t_sec = float(fr[0])
     finally:
         conn.close()
 
@@ -724,10 +786,13 @@ def _faces_preview_meta(*, path: str, mime_type: str | None, media_type: str | N
         elif mt == "video" or mime.startswith("video/"):
             preview_kind = "video"
         if preview_kind != "none":
-            q = "path=" + urllib.parse.quote(path, safe="")
-            if pipeline_run_id is not None:
-                q += "&pipeline_run_id=" + urllib.parse.quote(str(int(pipeline_run_id)), safe="")
-            preview_url = "/api/local/preview?" + q
+            if preview_kind == "video":
+                preview_url = "/api/faces/video-frame?pipeline_run_id=" + urllib.parse.quote(str(int(pipeline_run_id)), safe="") + "&path=" + urllib.parse.quote(path, safe="") + "&frame_idx=1" if pipeline_run_id is not None else None
+            else:
+                q = "path=" + urllib.parse.quote(path, safe="")
+                if pipeline_run_id is not None:
+                    q += "&pipeline_run_id=" + urllib.parse.quote(str(int(pipeline_run_id)), safe="")
+                preview_url = "/api/local/preview?" + q
     return {"preview_kind": preview_kind, "preview_url": preview_url, "open_url": open_url}
 
 
@@ -5628,6 +5693,19 @@ def _delete_from_all_gold_files(path: str) -> int:
             gold_write_ndjson_by_path(ndjson_path, items)
 
     return removed_count
+
+
+@router.get("/api/faces/pipeline-run-for-path")
+def api_faces_pipeline_run_for_path(path: str = Query(..., description="Путь к файлу (local: или disk:)")) -> dict[str, Any]:
+    """
+    Возвращает pipeline_run_id для файла по пути (из file_groups).
+    Используется в карточке при удалении, когда прогон не передан (например, открыто из поездки).
+    """
+    path_s = (path or "").strip()
+    if not path_s or not (path_s.startswith("local:") or path_s.startswith("disk:")):
+        return {"pipeline_run_id": None}
+    run_id = get_pipeline_run_id_for_path(path_s)
+    return {"pipeline_run_id": run_id}
 
 
 @router.post("/api/faces/delete")

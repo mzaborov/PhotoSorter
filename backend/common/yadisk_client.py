@@ -4,21 +4,26 @@ from pathlib import Path
 import yadisk
 from dotenv import load_dotenv
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent  # backend/common
+BACKEND_DIR = BASE_DIR.parent              # backend
+REPO_ROOT = BACKEND_DIR.parent             # корень проекта
 
 
 def _load_env() -> None:
     """
     Загружает переменные окружения из файла с секретами.
-    Поддерживаем `secrets.env` (основной) и `.env` (fallback), ничего не печатаем.
+    Проверяем: корень проекта (secrets.env), backend (secrets.env), backend/common (secrets.env/.env).
     """
-    secrets_env = BASE_DIR / "secrets.env"
-    dot_env = BASE_DIR / ".env"
-
-    if secrets_env.exists():
-        load_dotenv(secrets_env)
-    elif dot_env.exists():
-        load_dotenv(dot_env)
+    for base in (REPO_ROOT, BACKEND_DIR, BASE_DIR):
+        secrets_env = base / "secrets.env"
+        if secrets_env.exists():
+            load_dotenv(secrets_env)
+            return
+    for base in (REPO_ROOT, BACKEND_DIR, BASE_DIR):
+        dot_env = base / ".env"
+        if dot_env.exists():
+            load_dotenv(dot_env)
+            return
 
 
 def get_disk() -> yadisk.YaDisk:

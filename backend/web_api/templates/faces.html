@@ -814,62 +814,111 @@
           }
         }
         
+        // Сохраняем для фокуса (близкие по дате)
+        window._lastLoadedGroupsForAssign = groups;
+
         // Обновляем все select'ы в карточках (ищем по data-file-path)
         const selects = qsa('select[data-file-path]');
+        selects.forEach(select => fillOneGroupSelect(select, groups, null));
+      }
 
-        selects.forEach(select => {
-          const currentValue = select.value;
-          select.innerHTML = '<option value="">Назначить группу...</option>';
-          
-          // Всегда добавляем блок "Поездки" (даже если поездок пока нет — будет "+ Создать новую поездку...")
-          const tripsOptgroup = document.createElement("optgroup");
-          tripsOptgroup.label = "Поездки";
-          if (categoryMap["Поездки"] && categoryMap["Поездки"].length > 0) {
-            categoryMap["Поездки"].sort((a, b) => {
-              const dateA = a.last_created_at || "";
-              const dateB = b.last_created_at || "";
-              if (dateA && dateB) {
-                const dateCompare = dateB.localeCompare(dateA);
-                if (dateCompare !== 0) return dateCompare;
-              }
-              return a.name.localeCompare(b.name);
-            });
-            categoryMap["Поездки"].forEach(trip => {
-              const opt = document.createElement("option");
-              opt.value = trip.name;
-              opt.textContent = trip.name;
-              tripsOptgroup.appendChild(opt);
-            });
-          }
-          const createOptInGroup = document.createElement("option");
-          createOptInGroup.value = "__create_new_Поездки__";
-          createOptInGroup.textContent = "+ Создать новую поездку...";
-          createOptInGroup.style.fontStyle = "italic";
-          tripsOptgroup.appendChild(createOptInGroup);
-          select.appendChild(tripsOptgroup);
-          
-          // Добавляем остальные группы
-          otherGroups.sort();
-          otherGroups.forEach(groupPath => {
-            const opt = document.createElement("option");
-            opt.value = groupPath;
-            opt.textContent = groupPath;
-            select.appendChild(opt);
-          });
-          
-          // Добавляем опцию для создания новой группы (общая)
-          const createOpt = document.createElement("option");
-          createOpt.value = "__create_new__";
-          createOpt.textContent = "+ Создать новую группу...";
-          createOpt.style.fontStyle = "italic";
-          select.appendChild(createOpt);
-          
-          // Восстанавливаем выбранное значение
-          if (currentValue) {
-            select.value = currentValue;
+      function fillOneGroupSelect(selectEl, groups, suggestedTrips) {
+        if (!selectEl) return;
+        const predefinedGroups = ["Артефакты людей", "Гитара", "Дом и ремонт", "Здоровье", "Чеки"];
+        const tripsKeywords = ["Турция", "Минск", "Италия", "Испания", "Греция", "Франция", "Польша", "Чехия", "Германия", "Тургояк"];
+        const allGroups = new Set();
+        const groupsWithData = [];
+        (groups || []).forEach(g => {
+          const groupName = g.group_path || "";
+          if (!groupName) return;
+          allGroups.add(groupName);
+          const hasYear = /\d{4}/.test(groupName);
+          const hasPlace = tripsKeywords.some(kw => groupName.includes(kw));
+          const startsWithYear = /^\d{4}\s/.test(groupName);
+          const isTrip = (hasYear && hasPlace) || (startsWithYear && groupName.length > 5);
+          groupsWithData.push({ name: groupName, isTrip, last_created_at: g.last_created_at || "" });
+        });
+        predefinedGroups.forEach(p => {
+          if (!allGroups.has(p)) groupsWithData.push({ name: p, isTrip: false, last_created_at: "" });
+        });
+        const categoryMap = {};
+        const otherGroups = [];
+        groupsWithData.forEach(gd => {
+          if (gd.isTrip) {
+            if (!categoryMap["Поездки"]) categoryMap["Поездки"] = [];
+            categoryMap["Поездки"].push({ name: gd.name, last_created_at: gd.last_created_at });
+          } else {
+            otherGroups.push(gd.name);
           }
         });
+        const currentValue = selectEl.value;
+        selectEl.innerHTML = '<option value="">Назначить группу...</option>';
+        const suggestedNames = new Set((suggestedTrips || []).map(t => (t.name || "").trim()).filter(Boolean));
+        if (suggestedTrips && suggestedTrips.length > 0) {
+          const closeOptgroup = document.createElement("optgroup");
+          closeOptgroup.label = "Близкие по дате";
+          suggestedTrips.forEach(t => {
+            const name = (t.name || "").trim() || "Поездка";
+            const opt = document.createElement("option");
+            opt.value = name;
+            opt.textContent = name + (t.start_date ? " (" + t.start_date + (t.end_date && t.end_date !== t.start_date ? " – " + t.end_date : "") + ")" : "");
+            closeOptgroup.appendChild(opt);
+          });
+          selectEl.appendChild(closeOptgroup);
+        }
+        const tripsOptgroup = document.createElement("optgroup");
+        tripsOptgroup.label = "Поездки";
+        if (categoryMap["Поездки"] && categoryMap["Поездки"].length > 0) {
+          categoryMap["Поездки"].sort((a, b) => {
+            const dateA = a.last_created_at || "";
+            const dateB = b.last_created_at || "";
+            if (dateA && dateB) {
+              const dateCompare = dateB.localeCompare(dateA);
+              if (dateCompare !== 0) return dateCompare;
+            }
+            return a.name.localeCompare(b.name);
+          });
+          categoryMap["Поездки"].forEach(trip => {
+            if (suggestedNames.has(trip.name)) return;
+            const opt = document.createElement("option");
+            opt.value = trip.name;
+            opt.textContent = trip.name;
+            tripsOptgroup.appendChild(opt);
+          });
+        }
+        const createOptInGroup = document.createElement("option");
+        createOptInGroup.value = "__create_new_Поездки__";
+        createOptInGroup.textContent = "+ Создать новую поездку...";
+        createOptInGroup.style.fontStyle = "italic";
+        tripsOptgroup.appendChild(createOptInGroup);
+        selectEl.appendChild(tripsOptgroup);
+        otherGroups.sort();
+        otherGroups.forEach(groupPath => {
+          const opt = document.createElement("option");
+          opt.value = groupPath;
+          opt.textContent = groupPath;
+          selectEl.appendChild(opt);
+        });
+        const createOpt = document.createElement("option");
+        createOpt.value = "__create_new__";
+        createOpt.textContent = "+ Создать новую группу...";
+        createOpt.style.fontStyle = "italic";
+        selectEl.appendChild(createOpt);
+        if (currentValue) selectEl.value = currentValue;
       }
+
+      document.addEventListener("focusin", async function(e) {
+        const sel = e.target && e.target.classList && e.target.classList.contains("group-select-no-faces") ? e.target : null;
+        if (!sel || !window._lastLoadedGroupsForAssign) return;
+        const takenAt = (sel.getAttribute("data-taken-at") || "").replace(/&quot;/g, '"').trim().slice(0, 10);
+        if (takenAt.length !== 10 || takenAt[4] !== "-" || takenAt[7] !== "-") return;
+        try {
+          const r = await fetch("/api/trips/suggest-by-date?date=" + encodeURIComponent(takenAt) + "&limit=15");
+          const suggested = r.ok ? await r.json() : null;
+          const arr = Array.isArray(suggested) ? suggested : null;
+          if (arr && arr.length > 0) fillOneGroupSelect(sel, window._lastLoadedGroupsForAssign, arr);
+        } catch (err) { console.warn("[faces] suggest-by-date:", err); }
+      }, true);
 
       async function handleGroupSelectFromDropdown(selectEl, event) {
         if (event) {
@@ -887,22 +936,27 @@
         if (!groupPath) return;
 
         if (groupPath === "__create_new__" || groupPath === "__create_new_Поездки__") {
-          // Определяем, в какой категории создаем группу
           const isTrips = groupPath === "__create_new_Поездки__";
           const optgroup = selectEl.closest('optgroup');
           const category = isTrips ? "Поездки" : (optgroup ? optgroup.label : null);
-          
           let promptText = "Введите название новой группы:";
           if (category === "Поездки" || isTrips) {
             promptText = "Введите название поездки (например: 2025 Италия):";
           }
-          
           const newGroupName = prompt(promptText);
           if (newGroupName && newGroupName.trim()) {
-            // Храним просто название без префикса категории
-            await assignGroupToFile(filePath, newGroupName.trim(), selectEl);
+            const name = newGroupName.trim();
+            if (isTrips) {
+              try {
+                await postJson("/api/trips", { name });
+              } catch (e) {
+                alert(e?.message || "Не удалось создать поездку");
+                selectEl.value = "";
+                return;
+              }
+            }
+            await assignGroupToFile(filePath, name, selectEl);
           } else {
-            // Возвращаем select в исходное состояние
             selectEl.value = "";
           }
         } else if (groupPath) {
@@ -2133,9 +2187,9 @@
           const escapedPathForAttr = (path ?? "").toString().replace(/"/g, '&quot;');
           const escapedPath = escapeHtml(path);
           const groupSelectId = `group-select-${escapedPath.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 50)}`;
-          // Используем data-file-path атрибут для передачи пути, чтобы избежать проблем с экранированием в onchange
-          // Обработчик будет получать путь из атрибута
-          const groupSelectHtml = `<select class="btn" style="padding:6px 12px; cursor:pointer; border:1px solid #d1d5db; border-radius:4px; background:white; min-width:180px;" onchange="handleGroupSelectFromDropdown(this, event)" id="${groupSelectId}" data-file-path="${escapedPathForAttr}">
+          const escapedTakenAt = (takenAt ?? "").toString().replace(/"/g, '&quot;');
+          // Используем data-file-path и data-taken-at для пути и даты (близкие по дате поездки при фокусе)
+          const groupSelectHtml = `<select class="btn group-select-no-faces" style="padding:6px 12px; cursor:pointer; border:1px solid #d1d5db; border-radius:4px; background:white; min-width:180px;" onchange="handleGroupSelectFromDropdown(this, event)" id="${groupSelectId}" data-file-path="${escapedPathForAttr}" data-taken-at="${escapedTakenAt}">
             <option value="">Назначить группу...</option>
           </select>`;
           btn = `
@@ -2172,10 +2226,12 @@
         const aManKind = (it.animals_manual_kind || "").toString();
         const pnfPerson2 = (it.people_no_face_person || "").toString();
         const fileId = it.file_id ? Number(it.file_id) : null;
+        const videoFrameIdxAttr = (kind === "video" && typeof videoFrameIdx === "number" && videoFrameIdx >= 1 && videoFrameIdx <= 3) ? ` data-video-frame-idx="${videoFrameIdx}"` : "";
         return `
           <div class="${cls}"
                data-path="${escapeHtml(path)}"
                ${fileId ? `data-file-id="${fileId}"` : ''}
+               ${videoFrameIdxAttr}
                data-row="${Number(rowNum || 0) || ""}"
                data-taken-at="${escapeHtml(takenAt)}"
                data-place-country="${escapeHtml(placeC)}"
@@ -3432,11 +3488,14 @@
         
         // Для видео — карточка видео; для изображений — карточка фото (общий list_context для листания)
         if (kind === "video" && window.openVideoCard) {
+          const vfIdx = currentCard ? parseInt(currentCard.getAttribute("data-video-frame-idx") || "0", 10) : 0;
+          const hl = (vfIdx >= 1 && vfIdx <= 3) ? { frame_idx: vfIdx } : null;
           window.openVideoCard({
             file_id: fileId,
             file_path: p,
             pipeline_run_id: pipelineRunId,
             list_context: listContext,
+            highlight_frame_rect: hl,
             on_close: onClose
           });
         } else if (window.openPhotoCard) {
@@ -3511,11 +3570,14 @@
           };
           const fileIdAttr = currentCard?.getAttribute("data-file-id");
           const fileId = fileIdAttr ? parseInt(fileIdAttr) : null;
+          const vfIdx = currentCard ? parseInt(currentCard.getAttribute("data-video-frame-idx") || "0", 10) : 0;
+          const hl = (vfIdx >= 1 && vfIdx <= 3) ? { frame_idx: vfIdx } : null;
           window.openVideoCard({
             file_path: p,
             file_id: fileId,
             pipeline_run_id: pipelineRunId,
             list_context: listContext,
+            highlight_frame_rect: hl,
             on_close: () => { load(true); refreshTabCounts(); loadPersonsSubtabs(true); }
           });
         } else {

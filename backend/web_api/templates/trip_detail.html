@@ -1,0 +1,694 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>PhotoSorter — {{ trip.name }}</title>
+    <style>
+      :root { color-scheme: light; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      a { color: #0b57d0; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      .muted { color: #6b7280; }
+      .wrap { max-width: 1400px; }
+      .header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+      .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+      .section { margin-top: 24px; border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; background: #fff; }
+      .section h3 { margin: 0 0 12px 0; font-size: 16px; }
+      .thumb-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; }
+      .thumb { aspect-ratio: 1; background: #f3f4f6; border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; cursor: pointer; border: 1px solid #e5e7eb; position: relative; }
+      .thumb:hover { border-color: #0b57d0; }
+      .thumb img { width: 100%; height: 100%; object-fit: cover; }
+      .thumb .noimg { color: #9ca3af; font-size: 11px; padding: 8px; text-align: center; }
+      .thumb-actions { position: absolute; bottom: 0; left: 0; right: 0; background: rgba(0,0,0,0.75); padding: 6px; display: flex; flex-wrap: wrap; gap: 6px; opacity: 0; transition: opacity 0.2s; }
+      .thumb:hover .thumb-actions { opacity: 1; }
+      .thumb:hover .thumb-actions-cover { opacity: 1; }
+      .thumb-actions button { flex: 1; padding: 6px 8px; border: none; border-radius: 6px; font-size: 11px; font-weight: 700; cursor: pointer; }
+      .thumb-actions-cover { display: flex; flex-wrap: wrap; gap: 6px; }
+      .thumb-actions-cover .btn-set-cover { flex: 1; padding: 6px 8px; border: none; border-radius: 6px; font-size: 11px; font-weight: 700; cursor: pointer; background: #0b57d0; color: #fff; }
+      .thumb-actions-cover .btn-set-cover:hover { background: #094bb5; }
+      .thumb-actions-cover .btn-exclude { flex: 1; padding: 6px 8px; border: none; border-radius: 6px; font-size: 11px; font-weight: 700; cursor: pointer; background: #6b7280; color: #fff; }
+      .thumb-actions-cover .btn-exclude:hover { background: #4b5563; }
+      .thumb-actions-cover .btn-move-trip { flex: 1; padding: 6px 8px; border: none; border-radius: 6px; font-size: 10px; font-weight: 700; cursor: pointer; background: #7c3aed; color: #fff; }
+      .thumb-actions-cover .btn-move-trip:hover { background: #6d28d9; }
+      .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 9999; }
+      .modal-box { background: #fff; border-radius: 12px; padding: 20px; max-width: 400px; width: 90%; max-height: 80vh; overflow: auto; }
+      .modal-box h4 { margin: 0 0 12px 0; }
+      .modal-trip-list { display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow-y: auto; }
+      .modal-trip-item { padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 8px; cursor: pointer; background: #fff; }
+      .modal-trip-item:hover { background: #f3f4f6; border-color: #7c3aed; }
+      .modal-actions { margin-top: 16px; display: flex; gap: 8px; justify-content: flex-end; }
+      .thumb-is-cover { border-color: #059669; box-shadow: 0 0 0 2px #059669; }
+      label { margin-right: 8px; font-size: 14px; }
+      label input[type=date] { margin-left: 4px; padding: 4px 8px; border-radius: 6px; border: 1px solid #d1d5db; }
+      .dates-edit-box { display: flex; flex-direction: column; gap: 10px; padding: 12px; background: #f9fafb; border-radius: 10px; max-width: 320px; }
+      .dates-edit-row { display: flex; align-items: center; gap: 10px; }
+      .dates-edit-row label { min-width: 120px; margin: 0; }
+      .dates-edit-row input[type=date] { flex: 1; padding: 6px 10px; border-radius: 8px; border: 1px solid #d1d5db; font-size: 14px; }
+      .dates-edit-actions { display: flex; gap: 8px; }
+      .date-group { margin-bottom: 20px; }
+      .date-group-title { font-size: 14px; font-weight: 700; color: #374151; margin-bottom: 8px; }
+      .date-group-actions { margin-bottom: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+      .thumb-actions .btn-attach { background: #059669; color: #fff; }
+      .thumb-actions .btn-attach:hover { background: #047857; }
+      .thumb-actions .btn-to-trip { background: #7c3aed; color: #fff; }
+      .thumb-actions .btn-to-trip:hover { background: #6d28d9; }
+      .thumb-actions .btn-exclude { background: #6b7280; color: #fff; }
+      .btn { padding: 8px 16px; border-radius: 8px; border: 1px solid #d1d5db; background: #fff; cursor: pointer; font-size: 14px; }
+      .btn-primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+      .btn-primary:hover { background: #1d4ed8; }
+      .thumb-actions .btn-exclude:hover { background: #4b5563; }
+      .btn-attach-all { background: #059669; color: #fff; border-color: #059669; }
+      .btn-attach-all:hover { background: #047857; }
+      .btn-attach-all:disabled { opacity: 0.7; cursor: not-allowed; }
+      .btn-save-derived { background: #059669; color: #fff; border-color: #059669; }
+      .btn-save-derived:hover { background: #047857; }
+      .btn { appearance: none; border: 1px solid #d1d5db; background: #fff; padding: 8px 12px; border-radius: 10px; cursor: pointer; font-weight: 700; }
+      .btn-rename { padding: 4px 8px; font-size: 14px; color: #6b7280; }
+      .btn-rename:hover { color: #0b57d0; }
+      .btn:hover { background: #f9fafb; }
+      .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f3f4f6; color: #374151; font-size: 12px; }
+      code { font-family: ui-monospace, monospace; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="header">
+        <div>
+          <h2 style="margin: 0; display: flex; align-items: center; gap: 10px;">
+            <span id="tripName">{{ trip.name or "Поездка" }}</span>
+            <button type="button" class="btn btn-inline btn-rename" id="renameTripBtn" title="Переименовать поездку">✎</button>
+          </h2>
+          <div class="muted" style="margin-top: 6px;">
+            {% if trip.place_country %}{{ trip.place_country }}{% endif %}
+          </div>
+          <div class="trip-dates" style="margin-top: 8px;">
+            <span class="trip-dates-view">
+              <span class="muted">Даты:</span>
+              <span id="datesText">{% if trip.start_date %}{{ trip.start_date }}{% if trip.end_date and trip.end_date != trip.start_date %} — {{ trip.end_date }}{% endif %}{% elif derived_start_date %}<span id="datesDerived">по фото: {{ derived_start_date }}{% if derived_end_date and derived_end_date != derived_start_date %} — {{ derived_end_date }}{% endif %}</span>{% else %}не указаны{% endif %}</span>
+              <button type="button" class="btn btn-inline" id="editDatesBtn">Изменить</button>
+              {% if derived_start_date and not trip.start_date %}
+              <button type="button" class="btn btn-inline btn-save-derived" id="saveDerivedDatesBtn" data-derived-start="{{ derived_start_date }}" data-derived-end="{{ derived_end_date or derived_start_date }}">Сохранить даты</button>
+              {% endif %}
+            </span>
+            <span class="trip-dates-edit" id="datesEdit" style="display: none;">
+              <div class="dates-edit-box">
+                <div class="dates-edit-row">
+                  <label for="dateStart">Начало поездки</label>
+                  <input type="date" id="dateStart" value="{{ trip.start_date or derived_start_date or '' }}" />
+                </div>
+                <div class="dates-edit-row">
+                  <label for="dateEnd">Конец поездки</label>
+                  <input type="date" id="dateEnd" value="{{ trip.end_date or derived_end_date or '' }}" />
+                </div>
+                <div class="dates-edit-actions">
+                  <button type="button" class="btn" id="saveDatesBtn">Сохранить</button>
+                  <button type="button" class="btn" id="cancelDatesBtn">Отмена</button>
+                </div>
+              </div>
+            </span>
+          </div>
+        </div>
+        <div class="row">
+          <a href="/trips" class="btn">← К списку</a>
+        </div>
+      </div>
+
+      <div class="section trip-cover-section">
+        <h3>Фото для списка (обложка)</h3>
+        <div class="row" style="align-items: center; gap: 16px;">
+          <div class="cover-preview" id="coverPreview" style="width: 120px; height: 120px; background: #f3f4f6; border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center;">
+            {% if cover_preview_url %}
+            <img id="coverPreviewImg" src="{{ cover_preview_url }}" alt="" referrerpolicy="no-referrer" style="width: 100%; height: 100%; object-fit: cover;" onerror="this.style.display='none';var ph=document.getElementById('coverPreviewPlaceholder');if(ph){ph.style.display='';ph.textContent='Фото';}" />
+            <span class="noimg" id="coverPreviewPlaceholder" style="display: none;">Не выбрано</span>
+            {% else %}
+            <span class="noimg" id="coverPreviewPlaceholder">Не выбрано</span>
+            <img id="coverPreviewImg" src="" alt="" referrerpolicy="no-referrer" style="display: none; width: 100%; height: 100%; object-fit: cover;" />
+            {% endif %}
+          </div>
+          <p class="muted" style="margin: 0;">Выберите фото из блока «Фото поездки» — нажмите «Сделать обложкой» на нужном.</p>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>Фото поездки ({{ files | length }})</h3>
+        {% if files %}
+        {% set file_index = namespace(value=0) %}
+        {% for date_key in (files_by_date.keys()|list|sort) %}
+        <div class="date-group" id="filesGroup-{{ date_key }}">
+          <div class="date-group-title">{{ date_key if date_key != '_no_date' else 'Без даты' }}</div>
+          <div class="thumb-grid thumb-grid-files" data-date="{{ date_key }}">
+            {% for f in files_by_date[date_key] %}
+            <div class="thumb thumb-open-card thumb-trip-file {{ 'thumb-is-cover' if f.file_id == trip.cover_file_id else '' }}" data-file-id="{{ f.file_id }}" data-path="{{ f.path | e }}" data-pipeline-run-id="{{ f.pipeline_run_id or '' }}" data-media-type="{{ (f.media_type or '') | e }}" data-preview-url="{{ (f.preview_url or '') | e }}" data-index="{{ file_index.value }}" data-src="{{ (f.preview_url or '') | e }}" title="{{ f.path or f.name or '' }}">
+              {% if f.preview_url %}
+              <img data-src="{{ f.preview_url }}" alt="" referrerpolicy="no-referrer" loading="lazy" class="thumb-img-lazy" onerror="this.style.display='none';var n=this.nextElementSibling;if(n&&n.classList.contains('thumb-preview-fallback'))n.style.display='';" />
+              <span class="noimg thumb-preview-fallback" style="display:none">Фото</span>
+              {% else %}
+              <span class="noimg">{{ 'Видео' if (f.media_type or '').lower() == 'video' else 'Фото' }}</span>
+              {% endif %}
+              <div class="thumb-actions thumb-actions-cover">
+                <button type="button" class="btn-set-cover" data-action="set-cover">Сделать обложкой</button>
+                <button type="button" class="btn-exclude" data-action="remove-from-trip">Убрать из поездки</button>
+                <button type="button" class="btn-move-trip" data-action="move-to-trip">В другую поездку</button>
+              </div>
+            </div>
+            {% set file_index.value = file_index.value + 1 %}{% endfor %}
+          </div>
+        </div>
+        {% endfor %}
+        {% else %}
+        <p class="muted">Нет привязанных фото. Добавьте из блока «Предложения» ниже или загрузите файлы в папку поездки на Я.Диске.</p>
+        {% endif %}
+      </div>
+
+      <div class="section">
+        <h3>Предложения по датам (±1 день) — {{ suggestions | length }}</h3>
+        {% if suggestions %}
+        <div class="row" style="margin-bottom: 12px;">
+          <button type="button" class="btn btn-attach-all" id="attachAllBtn">Привязать все</button>
+        </div>
+        {% set sug_index = namespace(value=files|length) %}
+        {% for date_key in (suggestions_by_date.keys()|list|sort) %}
+        <div class="date-group" data-suggestion-date="{{ date_key }}">
+          <div class="date-group-title">{{ date_key if date_key != '_no_date' else 'Без даты' }}</div>
+          <div class="date-group-actions">
+            <button type="button" class="btn btn-attach-date" data-date="{{ date_key }}">Привязать всю дату</button>
+            <button type="button" class="btn btn-exclude-date" data-date="{{ date_key }}">Исключить всю дату</button>
+          </div>
+          <div class="thumb-grid suggestionsGrid" data-date="{{ date_key }}">
+            {% for s in suggestions_by_date[date_key] %}
+            <div class="thumb thumb-open-card thumb-suggestion" data-file-id="{{ s.file_id }}" data-path="{{ s.path | e }}" data-pipeline-run-id="{{ s.pipeline_run_id or '' }}" data-media-type="{{ (s.media_type or '') | e }}" data-taken-at="{{ (s.taken_at or '') | e }}" data-index="{{ sug_index.value }}" data-src="{{ (s.preview_url or '') | e }}" title="{{ s.taken_at or '' }} {{ s.path or s.name or '' }}">
+              {% if s.preview_url %}
+              <img data-src="{{ s.preview_url }}" alt="" referrerpolicy="no-referrer" loading="lazy" class="thumb-img-lazy" onerror="this.style.display='none';var n=this.nextElementSibling;if(n&&n.classList.contains('thumb-preview-fallback'))n.style.display='';" />
+              <span class="noimg thumb-preview-fallback" style="display:none">Фото</span>
+              {% else %}
+              <span class="noimg">{{ 'Видео' if (s.media_type or '').lower() == 'video' else 'Фото' }}</span>
+              {% endif %}
+              <div class="thumb-actions">
+                <button class="btn-attach" type="button" data-action="attach">Привязать</button>
+                <button class="btn-to-trip" type="button" data-action="add-to-trip">В поездку</button>
+                <button class="btn-exclude" type="button" data-action="exclude">Нет в поездке</button>
+              </div>
+            </div>
+            {% set sug_index.value = sug_index.value + 1 %}{% endfor %}
+          </div>
+        </div>
+        {% endfor %}
+        {% else %}
+        <p class="muted">Нет предложений по датам. Все фото в диапазоне ±1 день уже привязаны или исключены.</p>
+        {% endif %}
+      </div>
+
+      {% if excluded_in_range %}
+      <div class="section">
+        <h3>В это время в другом месте ({{ excluded_in_range | length }})</h3>
+        <p class="muted" style="margin-bottom: 12px;">Исключённые из поездки, но сняты в те же даты — можно снова привязать.</p>
+        {% for date_key in (excluded_by_date.keys()|list|sort) %}
+        <div class="date-group">
+          <div class="date-group-title">{{ date_key if date_key != '_no_date' else 'Без даты' }}</div>
+          <div class="thumb-grid excludedGrid" data-date="{{ date_key }}">
+            {% for e in excluded_by_date[date_key] %}
+            <div class="thumb thumb-open-card thumb-excluded" data-file-id="{{ e.file_id }}" data-path="{{ e.path | e }}" data-pipeline-run-id="{{ e.pipeline_run_id or '' }}" data-media-type="{{ (e.media_type or '') | e }}" data-preview-url="{{ (e.preview_url or '') | e }}" data-src="{{ (e.preview_url or '') | e }}">
+              {% if e.preview_url %}
+              <img data-src="{{ e.preview_url }}" alt="" referrerpolicy="no-referrer" loading="lazy" class="thumb-img-lazy" onerror="this.style.display='none';var n=this.nextElementSibling;if(n&&n.classList.contains('thumb-preview-fallback'))n.style.display='';" />
+              <span class="noimg thumb-preview-fallback" style="display:none">Фото</span>
+              {% else %}
+              <span class="noimg">{{ 'Видео' if (e.media_type or '').lower() == 'video' else 'Фото' }}</span>
+              {% endif %}
+              <div class="thumb-actions"><button type="button" class="btn-attach" data-action="attach">Привязать</button></div>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+
+    <div id="moveToTripModal" class="modal-overlay" style="display: none;">
+      <div class="modal-box">
+        <h4>Выберите поездку</h4>
+        <div id="moveToTripList" class="modal-trip-list"></div>
+        <div id="moveToTripNewForm" style="display: none; margin: 12px 0; padding: 12px; background: #f9fafb; border-radius: 8px;">
+          <input type="text" id="moveToTripNewName" placeholder="Название поездки" style="width: 100%; padding: 8px 12px; margin-bottom: 8px; box-sizing: border-box;" />
+          <button type="button" class="btn btn-primary" id="moveToTripNewSubmit">Создать и добавить</button>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn" id="moveToTripCancel">Отмена</button>
+        </div>
+      </div>
+    </div>
+
+    {% include "photo_card.html" %}
+    {% include "video_card.html" %}
+    <script src="/static/photo_card.js?v=50"></script>
+    <script src="/static/video_card.js"></script>
+    <script>
+      (function() {
+        const tripId = {{ trip.id }};
+        var tripItems = [];
+        document.querySelectorAll('.thumb-open-card').forEach(function(thumb) {
+          var fid = thumb.getAttribute('data-file-id');
+          var path = thumb.getAttribute('data-path') || '';
+          var runId = thumb.getAttribute('data-pipeline-run-id');
+          var mediaType = (thumb.getAttribute('data-media-type') || '').trim().toLowerCase();
+          tripItems.push({
+            file_id: fid ? parseInt(fid, 10) : null,
+            file_path: path || null,
+            pipeline_run_id: runId ? parseInt(runId, 10) : null,
+            media_type: mediaType || null
+          });
+        });
+
+        document.querySelectorAll('.thumb-open-card').forEach(function(thumb) {
+          thumb.addEventListener('click', function(e) {
+            if (e.target.closest('.thumb-actions') || e.target.closest('.thumb-actions-cover')) return;
+            var index = parseInt(thumb.dataset.index, 10);
+            var item = tripItems[index];
+            if (!item || (!item.file_id && !item.file_path)) return;
+            var listContext = { items: tripItems, current_index: index, source_page: 'trip' };
+            var opts = {
+              file_id: item.file_id || null,
+              file_path: item.file_path || null,
+              pipeline_run_id: item.pipeline_run_id || null,
+              list_context: listContext,
+              on_close: function() { location.reload(); }
+            };
+            var isVideo = (item.media_type || '').toLowerCase() === 'video' || (item.file_path || '').toLowerCase().match(/\.(mp4|webm|mov|avi|mkv)$/);
+            if (isVideo && typeof window.openVideoCard === 'function') {
+              window.openVideoCard(opts);
+            } else if (typeof window.openPhotoCard === 'function') {
+              window.openPhotoCard(opts);
+            }
+          });
+        });
+
+        function removeThumb(el) {
+          el.style.opacity = '0.5';
+          el.style.pointerEvents = 'none';
+          setTimeout(function() { el.remove(); updateCounts(); rebuildTripItems(); }, 300);
+        }
+
+        function rebuildTripItems() {
+          tripItems.length = 0;
+          document.querySelectorAll('.thumb-open-card').forEach(function(thumb, idx) {
+            thumb.dataset.index = String(idx);
+            var fid = thumb.getAttribute('data-file-id');
+            var path = thumb.getAttribute('data-path') || '';
+            var runId = thumb.getAttribute('data-pipeline-run-id');
+            var mediaType = (thumb.getAttribute('data-media-type') || '').trim().toLowerCase();
+            tripItems.push({
+              file_id: fid ? parseInt(fid, 10) : null,
+              file_path: path || null,
+              pipeline_run_id: runId ? parseInt(runId, 10) : null,
+              media_type: mediaType || null
+            });
+          });
+        }
+
+        function dateKeyFromTakenAt(takenAt) {
+          var t = (takenAt || '').trim();
+          if (!t) return '_no_date';
+          var space = t.indexOf(' ');
+          return space >= 0 ? t.substring(0, space) : t;
+        }
+
+        function getOrCreateFilesDateGroup(dateKey) {
+          var dk = (dateKey === '' || dateKey === null || dateKey === undefined) ? '_no_date' : dateKey;
+          var id = 'filesGroup-' + dk;
+          var grp = document.getElementById(id);
+          if (grp) return grp.querySelector('.thumb-grid-files');
+          var firstGrid = document.querySelector('.thumb-grid-files');
+          if (!firstGrid) return null;
+          var filesSection = firstGrid.closest('.section');
+          if (!filesSection) return null;
+          var title = (dk !== '_no_date') ? dk : 'Без даты';
+          var newGrp = document.createElement('div');
+          newGrp.className = 'date-group';
+          newGrp.id = id;
+          newGrp.innerHTML = '<div class="date-group-title">' + title + '</div><div class="thumb-grid thumb-grid-files" data-date="' + dk + '"></div>';
+          filesSection.appendChild(newGrp);
+          return newGrp.querySelector('.thumb-grid-files');
+        }
+
+        function convertToTripFile(thumb) {
+          thumb.classList.remove('thumb-suggestion', 'thumb-excluded');
+          thumb.classList.add('thumb-trip-file');
+          var actions = thumb.querySelector('.thumb-actions');
+          if (actions) {
+            actions.className = 'thumb-actions thumb-actions-cover';
+            actions.innerHTML = '<button type="button" class="btn-set-cover" data-action="set-cover">Сделать обложкой</button><button type="button" class="btn-exclude" data-action="remove-from-trip">Убрать из поездки</button><button type="button" class="btn-move-trip" data-action="move-to-trip">В другую поездку</button>';
+          }
+          var src = thumb.dataset.src || '';
+          if (src) thumb.dataset.previewUrl = src;
+        }
+
+        function moveThumbToFiles(thumb, dateKey) {
+          var target = getOrCreateFilesDateGroup(dateKey);
+          if (!target) return;
+          convertToTripFile(thumb);
+          thumb.remove();
+          target.appendChild(thumb);
+          updateCounts();
+          rebuildTripItems();
+        }
+
+        function updateCounts() {
+          var filesCount = document.querySelectorAll('.thumb-trip-file').length;
+          var suggCount = document.querySelectorAll('.thumb-suggestion').length;
+          var exclCount = document.querySelectorAll('.thumb-excluded').length;
+          var filesSection = document.querySelector('.thumb-grid-files');
+          if (filesSection) {
+            var h3Files = filesSection.closest('.section').querySelector('h3');
+            if (h3Files) h3Files.textContent = 'Фото поездки (' + filesCount + ')';
+          }
+          var suggGrid = document.querySelector('.suggestionsGrid');
+          if (suggGrid) {
+            var h3Sugg = suggGrid.closest('.section').querySelector('h3');
+            if (h3Sugg) h3Sugg.textContent = 'Предложения по датам (±1 день) — ' + suggCount;
+          }
+          var exclGrid = document.querySelector('.excludedGrid');
+          if (exclGrid) {
+            var exclSection = exclGrid.closest('.section');
+            if (exclSection) {
+              var h3Excl = exclSection.querySelector('h3');
+              if (h3Excl) h3Excl.textContent = 'В это время в другом месте (' + exclCount + ')';
+              if (exclCount === 0) exclSection.style.display = 'none';
+            }
+          }
+          if (suggCount === 0) {
+            var ab = document.getElementById('attachAllBtn');
+            if (ab) ab.style.display = 'none';
+          }
+        }
+
+        document.body.addEventListener('click', async function(e) {
+          var grid = e.target.closest('.suggestionsGrid');
+          if (grid) {
+            var btn = e.target.closest('[data-action]');
+            if (!btn) return;
+            if (btn.dataset.action === 'add-to-trip') return;
+            var thumb = btn.closest('.thumb');
+            var fileId = thumb && parseInt(thumb.dataset.fileId, 10);
+            if (!fileId) return;
+            var action = btn.dataset.action;
+            var url = action === 'attach' ? '/api/trips/' + tripId + '/attach' : '/api/trips/' + tripId + '/exclude';
+            try {
+              var r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ file_id: fileId }) });
+              if (r.ok) {
+                if (action === 'attach') {
+                  var dateKey = dateKeyFromTakenAt(thumb.dataset.takenAt);
+                  moveThumbToFiles(thumb, dateKey);
+                } else { removeThumb(thumb); }
+              }
+            } catch (err) { console.error(err); }
+            return;
+          }
+          if (e.target.closest('.thumb-excluded') && e.target.closest('[data-action="attach"]')) {
+            var thumb = e.target.closest('.thumb-excluded');
+            var fileId = thumb && parseInt(thumb.dataset.fileId, 10);
+            if (!fileId) return;
+            try {
+              var r = await fetch('/api/trips/' + tripId + '/attach', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ file_id: fileId }) });
+              if (r.ok) {
+                var parentGrid = thumb.closest('.thumb-grid');
+                var dateKey = (parentGrid && parentGrid.dataset.date) ? parentGrid.dataset.date : '_no_date';
+                moveThumbToFiles(thumb, dateKey);
+              }
+            } catch (err) { console.error(err); }
+            return;
+          }
+        });
+
+        document.querySelectorAll('.btn-attach-date').forEach(function(btn) {
+          btn.addEventListener('click', async function() {
+            var date = (btn.dataset.date || '').trim();
+            if (date === '_no_date') date = '';
+            try {
+              var r = await fetch('/api/trips/' + tripId + '/attach-date', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ date: date }) });
+              if (r.ok) {
+                var dateKey = date || '_no_date';
+                var grp = btn.closest('[data-suggestion-date]');
+                var grid = grp ? grp.querySelector('.thumb-grid') : null;
+                if (grid) {
+                  var thumbs = Array.prototype.slice.call(grid.querySelectorAll('.thumb-suggestion'));
+                  thumbs.forEach(function(t) { moveThumbToFiles(t, dateKey); });
+                }
+              }
+            } catch (err) { console.error(err); }
+          });
+        });
+        document.querySelectorAll('.btn-exclude-date').forEach(function(btn) {
+          btn.addEventListener('click', async function() {
+            var date = (btn.dataset.date || '').trim();
+            if (date === '_no_date') date = '';
+            try {
+              var r = await fetch('/api/trips/' + tripId + '/exclude-date', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ date: date }) });
+              if (r.ok) {
+                var grp = btn.closest('[data-suggestion-date]');
+                var grid = grp ? grp.querySelector('.thumb-grid') : null;
+                if (grid) {
+                  var thumbs = Array.prototype.slice.call(grid.querySelectorAll('.thumb-suggestion'));
+                  thumbs.forEach(function(t) { removeThumb(t); });
+                }
+              }
+            } catch (err) { console.error(err); }
+          });
+        });
+
+        var attachAllBtn = document.getElementById('attachAllBtn');
+        if (attachAllBtn) {
+          attachAllBtn.addEventListener('click', async function() {
+            var thumbs = document.querySelectorAll('.thumb-suggestion');
+            var fileIds = [];
+            thumbs.forEach(function(t) { var id = parseInt(t.dataset.fileId, 10); if (id) fileIds.push(id); });
+            if (fileIds.length === 0) return;
+            attachAllBtn.disabled = true;
+            attachAllBtn.textContent = 'Привязка…';
+            try {
+              for (var i = 0; i < fileIds.length; i++) {
+                await fetch('/api/trips/' + tripId + '/attach', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ file_id: fileIds[i] }) });
+              }
+              var toMove = Array.prototype.slice.call(document.querySelectorAll('.thumb-suggestion'));
+              toMove.forEach(function(t) {
+                var dateKey = dateKeyFromTakenAt(t.dataset.takenAt);
+                moveThumbToFiles(t, dateKey);
+              });
+            } catch (err) { console.error(err); }
+            attachAllBtn.disabled = false;
+            attachAllBtn.textContent = 'Привязать все';
+          });
+        }
+
+        var renameTripBtn = document.getElementById('renameTripBtn');
+        var tripNameEl = document.getElementById('tripName');
+        if (renameTripBtn && tripNameEl) {
+          renameTripBtn.addEventListener('click', async function() {
+            var cur = (tripNameEl.textContent || '').trim() || 'Поездка';
+            var n = window.prompt('Название поездки:', cur);
+            if (n === null || (n = (n || '').trim()) === '') return;
+            try {
+              var r = await fetch('/api/trips/' + tripId, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: n })
+              });
+              if (r.ok) tripNameEl.textContent = n;
+              else { var d = await r.json(); alert(d.detail || 'Ошибка'); }
+            } catch (err) { console.error(err); alert('Ошибка: ' + err.message); }
+          });
+        }
+
+        var editDatesBtn = document.getElementById('editDatesBtn');
+        var datesEdit = document.getElementById('datesEdit');
+        var datesText = document.getElementById('datesText');
+        var dateStart = document.getElementById('dateStart');
+        var dateEnd = document.getElementById('dateEnd');
+        var saveDatesBtn = document.getElementById('saveDatesBtn');
+        var cancelDatesBtn = document.getElementById('cancelDatesBtn');
+        if (editDatesBtn && datesEdit) {
+          editDatesBtn.addEventListener('click', function() {
+            datesEdit.style.display = '';
+            editDatesBtn.style.display = 'none';
+          });
+          cancelDatesBtn.addEventListener('click', function() {
+            datesEdit.style.display = 'none';
+            editDatesBtn.style.display = '';
+          });
+          var saveDerivedDatesBtn = document.getElementById('saveDerivedDatesBtn');
+          if (saveDerivedDatesBtn) {
+            saveDerivedDatesBtn.addEventListener('click', async function() {
+              var start = saveDerivedDatesBtn.dataset.derivedStart;
+              var end = saveDerivedDatesBtn.dataset.derivedEnd || start;
+              if (!start) return;
+              try {
+                var r = await fetch('/api/trips/' + tripId, {
+                  method: 'PATCH',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ start_date: start, end_date: end })
+                });
+                if (r.ok) location.reload();
+              } catch (err) { console.error(err); }
+            });
+          }
+          saveDatesBtn.addEventListener('click', async function() {
+            var start = dateStart.value || null;
+            var end = dateEnd.value || null;
+            try {
+              var r = await fetch('/api/trips/' + tripId, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ start_date: start, end_date: end })
+              });
+              if (r.ok) {
+                datesText.textContent = start ? (start + (end && end !== start ? ' — ' + end : '')) : 'не указаны';
+                datesEdit.style.display = 'none';
+                editDatesBtn.style.display = '';
+              }
+            } catch (err) { console.error(err); }
+          });
+        }
+
+        function openMoveToTripModal(fileId, excludeTripId, thumb, fromSuggestion) {
+          var modal = document.getElementById('moveToTripModal');
+          var listEl = document.getElementById('moveToTripList');
+          var newForm = document.getElementById('moveToTripNewForm');
+          var newNameInput = document.getElementById('moveToTripNewName');
+          var newSubmit = document.getElementById('moveToTripNewSubmit');
+          if (!modal || !listEl) return;
+          document.getElementById('moveToTripCancel').onclick = function() { modal.style.display = 'none'; newForm.style.display = 'none'; };
+          modal.onclick = function(ev) { if (ev.target === modal) { modal.style.display = 'none'; newForm.style.display = 'none'; } };
+          newForm.style.display = 'none';
+          function doAddToTrip(targetId, targetName, th) {
+            modal.style.display = 'none';
+            fetch('/api/trips/move-file-to-trip', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ file_id: fileId, target_trip_id: targetId }) })
+              .then(function(r) { return r.json().then(function(data) { return { ok: r.ok, data: data }; }); })
+              .then(function(res) {
+                if (res.ok && res.data.ok) {
+                  if (fromSuggestion && th) {
+                    if (targetId === tripId) { var d = dateKeyFromTakenAt(th.dataset.takenAt); moveThumbToFiles(th, d); }
+                    else removeThumb(th);
+                  } else if (th) removeThumb(th);
+                  if (targetId !== tripId && confirm('Файл добавлен в поездку «' + (targetName || '') + '». Перейти к ней?')) window.location = '/trips/' + targetId;
+                } else { alert(res.data.detail || 'Ошибка'); }
+              })
+              .catch(function(err) { console.error(err); alert('Ошибка: ' + err.message); });
+          }
+          fetch('/api/trips/list').then(function(r) { return r.json(); }).then(function(trips) {
+            listEl.innerHTML = '';
+            var newItem = document.createElement('div');
+            newItem.className = 'modal-trip-item';
+            newItem.textContent = '+ Новая поездка...';
+            newItem.dataset.new = '1';
+            newItem.addEventListener('click', function() {
+              newForm.style.display = 'block';
+              newNameInput.value = '';
+              newNameInput.focus();
+              newSubmit.onclick = function() {
+                var name = (newNameInput.value || '').trim() || 'Поездка';
+                fetch('/api/trips', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name }) })
+                  .then(function(r) { return r.json(); })
+                  .then(function(created) {
+                    if (created.id) doAddToTrip(created.id, name, thumb);
+                  })
+                  .catch(function(err) { console.error(err); alert('Ошибка: ' + err.message); });
+              };
+            });
+            listEl.appendChild(newItem);
+            var filtered = excludeTripId != null ? trips.filter(function(t) { return t.id !== excludeTripId; }) : trips;
+            filtered.forEach(function(t) {
+              var item = document.createElement('div');
+              item.className = 'modal-trip-item';
+              item.textContent = (t.name || ('Поездка ' + t.id)) + (t.yd_folder_path ? '' : ' (без папки)');
+              item.dataset.tripId = String(t.id);
+              item.addEventListener('click', function() { doAddToTrip(t.id, t.name || '', thumb); });
+              listEl.appendChild(item);
+            });
+            modal.style.display = 'flex';
+          }).catch(function(err) { console.error(err); alert('Не удалось загрузить список поездок'); });
+        }
+
+        document.body.addEventListener('click', async function(e) {
+          var moveBtn = e.target.closest('.thumb-trip-file [data-action="move-to-trip"]');
+          if (moveBtn) {
+            var thumb = moveBtn.closest('.thumb');
+            var fileId = thumb && parseInt(thumb.dataset.fileId, 10);
+            var path = (thumb && thumb.dataset.path) || '';
+            if (!fileId) return;
+            if (!path.startsWith('disk:')) { alert('Перенос на Я.Диске возможен только для файлов из архива (disk:). Для поездки без папки используйте «Убрать из поездки» и добавьте файл в нужную поездку из предложений.'); return; }
+            e.preventDefault();
+            e.stopPropagation();
+            openMoveToTripModal(fileId, tripId, thumb, false);
+            return;
+          }
+          var addToTripBtn = e.target.closest('[data-action="add-to-trip"]');
+          if (addToTripBtn && addToTripBtn.closest('.thumb-suggestion')) {
+            var thumb = addToTripBtn.closest('.thumb');
+            var fileId = thumb && parseInt(thumb.dataset.fileId, 10);
+            if (!fileId) return;
+            e.preventDefault();
+            e.stopPropagation();
+            openMoveToTripModal(fileId, null, thumb, true);
+            return;
+          }
+          var removeBtn = e.target.closest('.thumb-trip-file [data-action="remove-from-trip"]');
+          if (removeBtn) {
+            var thumb = removeBtn.closest('.thumb');
+            var fileId = thumb && parseInt(thumb.dataset.fileId, 10);
+            if (!fileId) return;
+            e.preventDefault();
+            e.stopPropagation();
+            try {
+              var r = await fetch('/api/trips/' + tripId + '/exclude', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ file_id: fileId }) });
+              if (r.ok) removeThumb(thumb);
+            } catch (err) { console.error(err); }
+            return;
+          }
+          var btn = e.target.closest('.thumb-trip-file [data-action="set-cover"]');
+          if (!btn) return;
+          var thumb = btn.closest('.thumb');
+          var fileId = thumb && parseInt(thumb.dataset.fileId, 10);
+          if (!fileId) return;
+          e.preventDefault();
+          e.stopPropagation();
+          try {
+            var r = await fetch('/api/trips/' + tripId, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cover_file_id: fileId }) });
+            if (r.ok) {
+              document.querySelectorAll('.thumb-trip-file').forEach(function(t) { t.classList.remove('thumb-is-cover'); });
+              thumb.classList.add('thumb-is-cover');
+              var previewUrl = thumb.dataset.previewUrl || '';
+              var img = document.getElementById('coverPreviewImg');
+              var placeholder = document.getElementById('coverPreviewPlaceholder');
+              if (previewUrl) { img.src = previewUrl; img.style.display = ''; if (placeholder) placeholder.style.display = 'none'; }
+              else { img.style.display = 'none'; if (placeholder) { placeholder.style.display = ''; placeholder.textContent = 'Фото/Видео'; } }
+            }
+          } catch (err) { console.error(err); }
+        });
+
+        (function previewThrottle() {
+          var imgs = Array.prototype.slice.call(document.querySelectorAll('img.thumb-img-lazy[data-src]'));
+          var queue = imgs.filter(function(img) { return img.dataset.src; });
+          var maxConcurrent = 2;
+          var delayMs = 400;
+          var loading = 0;
+          function startNext() {
+            if (loading >= maxConcurrent || queue.length === 0) return;
+            var img = queue.shift();
+            if (!img || !img.dataset.src) return;
+            loading++;
+            var url = img.dataset.src;
+            img.src = url;
+            img.onload = img.onerror = function() { loading--; setTimeout(startNext, delayMs); };
+          }
+          function startBatch() {
+            for (var i = 0; i < maxConcurrent && queue.length > 0; i++) {
+              setTimeout(startNext, i * delayMs);
+            }
+          }
+          startBatch();
+        })();
+      })();
+    </script>
+  </body>
+</html>

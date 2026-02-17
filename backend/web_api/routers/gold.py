@@ -117,10 +117,13 @@ def _faces_preview_meta(*, path: str, mime_type: str | None, media_type: str | N
         elif mt == "video" or mime.startswith("video/"):
             preview_kind = "video"
         if preview_kind != "none":
-            q = "path=" + urllib.parse.quote(path, safe="")
-            if pipeline_run_id is not None:
-                q += "&pipeline_run_id=" + urllib.parse.quote(str(int(pipeline_run_id)), safe="")
-            preview_url = "/api/local/preview?" + q
+            if preview_kind == "video":
+                preview_url = "/api/faces/video-frame?pipeline_run_id=" + urllib.parse.quote(str(int(pipeline_run_id)), safe="") + "&path=" + urllib.parse.quote(path, safe="") + "&frame_idx=1" if pipeline_run_id is not None else None
+            else:
+                q = "path=" + urllib.parse.quote(path, safe="")
+                if pipeline_run_id is not None:
+                    q += "&pipeline_run_id=" + urllib.parse.quote(str(int(pipeline_run_id)), safe="")
+                preview_url = "/api/local/preview?" + q
     return {"preview_kind": preview_kind, "preview_url": preview_url, "open_url": open_url}
 
 

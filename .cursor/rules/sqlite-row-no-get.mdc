@@ -1,0 +1,51 @@
+---
+description: Не использовать .get() у sqlite3.Row — в проекте row_factory=sqlite3.Row
+alwaysApply: true
+---
+
+# sqlite3.Row и метод .get()
+
+## Контекст
+
+В проекте `common.db.get_connection()` возвращает соединение с **`row_factory = sqlite3.Row`**.  
+Поэтому `cursor.fetchone()` и `cursor.fetchall()` возвращают объекты **`sqlite3.Row`**, а не словари.
+
+## Правило
+
+**У `sqlite3.Row` НЕТ метода `.get()`.** Вызов `row.get("key")` приводит к `AttributeError: 'sqlite3.Row' object has no attribute 'get'`.
+
+### Как правильно
+
+- Нужен доступ по ключу с возможностью отсутствия ключа или преобразование в словарь:
+  - **Вариант 1:** сразу преобразовать в словарь и дальше работать с ним:
+    ```python
+    row = cur.fetchone()
+    if row:
+        d = dict(row)
+        value = d.get("media_type")
+    ```
+  - **Вариант 2:** в цикле по строкам сначала `d = dict(r)`, затем использовать `d.get(...)` и `d["key"]`.
+- Допустим доступ по индексу: `row["column_name"]` (если ключ точно есть).
+
+### Примеры
+
+❌ **НЕПРАВИЛЬНО:**
+```python
+for r in cur.fetchall():
+    if r.get("media_type") == "image":  # AttributeError
+        ...
+return [dict(r) for r in cur.fetchall() if r.get("id")]  # AttributeError
+```
+
+✅ **ПРАВИЛЬНО:**
+```python
+for r in cur.fetchall():
+    d = dict(r)
+    if d.get("media_type") == "image":
+        ...
+return [d for r in cur.fetchall() if (d := dict(r)).get("id")]
+```
+
+### Где применяется
+
+Любой код, использующий `get_connection()` и затем `cur.fetchall()` / `cur.fetchone()`: в первую очередь `backend/common/db.py`, а также роутеры и скрипты, которые читают из БД через этот модуль.

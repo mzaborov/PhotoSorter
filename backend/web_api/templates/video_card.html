@@ -82,10 +82,11 @@
   .video-card-tabs {
     display: flex;
     gap: 8px;
-    padding: 10px 12px;
+    padding: 8px 12px;
     border-bottom: 1px solid #e5e7eb;
     background: #f9fafb;
     flex-wrap: wrap;
+    flex-shrink: 0;
   }
   .video-card-tabs .lb-tab {
     padding: 6px 12px;
@@ -111,10 +112,10 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 10px;
+    padding: 8px;
     flex: 1;
     min-height: 0;
-    overflow: hidden;
+    overflow: auto;
     position: relative;
   }
   .video-card-body .imgwrap {
@@ -123,8 +124,8 @@
   }
   .video-card-body .imgwrap img {
     max-width: 94vw;
-    max-height: calc(94vh - 180px);
-    min-height: 400px;
+    max-height: calc(94vh - 220px);
+    min-height: 200px;
     width: auto;
     height: auto;
     display: block;
@@ -134,11 +135,12 @@
   }
   .video-card-body .imgwrap video {
     max-width: 94vw;
-    max-height: calc(94vh - 180px);
-    min-height: 400px;
+    max-height: calc(94vh - 220px);
+    min-height: 200px;
     width: auto;
     height: auto;
     display: block;
+    object-fit: contain;
     background: #111827;
     user-select: none;
   }
@@ -165,11 +167,11 @@
     border-color: #2563eb;
   }
   .video-card-frame-actions {
-    padding: 8px 12px;
+    padding: 6px 12px;
     border-bottom: 1px solid #e5e7eb;
     background: #f9fafb;
     display: flex;
-    gap: 12px;
+    gap: 10px;
     flex-wrap: wrap;
     align-items: center;
   }
@@ -182,24 +184,38 @@
   .video-card-navigation {
     display: flex;
     align-items: center;
-    justify-content: center;
+    justify-content: space-between;
     gap: 12px;
-    padding: 10px 12px;
+    padding: 8px 12px;
     border-top: 1px solid #e5e7eb;
     background: #f9fafb;
+    flex-shrink: 0;
+    width: 100%;
     position: relative;
+    z-index: 100;
   }
+  .video-card-nav-left,
+  .video-card-nav-center,
+  .video-card-nav-right {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .video-card-nav-left { position: relative; z-index: 101; }
+  .video-card-nav-center { gap: 12px; }
   .video-card-position {
     font-weight: 700;
     font-size: 14px;
   }
   .video-card-bottom {
-    padding: 10px 12px;
+    padding: 8px 12px;
     border-top: 1px solid #e5e7eb;
     display: flex;
     gap: 10px;
     flex-wrap: wrap;
     align-items: center;
+    flex-shrink: 0;
   }
   .video-card-bottom .rectlist {
     display: flex;
@@ -347,17 +363,17 @@
     width: 100%;
     padding: 10px 14px;
     text-align: left;
-    background: none;
+    background: #fff !important;
     border: none;
     border-bottom: 1px solid #f3f4f6;
-    color: #111827;
+    color: #111827 !important;
     cursor: pointer;
     font-size: 13px;
   }
   .video-card .rectpill-actions-menu button:last-child { border-bottom: none; }
-  .video-card .rectpill-actions-menu button:hover { background: #f9fafb; }
-  .video-card .rectpill-actions-menu button.danger { color: #dc2626; }
-  .video-card .rectpill-actions-menu button.danger:hover { background: #fee2e2; }
+  .video-card .rectpill-actions-menu button:hover { background: #f9fafb !important; }
+  .video-card .rectpill-actions-menu button.danger { color: #dc2626 !important; }
+  .video-card .rectpill-actions-menu button.danger:hover { background: #fee2e2 !important; }
   .video-card .rectpill-action {
     background: none;
     border: none;
@@ -382,15 +398,15 @@
     width: 100%;
     padding: 10px 14px;
     text-align: left;
-    background: none;
+    background: #fff !important;
     border: none;
     border-bottom: 1px solid #f3f4f6;
-    color: #111827;
+    color: #111827 !important;
     cursor: pointer;
     font-size: 13px;
   }
   .video-card .video-rect-menu button:last-child { border-bottom: none; }
-  .video-card .video-rect-menu button:hover { background: #f9fafb; }
+  .video-card .video-rect-menu button:hover { background: #f9fafb !important; }
   .video-card .person-submenu .menu-group-label {
     padding: 6px 14px 4px;
     font-size: 11px;
@@ -400,13 +416,107 @@
     letter-spacing: 0.5px;
   }
   .video-card .video-rect-menu button.danger { color: #dc2626; }
+  /* Кнопка зума кадров (как в карточке фото) */
+  .video-card-zoom-trigger {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    z-index: 100;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    border: none;
+    border-radius: 8px;
+    background: rgba(255,255,255,0.25);
+    color: rgba(255,255,255,0.85);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s, color 0.15s;
+  }
+  .video-card-zoom-trigger:hover {
+    background: rgba(255,255,255,0.4);
+    color: #fff;
+  }
+  .video-card-zoom-trigger:focus {
+    outline: none;
+    box-shadow: 0 0 0 2px rgba(59,130,246,0.6);
+  }
+  /* Оверлей зума на весь экран */
+  .video-card-zoom-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.92);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 10001;
+  }
+  .video-card-zoom-overlay[aria-hidden="false"] {
+    display: flex;
+  }
+  .video-card-zoom-inner {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+  .video-card-zoom-inner img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    user-select: none;
+    pointer-events: auto;
+    transition: none;
+  }
+  .video-card-zoom-close {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    z-index: 10002;
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.2);
+    color: #fff;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 24px;
+    line-height: 1;
+    transition: background 0.15s;
+  }
+  .video-card-zoom-close:hover {
+    background: rgba(255,255,255,0.35);
+  }
+  .video-card-trip-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: #e0f2fe;
+    color: #0369a1;
+    font-size: 12px;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .video-card-trip-pill a { color: inherit; text-decoration: underline; }
+  .video-card-trip-pill a:hover { opacity: 0.9; }
 </style>
 
 <div class="video-card-modal video-card" id="videoCardModal" aria-hidden="true" style="display: none;">
   <div class="video-card-panel" role="dialog" aria-modal="true">
     <!-- Заголовок (как в photo_card) -->
     <div class="video-card-top">
-      <div style="display: flex; align-items: center; gap: 4px; flex: 1; min-width: 0;">
+      <div style="display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;">
         <code class="video-card-path" id="videoCardPath" style="flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">—</code>
         <button class="btn video-card-copy-btn" id="videoCardCopyPath" type="button" title="Скопировать путь в буфер обмена">
           <span role="img" style="display: inline-flex; align-items: center; justify-content: center;">
@@ -415,6 +525,7 @@
             </svg>
           </span>
         </button>
+        <span id="videoCardTripPill" class="video-card-trip-pill" style="display:none;"></span>
       </div>
       <div class="video-card-actions">
         <button class="btn" id="videoCardToggleRectangles" type="button">Скрыть прямоугольники</button>
@@ -447,22 +558,25 @@
         <img id="videoCardImg" alt="кадр видео" style="display:none;" referrerPolicy="no-referrer" />
         <video id="videoCardVideo" controls preload="metadata" style="display:none;"></video>
         <canvas id="videoCardCanvas"></canvas>
+        <button type="button" class="video-card-zoom-trigger" id="videoCardZoomTrigger" title="Зум (на весь экран)" aria-label="Зум" style="display:none;">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+        </button>
       </div>
     </div>
 
     <!-- Навигация (как в photo_card) -->
     <div class="video-card-navigation">
-      <div style="position: absolute; left: 12px; display: flex; gap: 8px; align-items: center;" id="videoCardAssignPersonContainer">
+      <div class="video-card-nav-left" id="videoCardAssignPersonContainer">
         <button class="btn" id="videoCardAssignPerson" type="button">Привязать персону ▶</button>
         <button class="btn danger" id="videoCardDelete" type="button" title="Удалить файл (в _delete)">Удалить</button>
         <button class="btn" id="videoCardMarkAsCat" type="button" title="Пометить файл как «кот» (удаляет прямоугольники, переводит в Животные)">Кот</button>
       </div>
-      <div style="display: flex; align-items: center; gap: 12px;">
+      <div class="video-card-nav-center">
         <button class="btn" id="videoCardPrev" type="button" style="display:none;">←</button>
         <span class="video-card-position" id="videoCardPosition">—</span>
         <button class="btn" id="videoCardNext" type="button" style="display:none;">→</button>
       </div>
-      <div id="videoCardSpecialActions" style="position: absolute; right: 12px; display: flex; gap: 8px; align-items: center;">
+      <div class="video-card-nav-right" id="videoCardSpecialActions">
         <button class="btn" id="videoCardAssignOutsider" type="button">Все остальные — посторонние</button>
         <select id="videoCardGroupSelect" style="min-width:160px; border:1px solid #d1d5db; border-radius:6px; padding:6px 10px; font-size:13px;">
           <option value="">Назначить группу...</option>
@@ -479,6 +593,14 @@
       <div class="rectlist" id="videoCardRectList"></div>
     </div>
   </div>
+</div>
+
+<!-- Оверлей зума кадра на весь экран -->
+<div class="video-card-zoom-overlay" id="videoCardZoomOverlay" aria-hidden="true">
+  <div class="video-card-zoom-inner" id="videoCardZoomInner">
+    <img id="videoCardZoomImg" alt="" />
+  </div>
+  <button type="button" class="video-card-zoom-close" id="videoCardZoomClose" aria-label="Закрыть зум">✕</button>
 </div>
 
 <!-- Модальное окно выбора персоны для прямоугольника -->
