@@ -222,3 +222,7 @@
 2026-02-17 (+03:00) - Бекап БД: создан photosorter_backup_*_session_close.db в data/backups/ (backup_database.py).
 
 2026-02-17 (+03:00) - Закрытие сессии: поездки (сортировка от новых к старым, attach/for-file по path, обновление таблицы после удаления из карточки, предложения по дате из for-file, создание поездки без закрытия карточки, даты при создании + проверка attach). Видеокарточка: fallback pipeline_run_id по path, нормализация пути и z-index для разметки; стили меню и нижней панели (кнопки не съезжают, «Привязать персону» кликабельна). Бекап БД выполнен.
+
+2026-02-19 (+03:00) - file_groups: скрипты очистки дубликатов (cleanup_file_groups_for_file.py — один файл, cleanup_file_groups_duplicates.py — массово по тройке run/file/group_path), подсчёт дублей (count_file_groups_duplicates.py), план миграции «группа как атрибут файла» (.cursor/plans). Проверка целостности бекапа (verify_backup_integrity.py). WAL-файлы data/photosorter.db-shm и .db-wal добавлены в .gitignore и убраны из индекса.
+
+2026-02-19 (+03:00) - Закрытие сессии: бекап БД session_close создан и проверен (PRAGMA integrity_check), старые бекапы удалены (оставлен один). Коммит: скрипты file_groups, verify_backup_integrity, .gitignore для WAL.

@@ -240,5 +240,7 @@ data/cache/
 
 # БД в корне и бэкапы БД
 photosorter.db
+data/photosorter.db-shm
+data/photosorter.db-wal
 data/photosorter_backup_*.db
 data/backups/
