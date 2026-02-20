@@ -3213,12 +3213,116 @@ def api_faces_manual_rectangles(payload: dict[str, Any] = Body(...)) -> dict[str
     return {"ok": True}
 
 
+def _yadisk_api_path(path: str) -> str:
+    """Путь для вызовов API yadisk (download/upload): как в main — без префикса disk:, с ведущим /, без strip()."""
+    p = path or ""
+    if p.startswith("disk:"):
+        p = p[5:]
+    if not p.startswith("/"):
+        p = "/" + p
+    return p
+
+
+def _exif_date_from_mtime(mtime: float) -> str:
+    """Формат EXIF DateTime: YYYY:MM:DD HH:MM:SS (20 символов)."""
+    from datetime import datetime, timezone
+    dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
+    return dt.strftime("%Y:%m:%d %H:%M:%S")
+
+
+def _exif_date_from_iso(iso_str: str | None) -> str | None:
+    """Парсит ISO 8601 (например с Я.Диска) в EXIF формат YYYY:MM:DD HH:MM:SS."""
+    if not iso_str or not isinstance(iso_str, str):
+        return None
+    import re
+    # 2014-04-21T14:57:14+04:00 или 2014-04-21T14:57:14Z
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})", iso_str.strip())
+    if m:
+        return f"{m.group(1)}:{m.group(2)}:{m.group(3)} {m.group(4)}:{m.group(5)}:{m.group(6)}"
+    return None
+
+
+def _build_exif_after_rotate(
+    original_exif_bytes: bytes | None,
+    file_mtime: float | None,
+    db_taken_at_iso: str | None = None,
+    fallback_date_iso: str | None = None,
+) -> bytes:
+    """
+    Собирает EXIF для сохранения после поворота: Orientation=1, даты — из исходного EXIF, mtime, БД (taken_at) или fallback (ЯД get_meta).
+    """
+    try:
+        import piexif
+    except ImportError:
+        return original_exif_bytes if original_exif_bytes else b""
+
+    date_str = None
+    if file_mtime is not None:
+        date_str = _exif_date_from_mtime(file_mtime)
+    if date_str is None and db_taken_at_iso:
+        date_str = _exif_date_from_iso(db_taken_at_iso)
+    if date_str is None and fallback_date_iso:
+        date_str = _exif_date_from_iso(fallback_date_iso)
+
+    exif_dict = {}
+    if original_exif_bytes:
+        try:
+            exif_dict = piexif.load(original_exif_bytes)
+        except Exception:
+            exif_dict = {}
+
+    # Берём дату из исходного EXIF, если есть
+    if date_str is None and exif_dict:
+        for ifd_name in ("Exif", "0th"):
+            ifd = exif_dict.get(ifd_name, {})
+            # DateTimeOriginal 36867, DateTime 306, DateTimeDigitized 36868
+            date_str = ifd.get(36867) or ifd.get(306) or ifd.get(36868)
+            if date_str and isinstance(date_str, bytes):
+                date_str = date_str.decode("utf-8", errors="ignore").strip()
+            elif date_str and isinstance(date_str, str):
+                date_str = date_str.strip()
+            else:
+                date_str = None
+            if date_str and len(date_str) >= 19:
+                break
+
+    if not date_str and file_mtime is not None:
+        date_str = _exif_date_from_mtime(file_mtime)
+    if not date_str and db_taken_at_iso:
+        date_str = _exif_date_from_iso(db_taken_at_iso)
+    if not date_str and fallback_date_iso:
+        date_str = _exif_date_from_iso(fallback_date_iso)
+
+    # 0th IFD: Orientation=1 (нормальная ориентация после поворота пикселей)
+    if "0th" not in exif_dict:
+        exif_dict["0th"] = {}
+    exif_dict["0th"][274] = 1  # piexif.ImageIFD.Orientation
+    if date_str:
+        exif_dict["0th"][306] = date_str  # DateTime
+
+    if date_str and "Exif" in exif_dict:
+        exif_dict["Exif"][36867] = date_str  # DateTimeOriginal
+        exif_dict["Exif"][36868] = date_str  # DateTimeDigitized
+    elif date_str:
+        exif_dict["Exif"] = exif_dict.get("Exif") or {}
+        exif_dict["Exif"][36867] = date_str
+        exif_dict["Exif"][36868] = date_str
+
+    # Удаляем миниатюру из EXIF, иначе dump может выбросить InvalidImageDataError
+    for key in ("1st", "thumbnail"):
+        exif_dict.pop(key, None)
+    try:
+        return piexif.dump(exif_dict)
+    except Exception:
+        return original_exif_bytes if original_exif_bytes else b""
+
+
 @router.post("/api/faces/rotate-photo")
 def api_faces_rotate_photo(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """
     Поворачивает изображение на 90° влево или вправо и пересчитывает все прямоугольники (photo_rectangles).
-    Только для локальных файлов (path должен начинаться с local:).
-    Параметры: path (обязателен для local) или file_id; direction: "left" | "right".
+    Поддерживаются локальные файлы (path начинается с local:) и архив на Я.Диске (path с disk:).
+    Параметры: path или file_id; direction: "left" | "right".
     """
     from PIL import Image
     from PIL import ImageOps
@@ -3235,8 +3339,8 @@ def api_faces_rotate_photo(payload: dict[str, Any] = Body(...)) -> dict[str, Any
         raise HTTPException(status_code=400, detail="path or file_id required")
     if path is not None and not isinstance(path, str):
         raise HTTPException(status_code=400, detail="path must be str")
-    if path is not None and not path.startswith("local:"):
-        raise HTTPException(status_code=400, detail="path must start with local: (only local files can be rotated)")
+    if path is not None and not (path.startswith("local:") or path.startswith("disk:")):
+        raise HTTPException(status_code=400, detail="path must start with local: or disk:")
 
     conn = get_connection()
     try:
@@ -3246,74 +3350,170 @@ def api_faces_rotate_photo(payload: dict[str, Any] = Body(...)) -> dict[str, Any
             cur.execute("SELECT path FROM files WHERE id = ? LIMIT 1", (resolved_file_id,))
             row = cur.fetchone()
             path = str(row["path"]) if row and row["path"] else None
-        if not path or not path.startswith("local:"):
-            raise HTTPException(status_code=404, detail="file not found or not local")
-        abs_path = _strip_local_prefix(path)
-        if not os.path.isfile(abs_path):
-            raise HTTPException(status_code=404, detail="file not found on disk")
+        if not path or not (path.startswith("local:") or path.startswith("disk:")):
+            raise HTTPException(status_code=404, detail="file not found or path not local/disk")
 
-        with Image.open(abs_path) as img0:
-            img = ImageOps.exif_transpose(img0)
-            if img.mode not in ("RGB", "RGBA"):
-                img = img.convert("RGB")
-            W, H = img.size
-            # PIL: положительный угол = против часовой (влево), отрицательный = по часовой (вправо)
-            angle = 90 if direction == "left" else -90
-            img_rot = img.rotate(angle, expand=True)
-            new_W, new_H = img_rot.size
-            out_format = img0.format or "JPEG"
+        # Дата из БД (taken_at) — приоритетнее даты с ЯД при записи EXIF после поворота
+        db_taken_at_iso = None
+        if resolved_file_id is not None:
+            cur = conn.cursor()
+            cur.execute("SELECT taken_at FROM files WHERE id = ? LIMIT 1", (resolved_file_id,))
+            row = cur.fetchone()
+            if row and row["taken_at"] and str(row["taken_at"]).strip():
+                db_taken_at_iso = str(row["taken_at"]).strip()
 
-        save_kw = {"format": out_format}
-        if out_format.upper() == "JPEG":
-            save_kw["quality"] = 95
-            save_kw["subsampling"] = 0
-            # Пиксели уже в нужной ориентации — сбрасываем EXIF Orientation, иначе браузер повернёт ещё раз
-            save_kw["exif"] = b""
-        # Сохраняем во временный файл и заменяем оригинал — иначе на Windows файл может быть занят (превью)
-        fd, temp_path = tempfile.mkstemp(suffix=Path(abs_path).suffix, dir=os.path.dirname(abs_path) or ".")
-        try:
-            os.close(fd)
-            img_rot.save(temp_path, **save_kw)
-            img_rot.close()
-            os.replace(temp_path, abs_path)
-        except Exception:
-            if os.path.isfile(temp_path):
+        is_disk = path.startswith("disk:")
+        if is_disk:
+            # Я.Диск: скачать → повернуть → загрузить с перезаписью
+            disk = get_disk()
+            yd_path = _yadisk_api_path(path)
+            # Дата с сервера — в EXIF, если в самом файле даты нет (чтобы «Дата съёмки» не была пустой)
+            disk_date_iso = None
+            try:
+                md = disk.get_meta(yd_path, limit=0)
+                disk_date_iso = getattr(md, "modified", None) or getattr(md, "created", None)
+                if disk_date_iso and hasattr(disk_date_iso, "isoformat"):
+                    disk_date_iso = disk_date_iso.isoformat()
+                disk_date_iso = str(disk_date_iso) if disk_date_iso else None
+            except Exception:
+                pass
+            suffix = Path(path).suffix or ".jpg"
+            fd, temp_path = tempfile.mkstemp(suffix=suffix)
+            try:
+                os.close(fd)
                 try:
-                    os.unlink(temp_path)
-                except OSError:
+                    disk.download(yd_path, temp_path)
+                except Exception as e:  # noqa: BLE001
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"YaDisk download failed: {type(e).__name__}: {e}",
+                    ) from e
+                with Image.open(temp_path) as img0:
+                    img = ImageOps.exif_transpose(img0)
+                    if img.mode not in ("RGB", "RGBA"):
+                        img = img.convert("RGB")
+                    W, H = img.size
+                    angle = 90 if direction == "left" else -90
+                    img_rot = img.rotate(angle, expand=True)
+                    new_W, new_H = img_rot.size
+                    out_format = img0.format or "JPEG"
+                    # EXIF: Orientation=1, даты из исходного EXIF, БД (taken_at) или с ЯД
+                    original_exif = img0.info.get("exif") if hasattr(img0, "info") else None
+                    exif_bytes = _build_exif_after_rotate(
+                        original_exif,
+                        file_mtime=None,
+                        db_taken_at_iso=db_taken_at_iso,
+                        fallback_date_iso=disk_date_iso,
+                    )
+                save_kw = {"format": out_format}
+                if out_format.upper() == "JPEG":
+                    save_kw["quality"] = 95
+                    save_kw["subsampling"] = 0
+                save_kw["exif"] = exif_bytes
+                img_rot.save(temp_path, **save_kw)
+                img_rot.close()
+                try:
+                    disk.upload(temp_path, yd_path, overwrite=True)
+                except Exception as e:  # noqa: BLE001
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"YaDisk upload failed: {type(e).__name__}: {e}",
+                    ) from e
+                # Инвалидируем кэш превью, чтобы плитка и обновление из БД показывали новое изображение
+                try:
+                    main_mod = __import__("web_api.main", fromlist=["_preview_cache_invalidate"])
+                    if hasattr(main_mod, "_preview_cache_invalidate"):
+                        main_mod._preview_cache_invalidate(path)
+                except Exception:  # noqa: BLE001
                     pass
-            raise
+            finally:
+                if os.path.isfile(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+            abs_path = None
+        else:
+            abs_path = _strip_local_prefix(path)
+            if not os.path.isfile(abs_path):
+                raise HTTPException(status_code=404, detail="file not found on disk")
 
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE files SET image_width = ?, image_height = ?, exif_orientation = 1 WHERE id = ?",
-            (new_W, new_H, resolved_file_id),
-        )
+            # Сохраняем дату модификации и доступа для восстановления после записи
+            try:
+                st = os.stat(abs_path)
+                saved_atime, saved_mtime = st.st_atime, st.st_mtime
+            except OSError:
+                saved_atime = saved_mtime = None
 
-        cur.execute(
-            "SELECT id, bbox_x, bbox_y, bbox_w, bbox_h FROM photo_rectangles WHERE file_id = ? AND (ignore_flag IS NULL OR ignore_flag = 0)",
-            (resolved_file_id,),
-        )
-        rows = cur.fetchall()
-        for r in rows:
-            x, y, w, h = int(r["bbox_x"]), int(r["bbox_y"]), int(r["bbox_w"]), int(r["bbox_h"])
-            # Преобразование bbox при повороте: PIL rotate(-90)=CW (вправо), rotate(90)=CCW (влево).
-            # Ранее прямоугольник после поворота «вправо» оказывался не на лице — пробуем поменять формулы местами.
-            if direction == "right":
-                x2, y2, w2, h2 = H - (y + h), x, h, w
-            else:
-                x2, y2, w2, h2 = y, W - (x + w), h, w
-            x2 = max(0, min(x2, new_W - 1))
-            y2 = max(0, min(y2, new_H - 1))
-            w2 = max(1, min(w2, new_W - x2))
-            h2 = max(1, min(h2, new_H - y2))
+            with Image.open(abs_path) as img0:
+                img = ImageOps.exif_transpose(img0)
+                if img.mode not in ("RGB", "RGBA"):
+                    img = img.convert("RGB")
+                W, H = img.size
+                angle = 90 if direction == "left" else -90
+                img_rot = img.rotate(angle, expand=True)
+                new_W, new_H = img_rot.size
+                out_format = img0.format or "JPEG"
+                # EXIF: Orientation=1, даты из исходного EXIF, mtime или БД (taken_at)
+                original_exif = img0.info.get("exif") if hasattr(img0, "info") else None
+                exif_bytes = _build_exif_after_rotate(
+                    original_exif,
+                    file_mtime=saved_mtime,
+                    db_taken_at_iso=db_taken_at_iso,
+                )
+
+            save_kw = {"format": out_format}
+            if out_format.upper() == "JPEG":
+                save_kw["quality"] = 95
+                save_kw["subsampling"] = 0
+            save_kw["exif"] = exif_bytes
+            fd, temp_path = tempfile.mkstemp(suffix=Path(abs_path).suffix, dir=os.path.dirname(abs_path) or ".")
+            try:
+                os.close(fd)
+                img_rot.save(temp_path, **save_kw)
+                img_rot.close()
+                os.replace(temp_path, abs_path)
+                # Восстанавливаем дату модификации (и доступа), чтобы не менять «Изменён» в свойствах файла
+                if saved_atime is not None and saved_mtime is not None:
+                    try:
+                        os.utime(abs_path, (saved_atime, saved_mtime))
+                    except OSError:
+                        pass
+            except Exception:
+                if os.path.isfile(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+                raise
+
+        if resolved_file_id:
+            cur = conn.cursor()
             cur.execute(
-                "UPDATE photo_rectangles SET bbox_x = ?, bbox_y = ?, bbox_w = ?, bbox_h = ? WHERE id = ?",
-                (x2, y2, w2, h2, r["id"]),
+                "UPDATE files SET image_width = ?, image_height = ?, exif_orientation = 1 WHERE id = ?",
+                (new_W, new_H, resolved_file_id),
             )
-        # Инвалидируем сохранённые кропы — на странице персоны они пересчитаются на лету по новому файлу и bbox
-        cur.execute("UPDATE photo_rectangles SET thumb_jpeg = NULL WHERE file_id = ?", (resolved_file_id,))
-        conn.commit()
+            cur.execute(
+                "SELECT id, bbox_x, bbox_y, bbox_w, bbox_h FROM photo_rectangles WHERE file_id = ? AND (ignore_flag IS NULL OR ignore_flag = 0)",
+                (resolved_file_id,),
+            )
+            rows = cur.fetchall()
+            for r in rows:
+                x, y, w, h = int(r["bbox_x"]), int(r["bbox_y"]), int(r["bbox_w"]), int(r["bbox_h"])
+                if direction == "right":
+                    x2, y2, w2, h2 = H - (y + h), x, h, w
+                else:
+                    x2, y2, w2, h2 = y, W - (x + w), h, w
+                x2 = max(0, min(x2, new_W - 1))
+                y2 = max(0, min(y2, new_H - 1))
+                w2 = max(1, min(w2, new_W - x2))
+                h2 = max(1, min(h2, new_H - y2))
+                cur.execute(
+                    "UPDATE photo_rectangles SET bbox_x = ?, bbox_y = ?, bbox_w = ?, bbox_h = ? WHERE id = ?",
+                    (x2, y2, w2, h2, r["id"]),
+                )
+            cur.execute("UPDATE photo_rectangles SET thumb_jpeg = NULL WHERE file_id = ?", (resolved_file_id,))
+            conn.commit()
     finally:
         conn.close()
 
@@ -5230,18 +5430,26 @@ def sort_into_folders_impl(
                 finally:
                     ps_move.close()
 
-    # Сброс фазы прогресса и отметка «выполнено» для шагов 5/6 только при реальном переносе (не при dry_run — иначе шаг показывался бы выполненным при 0 перенесённых файлах)
+    # Сброс фазы прогресса всегда; отметку «выполнено» для шагов 5/6 — только если реально перенесли хотя бы один файл (иначе при 0 перенесённых UI показывал бы «выполнено», а файлы оставались бы в отчёте)
     if destination in ("local", "archive") and not limit_file_paths and not dry_run:
         ps_clear = PipelineStore()
         try:
             kwargs_clear: dict[str, Any] = {"run_id": pipeline_run_id, "step4_phase": ""}
-            if destination == "local":
-                kwargs_clear["step5_done"] = 1
-            elif destination == "archive":
-                kwargs_clear["step6_done"] = 1
+            if moved_count > 0:
+                if destination == "local":
+                    kwargs_clear["step5_done"] = 1
+                elif destination == "archive":
+                    kwargs_clear["step6_done"] = 1
             ps_clear.update_run(**kwargs_clear)
         finally:
             ps_clear.close()
+
+    # Сводка по ошибкам: какая ошибка сколько раз (чтобы сразу видеть массовую причину)
+    error_summary: list[dict[str, Any]] = []
+    if errors:
+        from collections import Counter
+        by_msg = Counter(e.get("error") or "?" for e in errors)
+        error_summary = [{"error": msg, "count": c} for msg, c in by_msg.most_common(15)]
 
     out: dict[str, Any] = {
         "ok": True,
@@ -5249,6 +5457,7 @@ def sort_into_folders_impl(
         "dry_run": bool(dry_run),
         "moved_count": moved_count,
         "errors": errors,
+        "error_summary": error_summary,
     }
     if destination == "archive":
         out["planned"] = planned

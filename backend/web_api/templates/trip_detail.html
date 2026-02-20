@@ -67,6 +67,8 @@
       .btn { appearance: none; border: 1px solid #d1d5db; background: #fff; padding: 8px 12px; border-radius: 10px; cursor: pointer; font-weight: 700; }
       .btn-rename { padding: 4px 8px; font-size: 14px; color: #6b7280; }
       .btn-rename:hover { color: #0b57d0; }
+      .btn-danger { color: #b91c1c; border-color: #b91c1c; background: #fff; }
+      .btn-danger:hover { background: #fef2f2; }
       .btn:hover { background: #f9fafb; }
       .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f3f4f6; color: #374151; font-size: 12px; }
       code { font-family: ui-monospace, monospace; font-size: 12px; }
@@ -112,6 +114,9 @@
         </div>
         <div class="row">
           <a href="/trips" class="btn">← К списку</a>
+          {% if not files %}
+          <button type="button" class="btn btn-danger" id="deleteTripBtn" data-trip-name="{{ trip.name or 'Поездка' }}" title="Удалить поездку">Удалить поездку</button>
+          {% endif %}
         </div>
       </div>
 
@@ -273,7 +278,7 @@
               file_path: item.file_path || null,
               pipeline_run_id: item.pipeline_run_id || null,
               list_context: listContext,
-              on_close: function() { location.reload(); }
+              on_close: function(opts) { if (opts && opts.reload) location.reload(); }
             };
             var isVideo = (item.media_type || '').toLowerCase() === 'video' || (item.file_path || '').toLowerCase().match(/\.(mp4|webm|mov|avi|mkv)$/);
             if (isVideo && typeof window.openVideoCard === 'function') {
@@ -500,6 +505,23 @@
           });
         }
 
+        var deleteTripBtn = document.getElementById('deleteTripBtn');
+        if (deleteTripBtn) {
+          deleteTripBtn.addEventListener('click', async function() {
+            var name = (deleteTripBtn.dataset.tripName || '').trim() || 'Поездка';
+            if (!confirm('Удалить поездку «' + name + '»?')) return;
+            try {
+              var r = await fetch('/api/trips/' + tripId, { method: 'DELETE' });
+              var data = r.ok ? null : (await r.json().catch(function() { return {}; }));
+              if (r.ok) {
+                window.location = '/trips';
+              } else {
+                alert((data && data.detail) || 'К поездке привязаны файлы. Удаление невозможно.');
+              }
+            } catch (err) { console.error(err); alert('Ошибка: ' + err.message); }
+          });
+        }
+
         var editDatesBtn = document.getElementById('editDatesBtn');
         var datesEdit = document.getElementById('datesEdit');
         var datesText = document.getElementById('datesText');
@@ -532,9 +554,23 @@
               } catch (err) { console.error(err); }
             });
           }
+          function isValidDateISO(val) {
+            if (!val || !val.trim()) return true;
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(val.trim())) return false;
+            var d = new Date(val);
+            return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === val.trim();
+          }
           saveDatesBtn.addEventListener('click', async function() {
-            var start = dateStart.value || null;
-            var end = dateEnd.value || null;
+            var start = (dateStart.value || '').trim() || null;
+            var end = (dateEnd.value || '').trim() || null;
+            if (!isValidDateISO(start)) {
+              alert('Дата начала должна быть в формате ГГГГ-ММ-ДД (например 2016-08-31).');
+              return;
+            }
+            if (!isValidDateISO(end)) {
+              alert('Дата окончания должна быть в формате ГГГГ-ММ-ДД (например 2016-08-31).');
+              return;
+            }
             try {
               var r = await fetch('/api/trips/' + tripId, {
                 method: 'PATCH',
@@ -545,8 +581,11 @@
                 datesText.textContent = start ? (start + (end && end !== start ? ' — ' + end : '')) : 'не указаны';
                 datesEdit.style.display = 'none';
                 editDatesBtn.style.display = '';
+              } else {
+                var err = await r.json().catch(function() { return {}; });
+                alert(err.detail || 'Ошибка сохранения дат');
               }
-            } catch (err) { console.error(err); }
+            } catch (err) { console.error(err); alert('Ошибка: ' + err.message); }
           });
         }
 

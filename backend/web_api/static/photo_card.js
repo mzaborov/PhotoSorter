@@ -72,7 +72,8 @@
       editingRectangleIndex: null,
       drawingState: null,
       person_id: null,
-      imageCacheBust: Date.now()
+      imageCacheBust: Date.now(),
+      cardHadChanges: false  // true если в карточке делали поворот/удаление/назначение — нужен reload при закрытии
     };
 
     // Если передан list_context, берем file_id, file_path и pipeline_run_id из него
@@ -225,10 +226,10 @@
       menus.forEach(el => el.remove());
     }
     
-    // Уведомляем открывший контекст (faces / trip): обновить таблицу при закрытии карточки
+    // Уведомляем открывший контекст (faces / trip): перезагружать только если были изменения
     if ((currentState.list_context?.source_page === 'faces' || currentState.list_context?.source_page === 'trip') && typeof currentState.on_close === 'function') {
       try {
-        currentState.on_close();
+        currentState.on_close({ reload: currentState.cardHadChanges === true });
       } catch (e) {
         console.warn('[photo_card] on_close failed:', e);
       }
@@ -569,7 +570,7 @@
         const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
         if (/^disk/i.test(path)) {
           const diskPath = path.replace(/^disk:?[/\\]?/i, 'disk:/').replace(/\\/g, '/').replace(/^disk:\/+/, 'disk:/');
-          const yadiskUrl = 'https://disk.yandex.ru/client/disk?path=' + encodeURIComponent(diskPath);
+          const yadiskUrl = '/api/yadisk/open?path=' + encodeURIComponent(diskPath);
           pathElement.innerHTML = '<a href="' + esc(yadiskUrl) + '" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline;">' + esc(path) + '</a>';
         } else {
           pathElement.textContent = path;
@@ -606,15 +607,15 @@
       // Загружаем изображение
       await loadImage();
 
-      // Группа над изображением (поворот + зум) — для изображений; кнопки поворота только для локальных
+      // Группа над изображением (поворот + зум) — для изображений; кнопки поворота для локальных и архива (disk:)
       const imageActionsEl = document.getElementById('photoCardImageActions');
       const rotateLeftBtn = document.getElementById('photoCardRotateLeft');
       const rotateRightBtn = document.getElementById('photoCardRotateRight');
       const isVideo = currentState.file_path && currentState.file_path.match(/\.(mp4|avi|mov|mkv|webm)$/i);
-      const isLocalImage = currentState.file_path && currentState.file_path.startsWith('local:') && !isVideo;
+      const isRotatableImage = currentState.file_path && (currentState.file_path.startsWith('local:') || currentState.file_path.startsWith('disk:')) && !isVideo;
       if (imageActionsEl) imageActionsEl.style.display = (currentState.file_path && !isVideo) ? 'inline-flex' : 'none';
-      if (rotateLeftBtn) rotateLeftBtn.style.display = isLocalImage ? 'inline-flex' : 'none';
-      if (rotateRightBtn) rotateRightBtn.style.display = isLocalImage ? 'inline-flex' : 'none';
+      if (rotateLeftBtn) rotateLeftBtn.style.display = isRotatableImage ? 'inline-flex' : 'none';
+      if (rotateRightBtn) rotateRightBtn.style.display = isRotatableImage ? 'inline-flex' : 'none';
 
       // Загружаем rectangles (при ошибке не блокируем загрузку прямых привязок)
       try {
@@ -941,6 +942,7 @@
         if (sel) sel.value = '';
       } else {
         if (tripId && typeof loadTripBlock === 'function') loadTripBlock();
+        currentState.cardHadChanges = true;
         closePhotoCard();
       }
     } catch (e) {
@@ -951,13 +953,13 @@
   }
 
   /**
-   * Поворот фото на 90° влево или вправо (только локальные изображения).
+   * Поворот фото на 90° влево или вправо (локальные и архив disk:).
    * После успеха перезагружает изображение и прямоугольники.
    */
   async function handleRotatePhoto(direction) {
-    if (!currentState.file_path || !currentState.file_path.startsWith('local:')) {
-      if (typeof window.setToast === 'function') window.setToast('Поворот доступен только для локальных файлов', true);
-      else alert('Поворот доступен только для локальных файлов');
+    if (!currentState.file_path || (!currentState.file_path.startsWith('local:') && !currentState.file_path.startsWith('disk:'))) {
+      if (typeof window.setToast === 'function') window.setToast('Поворот доступен только для локальных файлов и архива', true);
+      else alert('Поворот доступен только для локальных файлов и архива');
       return;
     }
     if (currentState.file_path.match(/\.(mp4|avi|mov|mkv|webm)$/i)) {
@@ -985,7 +987,9 @@
       const imgElement = document.getElementById('photoCardImg');
       if (imgElement && imgElement.src) {
         const sep = imgElement.src.indexOf('?') >= 0 ? '&' : '?';
-        const newSrc = imgElement.src + sep + 't=' + Date.now();
+        // Для disk: используем _bust, чтобы бэкенд не отдал закэшированное превью после поворота
+        const bustParam = (currentState.file_path || '').startsWith('disk:') ? '_bust=' : 't=';
+        const newSrc = imgElement.src + sep + bustParam + Date.now();
         imgElement.src = newSrc;
         // Ждём загрузки нового изображения, иначе drawRectangles() использует старые naturalWidth/Height
         await new Promise((resolve, reject) => {
@@ -1004,6 +1008,7 @@
       if (currentState.showRectangles && currentState.rectangles.length > 0) {
         drawRectangles();
       }
+      currentState.cardHadChanges = true;
       if (typeof window.setToast === 'function') window.setToast('Фото повёрнуто');
     } catch (e) {
       console.error('[photo_card] handleRotatePhoto failed:', e);
@@ -1855,6 +1860,7 @@
       }
       await loadFilePersons();
       updateRectanglesList();
+      currentState.cardHadChanges = true;
       if (currentState.list_context?.source_page === 'faces' && typeof currentState.on_assign_success === 'function') {
         await currentState.on_assign_success(currentState.file_path);
       }
@@ -1888,6 +1894,7 @@
         if (!ar.ok) throw new Error((await ar.json()).detail || 'Ошибка назначения');
         await loadFilePersons();
         updateRectanglesList();
+        currentState.cardHadChanges = true;
         if (currentState.list_context?.source_page === 'faces' && typeof currentState.on_assign_success === 'function') {
           await currentState.on_assign_success(currentState.file_path);
         }
@@ -2045,8 +2052,10 @@
               path: currentState.file_path
             })
           });
-          if (response.ok) await loadRectangles();
-          else {
+          if (response.ok) {
+            currentState.cardHadChanges = true;
+            await loadRectangles();
+          } else {
             const err = await response.json().catch(() => ({}));
             alert('Ошибка: ' + (err.detail || response.statusText));
           }
@@ -3384,7 +3393,7 @@
       const error = await response.json();
       throw new Error(error.detail || 'Failed to update rectangle');
     }
-    
+    currentState.cardHadChanges = true;
     return await response.json();
   }
 
@@ -3458,6 +3467,7 @@
     // Сбрасываем выделение, если удаленный rectangle был выделен
     currentState.selectedRectangleIndex = null;
     
+    currentState.cardHadChanges = true;
     // Немедленно обновляем UI (до перезагрузки с сервера)
     updateRectanglesList();
     drawRectangles();
@@ -3947,7 +3957,7 @@
             });
             if (response.ok) {
               if (fromTrip && typeof currentState.on_close === 'function') {
-                try { currentState.on_close(); } catch (e) { console.warn('[photo_card] on_close after archive delete:', e); }
+                try { currentState.on_close({ reload: true }); } catch (e) { console.warn('[photo_card] on_close after archive delete:', e); }
               } else {
                 navigateNext();
               }
@@ -3999,7 +4009,7 @@
               updateUndoButton();
             }
             if (fromTrip && typeof currentState.on_close === 'function') {
-              try { currentState.on_close(); } catch (e) { console.warn('[photo_card] on_close after delete:', e); }
+              try { currentState.on_close({ reload: true }); } catch (e) { console.warn('[photo_card] on_close after delete:', e); }
             } else {
               navigateNext();
             }

@@ -3,5 +3,6 @@ uvicorn[standard]==0.34.0
 jinja2==3.1.5
 yadisk==3.1.0
 python-dotenv==1.0.1
+piexif==1.1.3
 
 

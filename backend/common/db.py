@@ -1883,7 +1883,7 @@ def get_pipeline_run_id_for_path(file_path: str) -> int | None:
 
 
 def list_trips() -> list[dict[str, Any]]:
-    """Список поездок: от новых к старым по дате начала (start_date DESC), без даты — в конце; при равной дате — по названию."""
+    """Список поездок: сначала по году в начале названия (DESC), внутри года по start_date (DESC), без года/даты — в конце."""
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -1892,6 +1892,7 @@ def list_trips() -> list[dict[str, Any]]:
             SELECT id, name, start_date, end_date, place_country, place_city, yd_folder_path, cover_file_id, created_at, updated_at
             FROM trips
             ORDER BY
+              (CASE WHEN trim(name) GLOB '[0-9][0-9][0-9][0-9]*' THEN CAST(substr(trim(name), 1, 4) AS INTEGER) ELSE NULL END) DESC NULLS LAST,
               start_date DESC NULLS LAST,
               COALESCE(NULLIF(trim(name), ''), 'Поездка') COLLATE NOCASE ASC,
               id DESC
@@ -2094,7 +2095,8 @@ def trip_dates_from_files(trip_id: int) -> tuple[str | None, str | None]:
 def list_trip_suggestions(trip_id: int) -> list[dict[str, Any]]:
     """
     Предложения: файлы с taken_at в [start_date-1d, end_date+1d],
-    которых нет в trip_files.
+    которых ещё нет в этой поездке (в trip_files для данного trip_id).
+    Файлы, уже привязанные к другим поездкам, показываются — можно добавить в эту поездку или перенести.
     Если у поездки не заданы даты — берём диапазон по датам съёмки фото поездки.
     """
     conn = get_connection()
@@ -2117,7 +2119,13 @@ def list_trip_suggestions(trip_id: int) -> list[dict[str, Any]]:
             start_d = datetime.strptime(start_s, "%Y-%m-%d").date()
         except ValueError:
             return []
-        end_d = datetime.strptime(end_s, "%Y-%m-%d").date() if end_s else start_d
+        if end_s:
+            try:
+                end_d = datetime.strptime(end_s, "%Y-%m-%d").date()
+            except ValueError:
+                end_d = start_d
+        else:
+            end_d = start_d
         lo = (start_d - timedelta(days=1)).isoformat()
         hi = (end_d + timedelta(days=1)).isoformat()
 
@@ -2129,10 +2137,10 @@ def list_trip_suggestions(trip_id: int) -> list[dict[str, Any]]:
             WHERE f.taken_at IS NOT NULL AND f.taken_at != ''
               AND date(f.taken_at) >= date(?) AND date(f.taken_at) <= date(?)
               AND (f.status IS NULL OR f.status != 'deleted')
-              AND f.id NOT IN (SELECT file_id FROM trip_files WHERE status = 'included')
+              AND f.id NOT IN (SELECT file_id FROM trip_files WHERE trip_id = ? AND status = 'included')
             ORDER BY f.taken_at ASC, f.path ASC
             """,
-            (lo, hi),
+            (lo, hi, int(trip_id)),
         )
         return [d for r in cur.fetchall() if _is_media_file((d := dict(r)).get("media_type"))]
     finally:
@@ -2144,6 +2152,8 @@ def list_trip_files_excluded_in_range(trip_id: int) -> list[dict[str, Any]]:
     Исключённые файлы поездки, чья дата съёмки (taken_at) попадает в диапазон дат поездки.
     Для блока «В это время в другом месте» — можно снова привязать.
     """
+    from datetime import datetime
+
     trip = get_trip(trip_id)
     if not trip:
         return []
@@ -2154,6 +2164,11 @@ def list_trip_files_excluded_in_range(trip_id: int) -> list[dict[str, Any]]:
         if not start_s:
             return []
         end_s = end_s or start_s
+    try:
+        datetime.strptime(start_s, "%Y-%m-%d")
+        datetime.strptime(end_s, "%Y-%m-%d")
+    except ValueError:
+        return []
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -2239,10 +2254,12 @@ def trip_update(
     start_date: str | None = None,
     end_date: str | None = None,
     cover_file_id: int | None = None,
+    yd_folder_path: str | None = None,
 ) -> bool:
     """
     Обновить поля поездки. Передавать только те поля, которые нужно изменить.
     cover_file_id можно передать 0 или None, чтобы сбросить обложку.
+    yd_folder_path — путь папки поездки на Я.Диске (disk:/...).
     """
     conn = get_connection()
     try:
@@ -2261,6 +2278,9 @@ def trip_update(
         if cover_file_id is not None:
             updates.append("cover_file_id = ?")
             params.append(int(cover_file_id) if cover_file_id else None)
+        if yd_folder_path is not None:
+            updates.append("yd_folder_path = ?")
+            params.append((yd_folder_path or "").strip().rstrip("/") or None)
         if not updates:
             return True
         updates.append("updated_at = ?")
@@ -2269,6 +2289,29 @@ def trip_update(
         cur.execute("UPDATE trips SET " + ", ".join(updates) + " WHERE id = ?", params)
         conn.commit()
         return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def trip_delete(trip_id: int) -> bool:
+    """
+    Удалить поездку, только если к ней не привязаны файлы (нет записей в trip_files со status='included').
+    Удаляет все записи trip_files для поездки, затем запись в trips.
+    Возвращает True если поездка удалена, False если к ней есть привязанные файлы.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM trip_files WHERE trip_id = ? AND status = 'included' LIMIT 1",
+            (int(trip_id),),
+        )
+        if cur.fetchone():
+            return False
+        cur.execute("DELETE FROM trip_files WHERE trip_id = ?", (int(trip_id),))
+        cur.execute("DELETE FROM trips WHERE id = ?", (int(trip_id),))
+        conn.commit()
+        return True
     finally:
         conn.close()
 

@@ -69,8 +69,18 @@
         <span class="pill">root: <code id="rootPath">—</code></span>
         <button class="btn" id="btnMoveLocal" type="button" title="Переместить файлы в целевые подпапки под корнем прогона.">Переместить локально</button>
         <button class="btn" id="btnMoveArchive" type="button" title="Переместить файлы в фотоархив disk:/Фото/...">Переместить в фотоархив</button>
+        <button class="btn" id="btnCheckArchive" type="button" title="Проверить, сколько файлов будет загружено и доступен ли Яндекс.Диск.">Проверка перед загрузкой</button>
         <button class="btn" id="btnReload" type="button">Обновить отчёт</button>
         <span class="muted" id="toast"></span>
+      </div>
+
+      <div class="section" id="moveErrorsSection" style="display: none; border-color: #fecaca; background: #fef2f2;">
+        <h3>Ошибки последнего переноса в архив</h3>
+        <p class="muted" style="font-size: 12px; margin: 0 0 8px 0;">Перенос идёт по одному файлу: при ошибке для файла он остаётся на диске, остальные продолжают переноситься. Ниже — только те, что не удалось перенести, и причина.</p>
+        <p class="report-summary" id="moveErrorsSummary"></p>
+        <p id="moveErrorsByType" style="font-size: 12px; margin: 4px 0 0 0; color: #92400e; font-weight: 600;"></p>
+        <ul id="moveErrorsList" style="margin: 0; padding-left: 20px; font-size: 12px; max-height: 200px; overflow-y: auto;"></ul>
+        <p class="muted" style="margin-top: 10px; font-size: 12px;">Если загрузка не идёт: (1) <code>YADISK_ACCESS_TOKEN</code> в <code>secrets.env</code> (корень или backend) — токен должен быть валидным; (2) файлы по путям из отчёта должны существовать на диске; (3) сеть и квота Яндекс.Диска.</p>
       </div>
 
       <div class="section" id="reportSection">
@@ -96,6 +106,47 @@
         function setToast(msg, isErr) {
           const el = qs("#toast");
           if (el) { el.textContent = msg || ""; el.style.color = isErr ? "#991b1b" : ""; }
+        }
+        var STORAGE_KEY_ARCHIVE_ERRORS = "sorting_folders_archive_errors";
+        function saveArchiveErrors(runId, moved, errors, errorSummary) {
+          try {
+            sessionStorage.setItem(STORAGE_KEY_ARCHIVE_ERRORS, JSON.stringify({ run_id: runId, moved: moved, errors: errors || [], error_summary: errorSummary || [], at: new Date().toISOString() }));
+          } catch (e) {}
+        }
+        function errorSummaryFromList(errors) {
+          if (!errors || !errors.length) return [];
+          var byMsg = {};
+          errors.forEach(function (e) {
+            var msg = e.error || "?";
+            byMsg[msg] = (byMsg[msg] || 0) + 1;
+          });
+          var arr = Object.keys(byMsg).map(function (msg) { return { error: msg, count: byMsg[msg] }; });
+          arr.sort(function (a, b) { return b.count - a.count; });
+          return arr.slice(0, 10);
+        }
+        function loadArchiveErrors() {
+          try {
+            var raw = sessionStorage.getItem(STORAGE_KEY_ARCHIVE_ERRORS);
+            if (!raw) return null;
+            return JSON.parse(raw);
+          } catch (e) { return null; }
+        }
+        function showStoredErrors() {
+          var data = loadArchiveErrors();
+          if (!data || data.run_id !== pipelineRunId || !(data.errors && data.errors.length)) return;
+          var errSection = qs("#moveErrorsSection");
+          var errList = qs("#moveErrorsList");
+          var errSummary = qs("#moveErrorsSummary");
+          if (!errSection || !errList || !errSummary) return;
+          var summary = data.error_summary && data.error_summary.length ? data.error_summary : errorSummaryFromList(data.errors);
+          var summaryLine = summary.length ? " <strong>Типичная ошибка (" + summary[0].count + " раз):</strong> " + escapeHtml(summary[0].error) : "";
+          errSummary.innerHTML = "Перенесено: " + (data.moved || 0) + ", с ошибками: " + data.errors.length + " (результат последнего переноса)." + summaryLine + " Исправьте причину и нажмите «Переместить в фотоархив» снова.";
+          var byTypeEl = qs("#moveErrorsByType");
+          if (byTypeEl) byTypeEl.textContent = summary.length ? "По типам: " + summary.map(function (s) { return escapeHtml(s.error) + " — " + s.count; }).join("; ") : "";
+          errList.innerHTML = data.errors.map(function (e) {
+            return "<li><code>" + escapeHtml((e.path || "").slice(0, 80)) + (e.path && e.path.length > 80 ? "…" : "") + "</code> — " + escapeHtml(e.error || "") + "</li>";
+          }).join("");
+          errSection.style.display = "block";
         }
         async function fetchJson(url) {
           const r = await fetch(url);
@@ -146,6 +197,7 @@
         if (pipelineRunId == null) {
           qs("#btnMoveLocal").disabled = true;
           qs("#btnMoveArchive").disabled = true;
+          qs("#btnCheckArchive").disabled = true;
           setToast("Укажите pipeline_run_id в адресе: /sorting-folders?pipeline_run_id=26", true);
         }
 
@@ -562,15 +614,34 @@
           setToast("Перемещаю файлы " + label + "...");
           postJson("/api/faces/sort-into-folders", { pipeline_run_id: pipelineRunId, dry_run: false, destination: destination })
             .then(async (resp) => {
+              const errSection = qs("#moveErrorsSection");
+              const errList = qs("#moveErrorsList");
+              const errSummary = qs("#moveErrorsSummary");
               if (resp.ok) {
                 const moved = resp.moved_count || 0;
                 const errors = resp.errors || [];
                 if (errors.length > 0) {
-                  const firstErr = errors[0]?.error || "неизвестная ошибка";
-                  setToast("Перенесено: " + moved + ", ошибок: " + errors.length + ". Первая: " + firstErr, true);
-                } else setToast("Успешно перенесено файлов: " + moved);
+                  var summary = resp.error_summary || errorSummaryFromList(errors);
+                  saveArchiveErrors(pipelineRunId, moved, errors, summary);
+                  setToast("Перенесено: " + moved + ", ошибок: " + errors.length + ". См. блок ниже.", true);
+                  if (errSection && errList && errSummary) {
+                    var summaryLine = summary.length ? " <strong>Типичная ошибка (" + summary[0].count + " раз):</strong> " + escapeHtml(summary[0].error) : "";
+                    errSummary.innerHTML = "Перенесено: " + moved + ", с ошибками: " + errors.length + ". Эти файлы остались на диске." + summaryLine + " Исправьте причину и нажмите «Переместить в фотоархив» снова.";
+                    var byTypeEl = qs("#moveErrorsByType");
+                    if (byTypeEl) byTypeEl.textContent = summary.length ? "По типам: " + summary.map(function (s) { return escapeHtml(s.error) + " — " + s.count; }).join("; ") : "";
+                    errList.innerHTML = errors.map(function (e) {
+                      return "<li><code>" + escapeHtml((e.path || "").slice(0, 80)) + (e.path && e.path.length > 80 ? "…" : "") + "</code> — " + escapeHtml(e.error || "") + "</li>";
+                    }).join("");
+                    errSection.style.display = "block";
+                  }
+                } else {
+                  saveArchiveErrors(pipelineRunId, moved, [], []);
+                  if (errSection) errSection.style.display = "none";
+                  setToast("Успешно перенесено файлов: " + moved);
+                }
                 await loadReport();
               } else {
+                if (errSection) errSection.style.display = "none";
                 const msg = resp.detail || "Ошибка при сортировке";
                 setToast(typeof msg === "string" ? msg : JSON.stringify(msg), true);
               }
@@ -581,7 +652,34 @@
         qs("#btnMoveLocal").onclick = () => doMove("local");
         qs("#btnMoveArchive").onclick = () => doMove("archive");
 
-        loadReport();
+        qs("#btnCheckArchive").onclick = function () {
+          if (pipelineRunId == null) { setToast("pipeline_run_id не задан", true); return; }
+          const btn = qs("#btnCheckArchive");
+          btn.disabled = true;
+          setToast("Проверяю…");
+          postJson("/api/faces/sort-into-folders", { pipeline_run_id: pipelineRunId, dry_run: true, destination: "archive" })
+            .then(function (resp) {
+              if (resp.ok) {
+                const planned = resp.planned || [];
+                const n = planned.length;
+                if (n === 0) {
+                  setToast("Нет файлов для загрузки в архив (заполните целевые папки и убедитесь, что файлы локальные).", true);
+                } else {
+                  setToast("Будет загружено в архив: " + n + " файлов. Токен ЯД и пути в порядке.");
+                  if (n <= 10) {
+                    planned.forEach(function (p) { console.log("archive planned:", p.path, "→", p.disk_path); });
+                  }
+                }
+              } else {
+                const msg = resp.detail || resp.message || "Ошибка проверки";
+                setToast(typeof msg === "string" ? msg : JSON.stringify(msg), true);
+              }
+            })
+            .catch(function (e) { setToast(e.message || String(e), true); })
+            .finally(function () { btn.disabled = false; });
+        };
+
+        loadReport().then(function () { showStoredErrors(); });
       })();
     </script>
   </body>

@@ -226,3 +226,7 @@
 2026-02-19 (+03:00) - file_groups: скрипты очистки дубликатов (cleanup_file_groups_for_file.py — один файл, cleanup_file_groups_duplicates.py — массово по тройке run/file/group_path), подсчёт дублей (count_file_groups_duplicates.py), план миграции «группа как атрибут файла» (.cursor/plans). Проверка целостности бекапа (verify_backup_integrity.py). WAL-файлы data/photosorter.db-shm и .db-wal добавлены в .gitignore и убраны из индекса.
 
 2026-02-19 (+03:00) - Закрытие сессии: бекап БД session_close создан и проверен (PRAGMA integrity_check), старые бекапы удалены (оставлен один). Коммит: скрипты file_groups, verify_backup_integrity, .gitignore для WAL.
+
+2026-02-20 (+03:00) - Документация: changelog по повороту фото в архиве, EXIF и карточке поездки перенесён в docs/archive/changelog_rotate_archive_exif_trip_card.md.
+
+2026-02-20 (+03:00) - Закрытие сессии: поворот фото для disk: (API + UI), EXIF при повороте (дата из БД/ЯД/mtime, piexif), инвалидация кэша превью и «недавно повёрнутые» для актуального отображения, перезагрузка страницы поездки только при изменениях в карточке. Changelog перенесён в архив документации.

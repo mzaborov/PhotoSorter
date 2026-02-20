@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import urllib.parse
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from common.db import (
     list_trips_suggest_by_date,
     trip_create,
     trip_dates_from_files,
+    trip_delete,
     trip_file_attach,
     trip_file_exclude,
     trip_update,
@@ -31,6 +33,27 @@ from common.db import (
 from common.yadisk_client import get_disk
 
 router = APIRouter()
+
+# Формат дат поездки: YYYY-MM-DD
+_DATE_ISO_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _validate_date_iso(value: str | None) -> bool:
+    """Проверка формата даты YYYY-MM-DD. Пустая строка/None — допустимы (сброс даты)."""
+    if value is None:
+        return True
+    s = (value or "").strip()
+    if not s:
+        return True
+    if not _DATE_ISO_PATTERN.match(s):
+        return False
+    try:
+        from datetime import datetime
+
+        datetime.strptime(s, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
 
 APP_DIR = Path(__file__).resolve().parents[1]
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
@@ -296,12 +319,36 @@ class TripUpdateBody(BaseModel):
     cover_file_id: int | None = None
 
 
+@router.delete("/api/trips/{trip_id:int}")
+def api_trip_delete(trip_id: int) -> dict[str, Any]:
+    """API: удалить поездку. Разрешено только если к поездке не привязаны файлы (нет included в trip_files)."""
+    trip = get_trip(trip_id)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    if not trip_delete(trip_id):
+        raise HTTPException(
+            status_code=409,
+            detail="К поездке привязаны файлы. Удаление невозможно.",
+        )
+    return {"ok": True, "trip_id": trip_id}
+
+
 @router.patch("/api/trips/{trip_id:int}")
 def api_trip_update(trip_id: int, body: TripUpdateBody) -> dict[str, Any]:
     """API: обновить поездку (название, даты, обложка)."""
     trip = get_trip(trip_id)
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
+    if body.start_date is not None and not _validate_date_iso(body.start_date):
+        raise HTTPException(
+            status_code=400,
+            detail="start_date должен быть в формате YYYY-MM-DD или пустым",
+        )
+    if body.end_date is not None and not _validate_date_iso(body.end_date):
+        raise HTTPException(
+            status_code=400,
+            detail="end_date должен быть в формате YYYY-MM-DD или пустым",
+        )
     if body.cover_file_id is not None and body.cover_file_id != 0:
         files = list_trip_files_included(trip_id)
         file_ids = {f["file_id"] for f in files}

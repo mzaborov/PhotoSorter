@@ -205,6 +205,23 @@ def _preview_cache_put(key: tuple[str, str], preview_url: str) -> None:
             _PREVIEW_CACHE.popitem(last=False)
 
 
+# Пути, недавно повёрнутые на Я.Диске: для них отдаём download-ссылку вместо превью (превью у Яндекса кэшируется «на боку»).
+_PREVIEW_RECENTLY_ROTATED_TTL_SEC = 600  # 10 минут
+_PREVIEW_RECENTLY_ROTATED: dict[str, float] = {}
+
+
+def _preview_cache_invalidate(path: str) -> None:
+    """Удаляет из кэша превью все записи для данного path (все размеры). Помечает path как недавно повёрнутый."""
+    with _PREVIEW_CACHE_LOCK:
+        to_remove = [k for k in _PREVIEW_CACHE if k[0] == path]
+        for k in to_remove:
+            try:
+                del _PREVIEW_CACHE[k]
+            except KeyError:
+                pass
+    _PREVIEW_RECENTLY_ROTATED[path] = time.time()
+
+
 def _get(item: Any, key: str) -> Optional[Any]:
     if isinstance(item, dict):
         return item.get(key)
@@ -2966,16 +2983,17 @@ def api_local_video_duration(path: str) -> Response:
 
 
 @app.get("/api/yadisk/preview-image")
-def api_yadisk_preview_image(path: str, size: str = "M") -> Response:
+def api_yadisk_preview_image(path: str, size: str = "M", _bust: Optional[str] = None) -> Response:
     """
     Проксирует превью-картинку через наш сервер (localhost), чтобы браузеру не нужно было
     грузить изображения напрямую с downloader.disk.yandex.ru (иногда это блокируется).
 
     size: размер превью (S/M/L/XL, зависит от API; по умолчанию M).
+    _bust: если передан — не брать из кэша (для обновления после поворота и т.п.).
     """
     # Кэшируем preview_url, чтобы повторные заходы на /duplicates были быстрее и дешевле по YaDisk API.
     cache_key = (path, size)
-    cached_url = _preview_cache_get(cache_key)
+    cached_url = None if _bust else _preview_cache_get(cache_key)
     if cached_url:
         return RedirectResponse(url=cached_url, status_code=307, headers={"Cache-Control": "private, max-age=300"})
 
@@ -2992,6 +3010,28 @@ def api_yadisk_preview_image(path: str, size: str = "M") -> Response:
     try:
         disk = get_disk()
         p = _normalize_yadisk_path(path)
+
+        # Очищаем устаревшие записи из «недавно повёрнутых»
+        now_ts = time.time()
+        with _PREVIEW_CACHE_LOCK:
+            expired = [k for k, ts in _PREVIEW_RECENTLY_ROTATED.items() if now_ts - ts > _PREVIEW_RECENTLY_ROTATED_TTL_SEC]
+            for k in expired:
+                _PREVIEW_RECENTLY_ROTATED.pop(k, None)
+
+        # Для недавно повёрнутых (и при _bust) превью Яндекса может отдаваться из их кэша — картинка «на боку».
+        # Отдаём ссылку на скачивание файла: там актуальное содержимое.
+        use_download = _bust or (path in _PREVIEW_RECENTLY_ROTATED and (now_ts - _PREVIEW_RECENTLY_ROTATED.get(path, 0)) < _PREVIEW_RECENTLY_ROTATED_TTL_SEC)
+        if use_download:
+            try:
+                download_url = _get_download_url(disk, path=path)
+                return RedirectResponse(
+                    url=download_url,
+                    status_code=307,
+                    headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+                )
+            except Exception as fallback_err:  # noqa: BLE001
+                # Fallback: как обычно через preview
+                pass
 
         try:
             md = _yd_call_retry(lambda: disk.get_meta(p, limit=0, preview_size=size))

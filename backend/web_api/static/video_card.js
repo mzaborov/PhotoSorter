@@ -464,10 +464,11 @@
           renderRectList();
           drawOverlay();
           await saveCurrentFrameRects();
+          state.cardHadChanges = true;
           if (typeof state.on_assign_success === 'function') {
             try { await state.on_assign_success(getPath()); } catch (err) { console.warn('[video_card] on_assign_success:', err); }
           }
-          if (typeof state.on_close === 'function') state.on_close();
+          if (typeof state.on_close === 'function') state.on_close({ reload: true });
         };
         submenu.appendChild(btn);
       });
@@ -489,10 +490,11 @@
         renderRectList();
         drawOverlay();
         await saveCurrentFrameRects();
+        state.cardHadChanges = true;
         if (typeof state.on_assign_success === 'function') {
           try { await state.on_assign_success(getPath()); } catch (err) { console.warn('[video_card] on_assign_success:', err); }
         }
-        if (typeof state.on_close === 'function') state.on_close();
+        if (typeof state.on_close === 'function') state.on_close({ reload: true });
       };
       submenu.appendChild(btn);
     });
@@ -564,6 +566,7 @@
         rects: state.curManualRects
       });
       showToast('Сохранено');
+      state.cardHadChanges = true;
       loadFrames();
     } catch (e) {
       const msg = (e && e.message) ? e.message : (typeof e === 'string' ? e : 'Ошибка сохранения');
@@ -842,7 +845,7 @@
     if (img) img.src = '';
     state.frames = [];
     state.curManualRects = [];
-    if (typeof state.on_close === 'function') state.on_close();
+    if (typeof state.on_close === 'function') state.on_close({ reload: state.cardHadChanges === true });
   }
 
   function updateNavigation() {
@@ -988,7 +991,8 @@
       curManualRects: [],
       tempRect: null,
       dragging: false,
-      dragStart: null
+      dragStart: null,
+      cardHadChanges: false
     };
     if (state.list_context?.items) {
       const item = state.list_context.items[state.currentIndex];
@@ -1004,7 +1008,7 @@
     const path = state.file_path;
     if (/^disk/i.test(path)) {
       const diskPath = path.replace(/^disk:?[/\\]?/i, 'disk:/').replace(/\\/g, '/').replace(/^disk:\/+/, 'disk:/');
-      const yadiskUrl = 'https://disk.yandex.ru/client/disk?path=' + encodeURIComponent(diskPath);
+      const yadiskUrl = '/api/yadisk/open?path=' + encodeURIComponent(diskPath);
       pathEl.innerHTML = '<a href="' + yadiskUrl.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;') + '" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline;">' + path.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</a>';
     } else {
       pathEl.textContent = path;
@@ -1296,7 +1300,7 @@
       });
       if (res.ok) {
         showToast('Файл восстановлен');
-        if (typeof state.on_close === 'function') state.on_close();
+        if (typeof state.on_close === 'function') state.on_close({ reload: true });
       } else {
         const err = await res.json().catch(() => ({}));
         alert('Ошибка восстановления: ' + (err.detail || res.statusText));
@@ -1320,7 +1324,7 @@
           await postJson('/api/archive/delete', { path });
           showToast('Файл удалён');
           if (state.list_context?.source_page === 'trip' && typeof state.on_close === 'function') {
-            state.on_close();
+            state.on_close({ reload: true });
             return;
           }
           const lc = state.list_context;
@@ -1351,7 +1355,7 @@
         showToast('Файл удалён');
         const fromTrip = state.list_context?.source_page === 'trip';
         if (fromTrip && typeof state.on_close === 'function') {
-          state.on_close();
+          state.on_close({ reload: true });
           return;
         }
         const lc = state.list_context;
@@ -1395,10 +1399,11 @@
         }
         renderRectList();
         drawOverlay();
+        state.cardHadChanges = true;
         if (typeof state.on_assign_success === 'function') {
           try { await state.on_assign_success(path); } catch (err) { console.warn('[video_card] on_assign_success:', err); }
         }
-        if (typeof state.on_close === 'function') state.on_close();
+        if (typeof state.on_close === 'function') state.on_close({ reload: true });
       } catch (e) {
         alert(e?.message || String(e));
       }
@@ -1429,10 +1434,11 @@
         }
         renderRectList();
         drawOverlay();
+        state.cardHadChanges = true;
         if (typeof state.on_assign_success === 'function') {
           try { await state.on_assign_success(path); } catch (err) { console.warn('[video_card] on_assign_success:', err); }
         }
-        if (typeof state.on_close === 'function') state.on_close();
+        if (typeof state.on_close === 'function') state.on_close({ reload: true });
       } catch (e) {
         alert(e?.message || String(e));
       }
@@ -1501,7 +1507,8 @@
           loadGroupsAndPersons();
         } else {
           if (tripId) loadTripBlock();
-          if (typeof state.on_close === 'function') state.on_close();
+          state.cardHadChanges = true;
+          if (typeof state.on_close === 'function') state.on_close({ reload: true });
         }
       } catch (e) {
         alert(e?.message || String(e));
@@ -1710,7 +1717,8 @@
           await postJson('/api/persons/assign-file', { pipeline_run_id: Number(runId), file_path: path, person_id: parseInt(val) });
           showToast('Персона назначена');
           closePersonModal();
-          if (typeof state.on_close === 'function') state.on_close();
+          state.cardHadChanges = true;
+          if (typeof state.on_close === 'function') state.on_close({ reload: true });
         } catch (e) { alert(e?.message || String(e)); }
       } else {
         const opt = personSelectEl.options[personSelectEl.selectedIndex];
@@ -1773,7 +1781,8 @@
         exitDrawMode();
         try {
           await saveCurrentFrameRects();
-          if (typeof state.on_close === 'function') state.on_close();
+          state.cardHadChanges = true;
+          if (typeof state.on_close === 'function') state.on_close({ reload: true });
         } catch (err) {
           alert(err?.message || String(err));
         }
