@@ -3397,28 +3397,38 @@ def api_faces_rotate_photo(payload: dict[str, Any] = Body(...)) -> dict[str, Any
                     img_rot = img.rotate(angle, expand=True)
                     new_W, new_H = img_rot.size
                     out_format = img0.format or "JPEG"
-                    # EXIF: Orientation=1, даты из исходного EXIF, БД (taken_at) или с ЯД
-                    original_exif = img0.info.get("exif") if hasattr(img0, "info") else None
-                    exif_bytes = _build_exif_after_rotate(
-                        original_exif,
-                        file_mtime=None,
-                        db_taken_at_iso=db_taken_at_iso,
-                        fallback_date_iso=disk_date_iso,
-                    )
+                    # EXIF в формате Pillow (getexif/tobytes), иначе JPEG не записывает Orientation — остаётся 6
+                    exif_obj = img0.getexif()
+                    if exif_obj is None:
+                        from PIL.Image import Exif
+                        exif_obj = Exif()
+                    exif_obj[0x0112] = 1  # Orientation = 1 (normal)
+                    exif_bytes = exif_obj.tobytes()
                 save_kw = {"format": out_format}
                 if out_format.upper() == "JPEG":
                     save_kw["quality"] = 95
                     save_kw["subsampling"] = 0
                 save_kw["exif"] = exif_bytes
-                img_rot.save(temp_path, **save_kw)
-                img_rot.close()
+                # Сохраняем в отдельный файл: на Windows перезапись того же файла часто не срабатывает,
+                # и на ЯД уходит исходное (неповёрнутое) изображение.
+                fd_out, temp_path_out = tempfile.mkstemp(suffix=suffix)
                 try:
-                    disk.upload(temp_path, yd_path, overwrite=True)
-                except Exception as e:  # noqa: BLE001
-                    raise HTTPException(
-                        status_code=502,
-                        detail=f"YaDisk upload failed: {type(e).__name__}: {e}",
-                    ) from e
+                    os.close(fd_out)
+                    img_rot.save(temp_path_out, **save_kw)
+                    img_rot.close()
+                    try:
+                        disk.upload(temp_path_out, yd_path, overwrite=True)
+                    except Exception as e:  # noqa: BLE001
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"YaDisk upload failed: {type(e).__name__}: {e}",
+                        ) from e
+                finally:
+                    if os.path.isfile(temp_path_out):
+                        try:
+                            os.unlink(temp_path_out)
+                        except OSError:
+                            pass
                 # Инвалидируем кэш превью, чтобы плитка и обновление из БД показывали новое изображение
                 try:
                     main_mod = __import__("web_api.main", fromlist=["_preview_cache_invalidate"])
@@ -3454,13 +3464,13 @@ def api_faces_rotate_photo(payload: dict[str, Any] = Body(...)) -> dict[str, Any
                 img_rot = img.rotate(angle, expand=True)
                 new_W, new_H = img_rot.size
                 out_format = img0.format or "JPEG"
-                # EXIF: Orientation=1, даты из исходного EXIF, mtime или БД (taken_at)
-                original_exif = img0.info.get("exif") if hasattr(img0, "info") else None
-                exif_bytes = _build_exif_after_rotate(
-                    original_exif,
-                    file_mtime=saved_mtime,
-                    db_taken_at_iso=db_taken_at_iso,
-                )
+                # EXIF в формате Pillow, иначе Orientation не записывается
+                exif_obj = img0.getexif()
+                if exif_obj is None:
+                    from PIL.Image import Exif
+                    exif_obj = Exif()
+                exif_obj[0x0112] = 1  # Orientation = 1
+                exif_bytes = exif_obj.tobytes()
 
             save_kw = {"format": out_format}
             if out_format.upper() == "JPEG":

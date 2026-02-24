@@ -1052,6 +1052,8 @@
    * После успеха перезагружает изображение и прямоугольники.
    */
   async function handleRotatePhoto(direction) {
+    const rotateLeftBtn = document.getElementById('photoCardRotateLeft');
+    const rotateRightBtn = document.getElementById('photoCardRotateRight');
     if (!currentState.file_path || (!currentState.file_path.startsWith('local:') && !currentState.file_path.startsWith('disk:'))) {
       if (typeof window.setToast === 'function') window.setToast('Поворот доступен только для локальных файлов и архива', true);
       else alert('Поворот доступен только для локальных файлов и архива');
@@ -1062,19 +1064,22 @@
       else alert('Поворот недоступен для видео');
       return;
     }
-    const rotateLeftBtn = document.getElementById('photoCardRotateLeft');
-    const rotateRightBtn = document.getElementById('photoCardRotateRight');
+    if (typeof window.setToast === 'function') window.setToast('Поворот…', false);
     try {
       if (rotateLeftBtn) rotateLeftBtn.disabled = true;
       if (rotateRightBtn) rotateRightBtn.disabled = true;
       const body = { direction };
       if (currentState.file_id) body.file_id = currentState.file_id;
       if (currentState.file_path) body.path = currentState.file_path;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 60000);
       const response = await fetch('/api/faces/rotate-photo', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        signal: controller.signal
       });
+      clearTimeout(timeoutId);
       const data = await response.json();
       if (!response.ok) {
         throw new Error(data.detail || 'Ошибка поворота');
@@ -1104,11 +1109,11 @@
         drawRectangles();
       }
       currentState.cardHadChanges = true;
-      if (typeof window.setToast === 'function') window.setToast('Фото повёрнуто');
     } catch (e) {
       console.error('[photo_card] handleRotatePhoto failed:', e);
-      if (typeof window.setToast === 'function') window.setToast('Ошибка: ' + (e.message || 'не удалось повернуть'), true);
-      else alert('Ошибка: ' + (e.message || 'не удалось повернуть'));
+      var errMsg = (e && (e.message || e.reason)) || String(e);
+      if (typeof window.setToast === 'function') window.setToast('Ошибка: ' + errMsg, true);
+      alert('Ошибка поворота: ' + errMsg);
     } finally {
       if (rotateLeftBtn) rotateLeftBtn.disabled = false;
       if (rotateRightBtn) rotateRightBtn.disabled = false;
@@ -3922,10 +3927,10 @@
     const rotateLeftBtn = document.getElementById('photoCardRotateLeft');
     const rotateRightBtn = document.getElementById('photoCardRotateRight');
     if (rotateLeftBtn) {
-      rotateLeftBtn.addEventListener('click', function() { handleRotatePhoto('left'); });
+      rotateLeftBtn.addEventListener('click', function(e) { e.preventDefault(); handleRotatePhoto('left'); });
     }
     if (rotateRightBtn) {
-      rotateRightBtn.addEventListener('click', function() { handleRotatePhoto('right'); });
+      rotateRightBtn.addEventListener('click', function(e) { e.preventDefault(); handleRotatePhoto('right'); });
     }
     
     // Модальное окно выбора персоны (кнопка «Назначить» в модалке — отдельный id, т.к. «Привязать персону ▶» тоже photoCardAssignPerson)
