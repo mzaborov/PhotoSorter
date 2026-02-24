@@ -576,6 +576,35 @@
           pathElement.textContent = path;
         }
       }
+
+      // Сразу показываем кнопки навигации (Поездка/Назначить, Удалить), чтобы они были видны даже при ошибке загрузки ниже
+      const currentItem = currentState.list_context?.items?.[currentState.list_context?.current_index ?? 0];
+      if (currentItem && currentState.file_id == null && !(currentState.file_path || '').trim()) {
+        currentState.file_id = currentItem.file_id ?? currentState.file_id;
+        currentState.file_path = (currentItem.file_path || currentItem.path || currentState.file_path || '').trim() || currentState.file_path;
+      }
+      const hasFile = currentState.file_id != null ||
+        (currentState.file_path || '').trim() ||
+        (currentState.mode === 'sorting') ||
+        (currentItem && (currentItem.file_id != null || (currentItem.file_path || currentItem.path || '').trim()));
+      const assignGroupBlock = document.getElementById('photoCardAssignGroupBlock');
+      if (assignGroupBlock) {
+        assignGroupBlock.style.display = hasFile ? 'flex' : 'none';
+      }
+      const deleteFileBtn = document.getElementById('photoCardDeleteFile');
+      if (deleteFileBtn) {
+        const isArchiveFile = (currentState.file_path || '').toLowerCase().startsWith('disk:');
+        const fromTrip = currentState.list_context && currentState.list_context.source_page === 'trip';
+        const runIdForDelete = currentState.pipeline_run_id || (currentState.list_context && currentState.list_context.items && currentState.list_context.items[currentState.list_context.current_index || 0]?.pipeline_run_id);
+        const showDelete = isArchiveFile || currentState.mode === 'sorting' || (fromTrip && (isArchiveFile || runIdForDelete));
+        deleteFileBtn.style.display = showDelete ? '' : 'none';
+        deleteFileBtn.title = isArchiveFile ? 'Физически удалить файл из архива' : 'Удалить файл (в _delete)';
+      }
+      const specialActions = document.getElementById('photoCardSpecialActions');
+      if (specialActions) {
+        specialActions.style.display = currentState.mode === 'sorting' ? 'flex' : 'none';
+      }
+
       // Дата и место справа от пути — плашками в стиле таблицы faces
       const datePlaceEl = document.getElementById('photoCardDatePlace');
       if (datePlaceEl) {
@@ -601,6 +630,18 @@
           datePlaceEl.innerHTML = pills.join('');
         } else {
           datePlaceEl.textContent = '—';
+          // Подгружаем дату из API, если в контексте списка её не было
+          const hasFile = currentState.file_id != null || (currentState.file_path || '').trim();
+          if (hasFile) {
+            const q = currentState.file_id != null ? ('file_id=' + encodeURIComponent(currentState.file_id)) : ('path=' + encodeURIComponent(currentState.file_path));
+            fetch('/api/trips/for-file?' + q).then(r => r.ok ? r.json() : {}).then(data => {
+              const fileTaken = (data && data.file_taken_at) ? String(data.file_taken_at).trim() : '';
+              if (fileTaken.length >= 10 && datePlaceEl.textContent === '—') {
+                const d = fileTaken.slice(0, 10);
+                datePlaceEl.innerHTML = '<span class="pill">дата: ' + escapePc(d) + '</span>';
+              }
+            }).catch(() => {});
+          }
         }
       }
 
@@ -632,37 +673,18 @@
       if (currentState.pipeline_run_id) {
         await checkDuplicates();
       }
-      
-      // Показываем специальные действия для sorting режима
-      const specialActions = document.getElementById('photoCardSpecialActions');
-      if (specialActions) {
-        specialActions.style.display = currentState.mode === 'sorting' ? 'block' : 'none';
-      }
-      
-      // Кнопка «Удалить» — режим сортировки (в _delete), архив (физическое удаление) или из поездки (если есть прогон/архив)
-      const deleteFileBtn = document.getElementById('photoCardDeleteFile');
-      const isArchiveFile = (currentState.file_path || '').toLowerCase().startsWith('disk:');
-      const fromTrip = currentState.list_context && currentState.list_context.source_page === 'trip';
-      const runIdForDelete = currentState.pipeline_run_id || (currentState.list_context && currentState.list_context.items && currentState.list_context.items[currentState.list_context.current_index || 0]?.pipeline_run_id);
-      const showDelete = isArchiveFile || currentState.mode === 'sorting' || (fromTrip && (isArchiveFile || runIdForDelete));
-      if (deleteFileBtn) {
-        deleteFileBtn.style.display = showDelete ? '' : 'none';
-        deleteFileBtn.title = isArchiveFile ? 'Физически удалить файл из архива' : 'Удалить файл (в _delete)';
-      }
 
-      // Блок «Назначить группу» — только при mode=sorting и tab=no_faces
-      const assignGroupBlock = document.getElementById('photoCardAssignGroupBlock');
-      const tabParam = currentState.list_context?.api_fallback?.params?.tab;
-      if (assignGroupBlock) {
-        if (currentState.mode === 'sorting' && tabParam === 'no_faces') {
-          assignGroupBlock.style.display = 'flex';
+      // Заполняем блок «Поездка» / «Назначить» и вешаем обработчик (видимость уже выставлена выше)
+      const assignGroupBlock2 = document.getElementById('photoCardAssignGroupBlock');
+      if (assignGroupBlock2 && hasFile) {
+        if (currentState.pipeline_run_id) {
           await loadGroupsForAssignBlock();
-          const assignGroupBtn = document.getElementById('photoCardAssignGroupBtn');
-          if (assignGroupBtn) {
-            assignGroupBtn.onclick = () => handleAssignGroupFromCard();
-          }
         } else {
-          assignGroupBlock.style.display = 'none';
+          await loadTripsOnlyForAssignBlock();
+        }
+        const assignGroupBtn = document.getElementById('photoCardAssignGroupBtn');
+        if (assignGroupBtn) {
+          assignGroupBtn.onclick = () => handleAssignGroupFromCard();
         }
       }
 
@@ -676,8 +698,10 @@
     }
   }
 
-  /** Заполняет select групп как на faces (Близкие по дате, Поездки, остальные, + Создать группу/поездку). */
-  function fillGroupSelectForAssign(sel, groups, suggestedTrips) {
+  /** Заполняет select групп как на faces (Близкие по дате, Поездки, остальные, + Создать группу/поездку).
+   * allTrips — опционально список поездок {id, name, start_date, end_date} для режима «только поездки» (без pipeline_run_id).
+   */
+  function fillGroupSelectForAssign(sel, groups, suggestedTrips, allTrips) {
     const predefined = ['Здоровье', 'Чеки', 'Дом и ремонт', 'Артефакты людей'];
     const tripsKeywords = ['Турция', 'Минск', 'Италия', 'Испания', 'Греция', 'Франция', 'Польша', 'Чехия', 'Германия', 'Тургояк'];
     const groupsWithData = [];
@@ -705,7 +729,7 @@
         otherGroups.push(gd.name);
       }
     });
-    sel.innerHTML = '<option value="">Назначить группу...</option>';
+    sel.innerHTML = '<option value="">Поездка...</option>';
     const suggestedNames = new Set((suggestedTrips || []).map(t => (t.name || '').trim()).filter(Boolean));
     if (!window._tripIdToName) window._tripIdToName = {};
     if (suggestedTrips && suggestedTrips.length > 0) {
@@ -723,7 +747,18 @@
     }
     const tripsOptgroup = document.createElement('optgroup');
     tripsOptgroup.label = 'Поездки';
-    if (categoryMap['Поездки'] && categoryMap['Поездки'].length > 0) {
+    if (allTrips && allTrips.length > 0) {
+      allTrips.forEach(t => {
+        const name = (t.name || '').trim() || 'Поездка';
+        if (suggestedNames.has(name)) return;
+        if (!window._tripIdToName) window._tripIdToName = {};
+        window._tripIdToName[t.id] = name;
+        const opt = document.createElement('option');
+        opt.value = '__trip_' + t.id;
+        opt.textContent = name + (t.start_date ? ' (' + t.start_date + (t.end_date && t.end_date !== t.start_date ? ' – ' + t.end_date : '') + ')' : '');
+        tripsOptgroup.appendChild(opt);
+      });
+    } else if (categoryMap['Поездки'] && categoryMap['Поездки'].length > 0) {
       categoryMap['Поездки'].sort((a, b) => (b.last_created_at || '').localeCompare(a.last_created_at || ''));
       categoryMap['Поездки'].forEach(t => {
         if (suggestedNames.has(t.name)) return;
@@ -739,18 +774,20 @@
     createTrip.style.fontStyle = 'italic';
     tripsOptgroup.appendChild(createTrip);
     sel.appendChild(tripsOptgroup);
-    otherGroups.sort();
-    otherGroups.forEach(path => {
-      const opt = document.createElement('option');
-      opt.value = path;
-      opt.textContent = path;
-      sel.appendChild(opt);
-    });
-    const createOpt = document.createElement('option');
-    createOpt.value = '__create_new__';
-    createOpt.textContent = '+ Создать новую группу...';
-    createOpt.style.fontStyle = 'italic';
-    sel.appendChild(createOpt);
+    if (!allTrips || (groups && groups.length > 0)) {
+      otherGroups.sort();
+      otherGroups.forEach(path => {
+        const opt = document.createElement('option');
+        opt.value = path;
+        opt.textContent = path;
+        sel.appendChild(opt);
+      });
+      const createOpt = document.createElement('option');
+      createOpt.value = '__create_new__';
+      createOpt.textContent = '+ Создать новую группу...';
+      createOpt.style.fontStyle = 'italic';
+      sel.appendChild(createOpt);
+    }
   }
 
   /**
@@ -844,6 +881,37 @@
   }
 
   /**
+   * Заполняет блок «Назначить группу» только поездками (когда нет pipeline_run_id): список поездок + близкие по дате.
+   */
+  async function loadTripsOnlyForAssignBlock() {
+    const sel = document.getElementById('photoCardGroupSelect');
+    if (!sel) return;
+    try {
+      let dateStr = (currentState.file_taken_at || '').toString().trim().slice(0, 10);
+      if ((dateStr.length !== 10 || dateStr[4] !== '-' || dateStr[7] !== '-') && (currentState.file_id != null || (currentState.file_path || '').trim())) {
+        const q = currentState.file_id != null ? ('file_id=' + encodeURIComponent(currentState.file_id)) : ('path=' + encodeURIComponent(currentState.file_path));
+        const forFileRes = await fetch('/api/trips/for-file?' + q);
+        if (forFileRes.ok) {
+          const forFileData = await forFileRes.json().catch(() => ({}));
+          const takenAt = (forFileData.file_taken_at || '').toString().trim();
+          dateStr = takenAt.slice(0, 10);
+          if (dateStr.length === 10 && dateStr[4] === '-' && dateStr[7] === '-') currentState.file_taken_at = takenAt;
+        }
+      }
+      const dateOk = dateStr.length === 10 && dateStr[4] === '-' && dateStr[7] === '-';
+      const [allTripsRes, suggestedRes] = await Promise.all([
+        fetch('/api/trips/list').then(r => r.ok ? r.json() : []),
+        dateOk ? fetch(`/api/trips/suggest-by-date?date=${encodeURIComponent(dateStr)}&limit=15`).then(r => r.ok ? r.json() : null) : Promise.resolve(null)
+      ]);
+      const allTrips = Array.isArray(allTripsRes) ? allTripsRes : [];
+      const suggestedTrips = Array.isArray(suggestedRes) ? suggestedRes : (suggestedRes && suggestedRes.trips) ? suggestedRes.trips : null;
+      fillGroupSelectForAssign(sel, [], suggestedTrips, allTrips);
+    } catch (e) {
+      console.warn('[photo_card] loadTripsOnlyForAssignBlock failed:', e);
+    }
+  }
+
+  /**
    * Обработчик «Назначить» в блоке «Назначить группу»: POST assign-group, закрыть карточку, toast
    */
   async function handleAssignGroupFromCard() {
@@ -910,6 +978,32 @@
         }
       }
     }
+    // Привязка к поездке без прогона (только поездка — как в карточке видео)
+    const hasFileForTrip = currentState.file_id != null || (currentState.file_path || '').trim();
+    if (tripId && hasFileForTrip && !currentState.pipeline_run_id) {
+      try {
+        const attachBody = currentState.file_id != null ? { file_id: currentState.file_id } : { path: currentState.file_path };
+        const attachRes = await fetch('/api/trips/' + tripId + '/attach', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(attachBody)
+        });
+        if (attachRes.ok) {
+          if (typeof window.setToast === 'function') window.setToast('Добавлено в поездку «' + groupPath + '».', false);
+          if (typeof loadTripBlock === 'function') loadTripBlock();
+          if (sel) sel.value = '';
+          return;
+        }
+        const err = await attachRes.json().catch(() => ({}));
+        if (typeof window.setToast === 'function') window.setToast((err && err.detail) ? err.detail : 'Не удалось добавить в поездку', true);
+        else alert((err && err.detail) ? err.detail : 'Не удалось добавить в поездку');
+        return;
+      } catch (e) {
+        if (typeof window.setToast === 'function') window.setToast('Ошибка: ' + (e.message || 'не удалось добавить в поездку'), true);
+        else alert('Ошибка: ' + (e.message || 'не удалось добавить в поездку'));
+        return;
+      }
+    }
     if (!currentState.pipeline_run_id || !currentState.file_path) return;
     try {
       const res = await fetch('/api/faces/assign-group', {
@@ -938,7 +1032,8 @@
       }
       if (createdNewTripInThisAction) {
         if (typeof loadTripBlock === 'function') loadTripBlock();
-        if (typeof loadGroupsForAssignBlock === 'function') loadGroupsForAssignBlock();
+        if (currentState.pipeline_run_id && typeof loadGroupsForAssignBlock === 'function') loadGroupsForAssignBlock();
+        if (!currentState.pipeline_run_id && typeof loadTripsOnlyForAssignBlock === 'function') loadTripsOnlyForAssignBlock();
         if (sel) sel.value = '';
       } else {
         if (tripId && typeof loadTripBlock === 'function') loadTripBlock();

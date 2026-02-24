@@ -18,7 +18,11 @@
       th { font-weight: 600; color: #111827; background: #fafafa; position: sticky; top: 0; }
       code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
 
-      .row-meta { width: 220px; }
+      .row-meta { width: 260px; min-width: 200px; }
+      /* Кнопки и селект группы дублей — в одну линию с равномерными отступами */
+      .dup-group-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+      .dup-group-actions .btn { flex-shrink: 0; }
+      .dup-group-actions select { padding: 6px 10px; border-radius: 8px; border: 1px solid #d1d5db; min-width: 0; }
       .cards { display: flex; gap: 10px; align-items: stretch; }
       .card { width: 230px; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; background: #fff; }
       .thumb { height: 140px; background: #fff; display: flex; align-items: center; justify-content: center; position: relative; cursor: zoom-in; }
@@ -54,6 +58,12 @@
       .lb-actions { display: flex; gap: 10px; align-items: center; }
       .lb-imgwrap { background: #111827; display: flex; align-items: center; justify-content: center; }
       .lb-imgwrap img { max-width: 92vw; max-height: calc(92vh - 56px); width: auto; height: auto; display: block; object-fit: contain; background: #111827; }
+      .tabs { display: flex; gap: 8px; margin-top: 12px; }
+      .tabs .tab { padding: 8px 14px; border: 1px solid #d1d5db; border-radius: 10px; background: #fff; cursor: pointer; font-weight: 600; }
+      .tabs .tab:hover { background: #f9fafb; }
+      .tabs .tab.active { background: #eff6ff; border-color: #3b82f6; color: #1d4ed8; }
+      .duplicates-section { display: none; margin-top: 14px; }
+      .duplicates-section.active { display: block; }
     </style>
   </head>
   <body>
@@ -66,17 +76,30 @@
       </div>
     </div>
 
+    <div class="tabs">
+      <button class="tab active" type="button" data-tab="exact">Точные дубли (SHA256)</button>
+      <button class="tab" type="button" data-tab="similar">Визуально похожие фото</button>
+      <button class="tab" type="button" data-tab="video">Похожие видео</button>
+      <button class="tab" type="button" data-tab="allowed">Разрешенные дубли</button>
+    </div>
+
     <div class="muted" style="margin-top: 10px;">
-      Групп: <span class="pill">{{ summary.groups }}</span>
+      Точные: <span class="pill">{{ summary.groups }}</span> групп (макс. <span class="pill">{{ summary.max_group_size }}</span> в группе)
       &nbsp;·&nbsp;
-      Максимум файлов в группе: <span class="pill">{{ summary.max_group_size }}</span>
+      Визуально похожие: <span class="pill">{{ summary_similar.groups }}</span> групп (макс. <span class="pill">{{ summary_similar.max_group_size }}</span> в группе)
+      &nbsp;·&nbsp;
+      Похожие видео: <span class="pill">{{ summary_video.groups }}</span> групп (макс. <span class="pill">{{ summary_video.max_group_size }}</span> в группе)
+      &nbsp;·&nbsp;
+      Разрешенные: <span class="pill">{{ summary_allowed.groups }}</span> групп
     </div>
 
     <div class="actions">
       <button id="btnDeleteCopies" class="btn danger" type="button">Удалить копии (0)</button>
+      <button id="btnUndoDelete" class="btn" type="button" style="display: none; margin-left: 8px;">Отменить</button>
       <span id="toast" class="toast muted"></span>
     </div>
 
+    <div id="section-exact" class="duplicates-section active">
     <table>
       <thead>
         <tr>
@@ -86,7 +109,7 @@
       </thead>
       <tbody>
         {% for g in groups %}
-        <tr>
+        <tr data-group-type="exact" data-hash-alg="{{ g.hash_alg }}" data-hash-value="{{ g.hash_value }}">
           <td class="row-meta">
             <div><span class="pill">{{ g.cnt }} шт</span></div>
             <div style="margin-top: 6px;"><code>{{ g.hash_alg }}:{{ g.hash_short }}</code></div>
@@ -94,15 +117,22 @@
               <div class="muted" style="margin-top: 6px;">{{ g.note }}</div>
             {% endif %}
             <div class="warn hidden" style="margin-top: 8px;">Нужно оставить хотя бы один файл</div>
-            <div style="margin-top: 10px;">
-              <button class="btn" type="button" data-action="move-kids">В «Дети вместе» + удалить копии</button>
+            <div class="dup-group-actions">
+              <button class="btn danger btn-delete-row" type="button">Удалить копии</button>
+              <select class="dup-move-folder-select">
+                {% for f in target_move_folders %}
+                <option value="{{ f.path }}">{{ f.name }}</option>
+                {% endfor %}
+              </select>
+              <button class="btn btn-move-to-folder" type="button">Переместить в папку</button>
+              <button class="btn btn-keep-selected" type="button" title="Убрать группу из списка (файлы остаются на месте)">Оставить все выбранное</button>
             </div>
           </td>
           <td>
             <div class="cards" data-group="{{ g.hash_alg }}:{{ g.hash_short }}">
               {% for it in g.files %}
               <div class="card">
-                <div class="thumb" data-path="{{ it.path }}">
+                <div class="thumb" data-path="{{ it.path }}" data-file-id="{{ it.file_id or '' }}" data-media-type="{{ (it.media_type or it.mime_type or '')|lower }}">
                   <div class="noimg">превью…</div>
                 </div>
                 <div class="card-body">
@@ -121,6 +151,24 @@
                       <span class="pill">{{ it.mime_type }}</span>
                     {% endif %}
                   </div>
+                  {% if it.rectangles or it.persons or it.trips %}
+                  <div class="kv meta-attachments" style="margin-top: 4px;">
+                    {% if it.rectangles %}
+                      <span class="pill" title="Лица">Лица: {{ it.rectangles | length }}</span>
+                      {% for r in it.rectangles %}
+                        {% if r.person_name %}<span class="pill">{{ r.person_name }}</span>{% endif %}
+                      {% endfor %}
+                    {% endif %}
+                    {% if it.persons %}
+                      <span class="pill" title="Персоны (файл)">персоны</span>
+                      {% for p in it.persons %}<span class="pill">{{ p.name }}</span>{% endfor %}
+                    {% endif %}
+                    {% if it.trips %}
+                      <span class="pill" title="Поездки">поездки</span>
+                      {% for t in it.trips %}{% if t.name %}<span class="pill">{{ t.name }}</span>{% endif %}{% endfor %}
+                    {% endif %}
+                  </div>
+                  {% endif %}
                   <div class="keep">
                     <input class="keep-cb" type="checkbox" {% if it.keep %}checked{% endif %} />
                     <span class="muted">сохранить</span>
@@ -134,12 +182,257 @@
         {% endfor %}
       </tbody>
     </table>
+    </div>
 
+    <div id="section-similar" class="duplicates-section">
+    <table>
+      <thead>
+        <tr>
+          <th class="row-meta">Группа</th>
+          <th>Файлы</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for g in similar_groups %}
+        <tr data-group-type="similar" data-algorithm="{{ g.hash_alg }}" data-value="{{ g.hash_value }}">
+          <td class="row-meta">
+            <div><span class="pill">{{ g.cnt }} шт</span></div>
+            <div style="margin-top: 6px;"><code>{{ g.hash_alg }}:{{ g.hash_short }}</code></div>
+            {% if g.note %}
+              <div class="muted" style="margin-top: 6px;">{{ g.note }}</div>
+            {% endif %}
+            <div class="warn hidden" style="margin-top: 8px;">Нужно оставить хотя бы один файл</div>
+            <div class="dup-group-actions">
+              <button class="btn danger btn-delete-row" type="button">Удалить копии</button>
+              <select class="dup-move-folder-select">
+                {% for f in target_move_folders %}
+                <option value="{{ f.path }}">{{ f.name }}</option>
+                {% endfor %}
+              </select>
+              <button class="btn btn-move-to-folder" type="button">Переместить в папку</button>
+              <button class="btn btn-keep-selected" type="button" title="Убрать группу из списка (файлы остаются на месте)">Оставить все выбранное</button>
+            </div>
+          </td>
+          <td>
+            <div class="cards" data-group="{{ g.hash_alg }}:{{ g.hash_short }}">
+              {% for it in g.files %}
+              <div class="card">
+                <div class="thumb" data-path="{{ it.path }}" data-file-id="{{ it.file_id or '' }}" data-media-type="{{ (it.media_type or it.mime_type or '')|lower }}">
+                  <div class="noimg">превью…</div>
+                </div>
+                <div class="card-body">
+                  <div class="folder">{{ it.folder_short }}</div>
+                  <div class="muted path">
+                    <a class="link" href="/api/yadisk/open?path={{ it.path | urlencode }}" target="_blank" rel="noopener noreferrer"><code>{{ it.path_short }}</code></a>
+                  </div>
+                  <div class="kv">
+                    <span class="pill">{{ it.size_human }}</span>
+                    {% if it.media_type %}
+                      <span class="pill">{{ it.media_type }}</span>
+                    {% elif it.mime_type %}
+                      <span class="pill">{{ it.mime_type }}</span>
+                    {% endif %}
+                  </div>
+                  {% if it.rectangles or it.persons or it.trips %}
+                  <div class="kv meta-attachments" style="margin-top: 4px;">
+                    {% if it.rectangles %}
+                      <span class="pill" title="Лица">Лица: {{ it.rectangles | length }}</span>
+                      {% for r in it.rectangles %}
+                        {% if r.person_name %}<span class="pill">{{ r.person_name }}</span>{% endif %}
+                      {% endfor %}
+                    {% endif %}
+                    {% if it.persons %}
+                      <span class="pill" title="Персоны (файл)">персоны</span>
+                      {% for p in it.persons %}<span class="pill">{{ p.name }}</span>{% endfor %}
+                    {% endif %}
+                    {% if it.trips %}
+                      <span class="pill" title="Поездки">поездки</span>
+                      {% for t in it.trips %}{% if t.name %}<span class="pill">{{ t.name }}</span>{% endif %}{% endfor %}
+                    {% endif %}
+                  </div>
+                  {% endif %}
+                  <div class="keep">
+                    <input class="keep-cb" type="checkbox" {% if it.keep %}checked{% endif %} />
+                    <span class="muted">сохранить</span>
+                  </div>
+                </div>
+              </div>
+              {% endfor %}
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+
+    <div id="section-video" class="duplicates-section">
+    <table>
+      <thead>
+        <tr>
+          <th class="row-meta">Группа</th>
+          <th>Файлы</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for g in video_groups %}
+        <tr data-group-type="similar_video" data-duration-sec="{{ g.duration_sec }}" data-phash-key="{{ g.phash_key }}">
+          <td class="row-meta">
+            <div><span class="pill">{{ g.cnt }} шт</span></div>
+            <div style="margin-top: 6px;"><code>{{ g.duration_sec }} с · {{ g.phash_short }}</code></div>
+            {% if g.note %}
+              <div class="muted" style="margin-top: 6px;">{{ g.note }}</div>
+            {% endif %}
+            <div class="warn hidden" style="margin-top: 8px;">Нужно оставить хотя бы один файл</div>
+            <div class="dup-group-actions">
+              <button class="btn danger btn-delete-row" type="button">Удалить копии</button>
+              <select class="dup-move-folder-select">
+                {% for f in target_move_folders %}
+                <option value="{{ f.path }}">{{ f.name }}</option>
+                {% endfor %}
+              </select>
+              <button class="btn btn-move-to-folder" type="button">Переместить в папку</button>
+              <button class="btn btn-keep-selected" type="button" title="Убрать группу из списка (файлы остаются на месте)">Оставить все выбранное</button>
+            </div>
+          </td>
+          <td>
+            <div class="cards" data-group="video-{{ g.duration_sec }}">
+              {% for it in g.files %}
+              <div class="card">
+                <div class="thumb" data-path="{{ it.path }}" data-file-id="{{ it.file_id or '' }}" data-media-type="{{ (it.media_type or it.mime_type or '')|lower }}">
+                  <div class="noimg">превью…</div>
+                </div>
+                <div class="card-body">
+                  <div class="folder">{{ it.folder_short }}</div>
+                  <div class="muted path">
+                    <a class="link" href="/api/yadisk/open?path={{ it.path | urlencode }}" target="_blank" rel="noopener noreferrer"><code>{{ it.path_short }}</code></a>
+                  </div>
+                  <div class="kv">
+                    <span class="pill">{{ it.size_human }}</span>
+                    {% if (it.media_type and it.media_type|lower == 'video') or (it.mime_type and (it.mime_type|lower).startswith('video/')) %}
+                      <span class="pill duration" data-duration="—">длительность: —</span>
+                    {% endif %}
+                    {% if it.media_type %}
+                      <span class="pill">{{ it.media_type }}</span>
+                    {% elif it.mime_type %}
+                      <span class="pill">{{ it.mime_type }}</span>
+                    {% endif %}
+                  </div>
+                  {% if it.rectangles or it.persons or it.trips %}
+                  <div class="kv meta-attachments" style="margin-top: 4px;">
+                    {% if it.rectangles %}
+                      <span class="pill" title="Лица">Лица: {{ it.rectangles | length }}</span>
+                      {% for r in it.rectangles %}
+                        {% if r.person_name %}<span class="pill">{{ r.person_name }}</span>{% endif %}
+                      {% endfor %}
+                    {% endif %}
+                    {% if it.persons %}
+                      <span class="pill" title="Персоны (файл)">персоны</span>
+                      {% for p in it.persons %}<span class="pill">{{ p.name }}</span>{% endfor %}
+                    {% endif %}
+                    {% if it.trips %}
+                      <span class="pill" title="Поездки">поездки</span>
+                      {% for t in it.trips %}{% if t.name %}<span class="pill">{{ t.name }}</span>{% endif %}{% endfor %}
+                    {% endif %}
+                  </div>
+                  {% endif %}
+                  <div class="keep">
+                    <input class="keep-cb" type="checkbox" {% if it.keep %}checked{% endif %} />
+                    <span class="muted">сохранить</span>
+                  </div>
+                </div>
+              </div>
+              {% endfor %}
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+
+    <div id="section-allowed" class="duplicates-section">
+    <table>
+      <thead>
+        <tr>
+          <th class="row-meta">Группа</th>
+          <th>Файлы</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for g in allowed_groups %}
+        <tr class="allowed-group-row" data-group-type="{{ g.group_type }}"
+            {% if g.group_type == 'exact' %} data-hash-alg="{{ g.hash_alg }}" data-hash-value="{{ g.hash_value }}"
+            {% elif g.group_type == 'similar' %} data-algorithm="{{ g.algorithm }}" data-value="{{ g.value }}"
+            {% elif g.group_type == 'similar_video' %} data-duration-sec="{{ g.duration_sec }}" data-phash-key="{{ g.phash_key }}"
+            {% endif %}>
+          <td class="row-meta">
+            <div><span class="pill">{{ g.cnt }} шт</span></div>
+            <div style="margin-top: 6px;"><code>{{ g.label_short }}</code></div>
+            <div class="muted" style="margin-top: 6px;">скрыто {{ g.hidden_at[:10] if g.hidden_at else '' }}</div>
+            <div class="dup-group-actions">
+              <button class="btn btn-unhide-group" type="button" title="Вернуть группу в список дублей">Вернуть в список</button>
+            </div>
+          </td>
+          <td>
+            <div class="cards" data-group="allowed-{{ g.group_type }}-{{ g.cnt }}">
+              {% for it in g.files %}
+              <div class="card">
+                <div class="thumb" data-path="{{ it.path }}" data-file-id="{{ it.file_id or '' }}" data-media-type="{{ (it.media_type or it.mime_type or '')|lower }}">
+                  <div class="noimg">превью…</div>
+                </div>
+                <div class="card-body">
+                  <div class="folder">{{ it.folder_short }}</div>
+                  <div class="muted path">
+                    <a class="link" href="/api/yadisk/open?path={{ it.path | urlencode }}" target="_blank" rel="noopener noreferrer"><code>{{ it.path_short }}</code></a>
+                  </div>
+                  <div class="kv">
+                    <span class="pill">{{ it.size_human }}</span>
+                    {% if (it.media_type and it.media_type|lower == 'video') or (it.mime_type and (it.mime_type|lower).startswith('video/')) %}
+                      <span class="pill duration" data-duration="—">длительность: —</span>
+                    {% endif %}
+                    {% if it.media_type %}
+                      <span class="pill">{{ it.media_type }}</span>
+                    {% elif it.mime_type %}
+                      <span class="pill">{{ it.mime_type }}</span>
+                    {% endif %}
+                  </div>
+                  {% if it.rectangles or it.persons or it.trips %}
+                  <div class="kv meta-attachments" style="margin-top: 4px;">
+                    {% if it.rectangles %}
+                      <span class="pill" title="Лица">Лица: {{ it.rectangles | length }}</span>
+                      {% for r in it.rectangles %}
+                        {% if r.person_name %}<span class="pill">{{ r.person_name }}</span>{% endif %}
+                      {% endfor %}
+                    {% endif %}
+                    {% if it.persons %}
+                      <span class="pill" title="Персоны (файл)">персоны</span>
+                      {% for p in it.persons %}<span class="pill">{{ p.name }}</span>{% endfor %}
+                    {% endif %}
+                    {% if it.trips %}
+                      <span class="pill" title="Поездки">поездки</span>
+                      {% for t in it.trips %}{% if t.name %}<span class="pill">{{ t.name }}</span>{% endif %}{% endfor %}
+                    {% endif %}
+                  </div>
+                  {% endif %}
+                </div>
+              </div>
+              {% endfor %}
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+
+    {% include "photo_card.html" %}
+    {% include "video_card.html" %}
+    <script src="/static/photo_card.js"></script>
+    <script src="/static/video_card.js"></script>
     <script>
-      // Важно: не запускаем десятки загрузок превью одновременно, иначе сервер будет отдавать 429
-      // (защитный лимит на get_meta для preview URL). Держим параллелизм ниже лимита сервера
-      // (_PREVIEW_MAX_CONCURRENT=4).
-      const CONCURRENCY = 3;
+      // Параллелизм загрузки превью (сервер ограничивает _PREVIEW_MAX_CONCURRENT=4, при 429 делаем повтор).
+      const CONCURRENCY = 4;
 
       function escapeHtml(s) {
         return (s ?? "").toString()
@@ -178,7 +471,7 @@
         return `/api/yadisk/preview-image?size=${encodeURIComponent(size)}&path=${encodeURIComponent(path)}`;
       }
 
-      function loadOnePreview(el) {
+      function loadOnePreview(el, retry = 0) {
         return new Promise((resolve) => {
           const p = el?.getAttribute("data-path");
           if (!el || !p) return resolve();
@@ -187,18 +480,18 @@
           const img = new Image();
           img.loading = "lazy";
           img.alt = "preview";
-          // YaDisk preview hotlink защита: не отправляем Referer
           img.referrerPolicy = "no-referrer";
           img.onload = () => resolve();
           img.onerror = () => {
+            if (retry < 1) {
+              setTimeout(() => loadOnePreview(el, retry + 1).then(resolve), 1200);
+              return;
+            }
             el.innerHTML = `<div class="noimg">нет превью</div>`;
             resolve();
           };
           el.innerHTML = "";
           el.appendChild(img);
-
-          // Важно: нельзя делать fetch().blob() на redirect → YaDisk preview URL из-за CORS.
-          // Через <img src="..."> браузер спокойно загрузит картинку по редиректу.
           img.src = previewProxyUrl(p, "M");
         });
       }
@@ -245,10 +538,33 @@
         el.classList.toggle("err", !!isErr);
       }
 
+      /** Последние удалённые пути для Undo (только успешно удалённые). */
+      let lastDeletedPaths = [];
+      const UNDO_HIDE_MS = 12000;
+
+      function showUndo(paths) {
+        lastDeletedPaths = paths || [];
+        const btn = document.getElementById("btnUndoDelete");
+        if (btn) {
+          btn.style.display = "";
+          btn.disabled = false;
+          clearTimeout(btn._undoTimer);
+          btn._undoTimer = setTimeout(() => { btn.style.display = "none"; lastDeletedPaths = []; }, UNDO_HIDE_MS);
+        }
+      }
+
+      function hideUndo() {
+        lastDeletedPaths = [];
+        const btn = document.getElementById("btnUndoDelete");
+        if (btn) { btn.style.display = "none"; if (btn._undoTimer) clearTimeout(btn._undoTimer); }
+      }
+
       function collectAllUncheckedPaths() {
         /** @type {string[]} */
         const paths = [];
-        document.querySelectorAll(".card").forEach(card => {
+        const active = getActiveSection();
+        if (!active) return paths;
+        active.querySelectorAll(".card").forEach(card => {
           const thumb = card.querySelector(".thumb[data-path]");
           const cb = card.querySelector("input.keep-cb");
           const p = thumb?.getAttribute("data-path");
@@ -258,6 +574,10 @@
         return paths;
       }
 
+      function getActiveSection() {
+        return document.querySelector(".duplicates-section.active");
+      }
+
       function updateDeleteButtonLabel() {
         const btn = document.getElementById("btnDeleteCopies");
         if (!btn) return;
@@ -265,6 +585,20 @@
         btn.textContent = `Удалить копии (${n})`;
         btn.toggleAttribute("disabled", n === 0);
       }
+
+      document.querySelectorAll(".tabs .tab").forEach((tab) => {
+        tab.addEventListener("click", () => {
+          const t = tab.getAttribute("data-tab");
+          if (!t) return;
+          document.querySelectorAll(".tabs .tab").forEach((x) => x.classList.remove("active"));
+          tab.classList.add("active");
+          document.querySelectorAll(".duplicates-section").forEach((sec) => {
+            sec.classList.toggle("active", sec.id === "section-" + t);
+          });
+          updateDeleteButtonLabel();
+          try { sessionStorage.setItem("duplicatesTab", t); } catch (e) {}
+        });
+      });
 
       async function postJson(url, bodyObj) {
         const resp = await fetch(url, {
@@ -282,66 +616,249 @@
         return data;
       }
 
+      function saveDuplicatesState() {
+        const activeTab = document.querySelector(".tabs .tab.active")?.getAttribute("data-tab") || "exact";
+        const scrollY = window.scrollY;
+        try {
+          sessionStorage.setItem("duplicatesRestore", JSON.stringify({ tab: activeTab, scroll: scrollY }));
+        } catch (e) {}
+      }
+
+      function restoreDuplicatesState() {
+        try {
+          const raw = sessionStorage.getItem("duplicatesRestore");
+          if (raw) {
+            sessionStorage.removeItem("duplicatesRestore");
+            const state = JSON.parse(raw);
+            const tab = state.tab === "similar" ? "similar" : state.tab === "video" ? "video" : state.tab === "allowed" ? "allowed" : "exact";
+            document.querySelectorAll(".tabs .tab").forEach((x) => x.classList.toggle("active", x.getAttribute("data-tab") === tab));
+            document.querySelectorAll(".duplicates-section").forEach((sec) => {
+              sec.classList.toggle("active", sec.id === "section-" + tab);
+            });
+            const scroll = Number(state.scroll);
+            if (scroll >= 0) requestAnimationFrame(() => { window.scrollTo(0, scroll); });
+          } else {
+            const savedTab = sessionStorage.getItem("duplicatesTab");
+            if (savedTab === "similar" || savedTab === "exact" || savedTab === "video" || savedTab === "allowed") {
+              document.querySelectorAll(".tabs .tab").forEach((x) => x.classList.toggle("active", x.getAttribute("data-tab") === savedTab));
+              document.querySelectorAll(".duplicates-section").forEach((sec) => {
+                sec.classList.toggle("active", sec.id === "section-" + savedTab);
+              });
+            }
+          }
+          updateDeleteButtonLabel();
+        } catch (e) {}
+      }
+
+      /** Удаляет из DOM карточки с указанными путями (в активной секции или во всей таблице). */
+      function removeCardsByPaths(pathSet) {
+        const pathSetCopy = new Set(pathSet);
+        document.querySelectorAll(".duplicates-section .card").forEach(card => {
+          const p = card.querySelector(".thumb[data-path]")?.getAttribute("data-path");
+          if (p && pathSetCopy.has(p)) card.remove();
+        });
+        document.querySelectorAll("tr").forEach(row => {
+          const cardsEl = row.querySelector(".cards[data-group]");
+          if (cardsEl && cardsEl.querySelectorAll(".card").length === 0) row.remove();
+        });
+      }
+
       // Глобальная кнопка: удалить все НЕотмеченные (в корзину)
       document.getElementById("btnDeleteCopies")?.addEventListener("click", async () => {
         const paths = collectAllUncheckedPaths();
         if (paths.length === 0) return;
-        if (!confirm(`Удалить копии (в корзину): ${paths.length} файл(ов)?`)) return;
         setToast("Удаляю копии…");
         try {
           const r = await postJson("/api/duplicates/delete", { paths });
           const errs = Array.isArray(r?.errors) ? r.errors.length : 0;
+          const okPaths = paths.filter(p => !(r?.errors || []).some(e => e.path === p));
           setToast(errs ? `Удалено: ${r.deleted}. Ошибок: ${errs}` : `Удалено: ${r.deleted}.`, !!errs);
-          // Проще и надёжнее перезагрузить — группы/счётчики пересчитаются.
-          setTimeout(() => location.reload(), 350);
+          if (r.deleted > 0) {
+            removeCardsByPaths(okPaths);
+            showUndo(okPaths);
+          }
+          updateDeleteButtonLabel();
         } catch (e) {
           setToast(`Ошибка удаления: ${e?.message || e}`, true);
         }
       });
 
-      // Кнопка на строке: переместить 1 файл в "Дети вместе" и удалить остальные (в корзину)
-      document.querySelectorAll("button[data-action='move-kids']").forEach(btn => {
-        btn.addEventListener("click", async (e) => {
-          const b = e.currentTarget;
-          if (!(b instanceof HTMLButtonElement)) return;
-          const row = b.closest("tr");
-          const cardsEl = row?.querySelector(".cards[data-group]");
-          if (!row || !cardsEl) return;
+      // Кнопка «Отменить» — восстановить из корзины последние удалённые
+      document.getElementById("btnUndoDelete")?.addEventListener("click", async () => {
+        if (lastDeletedPaths.length === 0) return;
+        const btn = document.getElementById("btnUndoDelete");
+        if (btn) btn.disabled = true;
+        setToast("Восстанавливаю…");
+        try {
+          const r = await postJson("/api/duplicates/restore-from-trash", { paths: lastDeletedPaths });
+          hideUndo();
+          const errs = Array.isArray(r?.errors) ? r.errors.length : 0;
+          setToast(errs ? `Восстановлено: ${r.restored}. Ошибок: ${errs}` : `Восстановлено: ${r.restored}.`, !!errs);
+          saveDuplicatesState();
+          setTimeout(() => location.reload(), 300);
+        } catch (e) {
+          setToast(`Ошибка восстановления: ${e?.message || e}`, true);
+          if (btn) btn.disabled = false;
+        }
+      });
 
-          /** @type {string[]} */
-          const all = [];
-          /** @type {string[]} */
-          const checked = [];
+      // Кнопка «Переместить в папку» — переносит только отмеченные галкой файлы в выбранную папку из списка
+      document.querySelectorAll(".btn-move-to-folder").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          const row = btn.closest("tr");
+          const cardsEl = row?.querySelector(".cards[data-group]");
+          const selectEl = row?.querySelector(".dup-move-folder-select");
+          if (!row || !cardsEl || !(selectEl instanceof HTMLSelectElement)) return;
+          const checkedPaths = [];
           cardsEl.querySelectorAll(".card").forEach(card => {
             const thumb = card.querySelector(".thumb[data-path]");
             const cb = card.querySelector("input.keep-cb");
             const p = thumb?.getAttribute("data-path");
             if (!p || !(cb instanceof HTMLInputElement)) return;
-            all.push(p);
-            if (cb.checked) checked.push(p);
+            if (cb.checked) checkedPaths.push(p);
           });
-          if (all.length < 2) return;
-          const prefer = checked[0] || all[0];
-          const delCount = all.length - 1;
-          if (!confirm(`Переместить 1 файл в «Дети вместе» и отправить в корзину ${delCount} копии(й)?`)) return;
-
-          b.disabled = true;
-          setToast("Перемещаю и удаляю копии…");
+          if (checkedPaths.length === 0) return;
+          const targetFolder = selectEl.value;
+          if (!targetFolder) return;
+          if (!confirm(`Переместить ${checkedPaths.length} файл(ов) в выбранную папку?`)) return;
+          btn.disabled = true;
+          setToast("Перемещаю…");
           try {
-            const r = await postJson("/api/duplicates/move-to-kids", { paths: all, prefer_path: prefer });
+            const r = await postJson("/api/duplicates/move-to-folder", { paths: checkedPaths, target_folder: targetFolder });
             const errs = Array.isArray(r?.errors) ? r.errors.length : 0;
-            setToast(errs ? `Готово: перемещено, удалено ${r.deleted}. Ошибок: ${errs}` : `Готово: перемещено, удалено ${r.deleted}.`, !!errs);
+            setToast(errs ? `Перемещено: ${r.moved}. Ошибок: ${errs}` : `Перемещено: ${r.moved}.`, !!errs);
+            const movedFiles = Array.isArray(r?.moved_files) ? r.moved_files : [];
+            movedFiles.forEach(({ old_path, new_path, new_path_short }) => {
+              const card = cardsEl.querySelector(`.thumb[data-path="${CSS.escape(old_path)}"]`)?.closest(".card");
+              if (!card) return;
+              const thumb = card.querySelector(".thumb[data-path]");
+              const link = card.querySelector(".muted.path a.link");
+              const code = card.querySelector(".muted.path code");
+              if (thumb) thumb.setAttribute("data-path", new_path);
+              if (link) link.setAttribute("href", `/api/yadisk/open?path=${encodeURIComponent(new_path)}`);
+              if (code) code.textContent = new_path_short || new_path;
+              const fileIdRaw = thumb?.getAttribute("data-file-id");
+              const fileId = fileIdRaw ? parseInt(fileIdRaw, 10) : null;
+              if (fileId) refreshDuplicateTile(fileId);
+            });
+            updateDeleteButtonLabel();
+          } catch (e) {
+            setToast(`Ошибка: ${e?.message || e}`, true);
+            btn.disabled = false;
+          }
+        });
+      });
+
+      // Кнопка «Вернуть в список» на вкладке «Разрешенные дубли»
+      document.querySelectorAll(".btn-unhide-group").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          const row = btn.closest("tr.allowed-group-row");
+          if (!row) return;
+          const groupType = row.getAttribute("data-group-type");
+          let payload = { group_type: groupType };
+          if (groupType === "exact") {
+            payload.hash_alg = row.getAttribute("data-hash-alg") || "";
+            payload.hash_value = row.getAttribute("data-hash-value") || "";
+            if (!payload.hash_alg || !payload.hash_value) return;
+          } else if (groupType === "similar") {
+            payload.algorithm = row.getAttribute("data-algorithm") || "pHash";
+            payload.value = row.getAttribute("data-value") || "";
+            if (!payload.value) return;
+          } else if (groupType === "similar_video") {
+            payload.duration_sec = parseFloat(row.getAttribute("data-duration-sec") || "0");
+            payload.phash_key = row.getAttribute("data-phash-key") || "";
+            if (!payload.phash_key) return;
+          } else return;
+          btn.disabled = true;
+          setToast("Возвращаю группу в список…");
+          try {
+            await postJson("/api/duplicates/unhide-group", payload);
+            setToast("Группа снова отображается в своей вкладке.");
+            row.remove();
+          } catch (e) {
+            setToast(`Ошибка: ${e?.message || e}`, true);
+            btn.disabled = false;
+          }
+        });
+      });
+
+      // Кнопка «Оставить все выбранное» — убрать группу из списка (файлы не переносим, только скрываем в интерфейсе)
+      document.querySelectorAll(".btn-keep-selected").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          const row = btn.closest("tr");
+          if (!row) return;
+          const groupType = row.getAttribute("data-group-type");
+          let payload = { group_type: groupType };
+          if (groupType === "exact") {
+            payload.hash_alg = row.getAttribute("data-hash-alg") || "";
+            payload.hash_value = row.getAttribute("data-hash-value") || "";
+            if (!payload.hash_alg || !payload.hash_value) return;
+          } else if (groupType === "similar") {
+            payload.algorithm = row.getAttribute("data-algorithm") || "pHash";
+            payload.value = row.getAttribute("data-value") || "";
+            if (!payload.value) return;
+          } else if (groupType === "similar_video") {
+            payload.duration_sec = parseFloat(row.getAttribute("data-duration-sec") || "0");
+            payload.phash_key = row.getAttribute("data-phash-key") || "";
+            if (!payload.phash_key) return;
+          } else return;
+          btn.disabled = true;
+          setToast("Убираю группу из списка…");
+          try {
+            await postJson("/api/duplicates/hide-group", payload);
+            setToast("Группа убрана из списка.");
             row.remove();
             updateDeleteButtonLabel();
-          } catch (e2) {
-            setToast(`Ошибка: ${e2?.message || e2}`, true);
-            b.disabled = false;
+          } catch (e) {
+            setToast(`Ошибка: ${e?.message || e}`, true);
+            btn.disabled = false;
+          }
+        });
+      });
+
+      // Кнопка «Удалить копии» — удаляет в корзину только неотмеченные файлы этой группы
+      document.querySelectorAll(".btn-delete-row").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          const row = btn.closest("tr");
+          const cardsEl = row?.querySelector(".cards[data-group]");
+          if (!row || !cardsEl) return;
+          const paths = [];
+          cardsEl.querySelectorAll(".card").forEach(card => {
+            const thumb = card.querySelector(".thumb[data-path]");
+            const cb = card.querySelector("input.keep-cb");
+            const p = thumb?.getAttribute("data-path");
+            if (!p || !(cb instanceof HTMLInputElement)) return;
+            if (!cb.checked) paths.push(p);
+          });
+          if (paths.length === 0) return;
+          btn.disabled = true;
+          setToast("Удаляю копии…");
+          try {
+            const r = await postJson("/api/duplicates/delete", { paths });
+            const errs = Array.isArray(r?.errors) ? r.errors.length : 0;
+            const okPaths = paths.filter(p => !(r?.errors || []).some(e => e.path === p));
+            setToast(errs ? `Удалено: ${r.deleted}. Ошибок: ${errs}` : `Удалено: ${r.deleted}.`, !!errs);
+            if (r.deleted > 0) {
+              removeCardsByPaths(okPaths);
+              showUndo(okPaths);
+              const stillRow = btn.closest("tr");
+              if (stillRow) {
+                const stillCards = stillRow.querySelector(".cards[data-group]");
+                if (stillCards) updateGroupValidity(stillCards);
+              }
+            }
+            updateDeleteButtonLabel();
+          } catch (e) {
+            setToast(`Ошибка: ${e?.message || e}`, true);
+            btn.disabled = false;
           }
         });
       });
 
       // начальные счётчики
       updateDeleteButtonLabel();
+      // восстановление вкладки и прокрутки после перезагрузки (например после «Удалить копии»)
+      restoreDuplicatesState();
       // и обновление при кликах по чекбоксам
       document.addEventListener("change", (e) => {
         const t = e.target;
@@ -435,13 +952,91 @@
         lb.classList.add("open");
       }
 
+      /** Обновляет плитку файла на странице дублей после переноса или редактирования в карточке. */
+      async function refreshDuplicateTile(fileId) {
+        if (!fileId) return;
+        try {
+          const r = await fetch(`/api/duplicates/file-context?file_id=${encodeURIComponent(fileId)}`, { cache: "no-store" });
+          if (!r.ok) return;
+          const data = await r.json();
+          const card = document.querySelector(`.thumb[data-file-id="${fileId}"]`)?.closest(".card");
+          if (!card) return;
+          const thumb = card.querySelector(".thumb[data-path]");
+          const folderEl = card.querySelector(".folder");
+          const linkEl = card.querySelector(".muted.path a.link");
+          const codeEl = card.querySelector(".muted.path code");
+          const metaEl = card.querySelector(".kv.meta-attachments");
+          if (thumb) thumb.setAttribute("data-path", data.path || "");
+          if (folderEl) folderEl.textContent = data.folder_short || "";
+          if (linkEl) linkEl.setAttribute("href", `/api/yadisk/open?path=${encodeURIComponent(data.path || "")}`);
+          if (codeEl) codeEl.textContent = data.path_short || data.path || "";
+          if (metaEl) {
+            const rects = data.rectangles || [];
+            const persons = data.persons || [];
+            const trips = data.trips || [];
+            const parts = [];
+            if (rects.length) {
+              parts.push(`<span class="pill" title="Лица">Лица: ${rects.length}</span>`);
+              rects.forEach(r => { if (r.person_name) parts.push(`<span class="pill">${escapeHtml(r.person_name)}</span>`); });
+            }
+            if (persons.length) {
+              parts.push(`<span class="pill" title="Персоны (файл)">персоны</span>`);
+              persons.forEach(p => { parts.push(`<span class="pill">${escapeHtml(p.name || "")}</span>`); });
+            }
+            if (trips.length) {
+              parts.push(`<span class="pill" title="Поездки">поездки</span>`);
+              trips.forEach(t => { if (t.name) parts.push(`<span class="pill">${escapeHtml(t.name)}</span>`); });
+            }
+            metaEl.innerHTML = parts.length ? parts.join("") : "";
+            metaEl.style.display = parts.length ? "" : "none";
+          }
+        } catch (e) {
+          console.warn("refreshDuplicateTile:", e);
+        }
+      }
+
+      let clickOpenLightboxTimer = null;
       document.querySelectorAll(".thumb[data-path]").forEach(el => {
         el.addEventListener("click", (e) => {
           const p = el.getAttribute("data-path");
           if (!p) return;
-          // не перехватываем клики по ссылкам/кнопкам внутри (на будущее)
           if (e.target instanceof HTMLAnchorElement || e.target instanceof HTMLButtonElement) return;
-          openLightbox(p);
+          if (clickOpenLightboxTimer) clearTimeout(clickOpenLightboxTimer);
+          clickOpenLightboxTimer = setTimeout(() => {
+            clickOpenLightboxTimer = null;
+            const fileIdRaw = el.getAttribute("data-file-id");
+            const fileId = fileIdRaw ? parseInt(fileIdRaw, 10) : null;
+            const mediaType = (el.getAttribute("data-media-type") || "").toLowerCase();
+            const isVideo = mediaType === "video" || mediaType.startsWith("video/");
+            const onClose = (opts) => { if (opts && opts.reload && fileId) refreshDuplicateTile(fileId); };
+            if (isVideo && typeof window.openVideoCard === "function") {
+              window.openVideoCard({ file_path: p, file_id: fileId || undefined, on_close: onClose });
+            } else if (typeof window.openPhotoCard === "function") {
+              window.openPhotoCard({ file_path: p, file_id: fileId || undefined, on_close: onClose });
+            } else {
+              openLightbox(p);
+            }
+          }, 300);
+        });
+        el.addEventListener("dblclick", (e) => {
+          e.preventDefault();
+          if (clickOpenLightboxTimer) {
+            clearTimeout(clickOpenLightboxTimer);
+            clickOpenLightboxTimer = null;
+          }
+          const path = el.getAttribute("data-path");
+          const fileIdRaw = el.getAttribute("data-file-id");
+          const fileId = fileIdRaw ? parseInt(fileIdRaw, 10) : null;
+          const mediaType = (el.getAttribute("data-media-type") || "").toLowerCase();
+          const isVideo = mediaType === "video" || mediaType.startsWith("video/");
+          const onClose = (opts) => { if (opts && opts.reload && fileId) refreshDuplicateTile(fileId); };
+          if (isVideo && typeof window.openVideoCard === "function") {
+            window.openVideoCard({ file_path: path, file_id: fileId || undefined, on_close: onClose });
+          } else if (typeof window.openPhotoCard === "function") {
+            window.openPhotoCard({ file_path: path, file_id: fileId || undefined, on_close: onClose });
+          } else {
+            openLightbox(path);
+          }
         });
       });
     </script>

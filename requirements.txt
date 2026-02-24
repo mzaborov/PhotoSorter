@@ -4,5 +4,7 @@ jinja2==3.1.5
 yadisk==3.1.0
 python-dotenv==1.0.1
 piexif==1.1.3
+Pillow>=10.0.0
+imagehash>=4.3.0
 
 

@@ -10,6 +10,32 @@ from datetime import datetime, timezone
 # data/photosorter.db рядом с репозиторием (НЕ внутри backend/)
 DB_PATH = Path(__file__).resolve().parents[2] / "data" / "photosorter.db"
 
+# Кеш: id(conn) соединений, для которых уже проверено наличие idx_files_path (у Connection нет __dict__)
+_path_index_verified_conn_ids: set[int] = set()
+
+
+def _ensure_files_path_unique_index(conn: sqlite3.Connection) -> None:
+    """
+    Гарантирует наличие UNIQUE индекса по files.path для ON CONFLICT(path) в upsert_file.
+    Если в таблице есть дубликаты по path, индекс не создаётся — выполните одноразовую миграцию:
+      python backend/scripts/migration/dedup_files_path_remove_duplicates.py
+    """
+    cid = id(conn)
+    if cid in _path_index_verified_conn_ids:
+        return
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_files_path'")
+    if cur.fetchone():
+        _path_index_verified_conn_ids.add(cid)
+        return
+    try:
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_path ON files(path);")
+        conn.commit()
+        _path_index_verified_conn_ids.add(cid)
+    except sqlite3.OperationalError:
+        conn.rollback()
+        # Дубликаты path: миграция вынесена в backend/scripts/migration/dedup_files_path_remove_duplicates.py
+
 
 def get_connection():
     # ВАЖНО (Windows/SQLite): при параллельной работе web-сервера и pipeline (subprocess)
@@ -196,6 +222,47 @@ def init_db():
                         SELECT trip_id, file_id, 'excluded', 'manual', created_at FROM trip_file_excluded
                     """)
                     cur.execute("DROP TABLE trip_file_excluded")
+                # Таблица перцептивных хешей (визуально похожие фото)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS file_perceptual_hashes (
+                        file_id       INTEGER NOT NULL REFERENCES files(id),
+                        algorithm     TEXT NOT NULL,
+                        value         TEXT NOT NULL,
+                        computed_at   TEXT NOT NULL,
+                        PRIMARY KEY (file_id, algorithm)
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_file_perceptual_hashes_algo_value ON file_perceptual_hashes(algorithm, value);")
+                # Группы дублей, скрытые пользователем («Оставить все выбранное»)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS duplicate_groups_hidden (
+                        group_type   TEXT NOT NULL,
+                        hash_alg     TEXT NOT NULL,
+                        hash_value   TEXT NOT NULL,
+                        algorithm    TEXT NOT NULL,
+                        value        TEXT NOT NULL,
+                        hidden_at    TEXT NOT NULL,
+                        PRIMARY KEY (group_type, hash_alg, hash_value, algorithm, value)
+                    );
+                """)
+                # Хеши кадров видео для группировки «похожие видео» (длительность + phash в 3 моментах)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS file_video_frame_hashes (
+                        file_id          INTEGER NOT NULL REFERENCES files(id),
+                        duration_sec     REAL NOT NULL,
+                        time_offset_sec  REAL NOT NULL,
+                        phash_value     TEXT NOT NULL,
+                        computed_at     TEXT NOT NULL,
+                        PRIMARY KEY (file_id, time_offset_sec)
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_file_video_frame_hashes_duration ON file_video_frame_hashes(duration_sec);")
+                # ON CONFLICT(path) в upsert_file требует UNIQUE по path. При дубликатах path выполните:
+                # python backend/scripts/migration/dedup_files_path_remove_duplicates.py
+                try:
+                    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_path ON files(path);")
+                except sqlite3.OperationalError:
+                    pass
                 conn.commit()
                 conn.close()
                 _db_initialized = True
@@ -395,7 +462,45 @@ def init_db():
             },
         )
 
-        # --- Geocode cache (lat/lon -> country/city) ---
+        # --- Perceptual hashes для вычистки визуально похожих фото (дубли разного размера) ---
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS file_perceptual_hashes (
+                file_id       INTEGER NOT NULL REFERENCES files(id),
+                algorithm     TEXT NOT NULL,   -- 'pHash'|'dHash'
+                value         TEXT NOT NULL,   -- hex-строка хеша
+                computed_at   TEXT NOT NULL,   -- UTC ISO
+                PRIMARY KEY (file_id, algorithm)
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_perceptual_hashes_algo_value ON file_perceptual_hashes(algorithm, value);")
+
+        # --- Хеши кадров видео (дубли «тот же ролик, разное качество») ---
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS file_video_frame_hashes (
+                file_id          INTEGER NOT NULL REFERENCES files(id),
+                duration_sec     REAL NOT NULL,
+                time_offset_sec  REAL NOT NULL,
+                phash_value     TEXT NOT NULL,
+                computed_at     TEXT NOT NULL,
+                PRIMARY KEY (file_id, time_offset_sec)
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_file_video_frame_hashes_duration ON file_video_frame_hashes(duration_sec);")
+
+        # --- Группы дублей, скрытые пользователем («Оставить все выбранное» — не показывать в списке дублей) ---
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS duplicate_groups_hidden (
+                group_type   TEXT NOT NULL,   -- 'exact'|'similar'
+                hash_alg     TEXT NOT NULL,   -- для exact; для similar пустая строка
+                hash_value   TEXT NOT NULL,   -- для exact; для similar пустая строка
+                algorithm    TEXT NOT NULL,   -- для similar (pHash); для exact пустая строка
+                value        TEXT NOT NULL,   -- для similar; для exact пустая строка
+                hidden_at    TEXT NOT NULL,   -- UTC ISO
+                PRIMARY KEY (group_type, hash_alg, hash_value, algorithm, value)
+            );
+        """)
+
+        # --- Geocode cache
         cur.execute(
         """
         CREATE TABLE IF NOT EXISTS geocode_cache (
@@ -1985,6 +2090,57 @@ def get_trips_for_file(file_id: int) -> list[dict[str, Any]]:
         conn.close()
 
 
+def get_file_duplicate_context(file_id: int) -> dict[str, Any]:
+    """
+    Контекст файла для страницы дублей: ректанглы (лица) с именами персон,
+    прямые привязки к персонам (file_persons), поездки (trip_files).
+    Возвращает: {"rectangles": [...], "persons": [...], "trips": [...]}.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        fid = int(file_id)
+        # Прямоугольники: id, имя персоны (ручная или через кластер)
+        cur.execute(
+            """
+            SELECT
+              fr.id, fr.bbox_x, fr.bbox_y, fr.bbox_w, fr.bbox_h,
+              COALESCE(p_manual.name, p_cluster.name) AS person_name
+            FROM photo_rectangles fr
+            LEFT JOIN persons p_manual ON p_manual.id = fr.manual_person_id
+            LEFT JOIN face_clusters fc ON fc.id = fr.cluster_id
+            LEFT JOIN persons p_cluster ON p_cluster.id = fc.person_id
+            WHERE fr.file_id = ? AND COALESCE(fr.ignore_flag, 0) = 0
+            ORDER BY fr.face_index ASC, fr.id ASC
+            """,
+            (fid,),
+        )
+        rectangles = [dict(r) for r in cur.fetchall()]
+
+        # Прямые привязки файла к персонам (file_persons)
+        cur.execute(
+            """
+            SELECT fp.person_id AS id, p.name
+            FROM file_persons fp
+            JOIN persons p ON p.id = fp.person_id
+            WHERE fp.file_id = ?
+            ORDER BY p.name
+            """,
+            (fid,),
+        )
+        persons = [dict(r) for r in cur.fetchall()]
+
+        trips = get_trips_for_file(fid)
+
+        return {
+            "rectangles": rectangles,
+            "persons": persons,
+            "trips": [{"id": t["id"], "name": t.get("name") or ""} for t in trips],
+        }
+    finally:
+        conn.close()
+
+
 def get_trip_by_yd_folder_path(yd_folder_path: str) -> dict[str, Any] | None:
     """Поездка по пути папки на Я.Диске (нормализованное совпадение: без концевых пробелов и слэшей)."""
     if not (yd_folder_path or "").strip():
@@ -2625,6 +2781,7 @@ class DedupStore:
         scanned_at: str | None = None,
         hashed_at: str | None = None,
     ) -> None:
+        _ensure_files_path_unique_index(self.conn)
         cur = self.conn.cursor()
         cur.execute(
             """
@@ -2683,29 +2840,90 @@ class DedupStore:
             return None, None
         return (row["hash_alg"], row["hash_value"])
 
+    def count_archive_files_without_hash(self) -> int:
+        """Количество файлов архива без хэша (для прогресса дедупа по БД)."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*) AS cnt FROM files
+            WHERE COALESCE(inventory_scope, 'archive') = 'archive'
+              AND status != 'deleted'
+              AND hash_value IS NULL
+              AND path LIKE 'disk:%'
+            """
+        )
+        row = cur.fetchone()
+        return int(row["cnt"]) if row else 0
+
+    def list_archive_files_without_hash(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        """Список файлов архива без хэша (для дедупа по БД)."""
+        cur = self.conn.cursor()
+        sql = """
+            SELECT path, size, mime_type, media_type, name, parent_path, created, modified, resource_id
+            FROM files
+            WHERE COALESCE(inventory_scope, 'archive') = 'archive'
+              AND status != 'deleted'
+              AND hash_value IS NULL
+              AND path LIKE 'disk:%'
+            ORDER BY path
+        """
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        cur.execute(sql)
+        return [dict(r) for r in cur.fetchall()]
+
     def list_dup_groups_archive(self) -> list[dict[str, Any]]:
         """
         Возвращает группы дублей для архива YaDisk (inventory_scope='archive').
         Группа = одинаковый (hash_alg, hash_value), где количество файлов > 1.
+        Скрытые пользователем группы («Оставить все выбранное») не возвращаются.
         """
         cur = self.conn.cursor()
         cur.execute(
             """
             SELECT
-              hash_alg,
-              hash_value,
+              f.hash_alg,
+              f.hash_value,
               COUNT(*) AS cnt
-            FROM files
+            FROM files f
             WHERE
-              hash_value IS NOT NULL
-              AND COALESCE(inventory_scope, 'archive') = 'archive'
-              AND status != 'deleted'
-            GROUP BY hash_alg, hash_value
+              f.hash_value IS NOT NULL
+              AND COALESCE(f.inventory_scope, 'archive') = 'archive'
+              AND f.status != 'deleted'
+              AND NOT EXISTS (
+                SELECT 1 FROM duplicate_groups_hidden h
+                WHERE h.group_type = 'exact' AND h.hash_alg = f.hash_alg AND h.hash_value = f.hash_value
+              )
+            GROUP BY f.hash_alg, f.hash_value
             HAVING COUNT(*) > 1
-            ORDER BY cnt DESC, hash_alg ASC
+            ORDER BY cnt DESC, f.hash_alg ASC
             """
         )
         return [dict(r) for r in cur.fetchall()]
+
+    def hide_duplicate_group_exact(self, *, hash_alg: str, hash_value: str) -> None:
+        """Пометить группу точных дублей как «решённую» — больше не показывать на странице дублей."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO duplicate_groups_hidden (group_type, hash_alg, hash_value, algorithm, value, hidden_at)
+            VALUES ('exact', ?, ?, '', '', ?)
+            """,
+            (hash_alg, hash_value, _now_utc_iso()),
+        )
+        self.conn.commit()
+
+    def hide_duplicate_group_similar(self, *, algorithm: str, value: str) -> None:
+        """Пометить группу визуально похожих как «решённую» — больше не показывать на странице дублей."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO duplicate_groups_hidden (group_type, hash_alg, hash_value, algorithm, value, hidden_at)
+            VALUES ('similar', '', '', ?, ?, ?)
+            """,
+            (algorithm, value, _now_utc_iso()),
+        )
+        self.conn.commit()
 
     def list_group_items(self, *, hash_alg: str, hash_value: str, inventory_scope: str | None = None, last_run_id: int | None = None) -> list[dict[str, Any]]:
         cur = self.conn.cursor()
@@ -2719,7 +2937,7 @@ class DedupStore:
             params.append(last_run_id)
         cur.execute(
             f"""
-            SELECT path, name, parent_path, size, modified, mime_type, media_type, hash_source
+            SELECT id AS file_id, path, name, parent_path, size, modified, mime_type, media_type, hash_source
             FROM files
             WHERE {' AND '.join(where)}
             ORDER BY path ASC
@@ -2727,6 +2945,328 @@ class DedupStore:
             params,
         )
         return [dict(r) for r in cur.fetchall()]
+
+    # --- Perceptual hashes (визуально похожие фото) ---
+
+    def get_existing_perceptual_hash(self, *, path: str, algorithm: str = "pHash") -> str | None:
+        """Возвращает значение перцептивного хеша для файла по path или None."""
+        file_id = _get_file_id_from_path(self.conn, path)
+        if file_id is None:
+            return None
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT value FROM file_perceptual_hashes WHERE file_id = ? AND algorithm = ? LIMIT 1",
+            (file_id, algorithm),
+        )
+        row = cur.fetchone()
+        return row["value"] if row else None
+
+    def upsert_perceptual_hash(self, *, path: str, algorithm: str, value: str) -> bool:
+        """Записывает или обновляет перцептивный хеш для файла по path. Возвращает True если записано."""
+        file_id = _get_file_id_from_path(self.conn, path)
+        if file_id is None:
+            return False
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO file_perceptual_hashes (file_id, algorithm, value, computed_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(file_id, algorithm) DO UPDATE SET value = excluded.value, computed_at = excluded.computed_at
+            """,
+            (file_id, algorithm, value, _now_utc_iso()),
+        )
+        self.conn.commit()
+        return cur.rowcount is not None and cur.rowcount > 0
+
+    def list_archive_image_paths_without_phash(self, *, limit: int = 100, algorithm: str = "pHash") -> list[str]:
+        """Пути архивных изображений, для которых ещё нет перцептивного хеша (для досчёта pHash)."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT f.path
+            FROM files f
+            LEFT JOIN file_perceptual_hashes fph ON f.id = fph.file_id AND fph.algorithm = ?
+            WHERE COALESCE(f.inventory_scope, 'archive') = 'archive'
+              AND f.status != 'deleted'
+              AND (LOWER(COALESCE(f.media_type, '')) = 'image' OR LOWER(COALESCE(f.mime_type, '')) LIKE 'image/%')
+              AND fph.file_id IS NULL
+            ORDER BY f.path
+            LIMIT ?
+            """,
+            (algorithm, limit),
+        )
+        return [str(r["path"]) for r in cur.fetchall()]
+
+    def count_archive_images_without_phash(self, *, algorithm: str = "pHash") -> int:
+        """Количество архивных изображений без перцептивного хеша."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM files f
+            LEFT JOIN file_perceptual_hashes fph ON f.id = fph.file_id AND fph.algorithm = ?
+            WHERE COALESCE(f.inventory_scope, 'archive') = 'archive'
+              AND f.status != 'deleted'
+              AND (LOWER(COALESCE(f.media_type, '')) = 'image' OR LOWER(COALESCE(f.mime_type, '')) LIKE 'image/%')
+              AND fph.file_id IS NULL
+            """,
+            (algorithm,),
+        )
+        row = cur.fetchone()
+        return int(row["cnt"]) if row else 0
+
+    def count_archive_images(self) -> int:
+        """Всего архивных изображений (для отображения прогресса pHash)."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM files f
+            WHERE COALESCE(f.inventory_scope, 'archive') = 'archive'
+              AND f.status != 'deleted'
+              AND (LOWER(COALESCE(f.media_type, '')) = 'image' OR LOWER(COALESCE(f.mime_type, '')) LIKE 'image/%')
+            """
+        )
+        row = cur.fetchone()
+        return int(row["cnt"]) if row else 0
+
+    def list_similar_image_groups_archive(self, *, algorithm: str = "pHash") -> list[dict[str, Any]]:
+        """
+        Возвращает группы визуально похожих фото для архива (inventory_scope='archive').
+        Группа = одинаковый (algorithm, value) в file_perceptual_hashes, количество файлов > 1.
+        Скрытые пользователем группы («Оставить все выбранное») не возвращаются.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT
+              fph.algorithm,
+              fph.value,
+              COUNT(*) AS cnt
+            FROM file_perceptual_hashes fph
+            JOIN files f ON f.id = fph.file_id
+            WHERE
+              fph.algorithm = ?
+              AND COALESCE(f.inventory_scope, 'archive') = 'archive'
+              AND f.status != 'deleted'
+              AND NOT EXISTS (
+                SELECT 1 FROM duplicate_groups_hidden h
+                WHERE h.group_type = 'similar' AND h.algorithm = fph.algorithm AND h.value = fph.value
+              )
+            GROUP BY fph.algorithm, fph.value
+            HAVING COUNT(*) > 1
+            ORDER BY cnt DESC
+            """,
+            (algorithm,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_similar_image_group_items(
+        self,
+        *,
+        algorithm: str,
+        value: str,
+        inventory_scope: str | None = None,
+        last_run_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Элементы группы визуально похожих фото (те же поля, что list_group_items для UI)."""
+        cur = self.conn.cursor()
+        where: list[str] = [
+            "fph.algorithm = ? AND fph.value = ?",
+            "f.status != 'deleted'",
+        ]
+        params: list[Any] = [algorithm, value]
+        if inventory_scope is not None:
+            where.append("COALESCE(f.inventory_scope, 'archive') = ?")
+            params.append(inventory_scope)
+        if last_run_id is not None:
+            where.append("f.last_run_id = ?")
+            params.append(last_run_id)
+        cur.execute(
+            f"""
+            SELECT f.id AS file_id, f.path, f.name, f.parent_path, f.size, f.modified, f.mime_type, f.media_type, f.hash_source
+            FROM file_perceptual_hashes fph
+            JOIN files f ON f.id = fph.file_id
+            WHERE {' AND '.join(where)}
+            ORDER BY f.path ASC
+            """,
+            params,
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_similar_image_groups_for_run(self, *, run_id: int, algorithm: str = "pHash") -> list[dict[str, Any]]:
+        """Группы визуально похожих фото только среди source с last_run_id=run_id (для подшага 1.2)."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT fph.algorithm, fph.value, COUNT(*) AS cnt
+            FROM file_perceptual_hashes fph
+            JOIN files f ON f.id = fph.file_id
+            WHERE fph.algorithm = ?
+              AND COALESCE(f.inventory_scope, '') = 'source'
+              AND f.last_run_id = ?
+              AND f.status != 'deleted'
+            GROUP BY fph.algorithm, fph.value
+            HAVING COUNT(*) > 1
+            ORDER BY cnt DESC
+            """,
+            (algorithm, run_id),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_similar_image_groups_source_vs_archive(self, *, run_id: int, algorithm: str = "pHash") -> list[dict[str, Any]]:
+        """Группы (algorithm, value), у которых есть файлы и в source (last_run_id=run_id), и в archive (для подшага 1.1)."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT fph.algorithm, fph.value
+            FROM file_perceptual_hashes fph
+            JOIN files f ON f.id = fph.file_id
+            WHERE fph.algorithm = ? AND f.status != 'deleted'
+              AND COALESCE(f.inventory_scope, '') = 'source' AND f.last_run_id = ?
+            """,
+            (algorithm, run_id),
+        )
+        source_keys = {(str(r["algorithm"]), str(r["value"])) for r in cur.fetchall()}
+        cur.execute(
+            """
+            SELECT DISTINCT fph.algorithm, fph.value
+            FROM file_perceptual_hashes fph
+            JOIN files f ON f.id = fph.file_id
+            WHERE fph.algorithm = ? AND f.status != 'deleted'
+              AND COALESCE(f.inventory_scope, 'archive') = 'archive'
+            """,
+            (algorithm,),
+        )
+        archive_keys = {(str(r["algorithm"]), str(r["value"])) for r in cur.fetchall()}
+        common = source_keys & archive_keys
+        return [{"algorithm": a, "value": v} for a, v in sorted(common)]
+
+    # --- Видео: хеши кадров для группировки «похожие видео» ---
+    def upsert_video_frame_hashes(self, *, file_id: int, duration_sec: float, frames: list[tuple[float, str]]) -> None:
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM file_video_frame_hashes WHERE file_id = ?", (file_id,))
+        now = _now_utc_iso()
+        for time_offset_sec, phash_value in frames:
+            cur.execute(
+                "INSERT INTO file_video_frame_hashes (file_id, duration_sec, time_offset_sec, phash_value, computed_at) VALUES (?, ?, ?, ?, ?)",
+                (file_id, duration_sec, time_offset_sec, str(phash_value).strip(), now),
+            )
+        self.conn.commit()
+
+    def list_archive_video_paths_without_frame_hashes(self, *, limit: int = 50) -> list[tuple[str, int, float | None]]:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT f.id, f.path, f.duration_sec FROM files f
+            WHERE COALESCE(f.inventory_scope, 'archive') = 'archive' AND f.status != 'deleted'
+              AND (LOWER(COALESCE(f.media_type, '')) = 'video' OR LOWER(COALESCE(f.mime_type, '')) LIKE 'video/%')
+              AND (SELECT COUNT(*) FROM file_video_frame_hashes v WHERE v.file_id = f.id) < 3
+            ORDER BY f.path LIMIT ?
+            """,
+            (limit,),
+        )
+        return [(str(r["path"]), int(r["id"]), r["duration_sec"] if r["duration_sec"] is not None else None) for r in cur.fetchall()]
+
+    def list_similar_video_groups_archive(self) -> list[dict[str, Any]]:
+        from collections import defaultdict
+        cur = self.conn.cursor()
+        cur.execute("SELECT value FROM duplicate_groups_hidden WHERE group_type = 'similar_video'")
+        hidden_values = {str(r["value"] or "") for r in cur.fetchall()}
+        cur.execute(
+            """
+            SELECT v.file_id, v.duration_sec, v.time_offset_sec, v.phash_value
+            FROM file_video_frame_hashes v JOIN files f ON f.id = v.file_id
+            WHERE COALESCE(f.inventory_scope, 'archive') = 'archive' AND f.status != 'deleted'
+            ORDER BY v.file_id, v.time_offset_sec
+            """
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        by_file: dict[int, list[tuple[float, str]]] = defaultdict(list)
+        for r in rows:
+            by_file[int(r["file_id"])].append((float(r["time_offset_sec"]), str(r["phash_value"] or "")))
+        group_key_to_files: dict[tuple[float, str], list[int]] = defaultdict(list)
+        for file_id, pairs in by_file.items():
+            if len(pairs) < 3:
+                continue
+            pairs_sorted = sorted(pairs, key=lambda x: x[0])
+            duration_sec = next((float(r["duration_sec"]) for r in rows if r["file_id"] == file_id), 0.0)
+            phash_key = "|".join(p[1] for p in pairs_sorted[:3])
+            group_key_to_files[(duration_sec, phash_key)].append(file_id)
+        out = []
+        for (duration_sec, phash_key), file_ids in group_key_to_files.items():
+            if len(file_ids) < 2 or f"{duration_sec}:{phash_key}" in hidden_values:
+                continue
+            out.append({"duration_sec": duration_sec, "phash_key": phash_key, "cnt": len(file_ids)})
+        out.sort(key=lambda x: (-x["cnt"], x["duration_sec"]))
+        return out
+
+    def list_similar_video_group_items(self, *, duration_sec: float, phash_key: str, inventory_scope: str | None = None) -> list[dict[str, Any]]:
+        from collections import defaultdict
+        parts = phash_key.split("|")
+        if len(parts) < 3:
+            return []
+        cur = self.conn.cursor()
+        cur.execute("SELECT file_id, time_offset_sec, phash_value FROM file_video_frame_hashes WHERE duration_sec = ? ORDER BY file_id, time_offset_sec", (duration_sec,))
+        by_file: dict[int, list[str]] = defaultdict(list)
+        for r in cur.fetchall():
+            by_file[int(r["file_id"])].append(str(r["phash_value"] or ""))
+        target = "|".join(parts[:3])
+        matching = [fid for fid, ph in by_file.items() if len(ph) >= 3 and "|".join(ph[:3]) == target]
+        if not matching:
+            return []
+        q = ",".join(["?"] * len(matching))
+        where = [f"f.id IN ({q})", "f.status != 'deleted'"]
+        params: list[Any] = list(matching)
+        if inventory_scope:
+            where.append("COALESCE(f.inventory_scope, 'archive') = ?")
+            params.append(inventory_scope)
+        cur.execute(
+            f"SELECT f.id AS file_id, f.path, f.name, f.parent_path, f.size, f.modified, f.mime_type, f.media_type, f.hash_source FROM files f WHERE {' AND '.join(where)} ORDER BY f.path",
+            params,
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def hide_duplicate_group_similar_video(self, *, duration_sec: float, phash_key: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO duplicate_groups_hidden (group_type, hash_alg, hash_value, algorithm, value, hidden_at) VALUES ('similar_video', '', '', '', ?, ?)",
+            (f"{duration_sec}:{phash_key}", _now_utc_iso()),
+        )
+        self.conn.commit()
+
+    def list_hidden_duplicate_groups(self) -> list[dict[str, Any]]:
+        """Список скрытых групп («разрешенные дубли») для вкладки «Разрешенные дубли»."""
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT group_type, hash_alg, hash_value, algorithm, value, hidden_at FROM duplicate_groups_hidden ORDER BY hidden_at DESC"
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def unhide_duplicate_group_exact(self, *, hash_alg: str, hash_value: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "DELETE FROM duplicate_groups_hidden WHERE group_type = 'exact' AND hash_alg = ? AND hash_value = ? AND algorithm = '' AND value = ''",
+            (hash_alg, hash_value),
+        )
+        self.conn.commit()
+
+    def unhide_duplicate_group_similar(self, *, algorithm: str, value: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "DELETE FROM duplicate_groups_hidden WHERE group_type = 'similar' AND hash_alg = '' AND hash_value = '' AND algorithm = ? AND value = ?",
+            (algorithm, value),
+        )
+        self.conn.commit()
+
+    def unhide_duplicate_group_similar_video(self, *, duration_sec: float, phash_key: str) -> None:
+        cur = self.conn.cursor()
+        val = f"{duration_sec}:{phash_key}"
+        cur.execute(
+            "DELETE FROM duplicate_groups_hidden WHERE group_type = 'similar_video' AND value = ?",
+            (val,),
+        )
+        self.conn.commit()
 
     def set_ignore_archive_dup(self, *, paths: list[str], run_id: int) -> int:
         """
@@ -2837,6 +3377,16 @@ class DedupStore:
         cur = self.conn.cursor()
         q = ",".join(["?"] * len(paths))
         cur.execute(f"UPDATE files SET status = 'deleted', error = NULL WHERE path IN ({q})", paths)
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
+    def unmark_deleted(self, *, paths: list[str]) -> int:
+        """Снимает пометку удалённых (после восстановления из корзины Я.Диска)."""
+        if not paths:
+            return 0
+        cur = self.conn.cursor()
+        q = ",".join(["?"] * len(paths))
+        cur.execute(f"UPDATE files SET status = NULL WHERE path IN ({q})", paths)
         self.conn.commit()
         return int(cur.rowcount or 0)
 
@@ -4021,6 +4571,7 @@ class PipelineStore:
         scanned_at: str | None = None,
         hashed_at: str | None = None,
     ) -> None:
+        _ensure_files_path_unique_index(self.conn)
         cur = self.conn.cursor()
         cur.execute(
             """
@@ -4079,29 +4630,90 @@ class PipelineStore:
             return None, None
         return (row["hash_alg"], row["hash_value"])
 
+    def count_archive_files_without_hash(self) -> int:
+        """Количество файлов архива без хэша (для прогресса дедупа по БД)."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*) AS cnt FROM files
+            WHERE COALESCE(inventory_scope, 'archive') = 'archive'
+              AND status != 'deleted'
+              AND hash_value IS NULL
+              AND path LIKE 'disk:%'
+            """
+        )
+        row = cur.fetchone()
+        return int(row["cnt"]) if row else 0
+
+    def list_archive_files_without_hash(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        """Список файлов архива без хэша (для дедупа по БД)."""
+        cur = self.conn.cursor()
+        sql = """
+            SELECT path, size, mime_type, media_type, name, parent_path, created, modified, resource_id
+            FROM files
+            WHERE COALESCE(inventory_scope, 'archive') = 'archive'
+              AND status != 'deleted'
+              AND hash_value IS NULL
+              AND path LIKE 'disk:%'
+            ORDER BY path
+        """
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        cur.execute(sql)
+        return [dict(r) for r in cur.fetchall()]
+
     def list_dup_groups_archive(self) -> list[dict[str, Any]]:
         """
         Возвращает группы дублей для архива YaDisk (inventory_scope='archive').
         Группа = одинаковый (hash_alg, hash_value), где количество файлов > 1.
+        Скрытые пользователем группы («Оставить все выбранное») не возвращаются.
         """
         cur = self.conn.cursor()
         cur.execute(
             """
             SELECT
-              hash_alg,
-              hash_value,
+              f.hash_alg,
+              f.hash_value,
               COUNT(*) AS cnt
-            FROM files
+            FROM files f
             WHERE
-              hash_value IS NOT NULL
-              AND COALESCE(inventory_scope, 'archive') = 'archive'
-              AND status != 'deleted'
-            GROUP BY hash_alg, hash_value
+              f.hash_value IS NOT NULL
+              AND COALESCE(f.inventory_scope, 'archive') = 'archive'
+              AND f.status != 'deleted'
+              AND NOT EXISTS (
+                SELECT 1 FROM duplicate_groups_hidden h
+                WHERE h.group_type = 'exact' AND h.hash_alg = f.hash_alg AND h.hash_value = f.hash_value
+              )
+            GROUP BY f.hash_alg, f.hash_value
             HAVING COUNT(*) > 1
-            ORDER BY cnt DESC, hash_alg ASC
+            ORDER BY cnt DESC, f.hash_alg ASC
             """
         )
         return [dict(r) for r in cur.fetchall()]
+
+    def hide_duplicate_group_exact(self, *, hash_alg: str, hash_value: str) -> None:
+        """Пометить группу точных дублей как «решённую» — больше не показывать на странице дублей."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO duplicate_groups_hidden (group_type, hash_alg, hash_value, algorithm, value, hidden_at)
+            VALUES ('exact', ?, ?, '', '', ?)
+            """,
+            (hash_alg, hash_value, _now_utc_iso()),
+        )
+        self.conn.commit()
+
+    def hide_duplicate_group_similar(self, *, algorithm: str, value: str) -> None:
+        """Пометить группу визуально похожих как «решённую» — больше не показывать на странице дублей."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO duplicate_groups_hidden (group_type, hash_alg, hash_value, algorithm, value, hidden_at)
+            VALUES ('similar', '', '', ?, ?, ?)
+            """,
+            (algorithm, value, _now_utc_iso()),
+        )
+        self.conn.commit()
 
     def list_group_items(self, *, hash_alg: str, hash_value: str, inventory_scope: str | None = None, last_run_id: int | None = None) -> list[dict[str, Any]]:
         cur = self.conn.cursor()
@@ -4115,7 +4727,7 @@ class PipelineStore:
             params.append(last_run_id)
         cur.execute(
             f"""
-            SELECT path, name, parent_path, size, modified, mime_type, media_type, hash_source
+            SELECT id AS file_id, path, name, parent_path, size, modified, mime_type, media_type, hash_source
             FROM files
             WHERE {' AND '.join(where)}
             ORDER BY path ASC
@@ -4123,6 +4735,328 @@ class PipelineStore:
             params,
         )
         return [dict(r) for r in cur.fetchall()]
+
+    # --- Perceptual hashes (визуально похожие фото) ---
+
+    def get_existing_perceptual_hash(self, *, path: str, algorithm: str = "pHash") -> str | None:
+        """Возвращает значение перцептивного хеша для файла по path или None."""
+        file_id = _get_file_id_from_path(self.conn, path)
+        if file_id is None:
+            return None
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT value FROM file_perceptual_hashes WHERE file_id = ? AND algorithm = ? LIMIT 1",
+            (file_id, algorithm),
+        )
+        row = cur.fetchone()
+        return row["value"] if row else None
+
+    def upsert_perceptual_hash(self, *, path: str, algorithm: str, value: str) -> bool:
+        """Записывает или обновляет перцептивный хеш для файла по path. Возвращает True если записано."""
+        file_id = _get_file_id_from_path(self.conn, path)
+        if file_id is None:
+            return False
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO file_perceptual_hashes (file_id, algorithm, value, computed_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(file_id, algorithm) DO UPDATE SET value = excluded.value, computed_at = excluded.computed_at
+            """,
+            (file_id, algorithm, value, _now_utc_iso()),
+        )
+        self.conn.commit()
+        return cur.rowcount is not None and cur.rowcount > 0
+
+    def list_archive_image_paths_without_phash(self, *, limit: int = 100, algorithm: str = "pHash") -> list[str]:
+        """Пути архивных изображений, для которых ещё нет перцептивного хеша (для досчёта pHash)."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT f.path
+            FROM files f
+            LEFT JOIN file_perceptual_hashes fph ON f.id = fph.file_id AND fph.algorithm = ?
+            WHERE COALESCE(f.inventory_scope, 'archive') = 'archive'
+              AND f.status != 'deleted'
+              AND (LOWER(COALESCE(f.media_type, '')) = 'image' OR LOWER(COALESCE(f.mime_type, '')) LIKE 'image/%')
+              AND fph.file_id IS NULL
+            ORDER BY f.path
+            LIMIT ?
+            """,
+            (algorithm, limit),
+        )
+        return [str(r["path"]) for r in cur.fetchall()]
+
+    def count_archive_images_without_phash(self, *, algorithm: str = "pHash") -> int:
+        """Количество архивных изображений без перцептивного хеша."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM files f
+            LEFT JOIN file_perceptual_hashes fph ON f.id = fph.file_id AND fph.algorithm = ?
+            WHERE COALESCE(f.inventory_scope, 'archive') = 'archive'
+              AND f.status != 'deleted'
+              AND (LOWER(COALESCE(f.media_type, '')) = 'image' OR LOWER(COALESCE(f.mime_type, '')) LIKE 'image/%')
+              AND fph.file_id IS NULL
+            """,
+            (algorithm,),
+        )
+        row = cur.fetchone()
+        return int(row["cnt"]) if row else 0
+
+    def count_archive_images(self) -> int:
+        """Всего архивных изображений (для отображения прогресса pHash)."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM files f
+            WHERE COALESCE(f.inventory_scope, 'archive') = 'archive'
+              AND f.status != 'deleted'
+              AND (LOWER(COALESCE(f.media_type, '')) = 'image' OR LOWER(COALESCE(f.mime_type, '')) LIKE 'image/%')
+            """
+        )
+        row = cur.fetchone()
+        return int(row["cnt"]) if row else 0
+
+    def list_similar_image_groups_archive(self, *, algorithm: str = "pHash") -> list[dict[str, Any]]:
+        """
+        Возвращает группы визуально похожих фото для архива (inventory_scope='archive').
+        Группа = одинаковый (algorithm, value) в file_perceptual_hashes, количество файлов > 1.
+        Скрытые пользователем группы («Оставить все выбранное») не возвращаются.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT
+              fph.algorithm,
+              fph.value,
+              COUNT(*) AS cnt
+            FROM file_perceptual_hashes fph
+            JOIN files f ON f.id = fph.file_id
+            WHERE
+              fph.algorithm = ?
+              AND COALESCE(f.inventory_scope, 'archive') = 'archive'
+              AND f.status != 'deleted'
+              AND NOT EXISTS (
+                SELECT 1 FROM duplicate_groups_hidden h
+                WHERE h.group_type = 'similar' AND h.algorithm = fph.algorithm AND h.value = fph.value
+              )
+            GROUP BY fph.algorithm, fph.value
+            HAVING COUNT(*) > 1
+            ORDER BY cnt DESC
+            """,
+            (algorithm,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_similar_image_group_items(
+        self,
+        *,
+        algorithm: str,
+        value: str,
+        inventory_scope: str | None = None,
+        last_run_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Элементы группы визуально похожих фото (те же поля, что list_group_items для UI)."""
+        cur = self.conn.cursor()
+        where: list[str] = [
+            "fph.algorithm = ? AND fph.value = ?",
+            "f.status != 'deleted'",
+        ]
+        params: list[Any] = [algorithm, value]
+        if inventory_scope is not None:
+            where.append("COALESCE(f.inventory_scope, 'archive') = ?")
+            params.append(inventory_scope)
+        if last_run_id is not None:
+            where.append("f.last_run_id = ?")
+            params.append(last_run_id)
+        cur.execute(
+            f"""
+            SELECT f.id AS file_id, f.path, f.name, f.parent_path, f.size, f.modified, f.mime_type, f.media_type, f.hash_source
+            FROM file_perceptual_hashes fph
+            JOIN files f ON f.id = fph.file_id
+            WHERE {' AND '.join(where)}
+            ORDER BY f.path ASC
+            """,
+            params,
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_similar_image_groups_for_run(self, *, run_id: int, algorithm: str = "pHash") -> list[dict[str, Any]]:
+        """Группы визуально похожих фото только среди source с last_run_id=run_id (для подшага 1.2)."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT fph.algorithm, fph.value, COUNT(*) AS cnt
+            FROM file_perceptual_hashes fph
+            JOIN files f ON f.id = fph.file_id
+            WHERE fph.algorithm = ?
+              AND COALESCE(f.inventory_scope, '') = 'source'
+              AND f.last_run_id = ?
+              AND f.status != 'deleted'
+            GROUP BY fph.algorithm, fph.value
+            HAVING COUNT(*) > 1
+            ORDER BY cnt DESC
+            """,
+            (algorithm, run_id),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_similar_image_groups_source_vs_archive(self, *, run_id: int, algorithm: str = "pHash") -> list[dict[str, Any]]:
+        """Группы (algorithm, value), у которых есть файлы и в source (last_run_id=run_id), и в archive (для подшага 1.1)."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT fph.algorithm, fph.value
+            FROM file_perceptual_hashes fph
+            JOIN files f ON f.id = fph.file_id
+            WHERE fph.algorithm = ? AND f.status != 'deleted'
+              AND COALESCE(f.inventory_scope, '') = 'source' AND f.last_run_id = ?
+            """,
+            (algorithm, run_id),
+        )
+        source_keys = {(str(r["algorithm"]), str(r["value"])) for r in cur.fetchall()}
+        cur.execute(
+            """
+            SELECT DISTINCT fph.algorithm, fph.value
+            FROM file_perceptual_hashes fph
+            JOIN files f ON f.id = fph.file_id
+            WHERE fph.algorithm = ? AND f.status != 'deleted'
+              AND COALESCE(f.inventory_scope, 'archive') = 'archive'
+            """,
+            (algorithm,),
+        )
+        archive_keys = {(str(r["algorithm"]), str(r["value"])) for r in cur.fetchall()}
+        common = source_keys & archive_keys
+        return [{"algorithm": a, "value": v} for a, v in sorted(common)]
+
+    # --- Видео: хеши кадров для группировки «похожие видео» ---
+    def upsert_video_frame_hashes(self, *, file_id: int, duration_sec: float, frames: list[tuple[float, str]]) -> None:
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM file_video_frame_hashes WHERE file_id = ?", (file_id,))
+        now = _now_utc_iso()
+        for time_offset_sec, phash_value in frames:
+            cur.execute(
+                "INSERT INTO file_video_frame_hashes (file_id, duration_sec, time_offset_sec, phash_value, computed_at) VALUES (?, ?, ?, ?, ?)",
+                (file_id, duration_sec, time_offset_sec, str(phash_value).strip(), now),
+            )
+        self.conn.commit()
+
+    def list_archive_video_paths_without_frame_hashes(self, *, limit: int = 50) -> list[tuple[str, int, float | None]]:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT f.id, f.path, f.duration_sec FROM files f
+            WHERE COALESCE(f.inventory_scope, 'archive') = 'archive' AND f.status != 'deleted'
+              AND (LOWER(COALESCE(f.media_type, '')) = 'video' OR LOWER(COALESCE(f.mime_type, '')) LIKE 'video/%')
+              AND (SELECT COUNT(*) FROM file_video_frame_hashes v WHERE v.file_id = f.id) < 3
+            ORDER BY f.path LIMIT ?
+            """,
+            (limit,),
+        )
+        return [(str(r["path"]), int(r["id"]), r["duration_sec"] if r["duration_sec"] is not None else None) for r in cur.fetchall()]
+
+    def list_similar_video_groups_archive(self) -> list[dict[str, Any]]:
+        from collections import defaultdict
+        cur = self.conn.cursor()
+        cur.execute("SELECT value FROM duplicate_groups_hidden WHERE group_type = 'similar_video'")
+        hidden_values = {str(r["value"] or "") for r in cur.fetchall()}
+        cur.execute(
+            """
+            SELECT v.file_id, v.duration_sec, v.time_offset_sec, v.phash_value
+            FROM file_video_frame_hashes v JOIN files f ON f.id = v.file_id
+            WHERE COALESCE(f.inventory_scope, 'archive') = 'archive' AND f.status != 'deleted'
+            ORDER BY v.file_id, v.time_offset_sec
+            """
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        by_file: dict[int, list[tuple[float, str]]] = defaultdict(list)
+        for r in rows:
+            by_file[int(r["file_id"])].append((float(r["time_offset_sec"]), str(r["phash_value"] or "")))
+        group_key_to_files: dict[tuple[float, str], list[int]] = defaultdict(list)
+        for file_id, pairs in by_file.items():
+            if len(pairs) < 3:
+                continue
+            pairs_sorted = sorted(pairs, key=lambda x: x[0])
+            duration_sec = next((float(r["duration_sec"]) for r in rows if r["file_id"] == file_id), 0.0)
+            phash_key = "|".join(p[1] for p in pairs_sorted[:3])
+            group_key_to_files[(duration_sec, phash_key)].append(file_id)
+        out = []
+        for (duration_sec, phash_key), file_ids in group_key_to_files.items():
+            if len(file_ids) < 2 or f"{duration_sec}:{phash_key}" in hidden_values:
+                continue
+            out.append({"duration_sec": duration_sec, "phash_key": phash_key, "cnt": len(file_ids)})
+        out.sort(key=lambda x: (-x["cnt"], x["duration_sec"]))
+        return out
+
+    def list_similar_video_group_items(self, *, duration_sec: float, phash_key: str, inventory_scope: str | None = None) -> list[dict[str, Any]]:
+        from collections import defaultdict
+        parts = phash_key.split("|")
+        if len(parts) < 3:
+            return []
+        cur = self.conn.cursor()
+        cur.execute("SELECT file_id, time_offset_sec, phash_value FROM file_video_frame_hashes WHERE duration_sec = ? ORDER BY file_id, time_offset_sec", (duration_sec,))
+        by_file: dict[int, list[str]] = defaultdict(list)
+        for r in cur.fetchall():
+            by_file[int(r["file_id"])].append(str(r["phash_value"] or ""))
+        target = "|".join(parts[:3])
+        matching = [fid for fid, ph in by_file.items() if len(ph) >= 3 and "|".join(ph[:3]) == target]
+        if not matching:
+            return []
+        q = ",".join(["?"] * len(matching))
+        where = [f"f.id IN ({q})", "f.status != 'deleted'"]
+        params: list[Any] = list(matching)
+        if inventory_scope:
+            where.append("COALESCE(f.inventory_scope, 'archive') = ?")
+            params.append(inventory_scope)
+        cur.execute(
+            f"SELECT f.id AS file_id, f.path, f.name, f.parent_path, f.size, f.modified, f.mime_type, f.media_type, f.hash_source FROM files f WHERE {' AND '.join(where)} ORDER BY f.path",
+            params,
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def hide_duplicate_group_similar_video(self, *, duration_sec: float, phash_key: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO duplicate_groups_hidden (group_type, hash_alg, hash_value, algorithm, value, hidden_at) VALUES ('similar_video', '', '', '', ?, ?)",
+            (f"{duration_sec}:{phash_key}", _now_utc_iso()),
+        )
+        self.conn.commit()
+
+    def list_hidden_duplicate_groups(self) -> list[dict[str, Any]]:
+        """Список скрытых групп («разрешенные дубли») для вкладки «Разрешенные дубли»."""
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT group_type, hash_alg, hash_value, algorithm, value, hidden_at FROM duplicate_groups_hidden ORDER BY hidden_at DESC"
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def unhide_duplicate_group_exact(self, *, hash_alg: str, hash_value: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "DELETE FROM duplicate_groups_hidden WHERE group_type = 'exact' AND hash_alg = ? AND hash_value = ? AND algorithm = '' AND value = ''",
+            (hash_alg, hash_value),
+        )
+        self.conn.commit()
+
+    def unhide_duplicate_group_similar(self, *, algorithm: str, value: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "DELETE FROM duplicate_groups_hidden WHERE group_type = 'similar' AND hash_alg = '' AND hash_value = '' AND algorithm = ? AND value = ?",
+            (algorithm, value),
+        )
+        self.conn.commit()
+
+    def unhide_duplicate_group_similar_video(self, *, duration_sec: float, phash_key: str) -> None:
+        cur = self.conn.cursor()
+        val = f"{duration_sec}:{phash_key}"
+        cur.execute(
+            "DELETE FROM duplicate_groups_hidden WHERE group_type = 'similar_video' AND value = ?",
+            (val,),
+        )
+        self.conn.commit()
 
     def set_ignore_archive_dup(self, *, paths: list[str], run_id: int) -> int:
         """
@@ -4233,6 +5167,16 @@ class PipelineStore:
         cur = self.conn.cursor()
         q = ",".join(["?"] * len(paths))
         cur.execute(f"UPDATE files SET status = 'deleted', error = NULL WHERE path IN ({q})", paths)
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
+    def unmark_deleted(self, *, paths: list[str]) -> int:
+        """Снимает пометку удалённых (после восстановления из корзины Я.Диска)."""
+        if not paths:
+            return 0
+        cur = self.conn.cursor()
+        q = ",".join(["?"] * len(paths))
+        cur.execute(f"UPDATE files SET status = NULL WHERE path IN ({q})", paths)
         self.conn.commit()
         return int(cur.rowcount or 0)
 

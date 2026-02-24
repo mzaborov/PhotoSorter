@@ -222,7 +222,7 @@ PhotoSorter/
     db.py                    # SQLite-схема + доступ к данным (folders, dedup, faces)
   data/
     photosorter.db           # Локальная SQLite БД (состояние/кэш)
-    backups/                 # Бекапы БД: python backend/scripts/tools/backup_database.py → photosorter_backup_YYYYMMDD_HHMMSS.db; проверка: backend/scripts/debug/verify_backup_integrity.py <путь>
+    backups/                 # Бекапы БД: python backend/scripts/tools/backup_database.py → photosorter_backup_YYYYMMDD_HHMMSS.db; проверка: backend/scripts/tools/verify_backup_integrity.py <путь>
     models/                  # Кэш моделей (например YuNet onnx для face-scan) (НЕ коммитить)
   docs/
     diagrams/                # Диаграммы в PlantUML + PNG: сущности (AS-IS / TO-BE), ключевые экраны Web UI
@@ -290,7 +290,7 @@ PhotoSorter/
 - Асинхронный рекурсивный подсчёт количества файлов по папкам в UI.
 - API для подсчёта/отладки: `/api/folder-count/{code}`, `/api/path-count`, `/api/path-listing`, `/api/debug/build-info`.
 - Стабилизация работы с Я.Диском: ретраи/таймауты, защита от циклов; увеличен таймаут YaDisk-вызовов до 60 секунд; исправлена нормализация путей (без `.strip()`).
-- Дедупликация архива `disk:/Фото` (инвентаризация + хэши в SQLite) и страница `/duplicates` для просмотра групп дублей.
+- Дедупликация архива `disk:/Фото` (инвентаризация + хэши в SQLite) и страница `/duplicates` для просмотра групп дублей. На странице два режима: **точные дубли (SHA256)** — полное совпадение содержимого; **визуально похожие фото** — по перцептивному хешу (pHash), для вычистки одного и того же изображения в разном размере/качестве. pHash считается при скане архива при скачивании файла для SHA256 (только для изображений).
 - Действия на `/duplicates`:
   - удаление “неотмеченных” копий в корзину,
   - “переместить в «Дети вместе» + удалить остальные” (с обработкой конфликтов имён),

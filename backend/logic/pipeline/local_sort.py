@@ -6,6 +6,7 @@ import json
 import math
 import mimetypes
 import os
+import re
 import shutil
 import sys
 import time
@@ -20,6 +21,7 @@ import numpy as np  # type: ignore[import-untyped]
 from PIL import Image, ExifTags, ImageOps  # type: ignore[import-untyped]
 
 from common.db import DedupStore, FaceStore, PipelineStore, _get_file_id_from_path
+from common.perceptual_hash import compute_phash_hex
 from logic.gold.store import gold_file_map, gold_normalize_path, gold_read_lines
 
 
@@ -1332,6 +1334,14 @@ def dedup_local(
                     scanned_at=None,
                     hashed_at=_now_utc_iso(),
                 )
+                # Визуально похожие: pHash для изображений (1.1 и 1.2)
+                if media_type == "image":
+                    try:
+                        phash_val = compute_phash_hex(abspath)
+                        if phash_val:
+                            store.upsert_perceptual_hash(path=db_path, algorithm="pHash", value=phash_val)
+                    except Exception:
+                        pass
             except Exception as e:  # noqa: BLE001
                 stats.errors += 1
                 store.upsert_file(
@@ -2568,6 +2578,49 @@ def _sanitize_segment(s: str) -> str:
     return seg or "unknown"
 
 
+def _parse_date_from_filename(filename: str) -> Optional[str]:
+    """
+    Парсит дату/время из имени файла. Возвращает ISO-строку 'YYYY-MM-DDTHH:MM:SSZ' или None.
+    """
+    if not filename or not isinstance(filename, str):
+        return None
+    name = os.path.splitext(filename)[0].strip()
+    if not name:
+        return None
+    base = re.sub(r"^(IMG[-_]?|VID[-_]?|WA\d*[-_]?|PANO[-_]?)", "", name, flags=re.IGNORECASE).strip()
+    if not base:
+        return None
+
+    def to_iso(y: str, m: str, d: str, h: str = "00", i: str = "00", s: str = "00") -> Optional[str]:
+        if len(y) == 4 and y.isdigit() and len(m) == 2 and m.isdigit() and len(d) == 2 and d.isdigit():
+            if len(h) == 2 and h.isdigit() and len(i) == 2 and i.isdigit() and len(s) == 2 and s.isdigit():
+                return f"{y}-{m}-{d}T{h}:{i}:{s}Z"
+            return f"{y}-{m}-{d}T00:00:00Z"
+        return None
+
+    m = re.match(r"^(\d{4})(\d{2})(\d{2})[-_](\d{2})(\d{2})(\d{2})$", base)
+    if m:
+        return to_iso(m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), m.group(6))
+    m = re.match(r"^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$", base)
+    if m:
+        return to_iso(m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), m.group(6))
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})[-_\s](\d{2})[-:](\d{2})[-:](\d{2})$", base)
+    if m:
+        return to_iso(m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), m.group(6))
+    m = re.match(r"^(\d{4})(\d{2})(\d{2})$", base)
+    if m:
+        return to_iso(m.group(1), m.group(2), m.group(3))
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", base)
+    if m:
+        return to_iso(m.group(1), m.group(2), m.group(3))
+    m = re.search(r"[-_](\d{4})(\d{2})(\d{2})(?:[-_](\d{2})(\d{2})(\d{2}))?$", base)
+    if m:
+        if m.group(4) is not None:
+            return to_iso(m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), m.group(6))
+        return to_iso(m.group(1), m.group(2), m.group(3))
+    return None
+
+
 def _try_exif_datetime_year(img: Image.Image) -> Optional[str]:
     try:
         exif = img.getexif()
@@ -2575,8 +2628,7 @@ def _try_exif_datetime_year(img: Image.Image) -> Optional[str]:
         return None
     if not exif:
         return None
-    # DateTimeOriginal = 36867
-    dt = exif.get(36867) or exif.get(306)
+    dt = exif.get(36867) or exif.get(306)  # DateTimeOriginal or DateTime
     if not dt or not isinstance(dt, str):
         return None
     # "YYYY:MM:DD HH:MM:SS"

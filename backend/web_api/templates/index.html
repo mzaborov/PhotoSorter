@@ -58,6 +58,13 @@
       .bar { height: 10px; background: #f3f4f6; border-radius: 999px; overflow: hidden; border: 1px solid #e5e7eb; }
       .bar > div { height: 100%; width: 0%; background: #0b57d0; transition: width 200ms linear; }
 
+      .subtabs { display: flex; gap: 4px; margin-top: 10px; margin-bottom: 8px; }
+      .subtabs .subtab { appearance: none; border: 1px solid #d1d5db; background: #f9fafb; padding: 8px 14px; border-radius: 10px; cursor: pointer; font-weight: 600; font-size: 13px; }
+      .subtabs .subtab:hover { background: #f3f4f6; }
+      .subtabs .subtab.active { background: #eef2ff; border-color: #c7d2fe; color: #3730a3; }
+      .subtab-panel { margin-top: 4px; }
+      .hidden { display: none; }
+
       /* Lightbox */
       .lb { position: fixed; inset: 0; background: rgba(17,24,39,0.82); display: none; align-items: center; justify-content: center; padding: 18px; z-index: 9999; }
       .lb.open { display: flex; }
@@ -250,6 +257,11 @@
             <div><span class="pill">Источник</span> <span id="srcStatus">…</span></div>
             <div><span class="pill">Фотоархив</span> <span id="arcStatus">…</span></div>
           </div>
+          <div class="subtabs step1-tabs">
+            <button type="button" class="subtab active" data-tab="exact">Точные</button>
+            <button type="button" class="subtab" data-tab="similar">Визуально похожие с архивом</button>
+          </div>
+          <div id="panelStep1Exact" class="subtab-panel">
           <table>
             <thead>
               <tr>
@@ -263,6 +275,22 @@
               <tr><td colspan="4" class="muted">—</td></tr>
             </tbody>
           </table>
+          </div>
+          <div id="panelStep1Similar" class="subtab-panel" style="display: none;">
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 44px;"></th>
+                <th>В источнике</th>
+                <th>В архиве</th>
+                <th style="width: 240px;">Действия</th>
+              </tr>
+            </thead>
+            <tbody id="tbodyStep1Similar">
+              <tr><td colspan="4" class="muted">—</td></tr>
+            </tbody>
+          </table>
+          </div>
         </div>
 
         <div class="section" id="secStep2">
@@ -277,11 +305,16 @@
             </div>
           </div>
           <div class="muted" style="margin-top: 8px;">run: <span class="pill" id="runStep2">—</span> · источник: <code id="rootStep2">—</code></div>
+          <div class="subtabs step2-tabs">
+            <button type="button" class="subtab active" data-tab="exact">Точные</button>
+            <button type="button" class="subtab" data-tab="similar">Визуально похожие между собой</button>
+          </div>
           <div class="muted" style="margin-top: 8px;">
             Групп: <span class="pill" id="groupsCnt">—</span>
             &nbsp;·&nbsp;
             Макс. размер группы: <span class="pill" id="maxGroup">—</span>
           </div>
+          <div id="panelStep2Exact" class="subtab-panel">
           <table>
             <thead>
               <tr>
@@ -293,6 +326,20 @@
               <tr><td colspan="2" class="muted">—</td></tr>
             </tbody>
           </table>
+          </div>
+          <div id="panelStep2Similar" class="subtab-panel" style="display: none;">
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 220px;">Группа</th>
+                <th>Файлы</th>
+              </tr>
+            </thead>
+            <tbody id="tbodyStep2Similar">
+              <tr><td colspan="2" class="muted">—</td></tr>
+            </tbody>
+          </table>
+          </div>
         </div>
 
         </div> <!-- /secDedup -->
@@ -917,12 +964,36 @@
       }
 
       function step1CollectSelected() {
+        const activeTab = qs(".step1-tabs .subtab.active")?.getAttribute("data-tab") || "exact";
         const res = [];
-        document.querySelectorAll("input.step1-sel:checked").forEach(cb => {
-          const p = cb.getAttribute("data-path");
-          if (p) res.push(p);
-        });
+        if (activeTab === "exact") {
+          qs("#panelStep1Exact")?.querySelectorAll("input.step1-sel:checked").forEach(cb => {
+            const p = cb.getAttribute("data-path");
+            if (p) res.push(p);
+          });
+        } else {
+          qs("#panelStep1Similar")?.querySelectorAll("input.step1-keep").forEach(cb => {
+            if (!(cb instanceof HTMLInputElement) || cb.checked) return;
+            const p = cb.getAttribute("data-path");
+            if (p) res.push(p);
+          });
+        }
         return res;
+      }
+      function step1SwitchTab(tab) {
+        const exact = qs("#panelStep1Exact");
+        const similar = qs("#panelStep1Similar");
+        document.querySelectorAll(".step1-tabs .subtab").forEach(b => b.classList.remove("active"));
+        const activeBtn = document.querySelector(".step1-tabs .subtab[data-tab='" + tab + "']");
+        if (activeBtn) activeBtn.classList.add("active");
+        if (tab === "exact") {
+          if (exact) exact.style.display = "";
+          if (similar) similar.style.display = "none";
+        } else {
+          if (exact) exact.style.display = "none";
+          if (similar) similar.style.display = "";
+        }
+        step1UpdateButtons();
       }
       function step1UpdateButtons() {
         const n = step1CollectSelected().length;
@@ -936,24 +1007,34 @@
 
       async function loadStep1() {
         const tbody = qs("#tbodyStep1");
+        const tbodySim = qs("#tbodyStep1Similar");
         tbody.innerHTML = `<tr><td colspan="4" class="muted">Загрузка…</td></tr>`;
+        if (tbodySim) tbodySim.innerHTML = `<tr><td colspan="4" class="muted">Загрузка…</td></tr>`;
         step1UpdateButtons();
         try {
           const data = await fetchJson("/api/sort/dup-in-archive", { cache: "no-store" });
           qs("#runStep1").textContent = data?.source_run_id ? `#${data.source_run_id}` : "—";
           qs("#rootStep1").textContent = data?.source_root_path || "—";
           const items = Array.isArray(data?.items) ? data.items : [];
-          // счётчик шага 1 = кол-во source-файлов (лишние копии в архиве-аспекте)
-          qs("#cntStep1").textContent = String(Number(data?.total) || items.length || 0);
-          if (items.length === 0) {
+          const similarWithArchive = Array.isArray(data?.similar_with_archive) ? data.similar_with_archive : [];
+          let extraSimilar = 0;
+          for (const g of similarWithArchive) {
+            const sf = Array.isArray(g.source_files) ? g.source_files : [];
+            if (sf.length > 1) extraSimilar += (sf.length - 1);
+          }
+          qs("#cntStep1").textContent = String(items.length + extraSimilar);
+          if (items.length === 0 && similarWithArchive.length === 0) {
             const scanned = !!data?.archive_scanned;
             tbody.innerHTML = scanned
               ? `<tr><td colspan="4" class="muted">Совпадений с архивом не найдено.</td></tr>`
               : `<tr><td colspan="4" class="muted">Архив ещё не просканирован. Запусти “Сортировать” и дождись завершения scan архива.</td></tr>`;
+            if (tbodySim) tbodySim.innerHTML = `<tr><td colspan="4" class="muted">Визуально похожих с архивом нет.</td></tr>`;
             step1UpdateButtons();
             return;
           }
-          tbody.innerHTML = items.map(it => {
+          tbody.innerHTML = items.length === 0
+            ? `<tr><td colspan="4" class="muted">Точных совпадений с архивом не найдено.</td></tr>`
+            : items.map(it => {
             const sp = escapeHtml(it.source_path || "");
             const disk = (it.source_path || "").startsWith("disk:");
             const srcLink = disk
@@ -979,6 +1060,32 @@
             `;
           }).join("");
 
+          if (tbodySim) {
+            tbodySim.innerHTML = similarWithArchive.length === 0
+              ? `<tr><td colspan="4" class="muted">Визуально похожих с архивом не найдено.</td></tr>`
+              : similarWithArchive.map(g => {
+                const srcFiles = Array.isArray(g.source_files) ? g.source_files : [];
+                const arcFiles = Array.isArray(g.archive_files) ? g.archive_files : [];
+                const srcHtml = srcFiles.map(f => {
+                  const p = escapeHtml(f.path || "");
+                  const short = escapeHtml(f.path_short || f.path || "");
+                  const keep = !!f.keep;
+                  return `<div class="row" style="align-items:center; gap:8px; margin-bottom:6px;"><input class="step1-keep" type="checkbox" data-path="${p}" ${keep ? "checked" : ""} /><span class="muted">сохранить</span><code>${short}</code></div>`;
+                }).join("");
+                const arcHtml = arcFiles.slice(0, 5).map(f => {
+                  const ap = escapeHtml(f.path_short || f.path || "");
+                  const openUrl = f.open_url || "";
+                  return openUrl ? `<div><a href="${escapeHtml(openUrl)}" target="_blank" rel="noopener noreferrer"><code>${ap}</code></a></div>` : `<div><code>${ap}</code></div>`;
+                }).join("") + (arcFiles.length > 5 ? `<div class="muted">… ещё ${arcFiles.length - 5}</div>` : "");
+                return `<tr>
+                  <td></td>
+                  <td><div class="muted">В источнике: ${srcFiles.length} файл(ов)</div>${srcHtml}</td>
+                  <td><div class="muted">В архиве: ${arcFiles.length} файл(ов)</div>${arcHtml}</td>
+                  <td><button class="btn danger" type="button" data-act="step1-del-similar">Удалить выбранные</button></td>
+                </tr>`;
+              }).join("");
+          }
+
           const runId = data?.source_run_id;
           tbody.querySelectorAll("input.step1-sel").forEach(cb => cb.addEventListener("change", step1UpdateButtons));
           tbody.querySelectorAll("button[data-act='step1-del']").forEach(btn => btn.addEventListener("click", async () => {
@@ -994,6 +1101,17 @@
             await postJson("/api/sort/source/ignore-archive-dup", { paths: [p], source_run_id: runId });
             await loadAllResults();
           }));
+
+          if (tbodySim) {
+            tbodySim.querySelectorAll("input.step1-keep").forEach(cb => cb.addEventListener("change", step1UpdateButtons));
+            tbodySim.querySelectorAll("button[data-act='step1-del-similar']").forEach(btn => btn.addEventListener("click", async () => {
+              const paths = step1CollectSelected();
+              if (!paths.length) return;
+              if (!confirm(`Удалить из источника: ${paths.length} файл(ов)?`)) return;
+              await postJson("/api/sort/source/delete", { paths, source_run_id: runId });
+              await loadAllResults();
+            }));
+          }
 
           qs("#btnStep1Del").onclick = async () => {
             const paths = step1CollectSelected();
@@ -1011,6 +1129,7 @@
           step1UpdateButtons();
         } catch (e) {
           tbody.innerHTML = `<tr><td colspan="4" class="err">Ошибка: ${escapeHtml(e?.message || e)}</td></tr>`;
+          if (tbodySim) tbodySim.innerHTML = `<tr><td colspan="4" class="err">Ошибка</td></tr>`;
           step1UpdateButtons();
           qs("#cntStep1").textContent = "0";
         }
@@ -1018,7 +1137,9 @@
 
       function step2CollectAllUnchecked() {
         const paths = [];
-        document.querySelectorAll(".cards[data-group]").forEach(cardsEl => {
+        const activePanel = qs("#panelStep2Exact")?.style?.display !== "none" ? qs("#panelStep2Exact") : qs("#panelStep2Similar");
+        if (!activePanel) return paths;
+        activePanel.querySelectorAll(".cards[data-group]").forEach(cardsEl => {
           cardsEl.querySelectorAll(".card2").forEach(card => {
             const cb = card.querySelector("input.keep-cb");
             const p = card.getAttribute("data-path");
@@ -1040,37 +1161,59 @@
         const checked = cardsEl.querySelectorAll("input.keep-cb:checked").length;
         if (warn) warn.classList.toggle("hidden", checked > 0);
       }
+      function step2SwitchTab(tab) {
+        const exact = qs("#panelStep2Exact");
+        const similar = qs("#panelStep2Similar");
+        document.querySelectorAll(".step2-tabs .subtab").forEach(b => b.classList.remove("active"));
+        const activeBtn = document.querySelector(".step2-tabs .subtab[data-tab='" + tab + "']");
+        if (activeBtn) activeBtn.classList.add("active");
+        if (tab === "exact") {
+          if (exact) exact.style.display = "";
+          if (similar) similar.style.display = "none";
+        } else {
+          if (exact) exact.style.display = "none";
+          if (similar) similar.style.display = "";
+        }
+        const panel = tab === "exact" ? exact : similar;
+        if (panel) {
+          const g = panel.dataset.groups ?? "0";
+          const m = panel.dataset.maxGroup ?? "0";
+          if (qs("#groupsCnt")) qs("#groupsCnt").textContent = String(g);
+          if (qs("#maxGroup")) qs("#maxGroup").textContent = String(m);
+        }
+        step2UpdateDeleteBtn();
+      }
 
       async function loadStep2() {
         const tbody = qs("#tbodyStep2");
+        const tbodySim = qs("#tbodyStep2Similar");
         tbody.innerHTML = `<tr><td colspan="2" class="muted">Загрузка…</td></tr>`;
+        if (tbodySim) tbodySim.innerHTML = `<tr><td colspan="2" class="muted">Загрузка…</td></tr>`;
         step2UpdateDeleteBtn();
         try {
           const data = await fetchJson("/api/sort/dup-in-source", { cache: "no-store" });
           const runId = data?.source_run_id;
           qs("#runStep2").textContent = runId ? `#${runId}` : "—";
           qs("#rootStep2").textContent = data?.source_root_path || "—";
-          qs("#groupsCnt").textContent = String(data?.summary?.groups ?? "0");
-          qs("#maxGroup").textContent = String(data?.summary?.max_group_size ?? "0");
 
           const groups = Array.isArray(data?.groups) ? data.groups : [];
-          // счётчик шага 2 = сумма (cnt - 1) по группам (лишние копии)
+          const similarGroups = Array.isArray(data?.similar_groups) ? data.similar_groups : [];
+          const summaryExact = data?.summary || {};
+          const summarySim = data?.summary_similar || {};
           let extra = 0;
           for (const g of groups) {
             const c = Number(g?.cnt) || 0;
             if (c > 1) extra += (c - 1);
           }
+          for (const g of similarGroups) {
+            const c = Number(g?.cnt) || 0;
+            if (c > 1) extra += (c - 1);
+          }
           qs("#cntStep2").textContent = String(extra);
 
-          if (groups.length === 0) {
-            tbody.innerHTML = `<tr><td colspan="2" class="muted">Дублей внутри источника не найдено.</td></tr>`;
-            step2UpdateDeleteBtn();
-            return;
-          }
-
-          tbody.innerHTML = groups.map(g => {
+          const renderGroupRow = (g) => {
             const files = Array.isArray(g.files) ? g.files : [];
-            const groupKey = `${escapeHtml(g.hash_alg || "")}:${escapeHtml(g.hash_short || "")}`;
+            const groupKey = `${escapeHtml(g.hash_alg || g.algorithm || "")}:${escapeHtml(g.hash_short || g.value?.slice?.(0, 12) || "")}`;
             const cards = files.map(f => {
               const p = escapeHtml(f.path || "");
               const short = escapeHtml(f.path_short || f.path || "");
@@ -1080,7 +1223,6 @@
               const openUrl = f.open_url || "";
               const isDiskVideo = (pk === "video") && ((f.path || "").startsWith("disk:"));
               const isLocalVideo = (pk === "video") && ((f.path || "").startsWith("local:"));
-              // Превью грузим очередью после рендера (иначе большие группы забивают сервер и ловят 429).
               const fsBtn = (pk === "image" || pk === "video") ? `<button class="fsbtn" type="button" data-fs="1">⤢</button>` : ``;
               const thumbHtml = `<div class="noimg">превью…</div>${fsBtn}`;
               return `
@@ -1108,8 +1250,8 @@
             return `
               <tr>
                 <td>
-                  <div><span class="pill">${escapeHtml(g.cnt || "")} шт</span></div>
-                  <div style="margin-top: 6px;"><code>${escapeHtml(g.hash_alg || "")}:${escapeHtml(g.hash_short || "")}</code></div>
+                  <div><span class="pill">${escapeHtml(String(g.cnt || files.length))} шт</span></div>
+                  <div style="margin-top: 6px;"><code>${escapeHtml(g.hash_alg || g.algorithm || "")}:${escapeHtml(g.hash_short || (g.value && g.value.slice(0, 12)) || "")}</code></div>
                   <div class="warn hidden" style="margin-top: 8px;">Нужно оставить хотя бы один файл</div>
                   <div style="margin-top: 10px;">
                     <button class="btn danger" type="button" data-action="del-group" data-group="${groupKey}">Удалить копии в группе</button>
@@ -1119,11 +1261,41 @@
                 <td>
                   <div class="cards" data-group="${groupKey}">
                     ${cards}
-    </div>
+                  </div>
                 </td>
               </tr>
             `;
-          }).join("");
+          };
+
+          if (groups.length === 0 && similarGroups.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="2" class="muted">Дублей внутри источника не найдено.</td></tr>`;
+            if (tbodySim) tbodySim.innerHTML = `<tr><td colspan="2" class="muted">Визуально похожих внутри источника не найдено.</td></tr>`;
+            qs("#groupsCnt").textContent = "0";
+            qs("#maxGroup").textContent = "0";
+            if (qs("#panelStep2Exact")) { qs("#panelStep2Exact").dataset.groups = "0"; qs("#panelStep2Exact").dataset.maxGroup = "0"; }
+            if (qs("#panelStep2Similar")) { qs("#panelStep2Similar").dataset.groups = "0"; qs("#panelStep2Similar").dataset.maxGroup = "0"; }
+            step2UpdateDeleteBtn();
+            return;
+          }
+
+          tbody.innerHTML = groups.length === 0
+            ? `<tr><td colspan="2" class="muted">Точных дублей внутри источника не найдено.</td></tr>`
+            : groups.map(renderGroupRow).join("");
+          if (tbodySim) {
+            tbodySim.innerHTML = similarGroups.length === 0
+              ? `<tr><td colspan="2" class="muted">Визуально похожих между собой не найдено.</td></tr>`
+              : similarGroups.map(renderGroupRow).join("");
+          }
+          if (qs("#panelStep2Exact")) {
+            qs("#panelStep2Exact").dataset.groups = String(summaryExact.groups ?? groups.length ?? 0);
+            qs("#panelStep2Exact").dataset.maxGroup = String(summaryExact.max_group_size ?? 0);
+          }
+          if (qs("#panelStep2Similar")) {
+            qs("#panelStep2Similar").dataset.groups = String(summarySim.groups ?? similarGroups.length ?? 0);
+            qs("#panelStep2Similar").dataset.maxGroup = String(summarySim.max_group_size ?? 0);
+          }
+          const activeTab = document.querySelector(".step2-tabs .subtab.active")?.getAttribute("data-tab") || "exact";
+          step2SwitchTab(activeTab);
 
           // валидация групп и кнопка
           document.querySelectorAll(".cards[data-group]").forEach(cardsEl => {
@@ -1205,6 +1377,7 @@
           loadVideoDurations().catch(() => {});
         } catch (e) {
           tbody.innerHTML = `<tr><td colspan="2" class="err">Ошибка: ${escapeHtml(e?.message || e)}</td></tr>`;
+          if (tbodySim) tbodySim.innerHTML = `<tr><td colspan="2" class="err">Ошибка</td></tr>`;
           qs("#cntStep2").textContent = "0";
           step2UpdateDeleteBtn();
         }
@@ -1313,6 +1486,12 @@
       loadAllResults();
       qs("#btnStep1Reload")?.addEventListener("click", loadAllResults);
       qs("#btnStep2Reload")?.addEventListener("click", loadAllResults);
+      document.querySelectorAll(".step1-tabs .subtab").forEach(btn => {
+        btn.addEventListener("click", () => step1SwitchTab(btn.getAttribute("data-tab")));
+      });
+      document.querySelectorAll(".step2-tabs .subtab").forEach(btn => {
+        btn.addEventListener("click", () => step2SwitchTab(btn.getAttribute("data-tab")));
+      });
       setInterval(() => { refreshStatus(); }, 2500);
     </script>
   </body>

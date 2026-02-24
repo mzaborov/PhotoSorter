@@ -102,43 +102,38 @@
     <div class="section" id="dedupArchiveSection">
       <div class="section-title">
         <div>
-          <div style="font-weight: 600;">Дедупликация архива</div>
-          <div class="muted">Архив: <code>disk:/Фото</code>. Запуск доступен после завершения подсчёта “Файлов” по папкам выше.</div>
+          <div style="font-weight: 600;">Фотоархив</div>
+          <div class="muted">Архив: <code>disk:/Фото</code>. Запуск кнопок доступен после завершения подсчёта “Файлов” по папкам выше.</div>
         </div>
-        <div>
-          <div class="field">
+        <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center;">
+          <button class="btn" id="syncFilesBtn" type="button" disabled
+            title="Найти файлы, которых нет в БД (сверка с Я.Диском)">
+            Синхронизировать файлы
+          </button>
+          <div class="field" style="margin: 0;">
             <span class="muted">max GB:</span>
-            <input id="dedupMaxGb" type="number" min="0" step="1" value="5" />
+            <input id="dedupMaxGb" type="number" min="0" step="1" value="5" style="width: 3em;" />
           </div>
           <button class="btn" id="dedupArchiveStart" type="button" disabled
-            title="Запустить/продолжить дедупликацию архива (resume по данным)">
-            Запустить / Продолжить
+            title="SHA256 + визуально похожие (pHash). После дедупа автоматически досчитывается pHash для изображений.">
+            Дедупликация
           </button>
-          <button class="btn" id="reconcileArchiveStart" type="button"
-            title="Синхронизировать БД с Я.Диском и досчитать лица (актуализация списка файлов + append недостающих лиц без дублирования)">
-            Синхронизировать и досчитать лица
+          <button class="btn" id="scanFacesBtn" type="button" disabled
+            title="Досчёт лиц для новых файлов и embeddings/кластеры для ручных привязок">
+            Посчитать лица
           </button>
         </div>
       </div>
 
       <div style="margin-top: 10px;">
-        <div class="bar" aria-label="Dedup progress"><div id="dedupBarFill"></div></div>
-        <div class="muted status" id="dedupText" style="margin-top: 8px;">Дедупликация: статус загружается…</div>
-        <div class="bar" aria-label="Reconcile progress" style="margin-top: 10px;"><div id="reconcileBarFill"></div></div>
-        <div class="muted status" id="reconcileText" style="margin-top: 8px;">Синхронизация: статус загружается…</div>
+        <div class="bar" aria-label="Sync progress"><div id="reconcileBarFill"></div></div>
+        <div class="muted status" id="reconcileText" style="margin-top: 6px;">Синхронизация файлов: статус загружается…</div>
+        <div class="bar" aria-label="Dedup progress" style="margin-top: 10px;"><div id="dedupBarFill"></div></div>
+        <div class="muted status" id="dedupText" style="margin-top: 6px;">Дедупликация: статус загружается…</div>
+        <div class="muted status" id="phashText" style="margin-top: 4px;"></div>
+        <div class="muted status" id="scanFacesText" style="margin-top: 4px;"></div>
         <div class="muted" style="margin-top: 8px;">
           <a href="/duplicates">Посмотреть дубли</a>
-        </div>
-
-        <div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid #e5e7eb;">
-          <div style="font-weight: 600;">Ручные привязки в архиве</div>
-          <div class="muted" style="margin-top: 4px;">Досчитать embeddings и кластеры для новых ручных прямоугольников (нарисованных вручную на фото в архиве).</div>
-          <div style="margin-top: 8px;">
-            <button class="btn" id="backfillManualEmbeddingsBtn" type="button" title="Обработать manual-лица без embedding/cluster">
-              Досчитать embeddings и кластеры
-            </button>
-            <span class="muted status" id="backfillManualText" style="margin-left: 8px;"></span>
-          </div>
         </div>
       </div>
     </div>
@@ -199,20 +194,17 @@
 
       function updateArchiveButtonsDisabled() {
         const btn = document.getElementById("dedupArchiveStart");
-        const disabled = Boolean(dedupArchiveRunning) || Boolean(reconcileArchiveRunning) || !folderCountsDone;
-        const title = !folderCountsDone
-          ? "Дождитесь окончания подсчёта файлов по папкам (верхняя таблица)."
-          : ((dedupArchiveRunning || reconcileArchiveRunning) ? "Операция по архиву уже запущена." : "");
+        const disabled = Boolean(dedupArchiveRunning) || Boolean(reconcileArchiveRunning);
+        const title = (dedupArchiveRunning || reconcileArchiveRunning) ? "Операция по архиву уже запущена." : "";
         if (btn) {
           btn.disabled = disabled;
           if (title) btn.title = title;
         }
 
-        const btnR = document.getElementById("reconcileArchiveStart");
-        if (btnR) {
-          btnR.disabled = Boolean(dedupArchiveRunning) || Boolean(reconcileArchiveRunning);
-          if (dedupArchiveRunning || reconcileArchiveRunning) btnR.title = "Операция по архиву уже запущена.";
-        }
+        const btnSync = document.getElementById("syncFilesBtn");
+        const btnFaces = document.getElementById("scanFacesBtn");
+        if (btnSync) btnSync.disabled = disabled;
+        if (btnFaces) btnFaces.disabled = disabled;
       }
 
       async function pollDedupArchiveStatusOnce() {
@@ -249,24 +241,72 @@
           const denom = total ?? 0;
           const pct = denom > 0 ? Math.round((p / denom) * 100) : 0;
           setDedupBar(pct);
+          const lastErr = (latest && latest.last_error) ? String(latest.last_error) : "";
+          const errSuffix = lastErr ? ` · ошибка: ${lastErr}` : "";
           setDedupText(
-            `Дедупликация: ${dedupArchiveRunning ? "идёт" : st} · прогресс=${pct}% (${p}/${denom || "…"}) · с хэшем=${h} (meta=${mh}, download=${dh}) · пропущено(>max)=${sk} · ошибок=${er} · ${totalText} · ${maxText}`
+            `Дедупликация: ${dedupArchiveRunning ? "идёт" : st} · прогресс=${pct}% (${p}/${denom || "…"}) · с хэшем=${h} (meta=${mh}, download=${dh}) · пропущено(>max)=${sk} · ошибок=${er} · ${totalText} · ${maxText}${errSuffix}`
           );
 
           const btn = document.getElementById("dedupArchiveStart");
           if (btn) {
             if (dedupArchiveRunning) {
               btn.textContent = "Идёт…";
-            } else if (st === "completed") {
-              btn.textContent = "Запустить заново";
             } else if (st === "failed" || st === "running") {
-              btn.textContent = "Продолжить / запустить заново";
+              btn.textContent = "Продолжить дедупликацию";
             } else {
-              btn.textContent = "Запуск";
+              btn.textContent = "Дедупликация";
             }
+          }
+          if (!dedupArchiveRunning && st === "completed" && window._phashAfterDedup !== true) {
+            window._phashAfterDedup = true;
+            runPhashLoop();
           }
         } catch (e) {
           setDedupText("Дедупликация: ошибка статуса: " + String(e));
+        }
+      }
+
+      function setPhashText(text) {
+        const el = document.getElementById("phashText");
+        if (el) el.textContent = text ?? "";
+      }
+
+      async function runPhashLoop() {
+        setPhashText("Визуально похожие (pHash): считаем…");
+        let totalProcessed = 0;
+        for (;;) {
+          try {
+            const r = await fetch("/api/archive/scan-perceptual-hashes", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ limit: 15 }),
+            });
+            const data = await r.json().catch(() => ({}));
+            if (!data.ok) {
+              setPhashText("Визуально похожие: ошибка — " + (data.message || ""));
+              break;
+            }
+            const done = data.processed || 0;
+            const errs = data.errors || 0;
+            const rem = data.remaining || 0;
+            const totalImg = data.total ?? 0;
+            totalProcessed += done;
+            if (data.all_skipped) {
+              setPhashText(`Визуально похожие (pHash): готово. ${rem} файлов не удалось обработать (ошибки загрузки/формата), пропущены.`);
+              break;
+            }
+            if (rem <= 0) {
+              setPhashText(totalProcessed > 0 ? `Визуально похожие (pHash): готово, обработано ${totalProcessed} файлов.` : "Визуально похожие: нечего досчитывать.");
+              break;
+            }
+            const ready = totalImg > 0 ? totalImg - rem : 0;
+            const progressStr = totalImg > 0 ? ` (готово ${ready}/${totalImg})` : "";
+            const errStr = errs > 0 ? `, ошибок в пачке: ${errs}` : "";
+            setPhashText(`Визуально похожие (pHash): осталось ${rem}${progressStr}, за сессию: ${totalProcessed}${errStr}…`);
+          } catch (e) {
+            setPhashText("Визуально похожие: ошибка — " + String(e));
+            break;
+          }
         }
       }
 
@@ -281,7 +321,7 @@
 
           if (!latest) {
             setReconcileBar(0);
-            setReconcileText("Сверка архива: ещё не запускалась.");
+            setReconcileText("Синхронизация файлов: ещё не запускалась.");
             return;
           }
 
@@ -293,14 +333,11 @@
           const pct = denom > 0 ? Math.round((p / denom) * 100) : 0;
 
           setReconcileBar(pct);
-          const statusText = reconcileArchiveRunning 
-            ? "идёт (после завершения автоматически запустится досчёт лиц)"
-            : st;
           setReconcileText(
-            `Синхронизация и досчёт лиц: ${statusText} · прогресс=${pct}% (${p}/${denom || "…"}) · ошибок=${er}`
+            `Синхронизация файлов: ${reconcileArchiveRunning ? "идёт" : st} · прогресс=${pct}% (${p}/${denom || "…"}) · ошибок=${er}`
           );
         } catch (e) {
-          setReconcileText("Сверка архива: ошибка статуса: " + String(e));
+          setReconcileText("Синхронизация файлов: ошибка статуса: " + String(e));
         }
       }
 
@@ -310,6 +347,7 @@
       }
 
       async function startDedupArchive() {
+        window._phashAfterDedup = false;
         dedupArchiveRunning = true;
         updateArchiveButtonsDisabled();
         setDedupText("Дедупликация: запуск…");
@@ -328,17 +366,21 @@
         }
       }
 
-      async function startReconcileArchive() {
+      async function startSyncFiles() {
         reconcileArchiveRunning = true;
         updateArchiveButtonsDisabled();
-        setReconcileText("Сверка архива: запуск…");
+        setReconcileText("Синхронизация файлов: запуск…");
         try {
-          const resp = await fetch(`/api/archive/reconcile/start`, { method: "POST" });
+          const resp = await fetch(`/api/archive/reconcile/start`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ skip_face_scan: true }),
+          });
           const data = await resp.json().catch(() => ({}));
           if (!resp.ok || !data.ok) throw new Error(data.message || ("HTTP " + resp.status));
-          setReconcileText(`Сверка архива: запущено (run_id=${data.run_id}).`);
+          setReconcileText(`Синхронизация файлов: запущено (run_id=${data.run_id}).`);
         } catch (e) {
-          setReconcileText("Сверка архива: не удалось запустить: " + String(e));
+          setReconcileText("Синхронизация файлов: не удалось запустить: " + String(e));
         } finally {
           await pollArchiveReconcileStatusOnce();
         }
@@ -410,38 +452,26 @@
         startDedupArchive();
       });
 
-      document.getElementById("reconcileArchiveStart")?.addEventListener("click", (e) => {
+      document.getElementById("syncFilesBtn")?.addEventListener("click", (e) => {
         e.preventDefault();
-        startReconcileArchive();
+        startSyncFiles();
       });
 
-      async function startBackfillManualEmbeddings() {
-        const btn = document.getElementById("backfillManualEmbeddingsBtn");
-        const txt = document.getElementById("backfillManualText");
-        if (!btn || !txt) return;
-        btn.disabled = true;
-        txt.textContent = "Идёт…";
-        try {
-          const resp = await fetch("/api/archive/backfill-manual-embeddings", { method: "POST" });
-          const data = await resp.json().catch(() => ({}));
-          if (data.ok) {
-            txt.textContent = "Готово. " + (data.message || "");
-          } else {
-            txt.textContent = "Ошибка: " + (data.message || resp.status);
-            txt.classList.add("err");
-          }
-        } catch (e) {
-          txt.textContent = "Ошибка: " + String(e);
-          txt.classList.add("err");
-        } finally {
-          btn.disabled = false;
-          setTimeout(() => { txt.textContent = ""; txt.classList.remove("err"); }, 8000);
-        }
-      }
-
-      document.getElementById("backfillManualEmbeddingsBtn")?.addEventListener("click", (e) => {
+      document.getElementById("scanFacesBtn")?.addEventListener("click", async (e) => {
         e.preventDefault();
-        startBackfillManualEmbeddings();
+        const txt = document.getElementById("scanFacesText");
+        if (txt) { txt.textContent = ""; txt.classList.remove("err"); }
+        try {
+          const resp = await fetch("/api/archive/scan-faces/start", { method: "POST" });
+          const data = await resp.json().catch(() => ({}));
+          if (resp.ok && data.ok) {
+            if (txt) txt.textContent = "Посчитать лица: запущено (выполняется в фоне).";
+          } else {
+            if (txt) { txt.textContent = "Ошибка: " + (data.message || resp.status); txt.classList.add("err"); }
+          }
+        } catch (err) {
+          if (txt) { txt.textContent = "Ошибка: " + String(err); txt.classList.add("err"); }
+        }
       });
 
       // Конструктор правил папок (объявления до вызова initRuleConstructors)
@@ -749,10 +779,11 @@
       // Сначала отрисовываем конструкторы правил (данные уже в странице, без fetch)
       initRuleConstructors();
 
-      // Подсчёт файлов — отдельный async-процесс, не блокирует правила
-      loadCountsRowByRow();
-      pollDedupArchiveStatusOnce();
-      pollArchiveReconcileStatusOnce();
+      // Сначала загружаем статусы шагов (синхронизация, дедупликация), затем подсчёт файлов по папкам
+      (async function () {
+        await Promise.all([pollDedupArchiveStatusOnce(), pollArchiveReconcileStatusOnce()]);
+        loadCountsRowByRow();
+      })();
       setInterval(() => {
         pollDedupArchiveStatusOnce();
         pollArchiveReconcileStatusOnce();

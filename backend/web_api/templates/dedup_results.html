@@ -51,6 +51,12 @@
       .lb-actions { display: flex; gap: 10px; align-items: center; }
       .lb-body { background: #111827; display: flex; align-items: center; justify-content: center; }
       .lb-body img { max-width: 92vw; max-height: calc(92vh - 56px); width: auto; height: auto; display: block; object-fit: contain; background: #111827; }
+      .subtabs { display: flex; gap: 4px; margin-top: 10px; margin-bottom: 8px; }
+      .subtabs .subtab { appearance: none; border: 1px solid #d1d5db; background: #f9fafb; padding: 8px 14px; border-radius: 10px; cursor: pointer; font-weight: 600; font-size: 13px; }
+      .subtabs .subtab:hover { background: #f3f4f6; }
+      .subtabs .subtab.active { background: #eef2ff; border-color: #c7d2fe; color: #3730a3; }
+      .subtab-panel { margin-top: 4px; }
+      .hidden { display: none; }
     </style>
   </head>
   <body>
@@ -270,39 +276,89 @@
         qs("#noteA").textContent = data?.archive_scanned ? "" : "Архив ещё не просканирован (часть совпадений может отсутствовать).";
 
         const items = Array.isArray(data?.items) ? data.items : [];
+        const similarWithArchive = Array.isArray(data?.similar_with_archive) ? data.similar_with_archive : [];
         const selected = new Set();
+        let activeSubTabA = "exact";
         const content = qs("#content");
-        if (!items.length) {
-          content.innerHTML = `<div class="muted">Совпадений с архивом нет.</div>`;
-        } else {
-          content.innerHTML = items.map((it, idx) => {
-          const src = {
-            path: it.source_path,
-            name: it.source_name,
-            size: it.source_size,
-            mime_type: it.source_mime_type,
-            media_type: it.source_media_type,
-          };
-          const srcCard = cardHtml(src, { chkId: `A:${idx}`, chkLabel: "выбрать", checked: false });
-          const matches = Array.isArray(it.matches) ? it.matches : [];
-          const matchCards = matches.map(m => cardHtml({ path: m.path, name: m.name, size: m.size, mime_type: m.mime_type, media_type: m.media_type })).join("");
-          return `
+
+        const exactHtml = !items.length
+          ? `<div class="muted">Точных совпадений с архивом нет.</div>`
+          : items.map((it, idx) => {
+              const src = { path: it.source_path, name: it.source_name, size: it.source_size, mime_type: it.source_mime_type, media_type: it.source_media_type };
+              const srcCard = cardHtml(src, { chkId: `A:${idx}`, chkLabel: "выбрать", checked: false });
+              const matches = Array.isArray(it.matches) ? it.matches : [];
+              const matchCards = matches.map(m => cardHtml({ path: m.path, name: m.name, size: m.size, mime_type: m.mime_type, media_type: m.media_type })).join("");
+              return `
             <div class="row" data-row="${idx}">
-              <div class="row-left">
-                <div class="muted">Источник</div>
-                ${srcCard}
-              </div>
+              <div class="row-left"><div class="muted">Источник</div>${srcCard}</div>
               <div class="row-right">
                 <div class="muted">Совпало в архиве: <span class="pill">${matches.length}</span></div>
                 <div class="cards" style="margin-top:8px;">${matchCards || `<span class="muted">—</span>`}</div>
               </div>
-            </div>
-          `;
-          }).join("");
+            </div>`;
+            }).join("");
+
+        const similarHtml = !similarWithArchive.length
+          ? `<div class="muted">Визуально похожих с архивом нет.</div>`
+          : similarWithArchive.map(g => {
+              const srcFiles = Array.isArray(g.source_files) ? g.source_files : [];
+              const arcFiles = Array.isArray(g.archive_files) ? g.archive_files : [];
+              const srcRows = srcFiles.map(f => {
+                const p = escapeHtml(f.path || "");
+                const short = escapeHtml(f.path_short || f.path || "");
+                const keep = !!f.keep;
+                return `<div class="row" style="align-items:center;gap:8px;margin-bottom:6px;"><input type="checkbox" class="a-keep" data-path="${p}" ${keep ? "checked" : ""} /><span class="muted">сохранить</span><code>${short}</code></div>`;
+              }).join("");
+              const arcList = arcFiles.slice(0, 5).map(f => {
+                const ap = escapeHtml(f.path_short || f.path || "");
+                const openUrl = f.open_url || "";
+                return openUrl ? `<div><a href="${escapeHtml(openUrl)}" target="_blank" rel="noopener noreferrer"><code>${ap}</code></a></div>` : `<div><code>${ap}</code></div>`;
+              }).join("") + (arcFiles.length > 5 ? `<div class="muted">… ещё ${arcFiles.length - 5}</div>` : "");
+              return `
+            <div class="row">
+              <div class="row-left">
+                <div class="muted">В источнике: ${srcFiles.length} файл(ов)</div>${srcRows}
+              </div>
+              <div class="row-right">
+                <div class="muted">В архиве: ${arcFiles.length} файл(ов)</div>${arcList}
+              </div>
+            </div>`;
+            }).join("");
+
+        if (!items.length && !similarWithArchive.length) {
+          content.innerHTML = `<div class="muted">Совпадений с архивом нет.</div>`;
+        } else {
+          content.innerHTML = `
+          <div class="subtabs" data-main="A">
+            <button class="subtab active" data-subtab="exact">Точные</button>
+            <button class="subtab" data-subtab="similar">Визуально похожие с архивом</button>
+          </div>
+          <div id="panelAExact" class="subtab-panel">${exactHtml}</div>
+          <div id="panelASimilar" class="subtab-panel hidden">${similarHtml}</div>`;
+        }
+
+        function collectPathsA() {
+          if (activeSubTabA === "exact") {
+            const paths = [];
+            selected.forEach(key => {
+              const idx = Number(String(key).split(":")[1]);
+              const it = items[idx];
+              if (it?.source_path) paths.push(String(it.source_path));
+            });
+            return paths;
+          }
+          const paths = [];
+          qsa("input.a-keep", content).forEach(cb => {
+            if (!(cb instanceof HTMLInputElement) || cb.checked) return;
+            const p = cb.getAttribute("data-path");
+            if (p) paths.push(p);
+          });
+          return paths;
         }
 
         function updateButtons() {
-          const n = selected.size;
+          const paths = collectPathsA();
+          const n = paths.length;
           const del = qs("#btnDelA");
           const ign = qs("#btnIgnoreA");
           del.disabled = n === 0;
@@ -312,6 +368,19 @@
         }
         updateButtons();
 
+        function setSubTabA(subtab) {
+          activeSubTabA = subtab;
+          qsa(".subtabs[data-main='A'] .subtab").forEach(b => b.classList.toggle("active", b.getAttribute("data-subtab") === subtab));
+          const exact = qs("#panelAExact", content);
+          const sim = qs("#panelASimilar", content);
+          if (exact) exact.classList.toggle("hidden", subtab !== "exact");
+          if (sim) sim.classList.toggle("hidden", subtab !== "similar");
+          updateButtons();
+        }
+        qsa(".subtabs[data-main='A'] .subtab").forEach(btn => {
+          btn.addEventListener("click", () => setSubTabA(btn.getAttribute("data-subtab")));
+        });
+
         qsa("input[type=checkbox][data-chk^='A:']").forEach(cb => {
           cb.addEventListener("change", () => {
             const key = cb.getAttribute("data-chk");
@@ -320,32 +389,24 @@
             updateButtons();
           });
         });
+        qsa("input.a-keep", content).forEach(cb => {
+          cb.addEventListener("change", updateButtons);
+        });
 
         qs("#btnDelA").onclick = async () => {
-          const paths = [];
-          selected.forEach(key => {
-            const idx = Number(String(key).split(":")[1]);
-            const it = items[idx];
-            if (it?.source_path) paths.push(String(it.source_path));
-          });
+          const paths = collectPathsA();
           if (!paths.length) return;
           if (!confirm(`Удалить выбранные из источника: ${paths.length} файл(ов)?`)) return;
           await postJson("/api/sort/source/delete", { paths, source_run_id: ctxRunId });
           await render();
         };
         qs("#btnIgnoreA").onclick = async () => {
-          const paths = [];
-          selected.forEach(key => {
-            const idx = Number(String(key).split(":")[1]);
-            const it = items[idx];
-            if (it?.source_path) paths.push(String(it.source_path));
-          });
+          const paths = collectPathsA();
           if (!paths.length) return;
           await postJson("/api/sort/source/ignore-archive-dup", { paths, source_run_id: ctxRunId });
           await render();
         };
 
-        // lightbox for images
         qsa(".thumb[data-kind='image'][data-src]").forEach(el => {
           el.addEventListener("dblclick", () => {
             const src = el.getAttribute("data-src") || "";
@@ -364,45 +425,51 @@
         qs("#rootPath").textContent = data?.source_root_path || "—";
 
         const groups = Array.isArray(data?.groups) ? data.groups : [];
+        const similarGroups = Array.isArray(data?.similar_groups) ? data.similar_groups : [];
+        let activeSubTabB = "exact";
         const content = qs("#content");
-        content.innerHTML = groups.map((g, gi) => {
+
+        const renderGroupRows = (list) => list.map((g, gi) => {
           const files = Array.isArray(g.files) ? g.files : [];
           const cards = files.map((f, fi) => cardHtml(f, { chkId: `B:${gi}:${fi}`, chkLabel: "сохранить", checked: !!f.keep })).join("");
           return `
             <div class="row" data-group="${gi}">
               <div class="row-left">
                 <div class="muted">Группа</div>
-                <div style="margin-top:6px;"><span class="pill">${escapeHtml(g.cnt || "")} шт</span> <code>${escapeHtml(g.hash_short || "")}</code></div>
+                <div style="margin-top:6px;"><span class="pill">${escapeHtml(String(g.cnt || files.length))} шт</span> <code>${escapeHtml(g.hash_short || "")}</code></div>
                 <div class="muted" style="margin-top:8px;">Нужно оставить хотя бы один файл.</div>
               </div>
-              <div class="row-right">
-                <div class="cards">${cards}</div>
-              </div>
-            </div>
-          `;
-        }).join("") || `<div class="muted">Групп нет.</div>`;
+              <div class="row-right"><div class="cards">${cards}</div></div>
+            </div>`;
+        }).join("");
+
+        const exactHtml = !groups.length ? `<div class="muted">Точных дублей внутри источника нет.</div>` : renderGroupRows(groups);
+        const similarHtml = !similarGroups.length ? `<div class="muted">Визуально похожих между собой нет.</div>` : renderGroupRows(similarGroups);
+
+        if (!groups.length && !similarGroups.length) {
+          content.innerHTML = `<div class="muted">Групп нет.</div>`;
+        } else {
+          content.innerHTML = `
+          <div class="subtabs" data-main="B">
+            <button class="subtab active" data-subtab="exact">Точные</button>
+            <button class="subtab" data-subtab="similar">Визуально похожие между собой</button>
+          </div>
+          <div id="panelBExact" class="subtab-panel">${exactHtml}</div>
+          <div id="panelBSimilar" class="subtab-panel hidden">${similarHtml}</div>`;
+        }
 
         function groupValidity(rowEl) {
           const cbs = qsa("input[type=checkbox][data-chk^='B:']", rowEl);
           const checked = cbs.filter(x => x.checked).length;
           if (checked === 0 && cbs[0]) cbs[0].checked = true;
         }
-        qsa(".row[data-group]").forEach(row => {
-          groupValidity(row);
-          row.addEventListener("change", (e) => {
-            const t = e.target;
-            if (!(t instanceof HTMLInputElement)) return;
-            if (!t.getAttribute("data-chk")?.startsWith("B:")) return;
-            groupValidity(row);
-            updateDelBtn();
-          });
-        });
 
         function collectUnchecked() {
+          const panel = activeSubTabB === "exact" ? qs("#panelBExact", content) : qs("#panelBSimilar", content);
+          if (!panel) return [];
           const paths = [];
-          qsa("input[type=checkbox][data-chk^='B:']").forEach(cb => {
-            if (!(cb instanceof HTMLInputElement)) return;
-            if (cb.checked) return;
+          qsa("input[type=checkbox][data-chk^='B:']", panel).forEach(cb => {
+            if (!(cb instanceof HTMLInputElement) || cb.checked) return;
             const card = cb.closest(".card");
             const p = card?.getAttribute("data-path");
             if (p) paths.push(p);
@@ -416,6 +483,30 @@
           btn.textContent = `Удалить копии (${paths.length})`;
           btn.disabled = paths.length === 0;
         }
+
+        function setSubTabB(subtab) {
+          activeSubTabB = subtab;
+          qsa(".subtabs[data-main='B'] .subtab").forEach(b => b.classList.toggle("active", b.getAttribute("data-subtab") === subtab));
+          const exact = qs("#panelBExact", content);
+          const sim = qs("#panelBSimilar", content);
+          if (exact) exact.classList.toggle("hidden", subtab !== "exact");
+          if (sim) sim.classList.toggle("hidden", subtab !== "similar");
+          updateDelBtn();
+        }
+        qsa(".subtabs[data-main='B'] .subtab").forEach(btn => {
+          btn.addEventListener("click", () => setSubTabB(btn.getAttribute("data-subtab")));
+        });
+
+        qsa(".row[data-group]", content).forEach(row => {
+          groupValidity(row);
+          row.addEventListener("change", (e) => {
+            const t = e.target;
+            if (!(t instanceof HTMLInputElement)) return;
+            if (!t.getAttribute("data-chk")?.startsWith("B:")) return;
+            groupValidity(row);
+            updateDelBtn();
+          });
+        });
         updateDelBtn();
 
         qs("#btnDelB").onclick = async () => {

@@ -45,6 +45,10 @@
           Подсказка: для корректной работы в режиме sorting лучше передавать <code>pipeline_run_id</code>.
         </div>
 
+        <div class="muted" style="margin-bottom:8px;">
+          Укажите <strong>либо path, либо file_id</strong> (не оба) — иначе возможна путаница с количеством прямоугольников.
+        </div>
+
         <div class="row" style="margin-bottom:10px;">
           <form id="debugPhotoCardForm" method="get" action="/debug/photo-card" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; width:100%;">
             <input id="debugPath" name="path" placeholder="path (например: local:C:\tmp\Photo\_faces\IMG.jpg)" value="{{ path or '' }}" />
@@ -64,13 +68,36 @@
     {% if is_video %}<script src="/static/video_card.js?v=1"></script>{% endif %}
     <script>
       (function() {
+        // Либо path, либо file_id: при вводе в одно поле очищаем другое
+        const pathEl = document.getElementById('debugPath');
+        const fileIdEl = document.getElementById('debugFileId');
+        if (pathEl && fileIdEl) {
+          pathEl.addEventListener('input', function() {
+            if (String(pathEl.value || '').trim() !== '') fileIdEl.value = '';
+          });
+          pathEl.addEventListener('change', function() {
+            if (String(pathEl.value || '').trim() !== '') fileIdEl.value = '';
+          });
+          fileIdEl.addEventListener('input', function() {
+            if (String(fileIdEl.value || '').trim() !== '') pathEl.value = '';
+          });
+          fileIdEl.addEventListener('change', function() {
+            if (String(fileIdEl.value || '').trim() !== '') pathEl.value = '';
+          });
+        }
+
         // Не отправляем пустые поля как query-параметры (FastAPI ругается на file_id=).
+        // Если заполнены оба — отправляем только file_id.
         const form = document.getElementById('debugPhotoCardForm');
         if (form) {
           form.addEventListener('submit', function() {
-            const fileIdEl = document.getElementById('debugFileId');
+            const pathInput = document.getElementById('debugPath');
+            const fileIdInput = document.getElementById('debugFileId');
             const prEl = document.getElementById('debugPipelineRunId');
-            if (fileIdEl && String(fileIdEl.value || '').trim() === '') fileIdEl.disabled = true;
+            const hasPath = pathInput && String(pathInput.value || '').trim() !== '';
+            const hasFileId = fileIdInput && String(fileIdInput.value || '').trim() !== '';
+            if (hasPath && hasFileId) pathInput.disabled = true;
+            if (fileIdInput && !hasFileId) fileIdInput.disabled = true;
             if (prEl && String(prEl.value || '').trim() === '') prEl.disabled = true;
           });
         }

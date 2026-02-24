@@ -22,7 +22,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from common.db import DedupStore, FaceStore, PipelineStore, get_connection, list_folders, init_db
+from common.db import DedupStore, FaceStore, PipelineStore, get_connection, get_file_duplicate_context, list_folders, init_db
+from common.perceptual_hash import compute_phash_hex
 from common.yadisk_client import get_disk
 from web_api.routers.gold import router as gold_router
 from web_api.routers.preclean import router as preclean_router
@@ -34,6 +35,17 @@ from web_api.routers.face_clusters import router as face_clusters_router
 from web_api.routers.trips import router as trips_router
 from web_api.routers import gold as gold_api
 from logic.gold.store import gold_expected_tab_by_path
+
+# #region agent log
+def _debug_log(message: str, data: dict[str, Any] | None = None, hypothesis_id: str = "") -> None:
+    import json
+    _path = Path(__file__).resolve().parents[2] / "debug-1961e05a-1071-4973-978b-c21c38ac0efa.log"
+    try:
+        with open(_path, "a", encoding="utf-8") as _f:
+            _f.write(json.dumps({"location": "main.py", "message": message, "data": data or {}, "hypothesisId": hypothesis_id, "timestamp": _time.time()}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+# #endregion
 
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
@@ -153,6 +165,9 @@ _RECONCILE_EXEC = ThreadPoolExecutor(max_workers=1)
 _RECONCILE_LOCK = threading.Lock()
 _RECONCILE_FUTURE: Any = None
 _RECONCILE_RUN_ID: Optional[int] = None
+
+# Пути, для которых расчёт pHash стабильно падает — не повторяем бесконечно (сбрасывается при рестарте сервера)
+_PHASH_SKIP_PATHS: set[str] = set()
 
 # Таймауты/ретраи по умолчанию (можно будет вынести в настройки).
 YD_CALL_TIMEOUT_SEC = 60
@@ -368,8 +383,19 @@ def _dedup_scan_archive(
     Заполняет БД дублей: рекурсивно проходит папку на YaDisk,
     сохраняет метаданные файлов и хэш (sha256/md5). Если хэша нет — докачивает файл и считает sha256.
     """
+    # #region agent log
+    _roots = [_normalize_yadisk_path(r) for r in (root_paths or []) if str(r or "").strip()]
+    _stack = list(_roots)
+    _debug_log("scan_entry", {"run_id": run_id, "len_roots": len(_roots), "len_stack": len(_stack)}, "H2")
+    # #endregion
     disk = get_disk()
+    # #region agent log
+    _debug_log("scan_after_get_disk", {"run_id": run_id}, "H2")
+    # #endregion
     store = DedupStore()
+    # #region agent log
+    _debug_log("scan_after_store", {"run_id": run_id}, "H2")
+    # #endregion
 
     processed = 0
     hashed = 0
@@ -378,8 +404,8 @@ def _dedup_scan_archive(
     skipped_large = 0
     errors = 0
 
-    roots = [_normalize_yadisk_path(r) for r in (root_paths or []) if str(r or "").strip()]
-    stack = list(roots)
+    roots = _roots
+    stack = _stack
     visited: set[str] = set()
 
     try:
@@ -388,7 +414,10 @@ def _dedup_scan_archive(
             if current in visited:
                 continue
             visited.add(current)
-
+            # #region agent log
+            if processed == 0 and errors == 0:
+                _debug_log("scan_first_listdir", {"current": current[:80], "run_id": run_id}, "H3")
+            # #endregion
             try:
                 items = _yd_call_retry(lambda: list(disk.listdir(current)))
             except Exception as e:  # noqa: BLE001
@@ -564,6 +593,12 @@ def _dedup_scan_archive(
                                     scanned_at=None,
                                     hashed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                                 )
+                                # Визуально похожие фото: перцептивный хеш при скачивании изображения
+                                is_image = (media_type or "").lower() == "image" or (str(mime_type or "").lower().startswith("image/"))
+                                if is_image:
+                                    phash_val = compute_phash_hex(tmp_path)
+                                    if phash_val:
+                                        store.upsert_perceptual_hash(path=path, algorithm="pHash", value=phash_val)
                             except Exception as e:  # noqa: BLE001
                                 errors += 1
                                 store.upsert_file(
@@ -606,6 +641,255 @@ def _dedup_scan_archive(
 
                 if limit_files is not None and processed >= limit_files:
                     return
+    finally:
+        store.close()
+
+
+def _dedup_scan_archive_from_db(
+    *,
+    run_id: int,
+    max_download_bytes: int | None,
+    inventory_scope: str = "archive",
+) -> None:
+    """
+    Дедупликация по БД: обходит только записи files с inventory_scope=archive без хэша.
+    Для каждой: get_meta (sha256/md5) или скачивание + sha256, обновление строки в files.
+    Инвентарь не пополняется — только обновление существующих записей.
+    """
+    disk = get_disk()
+    store = DedupStore()
+    # #region agent log
+    try:
+        cur = store.conn.cursor()
+        cur.execute("SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name='files'")
+        rows = cur.fetchall()
+        indexes = [{"name": dict(r).get("name"), "sql": dict(r).get("sql")} for r in rows]
+        idx_exists = any((ix.get("name") or "") == "idx_files_path" for ix in indexes)
+        _log_path = __import__("pathlib").Path(__file__).resolve().parent.parent.parent / "debug-1961e05a-1071-4973-978b-c21c38ac0efa.log"
+        _log_line = __import__("json").dumps({"sessionId": "1961e05a-1071-4973-978b-c21c38ac0efa", "hypothesisId": "H2", "location": "main.py:_dedup_scan_archive_from_db", "message": "indexes on files", "data": {"indexes": indexes, "idx_files_path_exists": idx_exists}, "timestamp": int(__import__("time").time() * 1000)}) + "\n"
+        with open(_log_path, "a", encoding="utf-8") as _f:
+            _f.write(_log_line)
+    except Exception:
+        pass
+    # #endregion
+    processed = 0
+    hashed = 0
+    meta_hashed = 0
+    downloaded_hashed = 0
+    skipped_large = 0
+    errors = 0
+
+    try:
+        total = store.count_archive_files_without_hash()
+        store.update_run_progress(run_id=run_id, total_files=total)
+
+        for row in store.list_archive_files_without_hash():
+            path = row.get("path") or ""
+            if not path:
+                continue
+            size = row.get("size")
+            mime_type = row.get("mime_type")
+            media_type = row.get("media_type")
+            name = row.get("name")
+            parent_path = row.get("parent_path")
+            created = row.get("created")
+            modified = row.get("modified")
+            resource_id = row.get("resource_id")
+
+            processed += 1
+            try:
+                remote = _normalize_yadisk_path(path)
+                meta = _yd_call_retry(lambda: disk.get_meta(remote, limit=0))
+                sha256 = str(_get(meta, "sha256") or "") or None
+                md5 = str(_get(meta, "md5") or "") or None
+
+                if sha256:
+                    hashed += 1
+                    meta_hashed += 1
+                    store.upsert_file(
+                        run_id=run_id,
+                        path=path,
+                        resource_id=resource_id,
+                        inventory_scope=inventory_scope,
+                        name=name,
+                        parent_path=parent_path,
+                        size=size,
+                        created=created,
+                        modified=modified,
+                        mime_type=mime_type,
+                        media_type=media_type,
+                        hash_alg="sha256",
+                        hash_value=sha256,
+                        hash_source="meta",
+                        status="hashed",
+                        error=None,
+                        scanned_at=None,
+                        hashed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    )
+                elif md5:
+                    hashed += 1
+                    meta_hashed += 1
+                    store.upsert_file(
+                        run_id=run_id,
+                        path=path,
+                        resource_id=resource_id,
+                        inventory_scope=inventory_scope,
+                        name=name,
+                        parent_path=parent_path,
+                        size=size,
+                        created=created,
+                        modified=modified,
+                        mime_type=mime_type,
+                        media_type=media_type,
+                        hash_alg="md5",
+                        hash_value=md5,
+                        hash_source="meta",
+                        status="hashed",
+                        error=None,
+                        scanned_at=None,
+                        hashed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    )
+                else:
+                    if max_download_bytes is not None and size is not None and size > max_download_bytes:
+                        skipped_large += 1
+                        store.upsert_file(
+                            run_id=run_id,
+                            path=path,
+                            resource_id=resource_id,
+                            inventory_scope=inventory_scope,
+                            name=name,
+                            parent_path=parent_path,
+                            size=size,
+                            created=created,
+                            modified=modified,
+                            mime_type=mime_type,
+                            media_type=media_type,
+                            hash_alg=None,
+                            hash_value=None,
+                            hash_source=None,
+                            status="skipped_large",
+                            error=f"too_large: size={size} > max_download_bytes={max_download_bytes}",
+                            scanned_at=None,
+                            hashed_at=None,
+                        )
+                    else:
+                        tmp_path = None
+                        try:
+                            with tempfile.NamedTemporaryFile(prefix="photosorter_dedup_", suffix=".bin", delete=False) as tmp:
+                                tmp_path = tmp.name
+                            _yd_call_retry_timeout(lambda: disk.download(remote, tmp_path), timeout_sec=600)
+                            sha = _sha256_file(tmp_path)
+                            hashed += 1
+                            downloaded_hashed += 1
+                            store.upsert_file(
+                                run_id=run_id,
+                                path=path,
+                                resource_id=resource_id,
+                                inventory_scope=inventory_scope,
+                                name=name,
+                                parent_path=parent_path,
+                                size=size,
+                                created=created,
+                                modified=modified,
+                                mime_type=mime_type,
+                                media_type=media_type,
+                                hash_alg="sha256",
+                                hash_value=sha,
+                                hash_source="download",
+                                status="hashed",
+                                error=None,
+                                scanned_at=None,
+                                hashed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            )
+                            is_image = (media_type or "").lower() == "image" or (str(mime_type or "").lower().startswith("image/"))
+                            if is_image:
+                                phash_val = compute_phash_hex(tmp_path)
+                                if phash_val:
+                                    store.upsert_perceptual_hash(path=path, algorithm="pHash", value=phash_val)
+                        except Exception as e:  # noqa: BLE001
+                            errors += 1
+                            store.upsert_file(
+                                run_id=run_id,
+                                path=path,
+                                resource_id=resource_id,
+                                inventory_scope=inventory_scope,
+                                name=name,
+                                parent_path=parent_path,
+                                size=size,
+                                created=created,
+                                modified=modified,
+                                mime_type=mime_type,
+                                media_type=media_type,
+                                hash_alg=None,
+                                hash_value=None,
+                                hash_source=None,
+                                status="error",
+                                error=f"{type(e).__name__}: {e}",
+                                scanned_at=None,
+                                hashed_at=None,
+                            )
+                            store.update_run_progress(
+                                run_id=run_id,
+                                processed_files=processed,
+                                hashed_files=hashed,
+                                meta_hashed_files=meta_hashed,
+                                downloaded_hashed_files=downloaded_hashed,
+                                skipped_large_files=skipped_large,
+                                errors_count=errors,
+                                last_path=path,
+                                last_error=f"{type(e).__name__}: {e}",
+                            )
+                        finally:
+                            if tmp_path:
+                                try:
+                                    os.unlink(tmp_path)
+                                except OSError:
+                                    pass
+
+            except Exception as e:  # noqa: BLE001
+                errors += 1
+                store.upsert_file(
+                    run_id=run_id,
+                    path=path,
+                    resource_id=resource_id,
+                    inventory_scope=inventory_scope,
+                    name=name,
+                    parent_path=parent_path,
+                    size=size,
+                    created=created,
+                    modified=modified,
+                    mime_type=mime_type,
+                    media_type=media_type,
+                    hash_alg=None,
+                    hash_value=None,
+                    hash_source=None,
+                    status="error",
+                    error=f"{type(e).__name__}: {e}",
+                    scanned_at=None,
+                    hashed_at=None,
+                )
+                store.update_run_progress(
+                    run_id=run_id,
+                    processed_files=processed,
+                    hashed_files=hashed,
+                    meta_hashed_files=meta_hashed,
+                    downloaded_hashed_files=downloaded_hashed,
+                    skipped_large_files=skipped_large,
+                    errors_count=errors,
+                    last_path=path,
+                    last_error=f"{type(e).__name__}: {e}",
+                )
+
+            store.update_run_progress(
+                run_id=run_id,
+                processed_files=processed,
+                hashed_files=hashed,
+                meta_hashed_files=meta_hashed,
+                downloaded_hashed_files=downloaded_hashed,
+                skipped_large_files=skipped_large,
+                errors_count=errors,
+                last_path=path,
+            )
     finally:
         store.close()
 
@@ -1160,28 +1444,45 @@ def _reconcile_archive_inventory(*, run_id: int, root_path: str) -> None:
 def _pick_keep_indexes(items: list[dict[str, Any]], sort_order_by_folder: dict[str, int]) -> int:
     """
     Выбираем индекс элемента, который "оставляем" по умолчанию.
-    1) минимальный sort_order по top-level папке (Темка/Нюся/...), если известен
-    2) fallback: самый короткий path
+    Приоритет: 1) самый большой размер, 2) папка с меньшим sort_order, 3) больше всего привязок (лица+персоны+поездки).
+    Используется по raw items (без привязок); для привязок вызывайте _pick_keep_index_from_ui_items после сборки ui_items.
     """
     best_idx = 0
+    best_size: Optional[int] = None
     best_order: Optional[int] = None
-    best_len: Optional[int] = None
+    best_attachments = -1
     for i, it in enumerate(items):
+        size = it.get("size")
+        size_i = int(size) if isinstance(size, (int, float)) else None
         p = str(it.get("path") or "")
         folder = _short_folder_from_disk_path(p)
         order = sort_order_by_folder.get(folder.lower())
-        plen = len(p)
-        if order is not None:
-            if best_order is None or order < best_order or (order == best_order and plen < (best_len or plen + 1)):
-                best_idx = i
-                best_order = order
-                best_len = plen
-        else:
-            if best_order is None:  # пока нет кандидата с sort_order
-                if best_len is None or plen < best_len:
-                    best_idx = i
-                    best_len = plen
+        n_attachments = 0  # raw items не содержат привязок
+        if (size_i or 0) > (best_size or 0):
+            best_idx, best_size, best_order, best_attachments = i, size_i, order, n_attachments
+        elif (size_i or 0) == (best_size or 0) and order is not None and (best_order is None or order < best_order):
+            best_idx, best_size, best_order, best_attachments = i, size_i, order, n_attachments
+        elif (size_i or 0) == (best_size or 0) and (best_order is None or order == best_order) and n_attachments > best_attachments:
+            best_idx, best_size, best_order, best_attachments = i, size_i, order, n_attachments
     return best_idx
+
+
+def _pick_keep_index_from_ui_items(ui_items: list[dict[str, Any]], sort_order_by_folder: dict[str, int]) -> int:
+    """
+    Выбор индекса «оставить» по готовым ui_items (с size_bytes и привязками).
+    Приоритет: 1) самый большой размер, 2) папка с меньшим sort_order, 3) больше привязок (лица+персоны+поездки).
+    """
+    if not ui_items:
+        return 0
+    def key(i: int) -> tuple:
+        u = ui_items[i]
+        size = u.get("size_bytes") or 0
+        folder = (u.get("folder_short") or "").strip().lower()
+        order = sort_order_by_folder.get(folder)
+        order_val = order if order is not None else 999999
+        n = len(u.get("rectangles") or []) + len(u.get("persons") or []) + len(u.get("trips") or [])
+        return (size, -order_val, n)
+    return max(range(len(ui_items)), key=key)
 
 
 @app.get("/api/debug/module-path")
@@ -1258,39 +1559,17 @@ def api_dedup_archive_start(max_download_gb: int = 5) -> dict[str, Any]:
         def _runner() -> None:
             store2 = DedupStore()
             try:
-                # Всегда считаем total_files, чтобы UI мог рисовать процент.
-                try:
-                    disk = get_disk()
-                    total_sum = 0
-                    any_total = False
-                    for r in roots:
-                        total, err, err_path = _count_files_recursive(disk, r)
-                        if total is not None:
-                            total_sum += int(total)
-                            any_total = True
-                        else:
-                            store2.update_run_progress(
-                                run_id=run_id,
-                                last_path=err_path,
-                                last_error=f"total_files_count_failed({r}): {err}",
-                            )
-                    if any_total:
-                        store2.update_run_progress(run_id=run_id, total_files=int(total_sum))
-                except Exception as e:  # noqa: BLE001
-                    store2.update_run_progress(
-                        run_id=run_id,
-                        last_error=f"total_files_count_failed: {type(e).__name__}: {e}",
-                    )
-
-                _dedup_scan_archive(
+                _dedup_scan_archive_from_db(
                     run_id=run_id,
-                    root_paths=roots,
-                    limit_files=None,
                     max_download_bytes=max_download_bytes,
                     inventory_scope="archive",
                 )
                 store2.finish_run(run_id=run_id, status="completed")
             except Exception as e:  # noqa: BLE001
+                # #region agent log
+                _debug_log("runner_except", {"exc_type": type(e).__name__, "exc_msg": str(e)[:500]}, "H1")
+                print(f"[dedup archive] failed: {type(e).__name__}: {e}", file=sys.stderr)
+                # #endregion
                 store2.finish_run(run_id=run_id, status="failed", last_error=f"{type(e).__name__}: {e}")
             finally:
                 store2.close()
@@ -1301,13 +1580,14 @@ def api_dedup_archive_start(max_download_gb: int = 5) -> dict[str, Any]:
 
 
 @app.post("/api/archive/reconcile/start")
-def api_archive_reconcile_start() -> dict[str, Any]:
+def api_archive_reconcile_start(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
     """
-    Запускает фоновую сверку архива (актуализация списка файлов в files),
-    чтобы "догонять" редкие ручные изменения в веб-интерфейсе Я.Диска.
+    Запускает фоновую сверку архива (актуализация списка файлов в files).
+    Тело: {"skip_face_scan": true} — только синхронизация файлов, без автозапуска досчёта лиц.
     """
     global _RECONCILE_FUTURE, _RECONCILE_RUN_ID  # noqa: PLW0603
 
+    skip_face_scan = payload.get("skip_face_scan") is True
     root_path = "disk:/Фото"
 
     with _RECONCILE_LOCK:
@@ -1322,7 +1602,7 @@ def api_archive_reconcile_start() -> dict[str, Any]:
 
         _RECONCILE_RUN_ID = run_id
 
-        def _runner() -> None:
+        def _runner(skip_faces: bool = False) -> None:
             store2 = DedupStore()
             try:
                 # total_files считаем ПАРАЛЛЕЛЬНО (иначе старт сверки может долго "висеть" на 0%).
@@ -1348,42 +1628,40 @@ def api_archive_reconcile_start() -> dict[str, Any]:
 
                 _reconcile_archive_inventory(run_id=run_id, root_path=root_path)
                 store2.finish_run(run_id=run_id, status="completed")
-                
-                # После завершения reconcile запускаем досчёт лиц для архива (в фоне)
-                def _scan_faces_runner() -> None:
-                    try:
-                        repo_root = Path(__file__).resolve().parents[2]
-                        script_path = repo_root / "backend" / "scripts" / "tools" / "face_scan_archive.py"
-                        venv_python = repo_root / ".venv-face" / "Scripts" / "python.exe"
-                        
-                        if not script_path.exists():
-                            return  # Скрипт не найден - пропускаем
-                        
-                        if venv_python.exists():
-                            subprocess.run(
-                                [str(venv_python), str(script_path)],
-                                cwd=str(repo_root),
-                                timeout=None,  # Может быть долго
-                            )
-                        else:
-                            # Fallback на системный Python
-                            subprocess.run(
-                                [sys.executable, str(script_path)],
-                                cwd=str(repo_root),
-                                timeout=None,
-                            )
-                    except Exception as e:  # noqa: BLE001
-                        # Логируем, но не блокируем reconcile
-                        print(f"face_scan_archive failed: {type(e).__name__}: {e}", file=sys.stderr)
-                
-                # Запускаем в отдельном потоке, чтобы не блокировать
-                threading.Thread(target=_scan_faces_runner, daemon=True).start()
+
+                if not skip_faces:
+                    # После завершения reconcile запускаем досчёт лиц для архива (в фоне)
+                    def _scan_faces_runner() -> None:
+                        try:
+                            repo_root = Path(__file__).resolve().parents[2]
+                            script_path = repo_root / "backend" / "scripts" / "tools" / "face_scan_archive.py"
+                            venv_python = repo_root / ".venv-face" / "Scripts" / "python.exe"
+
+                            if not script_path.exists():
+                                return  # Скрипт не найден - пропускаем
+
+                            if venv_python.exists():
+                                subprocess.run(
+                                    [str(venv_python), str(script_path)],
+                                    cwd=str(repo_root),
+                                    timeout=None,  # Может быть долго
+                                )
+                            else:
+                                subprocess.run(
+                                    [sys.executable, str(script_path)],
+                                    cwd=str(repo_root),
+                                    timeout=None,
+                                )
+                        except Exception as e:  # noqa: BLE001
+                            print(f"face_scan_archive failed: {type(e).__name__}: {e}", file=sys.stderr)
+
+                    threading.Thread(target=_scan_faces_runner, daemon=True).start()
             except Exception as e:  # noqa: BLE001
                 store2.finish_run(run_id=run_id, status="failed", last_error=f"{type(e).__name__}: {e}")
             finally:
                 store2.close()
 
-        _RECONCILE_FUTURE = _RECONCILE_EXEC.submit(_runner)
+        _RECONCILE_FUTURE = _RECONCILE_EXEC.submit(_runner, skip_face_scan)
 
     return {"ok": True, "message": "started", "run_id": run_id, "root_path": root_path}
 
@@ -1403,6 +1681,32 @@ def api_archive_reconcile_status() -> dict[str, Any]:
         running = _RECONCILE_FUTURE is not None and not _RECONCILE_FUTURE.done()
 
     return {"running": running, "active_run_id": _RECONCILE_RUN_ID, "latest": latest}
+
+
+@app.post("/api/archive/scan-faces/start")
+def api_archive_scan_faces_start() -> dict[str, Any]:
+    """
+    Запускает в фоне: досчёт лиц для новых файлов архива (face_scan_archive.py),
+    затем досчёт embeddings и кластеров для ручных привязок (backfill_archive_manual_embeddings.py).
+    Возвращает сразу; прогресс в логах сервера.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    face_script = repo_root / "backend" / "scripts" / "tools" / "face_scan_archive.py"
+    backfill_script = repo_root / "backend" / "scripts" / "tools" / "backfill_archive_manual_embeddings.py"
+    venv_python = repo_root / ".venv-face" / "Scripts" / "python.exe"
+    python_exe = str(venv_python) if venv_python.exists() else sys.executable
+
+    def _run() -> None:
+        try:
+            if face_script.exists():
+                subprocess.run([python_exe, str(face_script)], cwd=str(repo_root), timeout=None)
+            if backfill_script.exists():
+                subprocess.run([python_exe, str(backfill_script)], cwd=str(repo_root), timeout=300)
+        except Exception as e:  # noqa: BLE001
+            print(f"archive scan-faces: {type(e).__name__}: {e}", file=sys.stderr)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "message": "started"}
 
 
 @app.post("/api/archive/backfill-manual-embeddings")
@@ -1440,6 +1744,92 @@ def api_archive_backfill_manual_embeddings() -> dict[str, Any]:
         return {"ok": False, "message": "Превышено время ожидания (5 мин)"}
     except Exception as e:
         return {"ok": False, "message": f"{type(e).__name__}: {e}"}
+
+
+@app.post("/api/archive/scan-perceptual-hashes")
+def api_archive_scan_perceptual_hashes(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    """
+    Досчитывает перцептивный хеш (pHash) для архивных изображений, у которых его ещё нет.
+    Скачивает файлы с Я.Диска, считает pHash, пишет в file_perceptual_hashes.
+    Тело: {"limit": 100} — сколько файлов обработать за один вызов (по умолчанию 50).
+    """
+    global _PHASH_SKIP_PATHS  # noqa: PLW0603
+    limit = 50
+    if isinstance(payload.get("limit"), (int, float)):
+        limit = max(1, min(500, int(payload["limit"])))
+
+    store = DedupStore()
+    try:
+        paths = store.list_archive_image_paths_without_phash(limit=limit)
+    finally:
+        store.close()
+
+    paths = [p for p in paths if p not in _PHASH_SKIP_PATHS]
+
+    if not paths:
+        store2 = DedupStore()
+        try:
+            remaining = store2.count_archive_images_without_phash()
+            total = store2.count_archive_images()
+        finally:
+            store2.close()
+        return {
+            "ok": True,
+            "processed": 0,
+            "errors": 0,
+            "remaining": remaining,
+            "total": total,
+            "all_skipped": remaining > 0 and len(_PHASH_SKIP_PATHS) > 0,
+            "message": "Нет файлов для обработки" if remaining == 0 else f"Осталось {remaining} без pHash (часть пропущена из-за ошибок)",
+        }
+
+    disk = get_disk()
+    processed = 0
+    errors = 0
+    for path in paths:
+        remote = _normalize_yadisk_path(path)
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix="photosorter_phash_", suffix=".bin", delete=False) as tmp:
+                tmp_path = tmp.name
+            _yd_call_retry_timeout(lambda: disk.download(remote, tmp_path), timeout_sec=300)
+            phash_val = compute_phash_hex(tmp_path)
+            if phash_val:
+                store3 = DedupStore()
+                try:
+                    if store3.upsert_perceptual_hash(path=path, algorithm="pHash", value=phash_val):
+                        processed += 1
+                finally:
+                    store3.close()
+            else:
+                errors += 1
+        except Exception:
+            errors += 1
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    if processed == 0 and errors == len(paths) and len(paths) > 0:
+        _PHASH_SKIP_PATHS.update(paths)
+
+    store4 = DedupStore()
+    try:
+        remaining = store4.count_archive_images_without_phash()
+        total = store4.count_archive_images()
+    finally:
+        store4.close()
+
+    return {
+        "ok": True,
+        "processed": processed,
+        "errors": errors,
+        "remaining": remaining,
+        "total": total,
+        "message": f"Обработано: {processed}, ошибок: {errors}, осталось без pHash: {remaining}",
+    }
 
 
 @app.get("/api/dedup/archive/status")
@@ -2158,12 +2548,91 @@ def api_sort_dup_in_archive(source_run_id: int | None = None) -> dict[str, Any]:
         )
 
     items = list(grouped.values())
+    # Визуально похожие с архивом (подшаг 1.1)
+    similar_with_archive: list[dict[str, Any]] = []
+    store_dedup = DedupStore()
+    try:
+        similar_keys = store_dedup.list_similar_image_groups_source_vs_archive(run_id=run_id, algorithm="pHash") if hasattr(store_dedup, "list_similar_image_groups_source_vs_archive") else []
+        for g in similar_keys:
+            algorithm = str(g.get("algorithm") or "pHash")
+            value = str(g.get("value") or "")
+            source_items = store_dedup.list_similar_image_group_items(algorithm=algorithm, value=value, inventory_scope="source", last_run_id=run_id)
+            archive_items = store_dedup.list_similar_image_group_items(algorithm=algorithm, value=value, inventory_scope="archive")
+            keep_idx = _pick_keep_indexes(source_items, {})
+            source_files = []
+            for i, it in enumerate(source_items):
+                d = dict(it)
+                path = str(d.get("path") or "")
+                mime_type = str(d.get("mime_type") or "") or None
+                media_type = str(d.get("media_type") or "") or None
+                size = d.get("size")
+                size_i = int(size) if isinstance(size, (int, float)) else None
+                preview_kind = "none"
+                preview_url = None
+                open_url = None
+                if path.startswith("disk:"):
+                    open_url = "/api/yadisk/open?path=" + urllib.parse.quote(path, safe="")
+                    if (media_type or "").lower() == "image" or (str(mime_type or "").lower()).startswith("image/"):
+                        preview_kind = "image"
+                        preview_url = "/api/yadisk/preview-image?size=M&path=" + urllib.parse.quote(path, safe="")
+                elif path.startswith("local:"):
+                    if (media_type or "").lower() == "image" or (str(mime_type or "").lower()).startswith("image/"):
+                        preview_kind = "image"
+                        preview_url = "/api/local/preview?path=" + urllib.parse.quote(path, safe="")
+                source_files.append({
+                    "path": path,
+                    "path_short": _short_path_for_ui(path) if path.startswith("disk:") else path,
+                    "keep": i == keep_idx,
+                    "size_human": _human_bytes(size_i),
+                    "mime_type": mime_type,
+                    "media_type": media_type,
+                    "preview_kind": preview_kind,
+                    "preview_url": preview_url,
+                    "open_url": open_url,
+                })
+            archive_files = []
+            for it in archive_items:
+                d = dict(it)
+                path = str(d.get("path") or "")
+                mime_type = str(d.get("mime_type") or "") or None
+                media_type = str(d.get("media_type") or "") or None
+                size = d.get("size")
+                size_i = int(size) if isinstance(size, (int, float)) else None
+                preview_kind = "none"
+                preview_url = None
+                open_url = None
+                if path.startswith("disk:"):
+                    open_url = "/api/yadisk/open?path=" + urllib.parse.quote(path, safe="")
+                    if (media_type or "").lower() == "image" or (str(mime_type or "").lower()).startswith("image/"):
+                        preview_kind = "image"
+                        preview_url = "/api/yadisk/preview-image?size=M&path=" + urllib.parse.quote(path, safe="")
+                archive_files.append({
+                    "path": path,
+                    "path_short": _short_path_for_ui(path),
+                    "size_human": _human_bytes(size_i),
+                    "mime_type": mime_type,
+                    "media_type": media_type,
+                    "preview_kind": preview_kind,
+                    "preview_url": preview_url,
+                    "open_url": open_url,
+                })
+            similar_with_archive.append({
+                "algorithm": algorithm,
+                "value": value,
+                "hash_short": (value[:12] + "…") if len(value) > 12 else value,
+                "source_files": source_files,
+                "archive_files": archive_files,
+            })
+    finally:
+        store_dedup.close()
+
     return {
         "ok": True,
         "source_run_id": run_id,
         "source_root_path": root_path,
         "items": items,
         "total": len(items),
+        "similar_with_archive": similar_with_archive,
         "archive_scanned": bool(locals().get("archive_scanned", False)),
     }
 
@@ -2392,8 +2861,86 @@ def api_sort_dup_in_source(source_run_id: int | None = None) -> dict[str, Any]:
             }
         )
 
+    # Визуально похожие между собой (подшаг 1.2)
+    similar_groups: list[dict[str, Any]] = []
+    max_similar_group_size = 0
+    store_s = DedupStore()
+    try:
+        similar_raw = store_s.list_similar_image_groups_for_run(run_id=run_id, algorithm="pHash") if hasattr(store_s, "list_similar_image_groups_for_run") else []
+    finally:
+        store_s.close()
+    for g in similar_raw:
+        algorithm = str(g.get("algorithm") or "pHash")
+        value = str(g.get("value") or "")
+        cnt = int(g.get("cnt") or 0)
+        max_similar_group_size = max(max_similar_group_size, cnt)
+        store3 = DedupStore()
+        try:
+            items = store3.list_similar_image_group_items(algorithm=algorithm, value=value, inventory_scope="source", last_run_id=run_id)
+        finally:
+            store3.close()
+        keep_idx = _pick_keep_indexes(items, {})
+        ui_items = []
+        for i, it in enumerate(items):
+            d = dict(it)
+            path = str(d.get("path") or "")
+            mime_type = str(d.get("mime_type") or "") or None
+            media_type = str(d.get("media_type") or "") or None
+            if not mime_type:
+                guess_name = _strip_local_prefix(path) if path.startswith("local:") else _basename_from_disk_path(path)
+                mt2, _enc = mimetypes.guess_type(guess_name)
+                mime_type = mt2 or None
+            if not media_type and mime_type:
+                if mime_type.startswith("image/"):
+                    media_type = "image"
+                elif mime_type.startswith("video/"):
+                    media_type = "video"
+            size = d.get("size")
+            size_i = int(size) if isinstance(size, (int, float)) else None
+            preview_kind = "none"
+            preview_url = None
+            open_url = None
+            if path.startswith("disk:"):
+                open_url = "/api/yadisk/open?path=" + urllib.parse.quote(path, safe="")
+                mt = (media_type or "").lower()
+                mime = (mime_type or "").lower()
+                if mt == "image" or (mime or "").startswith("image/"):
+                    preview_kind = "image"
+                    preview_url = "/api/yadisk/preview-image?size=M&path=" + urllib.parse.quote(path, safe="")
+                elif mt == "video" or (mime or "").startswith("video/"):
+                    preview_kind = "video"
+            elif path.startswith("local:"):
+                local_p = path
+                mt = (media_type or "").lower()
+                mime = (mime_type or "").lower()
+                if mt == "image" or (mime or "").startswith("image/"):
+                    preview_kind = "image"
+                    preview_url = "/api/local/preview?path=" + urllib.parse.quote(local_p, safe="")
+                elif mt == "video" or (mime or "").startswith("video/"):
+                    preview_kind = "video"
+                    preview_url = "/api/local/preview?path=" + urllib.parse.quote(local_p, safe="")
+            ui_items.append({
+                "path": path,
+                "path_short": _short_path_for_ui(path) if path.startswith("disk:") else path,
+                "size_human": _human_bytes(size_i),
+                "keep": i == keep_idx,
+                "mime_type": mime_type,
+                "media_type": media_type,
+                "preview_kind": preview_kind,
+                "preview_url": preview_url,
+                "open_url": open_url,
+            })
+        similar_groups.append({
+            "hash_alg": algorithm,
+            "hash_value": value,
+            "hash_short": (value[:12] + "…") if len(value) > 12 else value,
+            "cnt": cnt,
+            "files": ui_items,
+        })
+
+    summary_similar = {"groups": len(similar_groups), "max_group_size": max_similar_group_size}
     summary = {"groups": len(groups), "max_group_size": max_group_size}
-    return {"ok": True, "source_run_id": run_id, "source_root_path": root_path, "summary": summary, "groups": groups}
+    return {"ok": True, "source_run_id": run_id, "source_root_path": root_path, "summary": summary, "groups": groups, "similar_groups": similar_groups, "summary_similar": summary_similar}
 
 
 @app.get("/sort/dup-in-archive", response_class=HTMLResponse)
@@ -2558,6 +3105,17 @@ def api_path_count(path: str) -> dict[str, Any]:
     return {"path": path, "count": cnt, "seconds": round(dt, 2), "error": err, "error_path": err_path}
 
 
+@app.get("/api/duplicates/similar-photo-groups")
+def api_duplicates_similar_photo_groups() -> dict[str, Any]:
+    """Возвращает группы визуально похожих фото (по перцептивному хешу) для архива."""
+    store = DedupStore()
+    try:
+        groups = store.list_similar_image_groups_archive(algorithm="pHash")
+        return {"groups": groups}
+    finally:
+        store.close()
+
+
 @app.get("/duplicates", response_class=HTMLResponse)
 def duplicates_page(request: Request):
     """
@@ -2567,6 +3125,7 @@ def duplicates_page(request: Request):
     store = DedupStore()
     try:
         groups_raw = store.list_dup_groups_archive()
+        similar_raw = store.list_similar_image_groups_archive(algorithm="pHash")
         folders = list_folders(location="yadisk", role="target")
     finally:
         store.close()
@@ -2592,27 +3151,32 @@ def duplicates_page(request: Request):
         finally:
             store2.close()
 
-        keep_idx = _pick_keep_indexes(items, sort_order_by_folder)
-
-        ui_items: list[dict[str, Any]] = []
+        ui_items = []
         for i, it in enumerate(items):
             path = str(it.get("path") or "")
             mime_type = str(it.get("mime_type") or "") or None
             media_type = str(it.get("media_type") or "") or None
             size = it.get("size")
             size_i = int(size) if isinstance(size, (int, float)) else None
-
-            ui_items.append(
-                {
-                    "path": path,
-                    "path_short": _short_path_for_ui(path),
-                    "folder_short": _short_folder_from_disk_path(path),
-                    "size_human": _human_bytes(size_i),
-                    "mime_type": mime_type,
-                    "media_type": media_type,
-                    "keep": i == keep_idx,
-                }
-            )
+            file_id = it.get("file_id")
+            ctx = get_file_duplicate_context(file_id) if file_id is not None else {"rectangles": [], "persons": [], "trips": []}
+            ui_items.append({
+                "path": path,
+                "path_short": _short_path_for_ui(path),
+                "folder_short": _short_folder_from_disk_path(path),
+                "size_bytes": size_i,
+                "size_human": _human_bytes(size_i),
+                "mime_type": mime_type,
+                "media_type": media_type,
+                "file_id": file_id,
+                "keep": False,
+                "rectangles": ctx.get("rectangles") or [],
+                "persons": ctx.get("persons") or [],
+                "trips": ctx.get("trips") or [],
+            })
+        keep_idx = _pick_keep_index_from_ui_items(ui_items, sort_order_by_folder)
+        for i in range(len(ui_items)):
+            ui_items[i]["keep"] = (i == keep_idx)
 
         groups.append(
             {
@@ -2625,8 +3189,213 @@ def duplicates_page(request: Request):
             }
         )
 
+    # Группы визуально похожих фото (перцептивный хеш)
+    similar_groups: list[dict[str, Any]] = []
+    max_similar_group_size = 0
+    for g in similar_raw:
+        algorithm = str(g.get("algorithm") or "pHash")
+        value = str(g.get("value") or "")
+        cnt = int(g.get("cnt") or 0)
+        max_similar_group_size = max(max_similar_group_size, cnt)
+        store3 = DedupStore()
+        try:
+            items = store3.list_similar_image_group_items(algorithm=algorithm, value=value, inventory_scope="archive")
+        finally:
+            store3.close()
+        ui_items = []
+        for i, it in enumerate(items):
+            d = dict(it)
+            path = str(d.get("path") or "")
+            mime_type = str(d.get("mime_type") or "") or None
+            media_type = str(d.get("media_type") or "") or None
+            size = d.get("size")
+            size_i = int(size) if isinstance(size, (int, float)) else None
+            file_id = d.get("file_id")
+            ctx = get_file_duplicate_context(file_id) if file_id is not None else {"rectangles": [], "persons": [], "trips": []}
+            ui_items.append({
+                "path": path,
+                "path_short": _short_path_for_ui(path),
+                "folder_short": _short_folder_from_disk_path(path),
+                "size_bytes": size_i,
+                "size_human": _human_bytes(size_i),
+                "mime_type": mime_type,
+                "media_type": media_type,
+                "file_id": file_id,
+                "keep": False,
+                "rectangles": ctx.get("rectangles") or [],
+                "persons": ctx.get("persons") or [],
+                "trips": ctx.get("trips") or [],
+            })
+        keep_idx = _pick_keep_index_from_ui_items(ui_items, sort_order_by_folder)
+        for i in range(len(ui_items)):
+            ui_items[i]["keep"] = (i == keep_idx)
+        similar_groups.append({
+            "hash_alg": algorithm,
+            "hash_value": value,
+            "hash_short": (value[:12] + "…") if len(value) > 12 else value,
+            "cnt": cnt,
+            "files": ui_items,
+            "keep_invalid": False,
+            "note": "визуально похожие",
+        })
+    summary_similar = {"groups": len(similar_groups), "max_group_size": max_similar_group_size}
+
+    # Группы похожих видео (длительность + phash кадров в 3 моментах)
+    video_groups: list[dict[str, Any]] = []
+    max_video_group_size = 0
+    store_v = DedupStore()
+    try:
+        video_raw = store_v.list_similar_video_groups_archive() if hasattr(store_v, "list_similar_video_groups_archive") else []
+    finally:
+        store_v.close()
+    for g in video_raw:
+        duration_sec = float(g.get("duration_sec") or 0)
+        phash_key = str(g.get("phash_key") or "")
+        cnt = int(g.get("cnt") or 0)
+        max_video_group_size = max(max_video_group_size, cnt)
+        store4 = DedupStore()
+        try:
+            items = store4.list_similar_video_group_items(duration_sec=duration_sec, phash_key=phash_key, inventory_scope="archive")
+        finally:
+            store4.close()
+        ui_items = []
+        for i, it in enumerate(items):
+            d = dict(it)
+            path = str(d.get("path") or "")
+            mime_type = str(d.get("mime_type") or "") or None
+            media_type = str(d.get("media_type") or "") or None
+            size = d.get("size")
+            size_i = int(size) if isinstance(size, (int, float)) else None
+            file_id = d.get("file_id")
+            ctx = get_file_duplicate_context(file_id) if file_id is not None else {"rectangles": [], "persons": [], "trips": []}
+            ui_items.append({
+                "path": path,
+                "path_short": _short_path_for_ui(path),
+                "folder_short": _short_folder_from_disk_path(path),
+                "size_bytes": size_i,
+                "size_human": _human_bytes(size_i),
+                "mime_type": mime_type,
+                "media_type": media_type,
+                "file_id": file_id,
+                "keep": False,
+                "rectangles": ctx.get("rectangles") or [],
+                "persons": ctx.get("persons") or [],
+                "trips": ctx.get("trips") or [],
+            })
+        keep_idx = _pick_keep_index_from_ui_items(ui_items, sort_order_by_folder)
+        for i in range(len(ui_items)):
+            ui_items[i]["keep"] = (i == keep_idx)
+        video_groups.append({
+            "duration_sec": duration_sec,
+            "phash_key": phash_key,
+            "phash_short": (phash_key[:20] + "…") if len(phash_key) > 20 else phash_key,
+            "cnt": cnt,
+            "files": ui_items,
+            "keep_invalid": False,
+            "note": "одинаковая длительность + кадры",
+        })
+    summary_video = {"groups": len(video_groups), "max_group_size": max_video_group_size}
+
+    # Разрешенные дубли (скрытые группы) — для вкладки «Разрешенные дубли»
+    allowed_groups: list[dict[str, Any]] = []
+    store_allowed = DedupStore()
+    try:
+        hidden_raw = store_allowed.list_hidden_duplicate_groups() if hasattr(store_allowed, "list_hidden_duplicate_groups") else []
+    finally:
+        store_allowed.close()
+    for h in hidden_raw:
+        gtype = str(h.get("group_type") or "")
+        hidden_at = str(h.get("hidden_at") or "")
+        if gtype == "exact":
+            hash_alg = str(h.get("hash_alg") or "")
+            hash_value = str(h.get("hash_value") or "")
+            store_h = DedupStore()
+            try:
+                items = store_h.list_group_items(hash_alg=hash_alg, hash_value=hash_value, inventory_scope="archive")
+            finally:
+                store_h.close()
+            label_short = f"{hash_alg}:{(hash_value[:12] + '…') if len(hash_value) > 12 else hash_value}"
+            key = {"group_type": "exact", "hash_alg": hash_alg, "hash_value": hash_value}
+        elif gtype == "similar":
+            algorithm = str(h.get("algorithm") or "pHash")
+            value = str(h.get("value") or "")
+            store_h = DedupStore()
+            try:
+                items = store_h.list_similar_image_group_items(algorithm=algorithm, value=value, inventory_scope="archive")
+            finally:
+                store_h.close()
+            label_short = f"{algorithm}:{(value[:12] + '…') if len(value) > 12 else value}"
+            key = {"group_type": "similar", "algorithm": algorithm, "value": value}
+        elif gtype == "similar_video":
+            val = str(h.get("value") or "")
+            if ":" not in val:
+                continue
+            parts = val.split(":", 1)
+            try:
+                duration_sec = float(parts[0])
+            except (ValueError, TypeError):
+                continue
+            phash_key = parts[1]
+            store_h = DedupStore()
+            try:
+                items = store_h.list_similar_video_group_items(duration_sec=duration_sec, phash_key=phash_key, inventory_scope="archive")
+            finally:
+                store_h.close()
+            label_short = f"{duration_sec} с · {(phash_key[:20] + '…') if len(phash_key) > 20 else phash_key}"
+            key = {"group_type": "similar_video", "duration_sec": duration_sec, "phash_key": phash_key}
+        else:
+            continue
+        ui_items = []
+        for it in items:
+            d = dict(it) if hasattr(it, "keys") else it
+            path = str(d.get("path") or "")
+            mime_type = str(d.get("mime_type") or "") or None
+            media_type = str(d.get("media_type") or "") or None
+            size = d.get("size")
+            size_i = int(size) if isinstance(size, (int, float)) else None
+            file_id = d.get("file_id")
+            ctx = get_file_duplicate_context(file_id) if file_id is not None else {"rectangles": [], "persons": [], "trips": []}
+            ui_items.append({
+                "path": path,
+                "path_short": _short_path_for_ui(path),
+                "folder_short": _short_folder_from_disk_path(path),
+                "size_bytes": size_i,
+                "size_human": _human_bytes(size_i),
+                "mime_type": mime_type,
+                "media_type": media_type,
+                "file_id": file_id,
+                "rectangles": ctx.get("rectangles") or [],
+                "persons": ctx.get("persons") or [],
+                "trips": ctx.get("trips") or [],
+            })
+        allowed_groups.append({
+            **key,
+            "label_short": label_short,
+            "hidden_at": hidden_at,
+            "cnt": len(ui_items),
+            "files": ui_items,
+        })
+    summary_allowed = {"groups": len(allowed_groups)}
+
     summary = {"groups": len(groups), "max_group_size": max_group_size}
-    return templates.TemplateResponse("duplicates.html", {"request": request, "groups": groups, "summary": summary})
+    target_move_folders = [{"name": str(f.get("name") or f.get("path") or "").strip() or "Папка", "path": str(f.get("path") or "").strip()} for f in list_folders(location="yadisk", role="target") if f.get("path")]
+    if not target_move_folders:
+        target_move_folders = [{"name": "Дети вместе", "path": "disk:/Фото/Дети вместе"}]
+    return templates.TemplateResponse(
+        "duplicates.html",
+        {
+            "request": request,
+            "groups": groups,
+            "summary": summary,
+            "similar_groups": similar_groups,
+            "summary_similar": summary_similar,
+            "video_groups": video_groups,
+            "summary_video": summary_video,
+            "allowed_groups": allowed_groups,
+            "summary_allowed": summary_allowed,
+            "target_move_folders": target_move_folders,
+        },
+    )
 
 
 def _yadisk_remove_to_trash(disk, *, path: str) -> None:
@@ -2636,6 +3405,12 @@ def _yadisk_remove_to_trash(disk, *, path: str) -> None:
     except TypeError:
         # старые версии/обёртки могли не поддерживать permanently
         _yd_call_retry(lambda: disk.remove(p))
+
+
+def _yadisk_restore_from_trash(disk, *, path: str) -> None:
+    """Восстанавливает файл/папку из корзины Я.Диска по оригинальному пути."""
+    p = _normalize_yadisk_path(path)
+    _yd_call_retry(lambda: disk.restore_trash(p))
 
 
 def _yadisk_move(disk, *, src_path: str, dst_path: str) -> None:
@@ -2684,6 +3459,37 @@ def api_duplicates_delete(payload: dict[str, Any] = Body(...)) -> dict[str, Any]
         store.close()
 
     return {"ok": True, "deleted": len(ok_paths), "errors": errors}
+
+
+@app.post("/api/duplicates/restore-from-trash")
+def api_duplicates_restore_from_trash(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Восстанавливает файлы из корзины Я.Диска и снимает пометку deleted в БД.
+    Тело: { paths: string[] } — те же пути, что были удалены (disk:...).
+    """
+    paths = payload.get("paths")
+    if not isinstance(paths, list) or not paths:
+        raise HTTPException(status_code=400, detail="paths[] is required")
+    clean = [p for p in paths if isinstance(p, str) and p.startswith("disk:")]
+    if not clean:
+        raise HTTPException(status_code=400, detail="no valid disk: paths")
+    if len(clean) > 100:
+        raise HTTPException(status_code=400, detail="too many paths (max 100)")
+    disk = get_disk()
+    store = DedupStore()
+    restored = 0
+    errors: list[dict[str, str]] = []
+    try:
+        for p in clean:
+            try:
+                _yadisk_restore_from_trash(disk, path=p)
+                store.unmark_deleted(paths=[p])
+                restored += 1
+            except Exception as e:  # noqa: BLE001
+                errors.append({"path": p, "error": f"{type(e).__name__}: {e}"})
+        return {"ok": True, "restored": restored, "errors": errors}
+    finally:
+        store.close()
 
 
 @app.post("/api/archive/delete")
@@ -2811,6 +3617,162 @@ def api_duplicates_move_to_kids(payload: dict[str, Any] = Body(...)) -> dict[str
             "deleted": len(deleted_ok),
             "errors": errors,
         }
+    finally:
+        store.close()
+
+
+@app.get("/api/duplicates/file-context")
+def api_duplicates_file_context(file_id: int = Query(..., description="ID файла в таблице files")) -> dict[str, Any]:
+    """
+    Контекст файла для обновления плитки на странице дублей после переноса или редактирования в карточке.
+    Возвращает: path, path_short, folder_short, rectangles, persons, trips.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT path FROM files WHERE id = ? LIMIT 1", (file_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="file not found")
+        path = str(row["path"] or "")
+        ctx = get_file_duplicate_context(file_id)
+        return {
+            "path": path,
+            "path_short": _short_path_for_ui(path),
+            "folder_short": _short_folder_from_disk_path(path),
+            "rectangles": ctx.get("rectangles") or [],
+            "persons": ctx.get("persons") or [],
+            "trips": ctx.get("trips") or [],
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/duplicates/hide-group")
+def api_duplicates_hide_group(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Скрыть группу дублей из интерфейса («Оставить все выбранное»).
+    Тело: exact — hash_alg, hash_value; similar — algorithm, value; similar_video — duration_sec, phash_key.
+    """
+    group_type = payload.get("group_type")
+    if group_type not in ("exact", "similar", "similar_video"):
+        raise HTTPException(status_code=400, detail="group_type must be 'exact', 'similar' or 'similar_video'")
+    store = DedupStore()
+    try:
+        if group_type == "exact":
+            hash_alg = str(payload.get("hash_alg") or "").strip()
+            hash_value = str(payload.get("hash_value") or "").strip()
+            if not hash_alg or not hash_value:
+                raise HTTPException(status_code=400, detail="hash_alg and hash_value required for exact")
+            store.hide_duplicate_group_exact(hash_alg=hash_alg, hash_value=hash_value)
+        elif group_type == "similar":
+            algorithm = str(payload.get("algorithm") or "pHash").strip()
+            value = str(payload.get("value") or "").strip()
+            if not value:
+                raise HTTPException(status_code=400, detail="value required for similar")
+            store.hide_duplicate_group_similar(algorithm=algorithm, value=value)
+        else:
+            duration_sec = payload.get("duration_sec")
+            phash_key = str(payload.get("phash_key") or "").strip()
+            if not phash_key:
+                raise HTTPException(status_code=400, detail="phash_key required for similar_video")
+            try:
+                duration_sec = float(duration_sec)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="duration_sec required for similar_video")
+            store.hide_duplicate_group_similar_video(duration_sec=duration_sec, phash_key=phash_key)
+        return {"ok": True}
+    finally:
+        store.close()
+
+
+@app.post("/api/duplicates/unhide-group")
+def api_duplicates_unhide_group(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Вернуть группу в список дублей (убрать из «разрешенных»). Тело как у hide-group.
+    """
+    group_type = payload.get("group_type")
+    if group_type not in ("exact", "similar", "similar_video"):
+        raise HTTPException(status_code=400, detail="group_type must be 'exact', 'similar' or 'similar_video'")
+    store = DedupStore()
+    try:
+        if group_type == "exact":
+            hash_alg = str(payload.get("hash_alg") or "").strip()
+            hash_value = str(payload.get("hash_value") or "").strip()
+            if not hash_alg or not hash_value:
+                raise HTTPException(status_code=400, detail="hash_alg and hash_value required for exact")
+            store.unhide_duplicate_group_exact(hash_alg=hash_alg, hash_value=hash_value)
+        elif group_type == "similar":
+            algorithm = str(payload.get("algorithm") or "pHash").strip()
+            value = str(payload.get("value") or "").strip()
+            if not value:
+                raise HTTPException(status_code=400, detail="value required for similar")
+            store.unhide_duplicate_group_similar(algorithm=algorithm, value=value)
+        else:
+            duration_sec = payload.get("duration_sec")
+            phash_key = str(payload.get("phash_key") or "").strip()
+            if not phash_key:
+                raise HTTPException(status_code=400, detail="phash_key required for similar_video")
+            try:
+                duration_sec = float(duration_sec)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="duration_sec required for similar_video")
+            store.unhide_duplicate_group_similar_video(duration_sec=duration_sec, phash_key=phash_key)
+        return {"ok": True}
+    finally:
+        store.close()
+
+
+@app.post("/api/duplicates/move-to-folder")
+def api_duplicates_move_to_folder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Перемещает отмеченные файлы в выбранную папку (только перенос, без удаления).
+    Тело: { paths: string[], target_folder: string } — paths только те, что с галкой «сохранить».
+    """
+    paths = payload.get("paths")
+    target_folder = payload.get("target_folder")
+    if not isinstance(paths, list) or not paths:
+        raise HTTPException(status_code=400, detail="paths[] is required")
+    if not isinstance(target_folder, str) or not target_folder.strip().startswith("disk:"):
+        raise HTTPException(status_code=400, detail="target_folder (disk:...) is required")
+    target_dir = target_folder.strip()
+    target_dir_norm = _normalize_yadisk_path(target_dir)
+
+    clean_paths: list[str] = []
+    for p in paths:
+        if isinstance(p, str) and p.startswith("disk:"):
+            clean_paths.append(p)
+    if not clean_paths:
+        raise HTTPException(status_code=400, detail="no valid disk: paths")
+    if len(clean_paths) > 100:
+        raise HTTPException(status_code=400, detail="too many paths (max 100)")
+
+    disk = get_disk()
+    store = DedupStore()
+    moved_count = 0
+    moved_files: list[dict[str, str]] = []
+    errors: list[dict[str, str]] = []
+    try:
+        for src_path in clean_paths:
+            try:
+                base_name = _basename_from_disk_path(src_path)
+                dest_path = _disk_join(target_dir, _unique_dest_name(store=store, disk=disk, dest_dir=target_dir, src_name=base_name or "file"))
+                _yadisk_move(disk, src_path=src_path, dst_path=dest_path)
+                store.update_path(
+                    old_path=src_path,
+                    new_path=dest_path,
+                    new_name=_basename_from_disk_path(dest_path),
+                    new_parent_path=_parent_from_disk_path(dest_path),
+                )
+                moved_count += 1
+                moved_files.append({
+                    "old_path": src_path,
+                    "new_path": dest_path,
+                    "new_path_short": _short_path_for_ui(dest_path),
+                })
+            except Exception as e:  # noqa: BLE001
+                errors.append({"path": src_path, "error": f"{type(e).__name__}: {e}"})
+        return {"ok": True, "moved": moved_count, "moved_files": moved_files, "errors": errors}
     finally:
         store.close()
 

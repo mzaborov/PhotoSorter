@@ -75,6 +75,19 @@
     .diagram-hint { font-size: 0.8rem; color: #9ca3af; margin-top: 4px; }
     .zoom-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.9); display: flex; align-items: center; justify-content: center; z-index: 9999; cursor: zoom-out; }
     .zoom-overlay img { max-width: 95vw; max-height: 95vh; object-fit: contain; cursor: default; }
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; z-index: 10000; }
+    .modal-box { background: #fff; border-radius: 12px; padding: 24px; max-width: 480px; width: 90%; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }
+    .modal-box h3 { margin: 0 0 8px 0; font-size: 1.2rem; color: #374151; }
+    .modal-hint { font-size: 0.9rem; color: #6b7280; margin: 0 0 16px 0; }
+    .modal-box label { display: block; margin-bottom: 12px; }
+    .modal-box label span { display: block; font-size: 0.9rem; font-weight: 600; color: #374151; margin-bottom: 4px; }
+    .modal-box input[type="text"] { width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 0.95rem; box-sizing: border-box; }
+    .modal-box .checkbox-label { display: flex; align-items: center; gap: 8px; }
+    .modal-box .checkbox-label input { width: auto; }
+    .modal-actions { display: flex; gap: 12px; margin-top: 20px; }
+    .modal-actions button { padding: 10px 18px; border-radius: 8px; font-size: 0.95rem; font-weight: 600; cursor: pointer; border: 1px solid #d1d5db; background: #f3f4f6; color: #374151; }
+    .modal-actions button[type="submit"] { background: #0b57d0; color: #fff; border-color: #0b57d0; }
+    .modal-actions button:hover { opacity: 0.9; }
   </style>
 </head>
 <body>
@@ -106,7 +119,32 @@
       <div class="links" id="links"></div>
       <p class="note">
         Карточка фото: параметры <code>path</code>, <code>pipeline_run_id</code>, <code>auto_open</code>. Пример: <a id="photo-card-example" href="#">карточка с path и run_id</a>.
+        По клику на «Карточка фото» открывается форма для ввода пути к файлу.
       </p>
+    </div>
+    <div id="debug-card-modal" class="modal-overlay" style="display:none;" aria-hidden="true">
+      <div class="modal-box">
+        <h3>Карточка фото (debug)</h3>
+        <p class="modal-hint">Укажите путь к файлу — откроется карточка в приложении.</p>
+        <form id="debug-card-form">
+          <label>
+            <span>Путь к файлу</span>
+            <input type="text" name="path" placeholder="C:\tmp\Photo\file.jpg или disk:\Фото\file.jpg" required />
+          </label>
+          <label>
+            <span>pipeline_run_id (необязательно)</span>
+            <input type="text" name="pipeline_run_id" placeholder="26" />
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" name="auto_open" value="true" />
+            <span>auto_open</span>
+          </label>
+          <div class="modal-actions">
+            <button type="submit">Открыть карточку</button>
+            <button type="button" id="debug-card-cancel">Отмена</button>
+          </div>
+        </form>
+      </div>
     </div>
 
     <div id="panel-entities" class="panel" role="tabpanel">
@@ -150,7 +188,7 @@
         { name: 'Кластеры персоны', path: '/persons' },
         { name: 'Неназначенные кластеры', path: '/face-clusters' },
         { name: 'Деталь кластера лиц', path: '/face-clusters' },
-        { name: 'Карточка фото', path: '/debug/photo-card' },
+        { name: 'Карточка фото', path: '/debug/photo-card', openForm: true },
         { name: 'Лица (разметка)', path: '/faces' },
         { name: 'Папки сортировки', path: '/sorting-folders' },
         { name: 'Результаты preclean', path: '/preclean-results' },
@@ -160,12 +198,50 @@
       var container = document.getElementById('links');
       screens.forEach(function(s) {
         var a = document.createElement('a');
-        a.href = base + s.path;
+        a.href = s.openForm ? '#' : (base + s.path);
+        if (s.openForm) a.setAttribute('data-open-debug-form', '1');
         a.innerHTML = '<span>' + s.name + '</span><span class="path">' + s.path + '</span>';
         container.appendChild(a);
       });
 
-      document.getElementById('photo-card-example').href = base + '/debug/photo-card?path=C%3A%5Ctmp%5CPhoto%5C_faces%5C20250621_162513.jpg&pipeline_run_id=26&auto_open=true';
+      var modal = document.getElementById('debug-card-modal');
+      var form = document.getElementById('debug-card-form');
+      function openDebugForm() {
+        modal.style.display = 'flex';
+        modal.setAttribute('aria-hidden', 'false');
+      }
+      function closeDebugForm() {
+        modal.style.display = 'none';
+        modal.setAttribute('aria-hidden', 'true');
+      }
+      container.addEventListener('click', function(e) {
+        if (e.target.closest('[data-open-debug-form]')) {
+          e.preventDefault();
+          openDebugForm();
+        }
+      });
+      document.getElementById('debug-card-cancel').addEventListener('click', closeDebugForm);
+      modal.addEventListener('click', function(e) {
+        if (e.target === modal) closeDebugForm();
+      });
+      form.addEventListener('submit', function(e) {
+        e.preventDefault();
+        var path = (form.path.value || '').trim();
+        if (!path) return;
+        var params = new URLSearchParams();
+        params.set('path', path);
+        if ((form.pipeline_run_id.value || '').trim()) params.set('pipeline_run_id', form.pipeline_run_id.value.trim());
+        if (form.auto_open.checked) params.set('auto_open', 'true');
+        window.location.href = base + '/debug/photo-card?' + params.toString();
+      });
+
+      document.getElementById('photo-card-example').addEventListener('click', function(e) {
+        e.preventDefault();
+        form.path.value = 'C:\\tmp\\Photo\\_faces\\20250621_162513.jpg';
+        form.pipeline_run_id.value = '26';
+        form.auto_open.checked = true;
+        openDebugForm();
+      });
 
       function switchTo(tabId, panelId) {
         ['tab-readme', 'tab-screens', 'tab-entities'].forEach(function(id) {
