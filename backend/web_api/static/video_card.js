@@ -56,6 +56,7 @@
   const imgWrap = qs('#videoCardImgWrap');
   const img = qs('#videoCardImg');
   const video = qs('#videoCardVideo');
+  const diskPlaceholder = qs('#videoCardDiskPlaceholder');
   const canvas = qs('#videoCardCanvas');
   const keyframeRow = qs('#videoCardKeyframeRow');
   const setFrame1Btn = qs('#videoCardSetFrame1');
@@ -204,15 +205,23 @@
   }
 
   function buildPreviewUrl(path) {
-    if (!path || !path.startsWith('local:')) return '';
-    return '/api/local/preview?path=' + encodeURIComponent(path) + (getPipelineRunId() != null ? '&pipeline_run_id=' + encodeURIComponent(String(getPipelineRunId())) : '');
+    if (!path) return '';
+    if (path.startsWith('local:')) {
+      return '/api/local/preview?path=' + encodeURIComponent(path) + (getPipelineRunId() != null ? '&pipeline_run_id=' + encodeURIComponent(String(getPipelineRunId())) : '');
+    }
+    return '';
   }
 
   function buildFrameUrl(frameIdx, bustCache) {
-    const path = getPath();
+    let path = (getPath() || '').trim();
     if (!path) return '';
+    if (/^disk:/i.test(path)) {
+      path = 'disk:/' + path.replace(/^disk:?[/\\]*/i, '').replace(/\\/g, '/');
+      let url = '/api/yadisk/video-frame?path=' + encodeURIComponent(path) + '&frame_idx=' + encodeURIComponent(String(frameIdx)) + '&max_dim=960';
+      if (bustCache) url += '&_=' + Date.now();
+      return url;
+    }
     const runId = getPipelineRunId();
-    // video-frame API поддерживает отсутствие pipeline_run_id (берёт root_path из source/pipeline run)
     let url = '/api/faces/video-frame?';
     if (runId != null) url += 'pipeline_run_id=' + encodeURIComponent(String(runId)) + '&';
     url += 'path=' + encodeURIComponent(path) + '&frame_idx=' + encodeURIComponent(String(frameIdx)) + '&max_dim=640';
@@ -224,6 +233,11 @@
     const path = getPath();
     let runId = getPipelineRunId();
     if (!path) return { frames: [] };
+    if (path.startsWith('disk:')) {
+      state.frames = [{ frame_idx: 1, t_sec: null, rects: [] }, { frame_idx: 2, t_sec: null, rects: [] }, { frame_idx: 3, t_sec: null, rects: [] }];
+      state.file_person = null;
+      return { frames: state.frames };
+    }
     if (runId == null && path.startsWith('local:')) {
       try {
         const res = await fetchJson('/api/faces/pipeline-run-for-path?path=' + encodeURIComponent(path));
@@ -781,9 +795,20 @@
     setTabActive(tabVideo);
     if (keyframeRow) keyframeRow.style.display = '';
     if (img) img.style.display = 'none';
-    if (video) {
-      video.style.display = '';
-      video.src = buildPreviewUrl(getPath());
+    const path = getPath();
+    if (path && path.startsWith('disk:')) {
+      if (video) video.style.display = 'none';
+      if (diskPlaceholder) {
+        const openUrl = '/api/yadisk/open?path=' + encodeURIComponent(path);
+        diskPlaceholder.innerHTML = 'Воспроизведение с Я.Диска здесь недоступно. <a href="' + openUrl.replace(/"/g, '&quot;') + '" target="_blank" rel="noopener noreferrer" style="color:#0b57d0;text-decoration:underline;">Открыть в Я.Диске</a>';
+        diskPlaceholder.style.display = '';
+      }
+    } else {
+      if (diskPlaceholder) diskPlaceholder.style.display = 'none';
+      if (video) {
+        video.style.display = '';
+        video.src = buildPreviewUrl(path);
+      }
     }
     state.curManualRects = [];
     state.drawEnabled = false;
@@ -807,13 +832,18 @@
       try { video.pause(); } catch (e) {}
       video.style.display = 'none';
     }
-    if (img) img.style.display = '';
+    if (diskPlaceholder) diskPlaceholder.style.display = 'none';
+    const oldFallback = document.getElementById('videoCardFrameFallback');
+    if (oldFallback) oldFallback.remove();
+    if (!img) return;
+    img.style.display = '';
+    img.alt = 'Кадр ' + idx;
     state.drawEnabled = false;
     if (canvas) {
       canvas.classList.remove('draw-on');
       canvas.style.pointerEvents = 'auto';
     }
-    if (img) img.style.pointerEvents = 'none';
+    img.style.pointerEvents = 'none';
     if (!Array.isArray(state.frames) || state.frames.length === 0) {
       await loadFrames();
     }
@@ -825,10 +855,34 @@
       base.is_face = (r.is_face === 0) ? 0 : 1;
       return base;
     }) : [];
+    const frameUrl = buildFrameUrl(idx, !!bustCache);
     img.referrerPolicy = 'no-referrer';
     img.src = '';
-    img.src = buildFrameUrl(idx, !!bustCache);
-    await new Promise((res) => { if (img.complete) res(); else { img.onload = res; img.onerror = res; } });
+    if (img.nextElementSibling && img.nextElementSibling.id === 'videoCardFrameFallback') img.nextElementSibling.remove();
+    img.src = frameUrl;
+    await new Promise((res) => {
+      const onDone = () => { img.onload = null; img.onerror = null; res(); };
+      img.onload = onDone;
+      img.onerror = function() {
+        img.style.display = 'none';
+        if (imgWrap) {
+          const fallback = document.createElement('div');
+          fallback.className = 'video-card-frame-fallback';
+          fallback.style.cssText = 'padding:24px;text-align:center;background:#fef2f2;color:#991b1b;border-radius:12px;';
+          const path = getPath();
+          if (path && path.startsWith('disk:')) {
+            const openUrl = '/api/yadisk/open?path=' + encodeURIComponent(path);
+            fallback.innerHTML = 'Не удалось загрузить кадр. <a href="' + openUrl.replace(/"/g, '&quot;') + '" target="_blank" rel="noopener noreferrer" style="color:#0b57d0;">Открыть в Я.Диске</a>';
+          } else {
+            fallback.textContent = 'Не удалось загрузить кадр.';
+          }
+          fallback.id = 'videoCardFrameFallback';
+          img.parentNode.insertBefore(fallback, img.nextSibling);
+        }
+        onDone();
+      };
+      if (img.complete) onDone();
+    });
     renderRectList();
     requestAnimationFrame(() => drawOverlay());
     const zoomBtn = qs('#videoCardZoomTrigger');
@@ -842,6 +896,7 @@
       modal.style.display = 'none';
     }
     if (video) { video.pause(); video.src = ''; }
+    if (diskPlaceholder) { diskPlaceholder.style.display = 'none'; diskPlaceholder.innerHTML = ''; }
     if (img) img.src = '';
     state.frames = [];
     state.curManualRects = [];

@@ -3981,19 +3981,28 @@ def api_yadisk_preview_image(path: str, size: str = "M", _bust: Optional[str] = 
                 _PREVIEW_RECENTLY_ROTATED.pop(k, None)
 
         # Для недавно повёрнутых (и при _bust) превью Яндекса может отдаваться из их кэша — картинка «на боку».
-        # Отдаём ссылку на скачивание файла: там актуальное содержимое.
+        # Всегда отдаём байты (скачиваем через SDK), чтобы при повторном открытии карточки не подставлялся кэш по redirect.
         use_download = _bust or (path in _PREVIEW_RECENTLY_ROTATED and (now_ts - _PREVIEW_RECENTLY_ROTATED.get(path, 0)) < _PREVIEW_RECENTLY_ROTATED_TTL_SEC)
         if use_download:
+            suffix = Path(path).suffix if path else ".jpg"
+            fd, temp_path = tempfile.mkstemp(suffix=suffix or ".jpg")
             try:
-                download_url = _get_download_url(disk, path=path)
-                return RedirectResponse(
-                    url=download_url,
-                    status_code=307,
+                os.close(fd)
+                disk.download(p, temp_path)
+                with open(temp_path, "rb") as f:
+                    body = f.read()
+                content_type = (mimetypes.guess_type(temp_path)[0] or "image/jpeg")
+                return Response(
+                    content=body,
+                    media_type=content_type,
                     headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
                 )
-            except Exception as fallback_err:  # noqa: BLE001
-                # Fallback: как обычно через preview
-                pass
+            finally:
+                try:
+                    if os.path.isfile(temp_path):
+                        os.unlink(temp_path)
+                except OSError:
+                    pass
 
         try:
             md = _yd_call_retry(lambda: disk.get_meta(p, limit=0, preview_size=size))
@@ -4044,8 +4053,12 @@ def api_yadisk_video_frame(path: str, frame_idx: int = 1, max_dim: int = 960) ->
     Извлекает кадр из видео на YaDisk: скачивает во временный файл, вызывает video_keyframes.py.
     Для больших видео (>150MB) возвращает 413.
     """
-    if not isinstance(path, str) or not path.startswith("disk:"):
+    if not isinstance(path, str) or not path.strip():
+        raise HTTPException(status_code=400, detail="path is required")
+    path = path.strip()
+    if not path.lower().startswith("disk:"):
         raise HTTPException(status_code=400, detail="path must start with disk:")
+    path = "disk:/" + path[5:].lstrip("/\\").replace("\\", "/")
 
     idx = int(frame_idx or 0)
     if idx not in (1, 2, 3):

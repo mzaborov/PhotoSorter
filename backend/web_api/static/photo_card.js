@@ -226,8 +226,8 @@
       menus.forEach(el => el.remove());
     }
     
-    // Уведомляем открывший контекст (faces / trip): перезагружать только если были изменения
-    if ((currentState.list_context?.source_page === 'faces' || currentState.list_context?.source_page === 'trip') && typeof currentState.on_close === 'function') {
+    // Уведомляем открывший контекст (faces / trip / duplicates): перезагружать только если были изменения
+    if (typeof currentState.on_close === 'function') {
       try {
         currentState.on_close({ reload: currentState.cardHadChanges === true });
       } catch (e) {
@@ -992,6 +992,7 @@
           if (typeof window.setToast === 'function') window.setToast('Добавлено в поездку «' + groupPath + '».', false);
           if (typeof loadTripBlock === 'function') loadTripBlock();
           if (sel) sel.value = '';
+          currentState.cardHadChanges = true;
           return;
         }
         const err = await attachRes.json().catch(() => ({}));
@@ -1140,9 +1141,10 @@
     // Генерируем URL для изображения
     let imageUrl = '';
     if (currentState.file_path.startsWith('disk:')) {
-      // YaDisk
+      // YaDisk: _bust при каждом открытии, чтобы после поворота при повторном открытии карточки не показывалась закэшированная старая ориентация
       const encodedPath = encodeURIComponent(currentState.file_path);
-      imageUrl = `/api/yadisk/preview-image?size=XL&path=${encodedPath}`;
+      const bust = currentState.imageCacheBust != null ? currentState.imageCacheBust : Date.now();
+      imageUrl = `/api/yadisk/preview-image?size=XL&path=${encodedPath}&_bust=${bust}`;
     } else if (currentState.file_path.startsWith('local:')) {
       // Локальный файл: cache-bust при каждом открытии карточки, чтобы после поворота/изменений показывать актуальный файл
       const encodedPath = encodeURIComponent(currentState.file_path);
@@ -5020,6 +5022,7 @@
         throw new Error(error.detail || 'Failed to create rectangle');
       }
       
+      currentState.cardHadChanges = true;
       // Перезагружаем rectangles
       await loadRectangles();
       await checkDuplicates();

@@ -3149,7 +3149,7 @@ class DedupStore:
         now = _now_utc_iso()
         for time_offset_sec, phash_value in frames:
             cur.execute(
-                "INSERT INTO file_video_frame_hashes (file_id, duration_sec, time_offset_sec, phash_value, computed_at) VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO file_video_frame_hashes (file_id, duration_sec, time_offset_sec, phash_value, computed_at) VALUES (?, ?, ?, ?, ?)",
                 (file_id, duration_sec, time_offset_sec, str(phash_value).strip(), now),
             )
         self.conn.commit()
@@ -4939,7 +4939,7 @@ class PipelineStore:
         now = _now_utc_iso()
         for time_offset_sec, phash_value in frames:
             cur.execute(
-                "INSERT INTO file_video_frame_hashes (file_id, duration_sec, time_offset_sec, phash_value, computed_at) VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO file_video_frame_hashes (file_id, duration_sec, time_offset_sec, phash_value, computed_at) VALUES (?, ?, ?, ?, ?)",
                 (file_id, duration_sec, time_offset_sec, str(phash_value).strip(), now),
             )
         self.conn.commit()

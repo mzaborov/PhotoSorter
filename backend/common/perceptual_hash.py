@@ -26,6 +26,13 @@ def compute_phash_hex(local_path: str | Path) -> str | None:
             # Конвертируем в RGB, если нужно (для PNG с прозрачностью и т.д.)
             if img.mode not in ("RGB", "L"):
                 img = img.convert("RGB")
+            w, h = img.size
+            # imagehash.phash может падать на очень маленьких изображениях; доводим до минимум 8x8
+            if w < 8 or h < 8:
+                scale = max(8 / w, 8 / h) if w and h else 1
+                new_w = max(8, int(w * scale))
+                new_h = max(8, int(h * scale))
+                img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
             h = imagehash.phash(img)
         return str(h)
     except Exception:

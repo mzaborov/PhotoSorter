@@ -83,17 +83,20 @@
       <button class="tab" type="button" data-tab="allowed">Разрешенные дубли</button>
     </div>
 
-    <div class="muted" style="margin-top: 10px;">
+    <div id="summary-exact" class="summary-for-tab muted" style="margin-top: 10px;" data-for-tab="exact">
       Точные: <span class="pill">{{ summary.groups }}</span> групп (макс. <span class="pill">{{ summary.max_group_size }}</span> в группе)
-      &nbsp;·&nbsp;
+    </div>
+    <div id="summary-similar" class="summary-for-tab muted" style="margin-top: 10px; display: none;" data-for-tab="similar">
       Визуально похожие: <span class="pill">{{ summary_similar.groups }}</span> групп (макс. <span class="pill">{{ summary_similar.max_group_size }}</span> в группе)
-      &nbsp;·&nbsp;
+    </div>
+    <div id="summary-video" class="summary-for-tab muted" style="margin-top: 10px; display: none;" data-for-tab="video">
       Похожие видео: <span class="pill">{{ summary_video.groups }}</span> групп (макс. <span class="pill">{{ summary_video.max_group_size }}</span> в группе)
-      &nbsp;·&nbsp;
+    </div>
+    <div id="summary-allowed" class="summary-for-tab muted" style="margin-top: 10px; display: none;" data-for-tab="allowed">
       Разрешенные: <span class="pill">{{ summary_allowed.groups }}</span> групп
     </div>
 
-    <div class="actions">
+    <div class="actions" id="actionsDelete">
       <button id="btnDeleteCopies" class="btn danger" type="button">Удалить копии (0)</button>
       <button id="btnUndoDelete" class="btn" type="button" style="display: none; margin-left: 8px;">Отменить</button>
       <span id="toast" class="toast muted"></span>
@@ -471,10 +474,26 @@
         return `/api/yadisk/preview-image?size=${encodeURIComponent(size)}&path=${encodeURIComponent(path)}`;
       }
 
+      function isVideoPath(path) {
+        if (!path || !path.startsWith("disk:")) return false;
+        const lower = path.toLowerCase();
+        return /\.(mp4|mov|webm|avi|mkv|m4v)(\?|$)/i.test(lower);
+      }
+
+      function previewUrlForThumb(path, mediaType) {
+        const kind = (mediaType || "").trim().toLowerCase();
+        const asVideo = (kind === "video" || kind.startsWith("video/")) || isVideoPath(path);
+        if (asVideo && path.startsWith("disk:")) {
+          return `/api/yadisk/video-frame?path=${encodeURIComponent(path)}&frame_idx=1`;
+        }
+        return previewProxyUrl(path, "M");
+      }
+
       function loadOnePreview(el, retry = 0) {
         return new Promise((resolve) => {
           const p = el?.getAttribute("data-path");
           if (!el || !p) return resolve();
+          const mediaType = el.getAttribute("data-media-type") || "";
           el.innerHTML = `<div class="noimg">превью…</div>`;
 
           const img = new Image();
@@ -492,17 +511,18 @@
           };
           el.innerHTML = "";
           el.appendChild(img);
-          img.src = previewProxyUrl(p, "M");
+          img.src = previewUrlForThumb(p, mediaType);
         });
       }
 
-      async function loadPreviews() {
-        const thumbs = Array.from(document.querySelectorAll(".thumb[data-path]"));
+      async function loadPreviews(sectionId) {
+        const root = sectionId ? document.getElementById("section-" + sectionId) : null;
+        const thumbs = root ? Array.from(root.querySelectorAll(".thumb[data-path]")) : Array.from(document.querySelectorAll(".thumb[data-path]"));
+        const toLoad = thumbs.filter(el => !el.querySelector("img"));
+        const list = toLoad.length ? toLoad : thumbs;
         const limit = createLimiter(CONCURRENCY);
-        await Promise.all(thumbs.map(el => limit(() => loadOnePreview(el))));
+        await Promise.all(list.map(el => limit(() => loadOnePreview(el))));
       }
-
-      loadPreviews();
 
       // Валидация выбора: в каждой группе должен быть выбран хотя бы 1 чекбокс.
       function updateGroupValidity(cardsEl) {
@@ -595,6 +615,12 @@
           document.querySelectorAll(".duplicates-section").forEach((sec) => {
             sec.classList.toggle("active", sec.id === "section-" + t);
           });
+          document.querySelectorAll(".summary-for-tab").forEach((el) => {
+            el.style.display = el.getAttribute("data-for-tab") === t ? "" : "none";
+          });
+          const actionsEl = document.getElementById("actionsDelete");
+          if (actionsEl) actionsEl.style.display = t === "allowed" ? "none" : "";
+          loadPreviews(t);
           updateDeleteButtonLabel();
           try { sessionStorage.setItem("duplicatesTab", t); } catch (e) {}
         });
@@ -635,6 +661,11 @@
             document.querySelectorAll(".duplicates-section").forEach((sec) => {
               sec.classList.toggle("active", sec.id === "section-" + tab);
             });
+            document.querySelectorAll(".summary-for-tab").forEach((el) => {
+              el.style.display = el.getAttribute("data-for-tab") === tab ? "" : "none";
+            });
+            const actionsEl = document.getElementById("actionsDelete");
+            if (actionsEl) actionsEl.style.display = tab === "allowed" ? "none" : "";
             const scroll = Number(state.scroll);
             if (scroll >= 0) requestAnimationFrame(() => { window.scrollTo(0, scroll); });
           } else {
@@ -644,6 +675,11 @@
               document.querySelectorAll(".duplicates-section").forEach((sec) => {
                 sec.classList.toggle("active", sec.id === "section-" + savedTab);
               });
+              document.querySelectorAll(".summary-for-tab").forEach((el) => {
+                el.style.display = el.getAttribute("data-for-tab") === savedTab ? "" : "none";
+              });
+              const actionsEl = document.getElementById("actionsDelete");
+              if (actionsEl) actionsEl.style.display = savedTab === "allowed" ? "none" : "";
             }
           }
           updateDeleteButtonLabel();
@@ -859,6 +895,11 @@
       updateDeleteButtonLabel();
       // восстановление вкладки и прокрутки после перезагрузки (например после «Удалить копии»)
       restoreDuplicatesState();
+      // превью загружаем после restore, чтобы для восстановленной вкладки (в т.ч. «Визуально похожие») подгрузились картинки
+      (function () {
+        const activeTab = document.querySelector(".tabs .tab.active")?.getAttribute("data-tab") || "exact";
+        loadPreviews(activeTab);
+      })();
       // и обновление при кликах по чекбоксам
       document.addEventListener("change", (e) => {
         const t = e.target;
@@ -965,28 +1006,36 @@
           const folderEl = card.querySelector(".folder");
           const linkEl = card.querySelector(".muted.path a.link");
           const codeEl = card.querySelector(".muted.path code");
-          const metaEl = card.querySelector(".kv.meta-attachments");
+          let metaEl = card.querySelector(".kv.meta-attachments");
+          const rects = data.rectangles || [];
+          const persons = data.persons || [];
+          const trips = data.trips || [];
+          const parts = [];
+          if (rects.length) {
+            parts.push(`<span class="pill" title="Лица">Лица: ${rects.length}</span>`);
+            rects.forEach(r => { if (r.person_name) parts.push(`<span class="pill">${escapeHtml(r.person_name)}</span>`); });
+          }
+          if (persons.length) {
+            parts.push(`<span class="pill" title="Персоны (файл)">персоны</span>`);
+            persons.forEach(p => { parts.push(`<span class="pill">${escapeHtml(p.name || "")}</span>`); });
+          }
+          if (trips.length) {
+            parts.push(`<span class="pill" title="Поездки">поездки</span>`);
+            trips.forEach(t => { if (t.name) parts.push(`<span class="pill">${escapeHtml(t.name)}</span>`); });
+          }
           if (thumb) thumb.setAttribute("data-path", data.path || "");
           if (folderEl) folderEl.textContent = data.folder_short || "";
           if (linkEl) linkEl.setAttribute("href", `/api/yadisk/open?path=${encodeURIComponent(data.path || "")}`);
           if (codeEl) codeEl.textContent = data.path_short || data.path || "";
+          if (!metaEl && parts.length > 0) {
+            const keepEl = card.querySelector(".keep");
+            metaEl = document.createElement("div");
+            metaEl.className = "kv meta-attachments";
+            metaEl.style.marginTop = "4px";
+            if (keepEl && keepEl.parentNode) keepEl.parentNode.insertBefore(metaEl, keepEl);
+            else card.querySelector(".card-body")?.appendChild(metaEl);
+          }
           if (metaEl) {
-            const rects = data.rectangles || [];
-            const persons = data.persons || [];
-            const trips = data.trips || [];
-            const parts = [];
-            if (rects.length) {
-              parts.push(`<span class="pill" title="Лица">Лица: ${rects.length}</span>`);
-              rects.forEach(r => { if (r.person_name) parts.push(`<span class="pill">${escapeHtml(r.person_name)}</span>`); });
-            }
-            if (persons.length) {
-              parts.push(`<span class="pill" title="Персоны (файл)">персоны</span>`);
-              persons.forEach(p => { parts.push(`<span class="pill">${escapeHtml(p.name || "")}</span>`); });
-            }
-            if (trips.length) {
-              parts.push(`<span class="pill" title="Поездки">поездки</span>`);
-              trips.forEach(t => { if (t.name) parts.push(`<span class="pill">${escapeHtml(t.name)}</span>`); });
-            }
             metaEl.innerHTML = parts.length ? parts.join("") : "";
             metaEl.style.display = parts.length ? "" : "none";
           }
