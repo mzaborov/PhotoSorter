@@ -36,6 +36,7 @@ def sorting_folders_page(request: Request) -> HTMLResponse:
 _LOCAL_PIPELINE_EXEC = ThreadPoolExecutor(max_workers=1)
 _LOCAL_PIPELINE_LOCK = threading.Lock()
 _LOCAL_PIPELINE_FUTURE: Any = None
+_LOCAL_PIPELINE_PROCESS: Optional[subprocess.Popen] = None  # для принудительной остановки
 _LOCAL_PIPELINE_RUN_ID: Optional[int] = None
 _LOCAL_PIPELINE_STATE: dict[str, Any] = {
     "running": False,
@@ -84,6 +85,7 @@ def _local_pipeline_log_append(line: str) -> None:
 
 
 def _run_local_pipeline(*, root_path: str, apply: bool, skip_dedup: bool, no_dedup_move: bool, pipeline_run_id: int) -> None:
+    global _LOCAL_PIPELINE_PROCESS  # noqa: PLW0603
     rr = _repo_root()
     py = rr / ".venv-face" / "Scripts" / "python.exe"
     script = rr / "backend" / "scripts" / "tools" / "local_sort_by_faces.py"
@@ -162,6 +164,8 @@ def _run_local_pipeline(*, root_path: str, apply: bool, skip_dedup: bool, no_ded
             bufsize=1,
             env=env,
         )
+        with _LOCAL_PIPELINE_LOCK:
+            _LOCAL_PIPELINE_PROCESS = p
         assert p.stdout is not None
         ps = PipelineStore()
         try:
@@ -196,6 +200,7 @@ def _run_local_pipeline(*, root_path: str, apply: bool, skip_dedup: bool, no_ded
             ps2.close()
         with _LOCAL_PIPELINE_LOCK:
             _LOCAL_PIPELINE_STATE.update({"running": False, "finished_at": _now_utc_iso(), "exit_code": rc, "error": None if rc == 0 else f"exit_code={rc}"})
+            _LOCAL_PIPELINE_PROCESS = None
     except Exception as e:  # noqa: BLE001
         _local_pipeline_log_append(f"ERROR: {type(e).__name__}: {e}\n")
         ps3 = PipelineStore()
@@ -212,6 +217,7 @@ def _run_local_pipeline(*, root_path: str, apply: bool, skip_dedup: bool, no_ded
             ps3.close()
         with _LOCAL_PIPELINE_LOCK:
             _LOCAL_PIPELINE_STATE.update({"running": False, "finished_at": _now_utc_iso(), "exit_code": 1, "error": f"{type(e).__name__}: {e}"})
+            _LOCAL_PIPELINE_PROCESS = None
 
 
 def _get_step4_total(pipeline_run_id: int) -> int | None:
@@ -456,6 +462,7 @@ def _run_step4_only(pipeline_run_id: int, apply: bool, clear_first: bool = False
 
 @router.post("/api/local-pipeline/start")
 def api_local_pipeline_start(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    global _LOCAL_PIPELINE_FUTURE, _LOCAL_PIPELINE_RUN_ID  # noqa: PLW0603
     root_path = str(payload.get("root_path") or "").strip()
     apply = bool(payload.get("apply") or False)
     skip_dedup = bool(payload.get("skip_dedup") or False)
@@ -477,6 +484,13 @@ def api_local_pipeline_start(payload: dict[str, Any] = Body(...)) -> dict[str, A
         raise HTTPException(status_code=500, detail="Missing .venv-face (Python 3.12) — create it before running ML pipeline")
     if not script.exists():
         raise HTTPException(status_code=500, detail=f"Missing: {script}")
+
+    # При start_mode=="new": не создаём run, если воркер уже запущен (иначе плодим мусорные runs).
+    if start_mode == "new":
+        with _LOCAL_PIPELINE_LOCK:
+            fut = _LOCAL_PIPELINE_FUTURE
+            if fut is not None and not fut.done():
+                return {"ok": False, "message": "local pipeline already running"}
 
     ps = PipelineStore()
     try:
@@ -644,34 +658,27 @@ def api_local_pipeline_start(payload: dict[str, Any] = Body(...)) -> dict[str, A
     except Exception:
         pass
 
-    # При resume: если шаг 3 уже выполнен (face_run_id задан), продолжаем только шаг 4 (не перезапускаем 1–3).
-    run_only_step4 = bool(resumed) and pr is not None and pr.get("face_run_id")
-    global _LOCAL_PIPELINE_FUTURE  # noqa: PLW0603
+    # Шаг 4 всегда запускается только вручную (кнопка «Продолжить шаг»). При resume с выполненным шагом 3 — не автозапускаем шаг 4.
+    if bool(resumed) and pr is not None and pr.get("face_run_id"):
+        return {"ok": False, "message": "Шаг 4 запускается только вручную. Нажмите «Продолжить шаг»."}
+
     with _LOCAL_PIPELINE_LOCK:
         fut = _LOCAL_PIPELINE_FUTURE
         if fut is not None and not fut.done():
             return {"ok": False, "message": "local pipeline already running"}
-        global _LOCAL_PIPELINE_RUN_ID  # noqa: PLW0603
         _LOCAL_PIPELINE_RUN_ID = int(pipeline_run_id)
-        if run_only_step4:
-            _LOCAL_PIPELINE_FUTURE = _LOCAL_PIPELINE_EXEC.submit(
-                _run_step4_only,
-                pipeline_run_id=int(pipeline_run_id),
-                apply=apply,
-            )
-        else:
-            _LOCAL_PIPELINE_FUTURE = _LOCAL_PIPELINE_EXEC.submit(
-                _run_local_pipeline,
-                root_path=root_path,
-                apply=apply,
-                skip_dedup=skip_dedup,
-                no_dedup_move=no_dedup_move,
-                pipeline_run_id=int(pipeline_run_id),
-            )
+        _LOCAL_PIPELINE_FUTURE = _LOCAL_PIPELINE_EXEC.submit(
+            _run_local_pipeline,
+            root_path=root_path,
+            apply=apply,
+            skip_dedup=skip_dedup,
+            no_dedup_move=no_dedup_move,
+            pipeline_run_id=int(pipeline_run_id),
+        )
 
     return {
         "ok": True,
-        "message": "step4_only" if run_only_step4 else "started",
+        "message": "started",
         "run_id": int(pipeline_run_id),
         "resumed": bool(resumed),
         "start_mode": start_mode or ("continue" if resumed else "new"),
@@ -729,6 +736,30 @@ def api_local_pipeline_start_step4(payload: dict[str, Any] = Body(...)) -> dict[
     }
 
 
+@router.post("/api/local-pipeline/cancel")
+def api_local_pipeline_cancel() -> dict[str, Any]:
+    """Принудительно останавливает запущенный pipeline (subprocess). Применяется при зависании."""
+    global _LOCAL_PIPELINE_PROCESS  # noqa: PLW0603
+    with _LOCAL_PIPELINE_LOCK:
+        proc = _LOCAL_PIPELINE_PROCESS
+    if proc is None:
+        return {"ok": True, "message": "no process to cancel", "cancelled": False}
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+            with _LOCAL_PIPELINE_LOCK:
+                _LOCAL_PIPELINE_PROCESS = None
+            return {"ok": True, "message": "pipeline terminated", "cancelled": True}
+    except Exception as e:
+        return {"ok": False, "message": str(e), "cancelled": False}
+    return {"ok": True, "message": "process already finished", "cancelled": False}
+
+
 @router.get("/api/local-pipeline/latest")
 def api_local_pipeline_latest(root_path: str) -> dict[str, Any]:
     rp = str(root_path or "").strip()
@@ -767,7 +798,10 @@ def api_local_pipeline_status() -> dict[str, Any]:
         }
 
     status = str(pr.get("status") or "")
-    running = status == "running"
+    # running = реально идёт процесс (Future активна), а не только запись в БД (после перезапуска uvicorn БД может быть устаревшей)
+    with _LOCAL_PIPELINE_LOCK:
+        fut = _LOCAL_PIPELINE_FUTURE
+    running = fut is not None and not fut.done()
     exit_code: int | None
     if status == "completed":
         exit_code = 0

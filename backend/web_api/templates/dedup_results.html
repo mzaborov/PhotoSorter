@@ -228,8 +228,10 @@
         const path = item.path || item.source_path || "";
         const mime = (item.mime_type || item.source_mime_type || "").toLowerCase();
         const mt = (item.media_type || item.source_media_type || "").toLowerCase();
-        const kind = (mt === "video" || mime.startsWith("video/")) ? "video" : ((mt === "image" || mime.startsWith("image/")) ? "image" : "none");
-        const pv = item.preview_url || previewUrlForPath(path, kind);
+        const isImageByExt = /\.(webp|jpg|jpeg|png|gif|bmp|avif|heic)$/i.test(path);
+        const kind = (mt === "video" || mime.startsWith("video/")) ? "video" : ((mt === "image" || mime.startsWith("image/") || isImageByExt) ? "image" : "none");
+        // Для local: путей всегда используем previewUrlForPath (добавляет pipeline_run_id) — API возвращает preview_url без него
+        const pv = path.startsWith("local:") ? previewUrlForPath(path, kind) : (item.preview_url || previewUrlForPath(path, kind));
         const openUrl = path.startsWith("disk:") ? `/api/yadisk/open?path=${encodeURIComponent(path)}` : null;
         const chkId = opts.chkId || "";
         const chkLabel = opts.chkLabel || "";
@@ -238,7 +240,7 @@
         const name = item.name || item.source_name || "";
         const head = name ? `<div class="muted">${escapeHtml(name)}</div>` : "";
         const thumb = (kind === "image" && pv)
-          ? `<img loading="lazy" alt="preview" referrerpolicy="no-referrer" data-src="${escapeHtml(pv)}" />`
+          ? `<img loading="lazy" alt="preview" referrerpolicy="no-referrer" src="${escapeHtml(pv)}" />`
           : (kind === "video" && pv)
             ? `<video controls muted preload="metadata" src="${escapeHtml(pv)}"></video>`
             : `<div class="noimg">нет превью</div>`;

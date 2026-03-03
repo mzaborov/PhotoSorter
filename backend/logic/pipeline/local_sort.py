@@ -141,14 +141,9 @@ def _is_broken_image_file(path: str) -> bool:
         with open(path, "rb") as f:
             head = f.read(64)
             if ext in (".jpg", ".jpeg"):
-                if len(head) < 2 or head[0:2] != b"\xff\xd8":
-                    return True
-                try:
-                    f.seek(-2, os.SEEK_END)
-                    tail = f.read(2)
-                except Exception:
-                    return True
-                return tail != b"\xff\xd9"
+                # Мягкая проверка: достаточно корректного SOI в начале файла.
+                # Многие просмотрщики спокойно открывают JPEG без EOI, не считаем их битым медиа.
+                return not (len(head) >= 2 and head[0:2] == b"\xff\xd8")
             if ext == ".png":
                 return not (len(head) >= 8 and head[0:8] == b"\x89PNG\r\n\x1a\n")
             if ext == ".webp":
@@ -2510,7 +2505,8 @@ def sort_by_faces(
             if cat == 2:
                 target_root = faces_dirname
             elif cat == 1:
-                target_root = os.path.join(faces_dirname, faces_quarantine_dirname)
+                # Шаг 4 не создаёт _quarantine: файлы с автокарантином не перемещаем, остаются на месте.
+                continue
             elif cat == 4:
                 target_root = os.path.join(faces_dirname, faces_people_no_face_dirname)
             elif cat == 3:
@@ -2551,8 +2547,6 @@ def sort_by_faces(
 
             if cat == 2:
                 stats.moved_faces += 1
-            elif cat == 1:
-                stats.moved_quarantine += 1
             elif cat == 3:
                 stats.moved_animals += 1
             elif cat == 4:

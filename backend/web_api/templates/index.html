@@ -137,8 +137,9 @@
           </div>
           <div class="row" style="margin-top: 10px;">
             <label style="font-weight: 600;"><input id="pipeApply" type="checkbox" /> APPLY (двигаем файлы)</label>
-            <button class="btn" id="btnPipeResume" type="button" disabled title="Продолжить последний незавершённый прогон (если есть)">Продолжить</button>
-            <button class="btn primary" id="btnPipeStartNew" type="button">Начать заново</button>
+            <button class="btn" id="btnPipeResume" type="button" disabled title="Продолжить последний незавершённый прогон (если есть)" style="display:none;">Продолжить</button>
+            <button class="btn primary" id="btnPipeStartNew" type="button">Начать</button>
+            <button class="btn" id="btnPipeCancel" type="button" title="Принудительно завершить зависший процесс" style="display:none;">Принудительно остановить</button>
           </div>
 
           <div style="margin-top: 12px;">
@@ -582,27 +583,44 @@
             }
           }
 
-          // Кнопка "Продолжить" (общая): включаем только если для текущего пути есть незавершённый прогон.
+          // Кнопки "Продолжить" / "Начать": для новой папки — только "Начать"; для незавершённого прогона — обе.
           const btnResume = qs("#btnPipeResume");
-          const setResumeButtons = (disabled, text) => {
-            if (btnResume) { btnResume.disabled = disabled; btnResume.textContent = text; }
-          };
-          if (btnResume) {
+          const btnStartNew = qs("#btnPipeStartNew");
+          const btnCancel = qs("#btnPipeCancel");
+          let resumable = false;
+          if (btnResume && btnStartNew) {
             const rootNow = (qs("#path")?.value || "").trim();
             if (!rootNow || !isLocalSelected()) {
-              setResumeButtons(true, "Продолжить");
+              btnResume.style.display = "none";
+              btnStartNew.textContent = "Начать";
             } else {
               try {
                 const lr = await fetchJson(`/api/local-pipeline/latest?root_path=${encodeURIComponent(rootNow)}`, { cache: "no-store" });
                 const pr = lr?.latest || null;
                 const stt = String(pr?.status || "");
-                const resumable = !!pr?.id && (stt === "failed" || stt === "running");
-                setResumeButtons(!resumable, resumable ? `Продолжить (run ${pr.id})` : "Продолжить");
+                resumable = !!pr?.id && (stt === "failed" || stt === "running");
+                if (resumable) {
+                  btnResume.style.display = "inline-block";
+                  btnResume.disabled = false;
+                  btnResume.textContent = `Продолжить (run ${pr.id})`;
+                  btnStartNew.textContent = "Начать заново";
+                } else {
+                  btnResume.style.display = "none";
+                  btnStartNew.textContent = "Начать";
+                }
               } catch (e) {
-                setResumeButtons(true, "Продолжить");
+                btnResume.style.display = "none";
+                btnStartNew.textContent = "Начать";
               }
             }
           }
+          // Кнопка "Принудительно остановить": показываем, когда pipeline идёт.
+          if (btnCancel) {
+            btnCancel.style.display = running ? "inline-block" : "none";
+          }
+          // При идущем pipeline — отключаем старт и продолжение.
+          if (btnStartNew) btnStartNew.disabled = running;
+          if (btnResume && resumable) btnResume.disabled = running;
           // Кнопка шага 4: «Продолжить шаг» когда шаг 4 ещё не сделан, «Выполнить сортировку заново» когда шаг 4 уже done.
           const btnContinueStep4 = qs("#btnPipeContinueStep4");
           const rootNow = (qs("#path")?.value || "").trim();
@@ -804,6 +822,29 @@
           setToast(e?.message || String(e), true);
         } finally {
           const btn = qs("#btnPipeResume");
+          if (btn) btn.disabled = false;
+        }
+      }
+
+      async function cancelLocalPipeline() {
+        const loc = getLocation();
+        if (loc !== "local") return;
+        try {
+          setToast("");
+          const btn = qs("#btnPipeCancel");
+          if (btn) btn.disabled = true;
+          const resp = await postJson("/api/local-pipeline/cancel", {});
+          if (resp?.cancelled) {
+            setToast("Процесс остановлен. Можно начать заново.");
+          } else {
+            setToast(resp?.message || "Остановка выполнена");
+          }
+          if (pipePollTimer) clearTimeout(pipePollTimer);
+          pipePollOnce();
+        } catch (e) {
+          setToast(e?.message || String(e), true);
+        } finally {
+          const btn = qs("#btnPipeCancel");
           if (btn) btn.disabled = false;
         }
       }
@@ -1456,6 +1497,7 @@
 
       qs("#btnPipeStartNew")?.addEventListener("click", () => startLocalPipelineNew());
       qs("#btnPipeResume")?.addEventListener("click", () => startLocalPipelineResume());
+      qs("#btnPipeCancel")?.addEventListener("click", () => cancelLocalPipeline());
       qs("#btnPipeContinueStep4")?.addEventListener("click", () => startLocalPipelineStep4());
       qs("#btnMoveLocal")?.addEventListener("click", () => doSortIntoFolders("local"));
       qs("#btnMoveArchive")?.addEventListener("click", () => doSortIntoFolders("archive"));

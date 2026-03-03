@@ -349,7 +349,8 @@ def determine_target_folder(
         pn = (person_name or "").strip()
         folder_name = pn if pn else (_find_folder_by_rule_value(target_folders or [], "any_people") or "Другие люди")
     elif effective_tab == "quarantine":
-        folder_name = "_quarantine"
+        # Шаг 4 не создаёт _quarantine: такие файлы остаются без target_folder (разбор только в шаге 3).
+        return None
     elif effective_tab == "animals":
         folder_name = _find_folder_by_rule_value(target_folders or [], "animals") if target_folders else "_animals"
         if not folder_name:
@@ -395,7 +396,7 @@ def determine_target_folder(
         return None
 
     # Служебные папки — всегда под корнем прогона; папки из таблицы (лица, животные) — path из БД, если disk:
-    if folder_name in ("_non_media", "_broken_media", "_quarantine", "_people_no_face"):
+    if folder_name in ("_non_media", "_broken_media", "_people_no_face"):
         if root_path.startswith("disk:"):
             return f"{base_path}/{folder_name}"
         return f"local:{os.path.join(base_path, folder_name)}"

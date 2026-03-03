@@ -2978,6 +2978,12 @@ class DedupStore:
         self.conn.commit()
         return cur.rowcount is not None and cur.rowcount > 0
 
+    def update_file_size_by_path(self, *, path: str, size: int) -> None:
+        """Обновляет size файла по path (например после досчёта pHash по скачанному файлу)."""
+        cur = self.conn.cursor()
+        cur.execute("UPDATE files SET size = ? WHERE path = ?", (size, path))
+        self.conn.commit()
+
     def list_archive_image_paths_without_phash(self, *, limit: int = 100, algorithm: str = "pHash") -> list[str]:
         """Пути архивных изображений, для которых ещё нет перцептивного хеша (для досчёта pHash)."""
         cur = self.conn.cursor()
@@ -4767,6 +4773,12 @@ class PipelineStore:
         )
         self.conn.commit()
         return cur.rowcount is not None and cur.rowcount > 0
+
+    def update_file_size_by_path(self, *, path: str, size: int) -> None:
+        """Обновляет size файла по path (например после досчёта pHash по скачанному файлу)."""
+        cur = self.conn.cursor()
+        cur.execute("UPDATE files SET size = ? WHERE path = ?", (size, path))
+        self.conn.commit()
 
     def list_archive_image_paths_without_phash(self, *, limit: int = 100, algorithm: str = "pHash") -> list[str]:
         """Пути архивных изображений, для которых ещё нет перцептивного хеша (для досчёта pHash)."""

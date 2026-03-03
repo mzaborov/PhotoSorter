@@ -4619,6 +4619,14 @@ def api_faces_step4_report(pipeline_run_id: int) -> dict[str, Any]:
         folder = str(r["target_folder"] or "").strip()
         if not folder:
             continue
+        # Шаг 4 не показывает _quarantine: такие файлы считаем несортированными.
+        if "/_quarantine" in folder or folder.rstrip("/").endswith("_quarantine"):
+            entry = {"id": r["id"], "path": r["path"], "name": r["name"]}
+            fi = frames_with_markup.get(r["id"])
+            if fi is not None:
+                entry["video_frame_idx"] = fi
+            unsorted.append(entry)
+            continue
         entry = {"id": r["id"], "path": r["path"], "name": r["name"]}
         fi = frames_with_markup.get(r["id"])
         if fi is not None:
@@ -4877,8 +4885,8 @@ def fill_target_folders_impl(pipeline_run_id: int) -> dict[str, Any]:
                 effective_tab = "quarantine"
             elif (r.get("faces_count") or 0) > 0:
                 effective_tab = "faces"
-            # Файлы с привязкой к персоне (file_persons или лица): раскладываем по правилам, не в _people_no_face
-            if r.get("has_person_binding") and effective_tab in ("no_faces", "people_no_face"):
+            # Файлы с привязкой к персоне (file_persons или лица): раскладываем по правилам — в папку персоны, не в _people_no_face и не «без папки» из-за автокарантина
+            if r.get("has_person_binding") and effective_tab in ("no_faces", "people_no_face", "quarantine"):
                 effective_tab = "faces"
 
             person_name = None

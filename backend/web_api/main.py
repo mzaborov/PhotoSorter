@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from common.db import DedupStore, FaceStore, PipelineStore, get_connection, get_file_duplicate_context, list_folders, init_db
+from common.db import DedupStore, FaceStore, PipelineStore, get_connection, get_file_duplicate_context, get_pipeline_run_id_for_path, list_folders, init_db
 from common.perceptual_hash import compute_phash_hex
 from common.yadisk_client import get_disk
 from web_api.routers.gold import router as gold_router
@@ -1793,12 +1793,18 @@ def api_archive_scan_perceptual_hashes(payload: dict[str, Any] = Body(default_fa
             with tempfile.NamedTemporaryFile(prefix="photosorter_phash_", suffix=".bin", delete=False) as tmp:
                 tmp_path = tmp.name
             _yd_call_retry_timeout(lambda: disk.download(remote, tmp_path), timeout_sec=300)
+            try:
+                file_size = os.path.getsize(tmp_path)
+            except OSError:
+                file_size = None
             phash_val = compute_phash_hex(tmp_path)
             if phash_val:
                 store3 = DedupStore()
                 try:
                     if store3.upsert_perceptual_hash(path=path, algorithm="pHash", value=phash_val):
                         processed += 1
+                    if file_size is not None:
+                        store3.update_file_size_by_path(path=path, size=file_size)
                 finally:
                     store3.close()
             else:
@@ -4182,16 +4188,31 @@ def api_local_preview(path: str, pipeline_run_id: int | None = None) -> Response
         if not pr:
             raise HTTPException(status_code=404, detail="pipeline_run_id not found")
         root_path = str(pr.get("root_path") or "")
-    # 2) Fallback: legacy-логика (последний scope=source)
+    # 2) Fallback: ищем pipeline_run по path (root_path — префикс пути) и берём root оттуда
+    if not root_path:
+        try:
+            inferred_pr_id = get_pipeline_run_id_for_path(path)
+            if inferred_pr_id is not None:
+                ps_fb = PipelineStore()
+                try:
+                    pr_fb = ps_fb.get_run_by_id(run_id=int(inferred_pr_id))
+                    if pr_fb:
+                        root_path = str(pr_fb.get("root_path") or "")
+                finally:
+                    ps_fb.close()
+        except Exception:
+            pass
+    # 3) Fallback: legacy-логика (последний scope=source)
     if not root_path:
         store = DedupStore()
         try:
             src_latest = store.get_latest_run(scope="source")
-            if not src_latest:
-                raise HTTPException(status_code=400, detail="Нет активного source run.")
-            root_path = str(src_latest.get("root_path") or "")
+            if src_latest:
+                root_path = str(src_latest.get("root_path") or "")
         finally:
             store.close()
+    if not root_path:
+        raise HTTPException(status_code=400, detail="Не удалось определить root_path. Укажите pipeline_run_id в URL.")
 
     file_path = _strip_local_prefix(path)
     if not file_path:

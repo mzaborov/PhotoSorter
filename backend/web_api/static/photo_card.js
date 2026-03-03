@@ -1149,7 +1149,11 @@
       // Локальный файл: cache-bust при каждом открытии карточки, чтобы после поворота/изменений показывать актуальный файл
       const encodedPath = encodeURIComponent(currentState.file_path);
       const bust = currentState.imageCacheBust != null ? currentState.imageCacheBust : Date.now();
-      imageUrl = `/api/local/preview?path=${encodedPath}&t=${bust}`;
+      let url = `/api/local/preview?path=${encodedPath}&t=${bust}`;
+      if (currentState.pipeline_run_id != null) {
+        url += `&pipeline_run_id=${currentState.pipeline_run_id}`;
+      }
+      imageUrl = url;
     } else {
       console.error('[photo_card] Unknown file path format:', currentState.file_path);
       return;
@@ -2078,7 +2082,7 @@
 
   /**
    * Создает компактное меню действий для rectangle.
-   * Везде: Посторонний, Другой/Назначить персону (выпадашка), Режим редактирования (переместить/отредактировать), Удалить/Не лицо.
+   * Везде: Посторонний, Другой/Назначить персону (выпадашка), Режим редактирования (переместить/отредактировать), Удалить rectangle.
    * Только архив: тип привязки, Аватар (если person_id). Сортировка: дополнительно Кот.
    */
   function createRectangleActionsMenu(rectIndex) {
@@ -2281,9 +2285,9 @@
       }
     }
     
-    // Удалить rectangle / Не лицо
+    // Удалить rectangle — везде одна надпись для ясности
     const deleteBtn = document.createElement('button');
-    deleteBtn.textContent = isArchive ? 'Удалить rectangle' : 'Не лицо';
+    deleteBtn.textContent = 'Удалить rectangle';
     deleteBtn.className = 'danger';
     deleteBtn.addEventListener('click', function(e) {
       e.stopPropagation();
