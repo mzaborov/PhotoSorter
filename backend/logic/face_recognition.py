@@ -113,6 +113,7 @@ def cluster_face_embeddings(
     min_samples: int = 2,
     use_folder_context: bool = True,
     progress_callback: Callable[[str], None] | None = None,
+    min_bbox_min: int | None = None,
 ) -> dict[str, Any]:
     """
     Кластеризует face embeddings из БД используя DBSCAN.
@@ -123,6 +124,7 @@ def cluster_face_embeddings(
         eps: максимальное расстояние между точками в одном кластере (для косинусного расстояния)
         min_samples: минимальное количество точек для формирования кластера
         use_folder_context: использовать ли контекст папок для улучшения кластеризации
+        min_bbox_min: для архива — учитывать только лица с min(bbox_w, bbox_h) >= это значение (пиксели); None — без фильтра
     
     Returns:
         dict с результатами: {
@@ -150,10 +152,11 @@ def cluster_face_embeddings(
     # Формируем SQL-запрос в зависимости от режима
     if archive_scope == 'archive':
         # Для архива фильтруем по files.inventory_scope (3NF: archive_scope удалён из photo_rectangles)
+        # При min_bbox_min учитываем только лица с достаточным размером (качество для кластеризации)
         cur.execute(
             """
             SELECT 
-                pr.id, f.path AS file_path, pr.embedding
+                pr.id, f.path AS file_path, pr.embedding, pr.bbox_w, pr.bbox_h
             FROM photo_rectangles pr
             JOIN files f ON f.id = pr.file_id
             WHERE f.inventory_scope = 'archive'
@@ -183,7 +186,19 @@ def cluster_face_embeddings(
         )
     
     rows = cur.fetchall()
-    if progress_callback:
+    # Для архива: фильтр по качеству (min_bbox_min)
+    if archive_scope == 'archive' and min_bbox_min is not None and rows:
+        d_rows = [dict(r) for r in rows]
+        rows = []
+        for r in d_rows:
+            w = int(r.get("bbox_w") or 0)
+            h = int(r.get("bbox_h") or 0)
+            if min(w, h) >= min_bbox_min:
+                rows.append(r)
+        if progress_callback and len(rows) < len(d_rows):
+            progress_callback(f"По min_bbox_min>={min_bbox_min} отфильтровано, остаётся {len(rows)} лиц из {len(d_rows)}")
+        # Обратно в список dict — rows уже list[dict] после фильтра
+    if progress_callback and rows:
         progress_callback(f"Загружено {len(rows)} лиц из БД")
     
     if len(rows) == 0:
@@ -873,6 +888,20 @@ def _load_embedding_model() -> dict | None:
                 pass
         if onnx_path is None:
             return None
+        return _load_embedding_model_from_path(Path(onnx_path))
+    except Exception:
+        return None
+
+
+def _load_embedding_model_from_path(onnx_path: Path) -> dict | None:
+    """Загружает модель эмбеддингов по пути к ONNX (для альтернативных моделей)."""
+    try:
+        import onnxruntime as ort  # type: ignore[import-untyped]
+    except ImportError:
+        return None
+    if not onnx_path.exists():
+        return None
+    try:
         sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
         inp = sess.get_inputs()[0]
         return {

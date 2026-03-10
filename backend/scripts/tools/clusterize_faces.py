@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Запускает кластеризацию лиц для указанного face_run_id.
+Запускает кластеризацию лиц для указанного face_run_id или для архива (--archive).
 """
 
 import argparse
@@ -15,13 +15,52 @@ from backend.common.db import get_connection
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Кластеризация лиц для face_run_id")
-    parser.add_argument("--run-id", type=int, required=True, help="ID прогона детекции лиц (face_run_id)")
-    parser.add_argument("--eps", type=float, default=0.4, help="Параметр eps для DBSCAN (по умолчанию 0.4)")
+    parser = argparse.ArgumentParser(
+        description="Кластеризация лиц для face_run_id или для архива (--archive)."
+    )
+    parser.add_argument(
+        "--run-id",
+        type=int,
+        default=None,
+        help="ID прогона детекции лиц (face_run_id); обязателен, если не указан --archive",
+    )
+    parser.add_argument(
+        "--archive",
+        action="store_true",
+        help="Кластеризовать лица архива (inventory_scope='archive')",
+    )
+    parser.add_argument("--eps", type=float, default=None, help="Параметр eps для DBSCAN (по умолчанию для архива: 0.44, иначе 0.4)")
     parser.add_argument("--min-samples", type=int, default=2, help="Минимальное количество точек для кластера (по умолчанию 2)")
+    parser.add_argument(
+        "--min-bbox-min",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Для архива: учитывать только лица с min(bbox_w, bbox_h) >= N пикселей (по умолчанию при --archive: 70)",
+    )
     args = parser.parse_args()
 
-    print(f"Запуск кластеризации для face_run_id={args.run_id}")
+    if args.archive and args.run_id is not None:
+        print("Ошибка: укажите либо --run-id, либо --archive, но не оба.", file=sys.stderr)
+        return 1
+    if not args.archive and args.run_id is None:
+        print("Ошибка: укажите --run-id или --archive.", file=sys.stderr)
+        return 1
+
+    # Для архива — дефолты по результатам тюнинга (min_bbox_min=70, eps=0.44 → ARI_clustered ~0.36)
+    if args.archive:
+        if args.min_bbox_min is None:
+            args.min_bbox_min = 70
+        if args.eps is None:
+            args.eps = 0.44
+    elif args.eps is None:
+        args.eps = 0.4
+    if args.archive:
+        print("Запуск кластеризации для архива (inventory_scope='archive')")
+        if args.min_bbox_min is not None:
+            print(f"Фильтр по качеству: min_bbox_min={args.min_bbox_min}")
+    else:
+        print(f"Запуск кластеризации для face_run_id={args.run_id}")
     print(f"Параметры: eps={args.eps}, min_samples={args.min_samples}")
     print()
 
@@ -31,10 +70,12 @@ def main() -> int:
     try:
         result = cluster_face_embeddings(
             run_id=args.run_id,
+            archive_scope="archive" if args.archive else None,
             eps=args.eps,
             min_samples=args.min_samples,
             use_folder_context=True,
             progress_callback=progress,
+            min_bbox_min=args.min_bbox_min if args.archive else None,
         )
 
         print("=" * 60)

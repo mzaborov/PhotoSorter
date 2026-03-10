@@ -149,9 +149,10 @@ def main() -> int:
         result = cluster_face_embeddings(
             run_id=None,
             archive_scope='archive',
-            eps=0.2,
-            min_samples=3,
+            eps=0.44,
+            min_samples=2,
             use_folder_context=True,
+            min_bbox_min=70,
         )
         clusters_count = result.get("clusters_count", 0)
         noise_count = result.get("noise_count", 0)
