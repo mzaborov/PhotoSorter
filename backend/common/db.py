@@ -916,6 +916,7 @@ class FaceStore:
         # idx_photo_rect_archive_scope удалён — archive_scope в photo_rectangles удалён (3NF)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_face_clusters_archive_scope ON face_clusters(archive_scope);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photo_rect_cluster_id ON photo_rectangles(cluster_id);")
+
         # Старые индексы для face_labels (для обратной совместимости, будут удалены после миграции)
         # ВАЖНО: таблица face_labels больше не используется в рабочем коде, индексы оставлены только для совместимости
         # После полного тестирования можно удалить таблицу через migrate_drop_face_labels_table.py
