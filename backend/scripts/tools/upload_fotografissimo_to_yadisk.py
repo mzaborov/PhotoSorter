@@ -7,7 +7,7 @@
 Пример:
   python backend/scripts/tools/upload_fotografissimo_to_yadisk.py --dry-run
   python backend/scripts/tools/upload_fotografissimo_to_yadisk.py
-  python backend/scripts/tools/upload_fotografissimo_to_yadisk.py --file IMG_3951.jpg --file IMG_3973.jpg
+По умолчанию — 9 недостающих файлов с зашитыми piece_id (без запроса всей галереи).
 
 Нужен YADISK_ACCESS_TOKEN в secrets.env / .env (как у остальных скриптов PhotoSorter).
 HTTP к fotografissimo идёт через curl (wfolio отклоняет urllib из Python).
@@ -38,17 +38,19 @@ DEFAULT_FOLDER = "photos"
 DEFAULT_TARGET_DIR = "disk:/Фото/Темка/Свадьба"
 
 # 9 файлов, которые не загрузились через wfolio → ЯД (2026-07-02).
-DEFAULT_FILES = [
-    "IMG_3951.jpg",
-    "IMG_3973.jpg",
-    "IMG_4126.jpg",
-    "IMG_4218.jpg",
-    "IMG_4254.jpg",
-    "IMG_4257.jpg",
-    "IMG_4266.jpg",
-    "IMG_4277.jpg",
-    "IMG_4560.jpg",
-]
+# piece_id зафиксированы — не нужно тянуть индекс всей галереи (493 фото).
+DEFAULT_PIECE_IDS: dict[str, str] = {
+    "IMG_3951.jpg": "4777398274",
+    "IMG_3973.jpg": "4777398429",
+    "IMG_4126.jpg": "4777399131",
+    "IMG_4218.jpg": "4777399462",
+    "IMG_4254.jpg": "4777399698",
+    "IMG_4257.jpg": "4777399715",
+    "IMG_4266.jpg": "4777399786",
+    "IMG_4277.jpg": "4777399844",
+    "IMG_4560.jpg": "4777402052",
+}
+DEFAULT_FILES = list(DEFAULT_PIECE_IDS.keys())
 
 _PIECE_RE = re.compile(
     r'data-gallery-title="(?P<name>[^"]+)"[^>]*data-gallery-piece-id="(?P<piece_id>\d+)"'
@@ -123,18 +125,43 @@ def _ensure_yadisk_folder(disk, folder_disk_path: str) -> None:
                 raise
 
 
-def _fetch_piece_ids(
+def _lookup_piece_ids_in_gallery(
     session: _CurlSession,
     *,
     project_slug: str,
     folder_path: str,
+    filenames: list[str],
 ) -> dict[str, str]:
+    """Только для неизвестных имён: один запрос к галерее, из ответа берём нужные piece_id."""
     url = (
         f"{FOTOGRAFISSIMO_HOST}/disk/{project_slug}/pieces"
         f"?design_variant=storyboard&folder_path={urllib.parse.quote(folder_path)}"
     )
     html = session.get(url).decode("utf-8", errors="replace")
-    return {m.group("name"): m.group("piece_id") for m in _PIECE_RE.finditer(html)}
+    need = set(filenames)
+    return {
+        m.group("name"): m.group("piece_id")
+        for m in _PIECE_RE.finditer(html)
+        if m.group("name") in need
+    }
+
+
+def _resolve_piece_ids(
+    session: _CurlSession,
+    *,
+    project_slug: str,
+    folder_path: str,
+    filenames: list[str],
+) -> dict[str, str]:
+    known = {name: DEFAULT_PIECE_IDS[name] for name in filenames if name in DEFAULT_PIECE_IDS}
+    unknown = [name for name in filenames if name not in known]
+    if not unknown:
+        return known
+    print(f"Ищу piece_id в галерее для: {', '.join(unknown)}")
+    looked_up = _lookup_piece_ids_in_gallery(
+        session, project_slug=project_slug, folder_path=folder_path, filenames=unknown
+    )
+    return {**known, **looked_up}
 
 
 def _download_original(
@@ -215,11 +242,12 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory(prefix="fotografissimo_cookies_") as cookie_dir:
         session = _CurlSession(Path(cookie_dir) / "cookies.txt")
-        print(f"Загружаю список фото из галереи {args.project_slug}/{args.folder} ...")
-        piece_ids = _fetch_piece_ids(
-            session, project_slug=args.project_slug, folder_path=args.folder
+        piece_ids = _resolve_piece_ids(
+            session,
+            project_slug=args.project_slug,
+            folder_path=args.folder,
+            filenames=filenames,
         )
-        print(f"В галерее найдено файлов: {len(piece_ids)}")
 
         missing_in_gallery = [f for f in filenames if f not in piece_ids]
         if missing_in_gallery:
